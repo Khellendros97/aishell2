@@ -9,6 +9,7 @@ import { bus, openTab, Workbench } from '../core';
 import { confirmDialog, toast } from '../../../ui';
 import { fsCreate, fsDelete, fsImport, fsList, sftpDownload } from '../../../api';
 import type { FsEntry } from '../../../types';
+import { icon as iconSvg } from '../../../icons';
 import './explorer.css';
 
 /** 侧栏框架渲染 #sidebar-head 用（标题 + actions 按钮） */
@@ -18,14 +19,12 @@ export const explorerHead = {
     const newFile = document.createElement('button');
     newFile.className = 'icon-btn';
     newFile.title = '新建文件';
-    newFile.textContent = '📄+';
-    newFile.style.fontSize = '12px';
+    newFile.innerHTML = iconSvg('filePlus');
     newFile.onclick = () => startInlineInput(false);
     const newDir = document.createElement('button');
     newDir.className = 'icon-btn';
     newDir.title = '新建目录';
-    newDir.textContent = '📁+';
-    newDir.style.fontSize = '12px';
+    newDir.innerHTML = iconSvg('folderPlus');
     newDir.onclick = () => startInlineInput(true);
     el.append(newFile, newDir);
   },
@@ -41,7 +40,7 @@ const FILE_STYLES: Record<string, { label: string; color: string }> = {
   json: { label: '{}', color: '#e5c07b' },
   md: { label: 'md', color: '#b687e8' },
   sh: { label: 'sh', color: '#4ec98a' },
-  gitignore: { label: '⚙', color: '#6b7180' },
+  gitignore: { label: 'git', color: '#6b7180' },
 };
 
 interface TreeNode {
@@ -118,9 +117,24 @@ async function refreshDir(node: TreeNode): Promise<void> {
   }
 }
 
-/** 项目数据变化：路径变了重建根，否则刷新所有已加载目录 */
-const dirSig = (n: TreeNode): string =>
-  (n.children ?? []).map((c) => `${c.name}|${c.isDir ? 1 : 0}`).join(',');
+/** 项目数据变化：路径变了重建根，否则刷新所有已加载目录。
+ *  关键不变式：未变化的节点必须复用原对象——子树加载状态（children/loading）与
+ *  DOM 行闭包都挂在节点对象上，无差别替换会让行点击失效（点击写进孤儿节点）。 */
+function reconcile(dir: TreeNode, entries: FsEntry[]): boolean {
+  const old = dir.children ?? [];
+  const byPath = new Map(old.map((c) => [c.path, c]));
+  let changed = old.length !== entries.length;
+  const next: TreeNode[] = [];
+  for (const e of entries) {
+    const path = joinPath(dir.path, e.name);
+    const prev = byPath.get(path);
+    if (prev && prev.isDir === e.isDir) { next.push(prev); continue; }
+    changed = true;
+    next.push(makeChild(dir, e));
+  }
+  dir.children = next;
+  return changed;
+}
 
 async function refreshAll(): Promise<void> {
   const root = getRoot();
@@ -142,10 +156,7 @@ async function refreshAll(): Promise<void> {
     );
     if (token !== loadSeq) return;
     results.forEach((r) => {
-      if (!r) return;
-      const old = dirSig(r.d);
-      r.d.children = r.list.map((e) => makeChild(r.d, e));
-      if (dirSig(r.d) !== old) changed = true;
+      if (r && reconcile(r.d, r.list)) changed = true;
     });
   } finally {
     // 仅内容变化才重绘：定时轮询下避免无效 DOM 重建与 hover 态丢失
@@ -168,7 +179,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
   const icon = document.createElement('span');
   icon.className = 'wbs-explorer-file-tag';
   if (node.isDir) {
-    icon.textContent = '📁';
+    icon.innerHTML = iconSvg('folder');
   } else {
     const ext = (node.name.split('.').pop() || '').toLowerCase();
     const st = FILE_STYLES[ext];
@@ -178,7 +189,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
       icon.style.fontWeight = '700';
       icon.style.color = st.color;
     } else {
-      icon.textContent = '📄';
+      icon.innerHTML = iconSvg('file');
     }
   }
   row.appendChild(icon);
@@ -192,7 +203,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
     const del = document.createElement('button');
     del.className = 'icon-btn danger wbs-explorer-del';
     del.title = '删除';
-    del.textContent = '🗑';
+    del.innerHTML = iconSvg('trash');
     del.addEventListener('click', (e) => {
       e.stopPropagation();
       void deleteNode(node);
@@ -447,7 +458,7 @@ function render(): void {
   if (!root) {
     const es = document.createElement('div');
     es.className = 'empty-state';
-    es.innerHTML = '<div class="icon">📁</div><div>项目未设置本地路径</div><div style="font-size:11.5px">请在「设置」中为项目选择工作目录</div>';
+    es.innerHTML = `<div class="icon">${iconSvg('folder')}</div><div>项目未设置本地路径</div><div style="font-size:11.5px">请在「设置」中为项目选择工作目录</div>`;
     container.appendChild(es);
     return;
   }

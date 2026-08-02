@@ -7,6 +7,7 @@
 import type { AppState, LlmConfig, Server } from '../types';
 import { deleteServer, getState, openDialog, saveSettings, upsertServer } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
+import { icon } from '../icons';
 import type { PageRender } from '../main';
 import './settings.css';
 
@@ -17,21 +18,21 @@ export const renderSettings: PageRender = (root, params) => {
 
   /* ---------- 页面骨架（同 .proto/settings.html） ---------- */
   root.insertAdjacentHTML('beforeend', `
-    <div id="warn-banner">⚠ 缺少必要配置，请先完成系统设置</div>
+    <div id="warn-banner">${icon('alert')} 缺少必要配置，请先完成系统设置</div>
     <div id="settings-layout">
       <nav id="settings-nav">
-        <div class="nav-item active" data-panel="servers">🖥️ 服务器配置</div>
-        <div class="nav-item" data-panel="system">⚙️ 系统设置</div>
+        <div class="nav-item active" data-panel="servers">${icon('monitor')} 服务器配置</div>
+        <div class="nav-item" data-panel="system">${icon('gear')} 系统设置</div>
       </nav>
       <main id="settings-content">
         <section id="panel-servers" class="settings-panel">
           <div class="panel-head">
             <div class="panel-title">服务器 <span id="server-count" class="tag">0</span></div>
-            <button id="btn-new-server" class="btn primary">＋ 新建服务器</button>
+            <button id="btn-new-server" class="btn primary">${icon('plus')} 新建服务器</button>
           </div>
           <div id="server-grid" class="server-grid"></div>
           <div id="server-empty" class="empty-state hidden">
-            <div class="icon">🖥️</div>
+            <div class="icon">${icon('monitor')}</div>
             <div>暂无服务器，点击右上角「新建服务器」开始配置</div>
           </div>
         </section>
@@ -59,7 +60,7 @@ export const renderSettings: PageRender = (root, params) => {
               <label>API Key</label>
               <div class="input-row">
                 <input id="f-api-key" class="input mono" type="password" placeholder="已保存则不显示，留空表示不修改">
-                <button id="btn-toggle-key" class="icon-btn" title="显示 / 隐藏">👁</button>
+                <button id="btn-toggle-key" class="icon-btn" title="显示 / 隐藏">${icon('eye')}</button>
               </div>
             </div>
             <div class="field">
@@ -83,7 +84,7 @@ export const renderSettings: PageRender = (root, params) => {
       <div class="modal">
         <div class="modal-head">
           <h3 id="server-modal-title">新建服务器</h3>
-          <button id="server-modal-close" class="icon-btn" title="关闭">✕</button>
+          <button id="server-modal-close" class="icon-btn" title="关闭">${icon('x')}</button>
         </div>
         <div class="modal-body">
           <div class="field">
@@ -201,14 +202,14 @@ export const renderSettings: PageRender = (root, params) => {
       const editBtn = document.createElement('button');
       editBtn.className = 'icon-btn';
       editBtn.title = '编辑';
-      editBtn.textContent = '✎';
+      editBtn.innerHTML = icon('pencil');
       editBtn.dataset.act = 'edit';
       editBtn.dataset.id = s.id;
 
       const delBtn = document.createElement('button');
       delBtn.className = 'icon-btn danger';
       delBtn.title = '删除';
-      delBtn.textContent = '🗑';
+      delBtn.innerHTML = icon('trash');
       delBtn.dataset.act = 'del';
       delBtn.dataset.id = s.id;
 
@@ -226,7 +227,8 @@ export const renderSettings: PageRender = (root, params) => {
       tag.textContent = AUTH_LABEL[s.authType] || s.authType;
       const user = document.createElement('span');
       user.className = 'sc-user';
-      user.textContent = '👤 ' + (s.username || '-');
+      user.innerHTML = `${icon('user')} `;
+      user.appendChild(document.createTextNode(s.username || '-'));
       meta.append(tag, user);
 
       card.append(head, host, meta);
@@ -388,7 +390,7 @@ export const renderSettings: PageRender = (root, params) => {
   btnToggleKey.addEventListener('click', () => {
     const visible = fApiKey.type === 'text';
     fApiKey.type = visible ? 'password' : 'text';
-    btnToggleKey.textContent = visible ? '👁' : '🙈';
+    btnToggleKey.innerHTML = visible ? icon('eye') : icon('eyeOff');
     btnToggleKey.title = visible ? '显示 / 隐藏' : '隐藏 / 显示';
   });
 

@@ -1,7 +1,7 @@
 /**
  * SFTP 标签渲染器 —— 移植自 .proto/workbench-sftp.js，数据源换成真实后端命令。
  * - 每个 tab 独立维护 cwd / history / forward 栈；初始路径 '/'（后端 home 语义并入根）
- * - 顶栏：后退 ◀ 前进 ▶ 上级 ↑ home 🏠 根 / + 面包屑（每段可点、当前段禁用）+ ⊞/☰ 视图切换
+ * - 顶栏：后退 / 前进 / 上级 / home / 根 + 面包屑（每段可点、当前段禁用）+ 平铺/列表视图切换
  * - 平铺/列表双视图；单击目录进入、双击文件提示；条目可拖拽（source:'remote' + serverId）
  * - 容器 drop 收 source:'local' → sftp_upload → toast → 刷新
  * - OS 文件拖入（dataTransfer.files）在此面板刻意不接收：系统文件只进本地文件资源管理器
@@ -12,6 +12,7 @@ import type { FsEntry } from '../../types';
 import { sftpList, sftpUpload } from '../../api';
 import { toast } from '../../ui';
 import { bus, registerRenderer, Workbench, type Tab } from './core';
+import { icon, icon as iconSvg } from '../../icons';
 
 interface SftpEls {
   body: HTMLElement;
@@ -70,12 +71,12 @@ function parentOf(path: string): string {
   return idx <= 0 ? '/' : path.slice(0, idx);
 }
 
-function emptyState(icon: string, text: string): HTMLElement {
+function emptyState(iconName: Parameters<typeof icon>[0], text: string): HTMLElement {
   const es = document.createElement('div');
   es.className = 'empty-state';
   const ic = document.createElement('div');
   ic.className = 'icon';
-  ic.textContent = icon;
+  ic.innerHTML = icon(iconName);
   const tx = document.createElement('div');
   tx.textContent = text;
   es.appendChild(ic);
@@ -196,23 +197,23 @@ function buildCrumbs(cwd: string): Array<{ label: string; path: string }> {
 function buildToolbar(st: SftpTabState): HTMLElement {
   const bar = document.createElement('div');
   bar.className = 'sf-toolbar';
-  const mk = (cls: string, text: string, title: string, fn: () => void): HTMLButtonElement => {
+  const mk = (cls: string, html: string, title: string, fn: () => void): HTMLButtonElement => {
     const b = document.createElement('button');
     b.className = 'icon-btn ' + cls;
-    b.textContent = text;
+    b.innerHTML = html;
     b.title = title;
     b.addEventListener('click', fn);
     return b;
   };
-  st.els.backBtn = mk('', '◀', '后退', () => goBack(st));
-  st.els.fwdBtn = mk('', '▶', '前进', () => goForward(st));
-  st.els.upBtn = mk('', '↑', '上一级', () => goTo(st, parentOf(st.cwd), true));
-  st.els.homeBtn = mk('', '🏠', '回到根目录 /', () => goTo(st, '/', true));
-  st.els.rootBtn = mk('', '/', '根目录 /', () => goTo(st, '/', true));
+  st.els.backBtn = mk('', icon('arrowLeft'), '后退', () => goBack(st));
+  st.els.fwdBtn = mk('', icon('arrowRight'), '前进', () => goForward(st));
+  st.els.upBtn = mk('', icon('arrowUp'), '上一级', () => goTo(st, parentOf(st.cwd), true));
+  st.els.homeBtn = mk('', icon('home'), '回到根目录 /', () => goTo(st, '/', true));
+  st.els.rootBtn = mk('', icon('slash'), '根目录 /', () => goTo(st, '/', true));
   st.els.crumbs = document.createElement('div');
   st.els.crumbs.className = 'sf-crumb';
-  st.els.gridBtn = mk('sf-view', '⊞', '平铺视图', () => setViewMode('grid'));
-  st.els.listBtn = mk('sf-view', '☰', '列表视图', () => setViewMode('list'));
+  st.els.gridBtn = mk('sf-view', icon('grid'), '平铺视图', () => setViewMode('grid'));
+  st.els.listBtn = mk('sf-view', icon('list'), '列表视图', () => setViewMode('list'));
   bar.appendChild(st.els.backBtn);
   bar.appendChild(st.els.fwdBtn);
   bar.appendChild(st.els.upBtn);
@@ -231,13 +232,13 @@ function buildGrid(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[]):
     const el = document.createElement('div');
     el.className = 'sf-item';
     el.title = it.path + (it.isDir ? '' : ' · ' + fmtSize(it.size) + ' · ' + fmtTime(it.mtime));
-    const icon = document.createElement('div');
-    icon.className = 'sf-icon';
-    icon.textContent = it.isDir ? '📁' : '📄';
+    const iconEl = document.createElement('div');
+    iconEl.className = 'sf-icon';
+    iconEl.innerHTML = iconSvg(it.isDir ? 'folder' : 'file');
     const name = document.createElement('div');
     name.className = 'sf-name';
     name.textContent = it.name;
-    el.appendChild(icon);
+    el.appendChild(iconEl);
     el.appendChild(name);
     el.addEventListener('click', () => {
       grid.querySelectorAll('.sf-item').forEach((x) => x.classList.remove('sel'));
@@ -272,7 +273,7 @@ function buildTable(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[])
     const span = document.createElement('span');
     span.className = 'sf-t-name';
     const ic = document.createElement('span');
-    ic.textContent = it.isDir ? '📁' : '📄';
+    ic.innerHTML = iconSvg(it.isDir ? 'folder' : 'file');
     const nm = document.createElement('span');
     nm.className = 'nm';
     nm.textContent = it.name;
@@ -330,7 +331,7 @@ function renderView(st: SftpTabState): void {
   const body = st.els.body;
   body.textContent = '';
   if (st.loading) {
-    body.appendChild(emptyState('⏳', '加载中…'));
+    body.appendChild(emptyState('loader', '加载中…'));
     return;
   }
   if (st.error) {
@@ -349,7 +350,7 @@ function renderView(st: SftpTabState): void {
     return;
   }
   if (!st.entries.length) {
-    body.appendChild(emptyState('📂', '目录为空'));
+    body.appendChild(emptyState('folder', '目录为空'));
     return;
   }
   const entries: RemoteEntry[] = st.entries.map((e) => ({

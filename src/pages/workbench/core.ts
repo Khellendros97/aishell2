@@ -4,6 +4,7 @@
  * 与原型唯一差异：DOM 容器由 init() 注入（workbench.ts 建好布局后调用），项目数据由 workbench.ts 异步装载。
  */
 import type { Project, TermSnapshot } from '../../types';
+import { icon } from '../../icons';
 
 export type TabData = Record<string, unknown>;
 
@@ -43,7 +44,7 @@ export type RendererFn = (container: HTMLElement, tab: Tab) => unknown;
 export type BusEvent = 'tab-activated' | 'tab-closed' | 'project-changed';
 type BusCallback = (arg: Tab | null) => void;
 
-const TYPE_ICONS: Record<string, string> = { editor: '📄', sftp: '🗂️', terminal: '⌨️' };
+const TYPE_ICONS: Record<string, string> = { editor: icon('file'), sftp: icon('globe'), terminal: icon('terminal') };
 
 /* ---------- 事件总线 ----------
    'tab-activated'   (tab|null)      激活标签变化（关闭最后一个标签时发 null）
@@ -94,12 +95,12 @@ export function openTab({
   }
 
   const tab = {
-    id, type, title, icon: TYPE_ICONS[type] || '📄', data, onClose, api: null,
+    id, type, title, icon: TYPE_ICONS[type] || icon('file'), data, onClose, api: null,
   } as Tab;
   tab.el = document.createElement('div');
   tab.el.className = 'wb-tab';
-  tab.el.innerHTML = '<span class="tab-icon"></span><span class="tab-title"></span><button class="tab-close" title="关闭">✕</button>';
-  tab.el.querySelector('.tab-icon')!.textContent = tab.icon;
+  tab.el.innerHTML = `<span class="tab-icon"></span><span class="tab-title"></span><button class="tab-close" title="关闭">${icon('x')}</button>`;
+  tab.el.querySelector('.tab-icon')!.innerHTML = tab.icon;
   tab.el.querySelector('.tab-title')!.textContent = title;
   tab.el.onclick = (e) => { if (!(e.target as HTMLElement).closest('.tab-close')) activateTab(id); };
   (tab.el.querySelector('.tab-close') as HTMLButtonElement).onclick = () => closeTab(id);

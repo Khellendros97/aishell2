@@ -27,6 +27,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 4. **Git Bash 路径**写死逻辑里要排除 `C:\Windows\System32\bash.exe`(那是 WSL);正确路径 `C:\Program Files\Git\bin\bash.exe`。
 5. **pi sidecar**:`src-tauri/resources/pi/` 不入库,由 `scripts/fetch-pi.sh` 拉取。ai.rs 按 `(projectId, sessionId)` 懒启动 `pi --mode rpc`,stdout 是 LF 分隔 JSONL(**不要用按行 readline 之外的假设,U+2028/29 不是行分隔**)。
 6. 前端状态事实源在 Rust 端 `aishell.json`;前端不写 localStorage(那是原型的做法,已废弃)。
+7. **图标一律用 `src/icons.ts` 的 `icon()`(内联 SVG,stroke=currentColor,尺寸 1em 随容器字号),禁止 emoji**;新图标往 `PATHS` 里加,不要内联 SVG 字符串到业务文件。
+8. **DOM 行闭包引用的树节点对象不可无差别替换**(explorer.ts 教训:轮询刷新曾整体重建 children 数组,行点击把状态写进孤儿节点导致展开失效);变更时按 key reconcile 复用未变节点。
 
 ## 架构要点
 

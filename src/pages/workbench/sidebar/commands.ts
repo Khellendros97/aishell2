@@ -10,6 +10,7 @@ import { bus, getActiveTerminalApi, Workbench } from '../core';
 import { confirmDialog, toast, uid } from '../../../ui';
 import { upsertProject } from '../../../api';
 import type { QuickCommand } from '../../../types';
+import { icon } from '../../../icons';
 import './commands.css';
 
 /** 侧栏框架渲染 #sidebar-head 用（标题 + actions 按钮） */
@@ -116,7 +117,7 @@ function render(): void {
   if (!qcs.length) {
     const es = document.createElement('div');
     es.className = 'empty-state';
-    es.innerHTML = '<div class="icon">⚡</div><div>暂无快捷指令</div><div style="font-size:11.5px">点击「+ 新增」创建常用命令</div>';
+    es.innerHTML = `<div class="icon">${icon('zap')}</div><div>暂无快捷指令</div><div style="font-size:11.5px">点击「+ 新增」创建常用命令</div>`;
     wrap.appendChild(es);
     container.appendChild(wrap);
     return;

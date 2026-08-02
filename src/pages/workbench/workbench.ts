@@ -12,6 +12,7 @@ import { getState } from '../../api';
 import { renderTopbar } from '../../components/topbar';
 import { navigate } from '../../router';
 import { toast } from '../../ui';
+import { icon } from '../../icons';
 import type { Project } from '../../types';
 import { bus, closeTab, getActiveTab, getTabs, initWorkbench, openTab, Workbench } from './core';
 import type { Tab } from './core';
@@ -38,10 +39,10 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     <div id="workbench">
       <!-- 契约：activity-bar 的图标由本模块绑定事件；data-panel 取值为 explorer | servers | commands -->
       <div id="activity-bar">
-        <div class="activity-icon active" data-panel="explorer" title="文件资源管理器">📁</div>
-        <div class="activity-icon" data-panel="servers" title="服务器列表">🖥️</div>
-        <div class="activity-icon" data-panel="commands" title="快捷指令">⚡</div>
-        <div class="activity-icon ai-toggle" data-panel="ai" title="AI 助手">🤖</div>
+        <div class="activity-icon active" data-panel="explorer" title="文件资源管理器">${icon('folder')}</div>
+        <div class="activity-icon" data-panel="servers" title="服务器列表">${icon('monitor')}</div>
+        <div class="activity-icon" data-panel="commands" title="快捷指令">${icon('zap')}</div>
+        <div class="activity-icon ai-toggle" data-panel="ai" title="AI 助手">${icon('bot')}</div>
       </div>
       <div id="sidebar">
         <div id="sidebar-head"><span id="sidebar-title">文件资源管理器</span><span id="sidebar-actions"></span></div>

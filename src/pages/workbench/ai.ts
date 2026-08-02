@@ -5,6 +5,7 @@
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { ChatMsg, ChatSession, Project, TermSnapshot } from '../../types';
+import { icon } from '../../icons';
 import {
   aiAbort, aiChat, aiKillProject, onAiEvent, sessionUpsert, sessionsGet,
   type AiEvent,
@@ -140,7 +141,7 @@ export function mountAiPanel(container: HTMLElement): void {
   container.innerHTML = `
     <div id="ai-session-bar">
       <select id="ai-session-select" class="select" title="切换会话"></select>
-      <button id="ai-new-session" class="icon-btn" title="新建会话">＋</button>
+      <button id="ai-new-session" class="icon-btn" title="新建会话">${icon('plus')}</button>
     </div>
     <div id="ai-chat"></div>
     <div id="ai-input-area">
@@ -375,13 +376,13 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
   switch (p.kind) {
     case 'command':
       return `<div class="ai-suggest cmd" data-action="paste" data-cmd="${escapeHtml(p.body)}" title="点击卡片粘贴到终端">
-        <span class="ai-suggest-icon">⌨️</span>
+        <span class="ai-suggest-icon">${icon('terminal')}</span>
         <code class="ai-suggest-main">${escapeHtml(p.body)}</code>
         <button class="btn small" type="button">粘贴到终端</button>
       </div>`;
     case 'text':
       return `<div class="ai-suggest text" data-action="insert" data-text="${escapeHtml(p.body)}" title="点击卡片插入输入框">
-        <span class="ai-suggest-icon">💬</span>
+        <span class="ai-suggest-icon">${icon('message')}</span>
         <span class="ai-suggest-main">${escapeHtml(p.body)}</span>
         <button class="btn small" type="button">插入输入框</button>
       </div>`;
@@ -433,7 +434,7 @@ function addChip(snap: TermSnapshot): void {
   c.className = 'tag blue ai-snap-chip';
   c.dataset.id = snap.id;
   c.title = '点击查看快照全文，✕ 移除';
-  c.innerHTML = `@terminal_${escapeHtml(snap.id)}<span class="ai-chip-x" title="移除">✕</span>`;
+  c.innerHTML = `@terminal_${escapeHtml(snap.id)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
   chipRow.appendChild(c);
 }
 
@@ -458,7 +459,7 @@ function openSnapModal(snap: TermSnapshot | undefined): void {
   mask.className = 'modal-mask';
   mask.innerHTML = `
     <div class="modal" style="width:560px">
-      <div class="modal-head"><h3>终端快照 · @terminal_${escapeHtml(snap.id)}</h3><button class="icon-btn ai-modal-x" title="关闭">✕</button></div>
+      <div class="modal-head"><h3>终端快照 · @terminal_${escapeHtml(snap.id)}</h3><button class="icon-btn ai-modal-x" title="关闭">${icon('x')}</button></div>
       <div class="modal-body">
         <div class="ai-snap-command mono">$ ${escapeHtml(snap.command)}</div>
         <pre class="ai-snap-pre">${escapeHtml(snap.content || '')}</pre>

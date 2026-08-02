@@ -5,6 +5,7 @@
  * 侧栏框架契约：导出 head 描述符（title），mountServersPanel(container) 只渲染内容区。
  */
 import type { Server } from '../../../types';
+import { icon } from '../../../icons';
 import { getState } from '../../../api';
 import { navigate } from '../../../router';
 import { bus, openTab, Workbench } from '../core';
@@ -35,7 +36,7 @@ export function mountServersPanel(container: HTMLElement): void {
     if (!bound.length) {
       const es = document.createElement('div');
       es.className = 'empty-state';
-      es.innerHTML = '<div class="icon">🖥️</div><div>该项目尚未绑定服务器</div>'
+      es.innerHTML = `<div class="icon">${icon('monitor')}</div><div>该项目尚未绑定服务器</div>`
         + '<div style="font-size:11.5px">可前往「设置」为项目绑定远程服务器</div>';
       const btn = document.createElement('button');
       btn.className = 'btn small';
@@ -52,7 +53,7 @@ export function mountServersPanel(container: HTMLElement): void {
       card.innerHTML =
         '<div class="wbs-server-top">' +
           '<span class="wbs-server-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
-          '<span class="tag">' + (s.authType === 'key' ? '🔑 密钥' : '🔒 密码') + '</span>' +
+          '<span class="tag">' + icon(s.authType === 'key' ? 'key' : 'lock') + ' ' + (s.authType === 'key' ? '密钥' : '密码') + '</span>' +
         '</div>' +
         '<div class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</div>' +
         '<div class="wbs-server-actions">' +

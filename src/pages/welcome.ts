@@ -10,6 +10,7 @@ import {
   deleteProject, ensureProjectDirs, getConfigDir, getState, openDialog, upsertProject, upsertServer,
 } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
+import { icon } from '../icons';
 import { openPath } from '@tauri-apps/plugin-opener';
 import { navigate } from '../router';
 import type { PageRender } from '../main';
@@ -32,13 +33,13 @@ export const renderWelcome: PageRender = (root) => {
         <span class="tag" id="proj-count">0 个项目</span>
         <div class="spacer"></div>
         <button class="btn ghost small" id="btn-reset" title="打开应用配置目录">打开配置目录</button>
-        <button class="btn primary" id="btn-new">＋ 新建项目</button>
+        <button class="btn primary" id="btn-new">${icon('plus')} 新建项目</button>
       </div>
 
       <div class="proj-grid" id="proj-grid"></div>
 
       <div class="empty-state hidden" id="empty-state">
-        <div class="icon">📁</div>
+        <div class="icon">${icon('folder')}</div>
         <div>还没有项目，创建一个项目开始使用 AIShell</div>
         <button class="btn primary" id="btn-empty-new">新建项目</button>
       </div>
@@ -49,7 +50,7 @@ export const renderWelcome: PageRender = (root) => {
       <div class="modal">
         <div class="modal-head">
           <h3 id="modal-title">新建项目</h3>
-          <button class="icon-btn" id="modal-close" title="关闭">✕</button>
+          <button class="icon-btn" id="modal-close" title="关闭">${icon('x')}</button>
         </div>
         <div class="modal-body">
           <div class="field">
@@ -68,7 +69,7 @@ export const renderWelcome: PageRender = (root) => {
           <div class="field">
             <label>绑定远程服务器（可多选）</label>
             <div class="server-list" id="server-list"></div>
-            <div class="server-add" id="server-add-toggle">＋ 新建服务器连接</div>
+            <div class="server-add" id="server-add-toggle">${icon('plus')} 新建服务器连接</div>
             <div class="server-mini hidden" id="server-mini">
               <div class="mini-grid">
                 <div class="field">
@@ -180,8 +181,8 @@ export const renderWelcome: PageRender = (root) => {
         <div class="pc-head">
           <span class="pc-name ellipsis" title="${esc(p.name)}">${esc(p.name)}</span>
           <div class="pc-actions">
-            <button class="icon-btn" data-act="edit" title="编辑项目">⚙</button>
-            <button class="icon-btn danger" data-act="delete" title="删除项目">🗑</button>
+            <button class="icon-btn" data-act="edit" title="编辑项目">${icon('gear')}</button>
+            <button class="icon-btn danger" data-act="delete" title="删除项目">${icon('trash')}</button>
           </div>
         </div>
         <div class="pc-path mono ellipsis" title="${esc(displayPath)}">

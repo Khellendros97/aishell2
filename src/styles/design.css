@@ -90,6 +90,9 @@ html, body {
 .icon-btn:hover { background: var(--bg-hover); color: var(--text-0); }
 .icon-btn.danger:hover { background: var(--red-dim); color: var(--red); }
 
+/* SVG 图标（src/icons.ts）：尺寸 1em 随容器字号，颜色随 currentColor（含 hover/active/danger） */
+svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
+
 /* ---------- 表单 ---------- */
 .field { margin-bottom: 14px; }
 .field label { display: block; margin-bottom: 5px; color: var(--text-1); font-size: 12px; }

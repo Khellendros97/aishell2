@@ -19,6 +19,7 @@ import '@xterm/xterm/css/xterm.css';
 
 import { onTermData, onTermExit, termClose, termCreate, termInput, termResize, upsertProject } from '../../api';
 import type { TermKind } from '../../api';
+import { icon } from '../../icons';
 import { activateTab, bus, getActiveTab, registerRenderer, Workbench } from './core';
 import type { Tab } from './core';
 import { toast, uid } from '../../ui';
@@ -89,8 +90,8 @@ class TermSession {
         <span>最后命令:</span>
         <span class="term-info-cmd"></span>
         <span class="term-info-spacer"></span>
-        <button class="btn small term-toggle-drawer" title="历史区块">📜 历史区块</button>
-        <button class="btn small term-pin">📌 快捷指令</button>
+        <button class="btn small term-toggle-drawer" title="历史区块">${icon('history')} 历史区块</button>
+        <button class="btn small term-pin">${icon('pin')} 快捷指令</button>
         <button class="btn small term-addchat">添加到chat</button>
       </div>
       <div class="term-main">
@@ -368,7 +369,7 @@ class TermSession {
   }
 
   private renderDrawer(): void {
-    this.drawerToggle.textContent = `📜 历史区块 (${this.blocks.length})`;
+    this.drawerToggle.innerHTML = `${icon('history')} 历史区块 (${this.blocks.length})`;
     this.drawerBody.innerHTML = '';
     for (let bi = 0; bi < this.blocks.length; bi++) {
       const block = this.blocks[bi];
@@ -385,7 +386,7 @@ class TermSession {
       actions.className = 'term-block-item-actions';
       const pin = document.createElement('button');
       pin.className = 'btn small';
-      pin.textContent = '📌 快捷指令';
+      pin.innerHTML = `${icon('pin')} 快捷指令`;
       pin.title = '将该命令添加为快捷指令';
       pin.onclick = () => this.addToQuickCommands(block.command);
       const chat = document.createElement('button');
