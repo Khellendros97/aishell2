@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AIShell - 工作台</title>
+<link rel="stylesheet" href="shared/design.css">
+<style>
+  /* ===== 工作台整体布局（契约：以下 ID 归 core 所有，模块不得改动结构） ===== */
+  #workbench { display: flex; height: calc(100vh - var(--topbar-h)); }
+
+  /* 最左功能图标栏 */
+  #activity-bar {
+    width: var(--activity-bar-w); flex: none; background: var(--bg-1);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column; align-items: center;
+    padding-top: 6px; gap: 2px;
+  }
+  .activity-icon {
+    width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+    font-size: 18px; color: var(--text-1); cursor: pointer; border-radius: var(--radius-m);
+    border-left: 2px solid transparent; position: relative;
+  }
+  .activity-icon:hover { color: var(--text-0); background: var(--bg-hover); }
+  .activity-icon.active { color: var(--accent); border-left-color: var(--accent); border-radius: 0 var(--radius-m) var(--radius-m) 0; }
+
+  /* 左侧功能面板 */
+  #sidebar { width: var(--sidebar-w); flex: none; background: var(--bg-1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  #sidebar-head {
+    height: 34px; flex: none; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 10px 0 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-1); text-transform: uppercase;
+  }
+  #sidebar-content { flex: 1; overflow-y: auto; }
+
+  /* 中央工作区 */
+  #center { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg-0); }
+  #tab-bar {
+    height: var(--tab-h); flex: none; display: flex; align-items: stretch;
+    background: var(--bg-1); border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: thin;
+  }
+  #tab-bar::-webkit-scrollbar { height: 4px; }
+  .wb-tab {
+    display: flex; align-items: center; gap: 6px; padding: 0 8px 0 12px; max-width: 200px; min-width: 110px;
+    border-right: 1px solid var(--border); color: var(--text-1); cursor: pointer; user-select: none; flex: none;
+    border-top: 2px solid transparent; font-size: 12.5px;
+  }
+  .wb-tab:hover { background: var(--bg-hover); }
+  .wb-tab.active { background: var(--bg-0); color: var(--text-0); border-top-color: var(--accent); }
+  .wb-tab .tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .wb-tab .tab-close { border: none; background: none; color: var(--text-2); cursor: pointer; border-radius: 3px; width: 18px; height: 18px; font-size: 12px; line-height: 1; }
+  .wb-tab .tab-close:hover { background: var(--bg-active); color: var(--text-0); }
+  #tab-content { flex: 1; min-height: 0; position: relative; }
+  .tab-pane { position: absolute; inset: 0; display: none; }
+  .tab-pane.active { display: flex; flex-direction: column; }
+
+  /* 右侧 AI 面板 */
+  #ai-panel { width: var(--ai-panel-w); flex: none; background: var(--bg-1); border-left: 1px solid var(--border); display: flex; flex-direction: column; }
+</style>
+</head>
+<body>
+<script src="shared/mock.js"></script>
+<script>AIShell.renderTopbar();</script>
+
+<div id="workbench">
+  <!-- 契约：activity-bar 的图标由 sidebar 模块绑定事件；data-panel 取值为 explorer | servers | commands -->
+  <div id="activity-bar">
+    <div class="activity-icon active" data-panel="explorer" title="文件资源管理器">📁</div>
+    <div class="activity-icon" data-panel="servers" title="服务器列表">🖥️</div>
+    <div class="activity-icon" data-panel="commands" title="快捷指令">⚡</div>
+  </div>
+  <div id="sidebar">
+    <div id="sidebar-head"><span id="sidebar-title">文件资源管理器</span><span id="sidebar-actions"></span></div>
+    <div id="sidebar-content"></div>
+  </div>
+  <div id="center">
+    <div id="tab-bar"></div>
+    <div id="tab-content"></div>
+  </div>
+  <div id="ai-panel"></div>
+</div>
+
+<script src="workbench-core.js"></script>
+<script src="workbench-sidebar.js"></script>
+<script src="workbench-editor.js"></script>
+<script src="workbench-sftp.js"></script>
+<script src="workbench-terminal.js"></script>
+<script src="workbench-ai.js"></script>
+</body>
+</html>

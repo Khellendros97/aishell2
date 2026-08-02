@@ -1,0 +1,19 @@
+/* 编辑器模块样式：CodeMirror 铺满标签页面板（.tab-pane 为 flex 列容器） */
+.ed-root {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.ed-root .cm-editor {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+}
+.ed-root .cm-editor.cm-focused { outline: none; }
+.ed-root .cm-content {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+}

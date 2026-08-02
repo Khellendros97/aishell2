@@ -1,0 +1,29 @@
+/* SFTP 面板模块样式 —— 移植自 .proto/workbench-sftp.js 的 sf-style（只增不改 shared/design.css）。
+   新增：.sf-error（加载失败错误条 + 重试）。加载态复用 design.css 的 .empty-state。 */
+.sf-root { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; background: var(--bg-0); }
+.sf-toolbar { flex: none; display: flex; align-items: center; gap: 2px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--bg-1); }
+.sf-view.active { color: var(--accent); background: var(--bg-hover); }
+.sf-crumb { display: flex; align-items: center; gap: 2px; flex: 1 1 auto; min-width: 0; margin: 0 8px; overflow-x: auto; white-space: nowrap; }
+.sf-crumb-item { border: none; background: none; color: var(--text-1); font-size: 12.5px; padding: 2px 6px; border-radius: 4px; cursor: pointer; font-family: var(--font-ui); }
+.sf-crumb-item:hover { background: var(--bg-hover); color: var(--text-0); }
+.sf-crumb-item.cur { color: var(--text-0); font-weight: 600; cursor: default; }
+.sf-crumb-sep { color: var(--text-2); flex: none; user-select: none; }
+.sf-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px; }
+.sf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 4px; }
+.sf-item { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 4px; border-radius: var(--radius-m); border: 1px solid transparent; cursor: pointer; user-select: none; text-align: center; }
+.sf-item:hover { background: var(--bg-hover); border-color: var(--border); }
+.sf-item.sel { background: var(--bg-active); }
+.sf-item .sf-icon { font-size: 30px; line-height: 1; }
+.sf-item .sf-name { font-size: 12px; color: var(--text-1); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.sf-table th { text-align: left; color: var(--text-2); font-weight: 500; font-size: 11px; padding: 4px 10px; border-bottom: 1px solid var(--border-strong); }
+.sf-table td { padding: 4px 10px; border-bottom: 1px solid var(--border); }
+.sf-table tr { cursor: pointer; }
+.sf-table tr:hover td { background: var(--bg-hover); }
+.sf-table .sf-t-name { display: flex; align-items: center; gap: 8px; color: var(--text-0); min-width: 0; }
+.sf-table .sf-t-name .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-table .sf-t-size { color: var(--text-2); font-family: var(--font-mono); text-align: right; white-space: nowrap; }
+.sf-table .sf-t-time { color: var(--text-2); white-space: nowrap; }
+/* 加载失败错误条 */
+.sf-error { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 48px 24px; text-align: center; }
+.sf-error .msg { color: var(--red); font-size: 12.5px; line-height: 1.5; max-width: 100%; word-break: break-all; white-space: pre-wrap; }

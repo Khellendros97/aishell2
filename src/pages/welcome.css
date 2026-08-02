@@ -1,0 +1,49 @@
+/* 欢迎页 —— 移植自 .proto/welcome.html 的 <style>，选择器限定在 .welcome-page 内避免污染其他页面 */
+.page-root { display: flex; flex-direction: column; height: 100vh; }
+
+.welcome-page main { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 32px; }
+
+/* ---------- 页面标题栏 ---------- */
+.welcome-page .page-head { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+.welcome-page .page-head h2 { font-size: 16px; font-weight: 600; }
+.welcome-page .page-head .spacer { flex: 1; }
+
+/* ---------- 项目卡片网格 ---------- */
+.welcome-page .proj-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+
+.welcome-page .project-card { display: flex; flex-direction: column; gap: 10px; }
+.welcome-page .pc-head { display: flex; align-items: center; gap: 4px; }
+.welcome-page .pc-name { flex: 1; min-width: 0; font-size: 14px; font-weight: 600; }
+.welcome-page .pc-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+.welcome-page .pc-path { font-size: 12px; color: var(--text-2); }
+.welcome-page .pc-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ---------- 表单校验 ---------- */
+.welcome-page .input.invalid { border-color: var(--red); }
+.welcome-page .field .error { margin-top: 4px; font-size: 11px; color: var(--red); }
+
+/* ---------- 路径输入行 ---------- */
+.welcome-page .path-row { display: flex; gap: 8px; }
+.welcome-page .path-row .input { flex: 1; min-width: 0; }
+
+/* ---------- 服务器多选列表 ---------- */
+.welcome-page .server-list { display: flex; flex-direction: column; gap: 8px; max-height: 200px; overflow-y: auto; padding-right: 2px; }
+.welcome-page .server-card { padding: 10px 12px; }
+.welcome-page .sc-head { display: flex; align-items: center; gap: 8px; }
+.welcome-page .sc-name { flex: 1; min-width: 0; font-weight: 500; }
+.welcome-page .sc-meta { margin-top: 4px; font-size: 12px; color: var(--text-2); }
+.welcome-page .server-empty { font-size: 12px; color: var(--text-2); padding: 6px 2px; }
+
+/* ---------- 新建服务器快捷区 ---------- */
+.welcome-page .server-add {
+  margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-m); color: var(--text-1); font-size: 12.5px;
+  text-align: center; cursor: pointer; user-select: none;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
+}
+.welcome-page .server-add:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--text-0); }
+
+.welcome-page .server-mini { margin-top: 10px; padding: 14px 14px 8px; border: 1px dashed var(--border-strong); border-radius: var(--radius-m); background: var(--bg-2); }
+.welcome-page .mini-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; }
+.welcome-page .mini-grid .field { margin-bottom: 12px; }
+.welcome-page .mini-actions { display: flex; justify-content: flex-end; gap: 8px; padding-bottom: 6px; }

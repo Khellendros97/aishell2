@@ -1,0 +1,8 @@
+/* 服务器面板样式（wbs-server-* 私有前缀；.wbs-content 为面板共享约定，各面板 css 各自声明一份相同规则） */
+.wbs-content { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px 12px; }
+.wbs-server-card { padding: 12px 14px; display: flex; flex-direction: column; gap: 9px; }
+.wbs-server-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.wbs-server-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wbs-server-addr { font-size: 11.5px; color: var(--text-2); }
+.wbs-server-actions { display: flex; gap: 8px; }
+.wbs-server-actions .btn { flex: 1; }

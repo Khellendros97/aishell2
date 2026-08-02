@@ -1,0 +1,10 @@
+/* 快捷指令面板样式 —— 移植自 .proto/workbench-sidebar.js 内联样式（wbs- 前缀改 wbs-commands-）。
+   .wbs-content 为各侧栏面板共享的内容区规则，各面板 css 各自声明一份（跨文件零依赖）。 */
+.wbs-content { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.wbs-commands-qc-card { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.wbs-commands-qc-title { font-size: 13px; font-weight: 600; }
+.wbs-commands-qc-cmd {
+  font-size: 11.5px; color: var(--text-1); line-height: 1.5; word-break: break-all;
+  white-space: pre-wrap; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.wbs-commands-qc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
