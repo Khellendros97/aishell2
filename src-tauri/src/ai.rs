@@ -1,7 +1,9 @@
 //! AI 助手（pi 子进程 RPC 嵌入）。
 //! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)`；
-//! 事件 `ai:event:<key>` payload `{type:"delta",text}|{type:"done"}|{type:"error",message}`；
-//! key = "<projectId>:<sessionId>"，每 key 一个长驻 pi 进程（--no-tools 只对话不改文件不执行命令）。
+//! 事件 `ai:event:<key>` payload `{type:"delta",text}|{type:"tool",tool,label}|{type:"segment"}|{type:"done"}|{type:"error",message}`；
+//! key = "<projectId>:<sessionId>"，每 key 一个长驻 pi 进程。
+//! 工具边界：read/grep/find/ls/write/edit 白名单（无 bash），由 pi_ext/aishell-guard.ts
+//! 门控——写仅限项目 .aishell/ 目录，读仅限项目目录内；扩展每次 spawn 重写进 agent_dir。
 //!
 //! 与计划唯一偏差：`procs` 字段为 `Arc<Mutex<HashMap<...>>>`（计划给的是裸 `Mutex`）——
 //! 因为 stdout 读取线程必须在进程退出/管道破裂时「从 map 摘除」条目，裸 Mutex 无法被线程共享。
@@ -18,13 +20,21 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::store::Store;
 
-/// `--append-system-prompt` 的值（逐字，见计划步骤 9）。
+/// `--append-system-prompt` 的值。
 const SYSTEM_PROMPT: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
+文件工具边界（硬性，越界调用会被门控拒绝）：
+- read/grep/find/ls：只能读当前项目目录内的文件，项目外一律不可读。
+- write/edit：只能写项目下 .aishell/ 目录内的文件（可用于保存笔记、记忆、计划；父目录不存在会自动创建）。
+- 没有 bash 工具，不能执行任何命令。
+- 用户要求修改项目源码等 .aishell/ 之外的文件时：不要调用 write/edit（会被拒），改为给出命令或补丁文本让用户自行处理。
 输出协议（必须严格遵守）：
 1. 建议用户在终端执行的命令：每条命令单独放在一个 ```command 围栏代码块中，块内只有命令本身，不加解释。
 2. 给用户直接复用的文本（说明、模板等）：放在 ```text 围栏代码块中。
 3. 普通代码示例使用对应语言的围栏代码块。
 4. 用中文回复，简洁直接。";
+
+/// 门控扩展源码（spawn 时重写进 agent_dir，与 models.json 同模式）。
+const GUARD_EXT: &str = include_str!("pi_ext/aishell-guard.ts");
 
 /// 单个 key 的 pi 进程。
 pub struct AiProc {
@@ -99,6 +109,10 @@ impl AiManager {
             .store
             .project_path(project_id)
             .unwrap_or_else(|| self.agent_dir.to_string_lossy().into_owned());
+        // 门控扩展落盘（每次 spawn 重写，内容与仓库内源码同步）
+        std::fs::create_dir_all(&self.agent_dir).map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
+        let guard_path = self.agent_dir.join("aishell-guard.ts");
+        std::fs::write(&guard_path, GUARD_EXT).map_err(|e| format!("写入门控扩展失败: {e}"))?;
 
         let mut cmd = Command::new(&pi_exe);
         cmd.args([
@@ -110,7 +124,14 @@ impl AiManager {
             cfg.model_id.as_str(),
             "--thinking",
             &effort,
-            "--no-tools",
+            "--tools",
+            "read,grep,find,ls,write,edit",
+            "--no-extensions",
+            "--extension",
+        ])
+        .arg(&guard_path)
+        .args([
+            "--no-approve",
             "--no-session",
             "--no-context-files",
             "--append-system-prompt",
@@ -139,6 +160,8 @@ impl AiManager {
             let mut settled = false;
             // 本轮生成是否已发过终态事件（done 或 error 只发一次；turn_start 重置）
             let mut terminal_emitted = false;
+            // 当前 assistant 消息是否已流过文本增量（工具来回多段消息时分段用）
+            let mut text_started = false;
             let reader = BufReader::new(stdout);
             // LF 是 pi RPC 协议唯一分隔符；BufRead::lines 按 \n 切行（并剥离 \r），勿换 U+2028 类切行器
             for line in reader.lines() {
@@ -156,6 +179,7 @@ impl AiManager {
                             // 文本增量
                             Some("text_delta") => {
                                 if let Some(delta) = ae.get("delta").and_then(serde_json::Value::as_str) {
+                                    text_started = true;
                                     let _ = app2.emit(&event, json!({"type": "delta", "text": delta}));
                                 }
                             }
@@ -180,18 +204,61 @@ impl AiManager {
                     }
                     "agent_settled" => {
                         settled = true;
+                        text_started = false;
                         busy2.store(false, Ordering::SeqCst);
                         if !terminal_emitted {
                             terminal_emitted = true;
                             let _ = app2.emit(&event, json!({"type": "done"}));
                         }
                     }
-                    // 生成级错误（如 401 认证失败）：错误在 message.stopReason/errorMessage 上，
-                    // 不走 message_update 信封。message_start/message_end/turn_end 任一捕获即可。
+                    // 工具活动透传：前端在流式气泡里显示一行小字（只进瞬时 Pending，不落盘）
+                    "tool_execution_start" => {
+                        let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let label = ev
+                            .get("args")
+                            .and_then(|a| {
+                                a.get("path")
+                                    .or_else(|| a.get("pattern"))
+                                    .or_else(|| a.get("command"))
+                            })
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let _ = app2.emit(&event, json!({"type": "tool", "tool": tool, "label": label}));
+                    }
                     "turn_start" => {
                         terminal_emitted = false;
                     }
-                    "message_start" | "message_end" | "turn_end" => {
+                    "message_start" => {
+                        // 新 assistant 消息且上一条已流过文本：通知前端分段（工具来回时避免文本粘连）
+                        let role = ev
+                            .get("message")
+                            .and_then(|m| m.get("role"))
+                            .and_then(serde_json::Value::as_str);
+                        if role == Some("assistant") && text_started {
+                            text_started = false;
+                            let _ = app2.emit(&event, json!({"type": "segment"}));
+                        }
+                        if terminal_emitted {
+                            continue;
+                        }
+                        let msg = ev.get("message");
+                        let stop = msg
+                            .and_then(|m| m.get("stopReason"))
+                            .and_then(serde_json::Value::as_str);
+                        if stop == Some("error") {
+                            terminal_emitted = true;
+                            settled = true;
+                            busy2.store(false, Ordering::SeqCst);
+                            let emsg = msg
+                                .and_then(|m| m.get("errorMessage"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("AI 回复出错");
+                            let _ = app2.emit(&event, json!({"type": "error", "message": emsg}));
+                        }
+                    }
+                    // 生成级错误（如 401 认证失败）：错误在 message.stopReason/errorMessage 上，
+                    // 不走 message_update 信封。message_start/message_end/turn_end 任一捕获即可。
+                    "message_end" | "turn_end" => {
                         if terminal_emitted {
                             continue;
                         }

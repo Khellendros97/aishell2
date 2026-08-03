@@ -61,7 +61,7 @@
 .term-info-cmd { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .term-info-spacer { flex: 1; }
 .term-main { flex: 1; min-height: 0; display: flex; }
-.term-xterm { flex: 1; min-width: 0; background: #0d1117; padding: 6px 0 6px 8px; position: relative; }
+.term-xterm { flex: 1; min-width: 0; background: var(--term-bg); padding: 6px 0 6px 8px; position: relative; }
 .term-xterm .xterm { height: 100%; }
 
 /* 历史区块抽屉（右侧 280px，可开合） */

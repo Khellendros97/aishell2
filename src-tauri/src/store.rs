@@ -45,11 +45,22 @@ impl Default for LlmConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub workspace_dir: Option<String>,
     pub llm: LlmConfig,
+    /// 界面主题；旧配置无此字段时按深色处理
+    #[serde(default)]
+    pub theme: Theme,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +304,14 @@ impl Store {
         })
     }
 
+    /// 仅更新界面主题（顶栏快捷切换用；避免前端回传整个 Settings 造成 llm 字段竞态覆盖）。
+    fn set_theme(&self, theme: Theme) -> Result<(), String> {
+        self.with_state(|s| {
+            s.settings.theme = theme;
+            Ok(())
+        })
+    }
+
     /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
     fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
         if let Some(pw) = password {
@@ -451,6 +470,11 @@ pub async fn save_settings(
 }
 
 #[tauri::command]
+pub async fn set_theme(store: State<'_, Arc<Store>>, theme: Theme) -> Result<(), String> {
+    store.set_theme(theme)
+}
+
+#[tauri::command]
 pub async fn upsert_server(
     store: State<'_, Arc<Store>>,
     server: Server,
@@ -527,6 +551,7 @@ mod tests {
             settings: Settings {
                 workspace_dir: Some("D:\\AIShellWorkspace".to_string()),
                 llm: LlmConfig::default(),
+                theme: Theme::Dark,
             },
             servers: vec![
                 Server {
@@ -658,6 +683,22 @@ mod tests {
             )
             .unwrap();
         assert!(store.is_config_complete());
+    }
+
+    #[test]
+    fn theme_persists_and_legacy_json_defaults_dark() {
+        let dir = temp_config_dir("theme");
+        let store = test_store(dir.clone());
+        assert_eq!(store.state.lock().unwrap().settings.theme, Theme::Dark);
+        store.set_theme(Theme::Light).unwrap();
+        let store2 = test_store(dir);
+        assert_eq!(store2.state.lock().unwrap().settings.theme, Theme::Light);
+        // 旧配置 JSON 无 theme 字段:serde default 按深色解析
+        let legacy: Settings = serde_json::from_str(
+            r#"{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"medium"}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.theme, Theme::Dark);
     }
 
     #[test]
@@ -848,6 +889,7 @@ mod tests {
                         base_url: "https://api.deepseek.com/v1".to_string(),
                         effort: Effort::High,
                     },
+                    theme: Theme::Dark,
                 },
                 Some("sk-test-key"),
             )

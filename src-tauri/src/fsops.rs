@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 #[derive(Serialize, Clone, Debug)]
@@ -178,6 +178,108 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("文件数据解码失败：{e}"))
 }
 
+/// 移动/重命名：to 为完整目标路径；目标已存在报错；目录禁止移入自身或子孙。
+/// Windows rename 跨卷会失败——工作台内移动均在同盘，跨卷场景由用户走系统拷贝。
+#[tauri::command]
+pub fn fs_move(from: String, to: String) -> Result<(), String> {
+    let src = non_empty(&from)?;
+    let dst = non_empty(&to)?;
+    if !src.exists() {
+        return Err(format!("源不存在:「{}」", src.display()));
+    }
+    if src == dst {
+        return Ok(()); // 原地移动视为无操作
+    }
+    if dst.exists() {
+        return Err(format!("目标已存在:「{}」", dst.display()));
+    }
+    // Path::starts_with 按路径组件比较，E:\a 不会误判 E:\ab
+    if src.is_dir() && dst.starts_with(&src) {
+        return Err("不能把目录移动到它自身内部".to_string());
+    }
+    let parent = dst.parent().ok_or_else(|| "目标路径无效".to_string())?;
+    if !parent.is_dir() {
+        return Err(format!("目标目录不存在:{}", parent.display()));
+    }
+    fs::rename(&src, &dst).map_err(|e| format!("移动「{}」失败:{e}", src.display()))
+}
+
+/// 复制文件/目录(递归):to_dir 内重名自动 `name (1)`;返回最终落地路径。
+#[tauri::command]
+pub fn fs_copy(from: String, to_dir: String) -> Result<String, String> {
+    let src = non_empty(&from)?;
+    let dir = non_empty(&to_dir)?;
+    if !src.exists() {
+        return Err(format!("源不存在:「{}」", src.display()));
+    }
+    if !dir.is_dir() {
+        return Err(format!("目标目录不存在:{}", dir.display()));
+    }
+    if src.is_dir() && dir.starts_with(&src) {
+        return Err("不能把目录复制到它自身内部".to_string());
+    }
+    let name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "源路径无效".to_string())?;
+    let final_name = unique_local_name(&dir, name)?;
+    let dst = dir.join(&final_name);
+    copy_recursive(&src, &dst)?;
+    Ok(dst.to_string_lossy().into_owned())
+}
+
+/// 递归复制;调用方已保证 src 存在且 dst 不存在。
+fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    if src.is_dir() {
+        fs::create_dir(dst).map_err(|e| format!("创建目录「{}」失败:{e}", dst.display()))?;
+        let rd = fs::read_dir(src).map_err(|e| format!("读取目录「{}」失败:{e}", src.display()))?;
+        for entry in rd {
+            let entry = entry.map_err(|e| format!("读取目录项失败:{e}"))?;
+            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(src, dst)
+            .map(|_| ())
+            .map_err(|e| format!("复制「{}」失败:{e}", src.display()))
+    }
+}
+
+/// 在系统文件资源管理器中定位该文件/目录(Windows:explorer /select,)。
+/// explorer 退出码语义不可靠,spawn 成功即视为成功,不 wait。
+#[tauri::command]
+pub fn fs_reveal(path: String) -> Result<(), String> {
+    let p = non_empty(&path)?;
+    if !p.exists() {
+        return Err(format!("「{}」不存在", p.display()));
+    }
+    #[cfg(windows)]
+    {
+        // 两个坑:/select 与路径必须是同一个 argv token;explorer 不认正斜杠路径
+        // (前端树内路径统一用 / 拼接,Path::display 不规范化分隔符,原样传给 explorer 会打开桌面)
+        let win_path = p.to_string_lossy().replace('/', "\\");
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{win_path}"))
+            .spawn()
+            .map_err(|e| format!("打开系统文件资源管理器失败:{e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        // 非 Windows:文件打开其父目录,目录打开自身
+        let dir = if p.is_dir() {
+            p.as_path()
+        } else {
+            p.parent().unwrap_or(p.as_path())
+        };
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener)
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("打开系统文件管理器失败:{e}"))?;
+    }
+    Ok(())
+}
+
 /// 删除文件或目录（目录递归删除）。
 #[tauri::command]
 pub fn fs_delete(path: String) -> Result<(), String> {
@@ -205,6 +307,54 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn move_rejects_existing_and_self_descendant() {
+        let dir = tmp_dir("move");
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        fs::write(dir.join("b.txt"), "b").unwrap();
+        fs::create_dir_all(dir.join("sub/inner")).unwrap();
+        let s = |p: &str| dir.join(p).to_string_lossy().into_owned();
+
+        // 目标已存在报错
+        assert!(fs_move(s("a.txt"), s("b.txt")).is_err());
+        // 目录禁止移入自身子孙
+        assert!(fs_move(s("sub"), s("sub/inner/sub")).is_err());
+        // 同前缀但非子孙(E:\sub vs E:\subx)不应误判
+        fs::create_dir(dir.join("subx")).unwrap();
+        fs::write(dir.join("subx/c.txt"), "c").unwrap();
+        fs_move(s("subx/c.txt"), s("sub/c.txt")).unwrap();
+        // 正常移动 + 重命名
+        fs_move(s("a.txt"), s("sub/a.txt")).unwrap();
+        assert!(!dir.join("a.txt").exists() && dir.join("sub/a.txt").exists());
+        fs_move(s("sub/a.txt"), s("sub/a2.txt")).unwrap();
+        assert!(dir.join("sub/a2.txt").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_file_and_dir_with_dedup() {
+        let dir = tmp_dir("copy");
+        fs::write(dir.join("f.txt"), "hello").unwrap();
+        fs::create_dir_all(dir.join("d/nested")).unwrap();
+        fs::write(dir.join("d/nested/g.txt"), "world").unwrap();
+        fs::create_dir(dir.join("out")).unwrap();
+        let s = |p: &str| dir.join(p).to_string_lossy().into_owned();
+
+        // 文件复制 + 同目录重名自动改名
+        let p1 = fs_copy(s("f.txt"), s("out")).unwrap();
+        let p2 = fs_copy(s("f.txt"), s("out")).unwrap();
+        assert!(PathBuf::from(&p1).ends_with("f.txt"));
+        assert!(PathBuf::from(&p2).ends_with("f (1).txt"));
+        assert_eq!(fs::read_to_string(&p2).unwrap(), "hello");
+        // 目录递归复制,源不动
+        let p3 = fs_copy(s("d"), s("out")).unwrap();
+        assert_eq!(fs::read_to_string(PathBuf::from(&p3).join("nested/g.txt")).unwrap(), "world");
+        assert!(dir.join("d/nested/g.txt").exists());
+        // 目录禁止复制进自身子孙
+        assert!(fs_copy(s("d"), s("d/nested")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

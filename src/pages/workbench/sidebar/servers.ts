@@ -33,6 +33,26 @@ export function mountServersPanel(container: HTMLElement): void {
     container.innerHTML = '';
     const wrap = document.createElement('div');
     wrap.className = 'wbs-content';
+
+    /* 固定卡片：本地 Git Bash，整卡点击打开本地终端（与启动时自动开的 term-local 同 id，重复点击复用聚焦） */
+    const localCard = document.createElement('div');
+    localCard.className = 'card wbs-server-card wbs-local-card clickable';
+    localCard.innerHTML =
+      '<div class="wbs-server-top">' +
+        '<span class="wbs-server-name">本地 Git Bash</span>' +
+        '<span class="tag blue">' + icon('terminal') + ' 本地</span>' +
+      '</div>' +
+      '<div class="wbs-server-addr mono">本地终端 · 点击打开</div>';
+    localCard.onclick = () => {
+      openTab({
+        id: 'term-local',
+        type: 'terminal',
+        title: '本地 Git Bash',
+        data: { kind: 'local', cwd: project?.path ?? null },
+      });
+    };
+    wrap.appendChild(localCard);
+
     if (!bound.length) {
       const es = document.createElement('div');
       es.className = 'empty-state';
@@ -47,6 +67,10 @@ export function mountServersPanel(container: HTMLElement): void {
       container.appendChild(wrap);
       return;
     }
+    const sep = document.createElement('div');
+    sep.className = 'wbs-local-sep';
+    sep.textContent = '远程服务器';
+    wrap.appendChild(sep);
     bound.forEach((s) => {
       const card = document.createElement('div');
       card.className = 'card wbs-server-card';
@@ -57,7 +81,7 @@ export function mountServersPanel(container: HTMLElement): void {
         '</div>' +
         '<div class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</div>' +
         '<div class="wbs-server-actions">' +
-          '<button class="btn small primary wbs-ssh">SSH 连接</button>' +
+          '<button class="btn small wbs-ssh">SSH 连接</button>' +
           '<button class="btn small wbs-sftp">SFTP 文件管理</button>' +
         '</div>';
       (card.querySelector('.wbs-ssh') as HTMLButtonElement).onclick = () => {

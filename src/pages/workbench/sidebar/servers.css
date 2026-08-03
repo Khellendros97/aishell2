@@ -6,3 +6,5 @@
 .wbs-server-addr { font-size: 11.5px; color: var(--text-2); }
 .wbs-server-actions { display: flex; gap: 8px; }
 .wbs-server-actions .btn { flex: 1; }
+/* 固定本地卡片与远程服务器列表之间的分隔标题 */
+.wbs-local-sep { margin: 6px 2px -2px; font-size: 11px; color: var(--text-2); }

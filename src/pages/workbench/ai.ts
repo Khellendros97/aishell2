@@ -11,6 +11,7 @@ import {
   type AiEvent,
 } from '../../api';
 import { Workbench, getActiveTerminalApi } from './core';
+import { addQuickCommandModal } from './quickcommand';
 import { toast, uid } from '../../ui';
 
 /* ---------- 面板样式（原型 workbench-ai.js 注入的样式 + 错误气泡红边） ---------- */
@@ -37,17 +38,17 @@ const STYLE = `
 .ai-para { margin: 0 0 6px; }
 .ai-para:last-child { margin-bottom: 0; }
 .ai-code-inline {
-  background: rgba(0, 0, 0, 0.35); border: 1px solid var(--border); border-radius: 3px;
+  background: var(--inline-code-bg); border: 1px solid var(--border); border-radius: 3px;
   padding: 0 4px; font-family: var(--font-mono); font-size: 11.5px; color: var(--yellow);
 }
 .ai-code-block {
-  background: #0d0f14; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
   padding: 10px 12px; margin: 6px 0; overflow-x: auto; position: relative;
 }
 .ai-code-block code { font-family: var(--font-mono); font-size: 12px; color: var(--text-0); white-space: pre; }
 .ai-code-lang { position: absolute; top: 5px; right: 8px; font-size: 10px; color: var(--text-2); }
 .ai-suggest {
-  display: flex; align-items: center; gap: 8px; margin: 6px 0;
+  display: flex; flex-direction: column; gap: 6px; margin: 6px 0;
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
   padding: 8px 10px; cursor: pointer;
   transition: border-color 0.12s, background 0.12s;
@@ -55,13 +56,22 @@ const STYLE = `
 .ai-suggest:hover { border-color: var(--border-strong); background: var(--bg-3); }
 .ai-suggest.cmd { border-left: 3px solid var(--green); }
 .ai-suggest.text { border-left: 3px solid var(--accent); }
-.ai-suggest-icon { font-size: 14px; flex: none; }
+.ai-suggest-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ai-suggest-head .ai-suggest-icon { font-size: 14px; }
+.ai-suggest-actions { display: flex; align-items: center; gap: 6px; }
+.ai-suggest-actions .icon-btn { width: 24px; height: 24px; font-size: 13px; }
+/* 工具活动行（流式气泡内，瞬时展示） */
+.ai-tool-line {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text-2); margin-bottom: 3px;
+  font-family: var(--font-mono); word-break: break-all;
+}
+.ai-tool-line svg { flex: none; }
 .ai-suggest-main {
-  flex: 1; min-width: 0; font-size: 12px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px;
+  white-space: pre-wrap; word-break: break-all;
 }
 .ai-suggest.cmd .ai-suggest-main { font-family: var(--font-mono); color: var(--green); }
-.ai-suggest .btn { flex: none; }
 #ai-input-area {
   flex: none; border-top: 1px solid var(--border);
   padding: 8px; display: flex; flex-direction: column; gap: 6px;
@@ -82,23 +92,23 @@ const STYLE = `
 .ai-snap-chip .ai-chip-x:hover { opacity: 1; }
 .ai-msg-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
 .ai-typing { display: inline-flex; align-items: center; gap: 4px; }
-.ai-typing .ai-typing-label { font-size: 11px; color: var(--text-2); margin-right: 2px; }
-.ai-typing span {
+.ai-typing .ai-typing-label { font-size: 11px; color: var(--text-2); margin-right: 2px; white-space: nowrap; }
+.ai-typing .ai-typing-dot {
   width: 5px; height: 5px; border-radius: 50%; background: var(--text-2);
   animation: ai-blink 1.2s infinite;
 }
-.ai-typing span:nth-child(3) { animation-delay: 0.2s; }
-.ai-typing span:nth-child(4) { animation-delay: 0.4s; }
+.ai-typing .ai-typing-dot:nth-child(3) { animation-delay: 0.2s; }
+.ai-typing .ai-typing-dot:nth-child(4) { animation-delay: 0.4s; }
 @keyframes ai-blink {
   0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
   30% { opacity: 1; transform: translateY(-2px); }
 }
 .ai-snap-command {
-  background: rgba(0, 0, 0, 0.35); border: 1px solid var(--border); border-radius: 6px;
+  background: var(--inline-code-bg); border: 1px solid var(--border); border-radius: 6px;
   padding: 7px 10px; margin-bottom: 10px; font-size: 12px; color: var(--green);
 }
 .ai-snap-pre {
-  background: #0d0f14; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
   padding: 12px; overflow: auto; max-height: 60vh;
   font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text-0);
   white-space: pre-wrap; word-break: break-all;
@@ -106,11 +116,12 @@ const STYLE = `
 `;
 
 /* ---------- 状态 ---------- */
-/** 生成中/错误气泡的瞬时状态（不进 ChatSession.messages，不落盘） */
+/** 生成中/错误气泡的瞬时状态（不进 ChatSession.messages，不落盘）；tools 为工具活动行（同上） */
 interface Pending {
   phase: 'typing' | 'stream' | 'error';
   text: string;
   error?: string;
+  tools: string[];
 }
 
 let project: Project | null = null;
@@ -236,14 +247,36 @@ function handleEvent(key: string, ev: AiEvent): void {
   const sid = key.slice(key.indexOf(':') + 1);
   if (ev.type === 'delta') {
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? { phase: 'stream' as const, text: '' };
+    const p = cur ?? { phase: 'stream' as const, text: '', tools: [] };
     p.phase = 'stream';
     p.text += ev.text;
     pendingBy.set(sid, p);
+  } else if (ev.type === 'tool') {
+    /* 工具活动行：瞬时展示，不进历史；相邻重复行折叠为 ×N */
+    const cur = pendingBy.get(sid) ?? null;
+    const p = cur ?? { phase: 'typing' as const, text: '', tools: [] };
+    const label = ev.label ? `${ev.tool} ${ev.label}` : ev.tool;
+    const last = p.tools[p.tools.length - 1];
+    const m = last?.match(/^(.*) ×(\d+)$/);
+    if (last === label) {
+      p.tools[p.tools.length - 1] = `${label} ×2`;
+    } else if (m && m[1] === label) {
+      p.tools[p.tools.length - 1] = `${label} ×${Number(m[2]) + 1}`;
+    } else {
+      p.tools.push(label);
+    }
+    pendingBy.set(sid, p);
+  } else if (ev.type === 'segment') {
+    /* 新一轮 assistant 消息分段（工具来回时），仅流式中有文本才分段 */
+    const cur = pendingBy.get(sid) ?? null;
+    if (cur && cur.phase === 'stream' && cur.text) {
+      cur.text += '\n\n';
+      pendingBy.set(sid, cur);
+    }
   } else if (ev.type === 'done') {
     finalize(sid);
   } else {
-    pendingBy.set(sid, { phase: 'error', text: '', error: ev.message });
+    pendingBy.set(sid, { phase: 'error', text: '', error: ev.message, tools: [] });
   }
   if (sid === activeSessionId) {
     renderHistory();
@@ -328,13 +361,15 @@ function renderMessage(m: ChatMsg): HTMLElement {
 function renderPending(p: Pending): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'ai-msg ai';
+  const toolLines = p.tools.map((t) => `<div class="ai-tool-line">${icon('wrench')}${escapeHtml(t)}</div>`).join('');
   if (p.phase === 'typing' || (p.phase === 'stream' && !p.text)) {
     wrap.innerHTML =
-      '<div class="ai-bubble"><span class="ai-typing"><span class="ai-typing-label">正在输入</span><span></span><span></span><span></span></span></div>';
+      `<div class="ai-bubble">${toolLines}` +
+      '<span class="ai-typing"><span class="ai-typing-label">正在输入</span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span></span></div>';
   } else if (p.phase === 'error') {
     wrap.innerHTML = `<div class="ai-bubble error"><div class="ai-text">${escapeHtml(p.error ?? '')}</div></div>`;
   } else {
-    wrap.innerHTML = `<div class="ai-bubble">${renderAI(p.text)}</div>`;
+    wrap.innerHTML = `<div class="ai-bubble">${toolLines}${renderAI(p.text)}</div>`;
   }
   return wrap;
 }
@@ -376,15 +411,18 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
   switch (p.kind) {
     case 'command':
       return `<div class="ai-suggest cmd" data-action="paste" data-cmd="${escapeHtml(p.body)}" title="点击卡片粘贴到终端">
-        <span class="ai-suggest-icon">${icon('terminal')}</span>
+        <div class="ai-suggest-head"><span class="ai-suggest-icon">${icon('terminal')}</span>
+        <span class="ai-suggest-actions">
+          <button class="icon-btn ai-qc-fav" type="button" title="收藏为快捷指令">${icon('pin')}</button>
+          <button class="btn small" type="button">粘贴到终端</button>
+        </span></div>
         <code class="ai-suggest-main">${escapeHtml(p.body)}</code>
-        <button class="btn small" type="button">粘贴到终端</button>
       </div>`;
     case 'text':
-      return `<div class="ai-suggest text" data-action="insert" data-text="${escapeHtml(p.body)}" title="点击卡片插入输入框">
-        <span class="ai-suggest-icon">${icon('message')}</span>
+      return `<div class="ai-suggest text" data-action="copy" data-text="${escapeHtml(p.body)}" title="点击卡片复制到剪贴板">
+        <div class="ai-suggest-head"><span class="ai-suggest-icon">${icon('message')}</span>
+        <button class="btn small" type="button">复制到剪贴板</button></div>
         <span class="ai-suggest-main">${escapeHtml(p.body)}</span>
-        <button class="btn small" type="button">插入输入框</button>
       </div>`;
     case 'code':
       return `<pre class="ai-code-block">${p.lang ? `<span class="ai-code-lang">${escapeHtml(p.lang)}</span>` : ''}<code>${escapeHtml(p.body)}</code></pre>`;
@@ -401,6 +439,13 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
 /* ---------- 建议卡片 / 快照 chip 点击（事件委托） ---------- */
 function onChatClick(e: MouseEvent): void {
   const target = e.target as HTMLElement;
+  /* 收藏按钮在命令卡片内部，优先于卡片的 paste 动作 */
+  const fav = target.closest('.ai-qc-fav') as HTMLElement | null;
+  if (fav) {
+    const card = fav.closest('[data-cmd]') as HTMLElement | null;
+    if (card) addQuickCommandModal(card.dataset.cmd ?? '');
+    return;
+  }
   const card = target.closest('[data-action]') as HTMLElement | null;
   if (card) {
     if (card.dataset.action === 'paste') {
@@ -411,21 +456,16 @@ function onChatClick(e: MouseEvent): void {
       } else {
         toast('没有可用的终端标签页', 'error');
       }
-    } else if (card.dataset.action === 'insert') {
-      insertIntoInput(card.dataset.text ?? '');
+    } else if (card.dataset.action === 'copy') {
+      void navigator.clipboard.writeText(card.dataset.text ?? '').then(
+        () => toast('已复制到剪贴板', 'success'),
+        () => toast('复制到剪贴板失败', 'error'),
+      );
     }
     return;
   }
   const chip = target.closest('[data-snap-id]') as HTMLElement | null;
   if (chip) openSnapModal(snapshots.get(chip.dataset.snapId ?? ''));
-}
-
-function insertIntoInput(text: string): void {
-  if (input.value && !input.value.endsWith('\n')) input.value += '\n';
-  input.value += text;
-  autoGrow();
-  input.focus();
-  input.setSelectionRange(input.value.length, input.value.length);
 }
 
 /* ---------- 终端快照 chip（输入区） ---------- */
@@ -520,7 +560,7 @@ function send(): void {
   input.value = '';
   autoGrow();
   clearChips();
-  pendingBy.set(sid, { phase: 'typing', text: '' });
+  pendingBy.set(sid, { phase: 'typing', text: '', tools: [] });
   renderSessionBar();
   renderHistory();
   updateSendBtn();
@@ -532,7 +572,7 @@ function send(): void {
     .join('');
   aiChat(`${project.id}:${sid}`, prompt).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边
-    pendingBy.set(sid, { phase: 'error', text: '', error: String(err) });
+    pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [] });
     if (sid === activeSessionId) {
       renderHistory();
       updateSendBtn();

@@ -26,6 +26,14 @@
   --red-dim: rgba(229, 98, 106, 0.14);
   --purple: #b687e8;
 
+  /* 主题差异色(滚动条 / 终端与代码块背景等,亮色覆盖) */
+  --scrollbar-thumb: #3a404d;
+  --scrollbar-thumb-hover: #4a5160;
+  --term-bg: #0d1117;          /* 终端背景(与 terminal.ts xterm theme 一致) */
+  --code-bg: #0d0f14;          /* AI 代码块 / 快照背景 */
+  --inline-code-bg: rgba(0, 0, 0, 0.35);
+  --yellow-dim: rgba(229, 192, 123, 0.14);
+
   /* 尺寸 */
   --radius-s: 4px;
   --radius-m: 8px;
@@ -42,6 +50,39 @@
   --shadow-l: 0 8px 32px rgba(0, 0, 0, 0.55);
 }
 
+/* ---------- 亮色主题(切换按钮置 <html data-theme="light">,见 src/theme.ts) ----------
+   层级语义不变:bg-0 最底层、bg-1 面板、bg-2 卡片/输入(靠 border 与底层区分);亮色用深灰阴影。 */
+:root[data-theme='light'] {
+  --bg-0: #ffffff;
+  --bg-1: #f3f4f7;
+  --bg-2: #f7f8fa;
+  --bg-3: #e8eaf0;
+  --bg-hover: rgba(0, 0, 0, 0.05);
+  --bg-active: rgba(0, 0, 0, 0.09);
+  --border: #d8dce3;
+  --border-strong: #c3c9d2;
+  --text-0: #1f2329;
+  --text-1: #565e6b;
+  --text-2: #8b92a0;
+  --accent: #3b76e1;
+  --accent-hover: #2f66c9;
+  --accent-dim: rgba(59, 118, 225, 0.12);
+  --green: #1e9e62;
+  --green-dim: rgba(30, 158, 98, 0.12);
+  --yellow: #a5711b;
+  --yellow-dim: rgba(165, 113, 27, 0.12);
+  --red: #d6454d;
+  --red-dim: rgba(214, 69, 77, 0.1);
+  --purple: #8b4fc9;
+  --scrollbar-thumb: #c6ccd5;
+  --scrollbar-thumb-hover: #aab2bf;
+  --term-bg: #ffffff;
+  --code-bg: #eff1f5;
+  --inline-code-bg: rgba(0, 0, 0, 0.07);
+  --shadow-m: 0 4px 16px rgba(0, 0, 0, 0.12);
+  --shadow-l: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 html, body {
@@ -54,8 +95,8 @@ html, body {
 }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: #3a404d; border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
-::-webkit-scrollbar-thumb:hover { background: #4a5160; background-clip: content-box; border: 2px solid transparent; }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); background-clip: content-box; border: 2px solid transparent; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-corner { background: transparent; }
 
@@ -129,7 +170,7 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 .tag.green { background: var(--green-dim); color: var(--green); }
 .tag.blue { background: var(--accent-dim); color: var(--accent-hover); }
 .tag.red { background: var(--red-dim); color: var(--red); }
-.tag.yellow { background: rgba(229, 192, 123, 0.14); color: var(--yellow); }
+.tag.yellow { background: var(--yellow-dim); color: var(--yellow); }
 
 /* ---------- 模态框 ---------- */
 .modal-mask {
@@ -168,6 +209,17 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   display: flex; align-items: center; justify-content: center; font-size: 12px; color: #fff;
 }
 .page-topbar .spacer { flex: 1; }
+
+/* 自绘标题栏窗口控制（无边框窗口；data-tauri-drag-region 由 JS 打在 .page-topbar 上） */
+.page-topbar[data-tauri-drag-region] { user-select: none; }
+.tb-win-controls { display: flex; align-items: center; gap: 2px; margin-left: 6px; }
+.tb-win-btn {
+  width: 34px; height: 30px; border: none; background: none; cursor: pointer;
+  color: var(--text-1); border-radius: 6px; font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+}
+.tb-win-btn:hover { background: var(--bg-hover); color: var(--text-0); }
+.tb-win-close:hover { background: var(--red); color: #fff; }
 
 /* ---------- 空状态 ---------- */
 .empty-state {

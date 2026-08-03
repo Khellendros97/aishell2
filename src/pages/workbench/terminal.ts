@@ -12,17 +12,47 @@
  * tab.onClose 由本渲染器接管（term_close + 退订 + dispose）。
  */
 import { Terminal } from '@xterm/xterm';
+import type { ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
 
-import { onTermData, onTermExit, termClose, termCreate, termInput, termResize, upsertProject } from '../../api';
+import { onTermData, onTermExit, termClose, termCreate, termInput, termResize } from '../../api';
 import type { TermKind } from '../../api';
 import { icon } from '../../icons';
 import { activateTab, bus, getActiveTab, registerRenderer, Workbench } from './core';
+import { addQuickCommandModal } from './quickcommand';
 import type { Tab } from './core';
 import { toast, uid } from '../../ui';
+import { currentTheme, onThemeChange } from '../../theme';
+
+/* ---------- 终端配色：暗 / 亮两套（background 与 workbench.css --term-bg 一致） ---------- */
+const TERM_THEMES: Record<'dark' | 'light', ITheme> = {
+  dark: {
+    background: '#0d1117', foreground: '#e6edf3', cursor: '#4f8ef7',
+    selectionBackground: 'rgba(79, 142, 247, 0.35)',
+    black: '#0d1117', red: '#e5626a', green: '#4ec98a', yellow: '#e5c07b',
+    blue: '#4f8ef7', magenta: '#b687e8', cyan: '#56b6c2', white: '#c9d1d9',
+    brightBlack: '#8b93a5', brightRed: '#ff7b72', brightGreen: '#7ee2a8',
+    brightYellow: '#f2cc60', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
+    brightCyan: '#56d4dd', brightWhite: '#ffffff',
+  },
+  /* 亮色:ANSI white/brightWhite 语义反转(亮主题里「白字」要深,否则白底不可见) */
+  light: {
+    background: '#ffffff', foreground: '#1f2329', cursor: '#3b76e1',
+    selectionBackground: 'rgba(59, 118, 225, 0.3)',
+    black: '#1f2329', red: '#d6454d', green: '#1e9e62', yellow: '#a5711b',
+    blue: '#3b76e1', magenta: '#8b4fc9', cyan: '#0e8a9e', white: '#6b7280',
+    brightBlack: '#8b92a0', brightRed: '#e5626a', brightGreen: '#28b573',
+    brightYellow: '#c98d26', brightBlue: '#5b8ee8', brightMagenta: '#a56dd6',
+    brightCyan: '#15a3b8', brightWhite: '#1f2329',
+  },
+};
+
+/** 活跃终端实例:主题切换时批量换肤(destroy 时移除) */
+const liveTerms = new Set<TermSession>();
+onThemeChange((t) => { liveTerms.forEach((s) => { s.term.options.theme = TERM_THEMES[t]; }); });
 import type { TermSnapshot } from '../../types';
 
 /** 历史区块：一条已结算命令及其输出（纯文本，剥除 ANSI）。 */
@@ -51,7 +81,8 @@ function stripAnsi(s: string): string {
 }
 
 class TermSession {
-  private readonly term: Terminal;
+  /** 主题切换时模块级 liveTerms 需要重写 options.theme,不封装 */
+  readonly term: Terminal;
   private readonly fit: FitAddon;
   private readonly tab: Tab;
   private readonly host: HTMLElement;
@@ -116,7 +147,7 @@ class TermSession {
     };
     this.addChatBtn.onclick = () => this.sendToAI(this.takeSnapshot());
     this.pinBtn.onclick = () => {
-      if (this.lastCommand) this.addToQuickCommands(this.lastCommand);
+      if (this.lastCommand) addQuickCommandModal(this.lastCommand);
     };
 
     this.term = new Terminal({
@@ -124,17 +155,7 @@ class TermSession {
       fontSize: 13,
       cursorBlink: true,
       scrollback: 5000,
-      theme: {
-        background: '#0d1117',
-        foreground: '#e6edf3',
-        cursor: '#4f8ef7',
-        selectionBackground: 'rgba(79, 142, 247, 0.35)',
-        black: '#0d1117', red: '#e5626a', green: '#4ec98a', yellow: '#e5c07b',
-        blue: '#4f8ef7', magenta: '#b687e8', cyan: '#56b6c2', white: '#c9d1d9',
-        brightBlack: '#8b93a5', brightRed: '#ff7b72', brightGreen: '#7ee2a8',
-        brightYellow: '#f2cc60', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
-        brightCyan: '#56d4dd', brightWhite: '#ffffff',
-      },
+      theme: TERM_THEMES[currentTheme()],
     });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
@@ -388,7 +409,7 @@ class TermSession {
       pin.className = 'btn small';
       pin.innerHTML = `${icon('pin')} 快捷指令`;
       pin.title = '将该命令添加为快捷指令';
-      pin.onclick = () => this.addToQuickCommands(block.command);
+      pin.onclick = () => addQuickCommandModal(block.command);
       const chat = document.createElement('button');
       chat.className = 'btn small';
       chat.textContent = '添加到chat';
@@ -471,55 +492,6 @@ class TermSession {
     }
   }
 
-  /* ---------- 快捷指令（模态 DOM 照 .proto/workbench-terminal.js 的 addToQuickCommands） ---------- */
-  private addToQuickCommands(cmdText: string): void {
-    const project = Workbench.state.project;
-    if (!project) { toast('当前没有打开的项目', 'error'); return; }
-    const qcs = project.quickCommands ?? (project.quickCommands = []);
-    if (qcs.some((q) => q.command === cmdText)) {
-      toast('该命令已在快捷指令中', 'error');
-      return;
-    }
-    const mask = document.createElement('div');
-    mask.className = 'modal-mask';
-    mask.innerHTML = `
-      <div class="modal" style="width:440px">
-        <div class="modal-head"><h3>添加快捷指令</h3></div>
-        <div class="modal-body">
-          <div class="field"><label>指令标题<span class="req">*</span></label><input class="input term-qc-title" maxlength="40"></div>
-          <div class="field"><label>命令</label><input class="input mono term-qc-cmd"></div>
-        </div>
-        <div class="modal-foot">
-          <button class="btn term-qc-cancel">取消</button>
-          <button class="btn primary term-qc-ok">保存</button>
-        </div>
-      </div>`;
-    const titleInput = mask.querySelector('.term-qc-title') as HTMLInputElement;
-    const cmdInput = mask.querySelector('.term-qc-cmd') as HTMLInputElement;
-    titleInput.value = cmdText.length > 24 ? `${cmdText.slice(0, 24)}…` : cmdText;
-    cmdInput.value = cmdText;
-    document.body.appendChild(mask);
-    requestAnimationFrame(() => mask.classList.add('open'));
-    titleInput.focus();
-    titleInput.select();
-    const close = () => { mask.classList.remove('open'); setTimeout(() => mask.remove(), 160); };
-    (mask.querySelector('.term-qc-cancel') as HTMLButtonElement).onclick = close;
-    mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
-    const save = () => {
-      const title = titleInput.value.trim();
-      const command = cmdInput.value.trim();
-      if (!title) { titleInput.style.borderColor = 'var(--red)'; titleInput.focus(); return; }
-      if (!command) { cmdInput.style.borderColor = 'var(--red)'; cmdInput.focus(); return; }
-      qcs.push({ id: uid('qc'), title, command });
-      void upsertProject(project).catch((e) => toast(String(e), 'error'));
-      bus.emit('project-changed');
-      toast('已添加快捷指令', 'success');
-      close();
-    };
-    (mask.querySelector('.term-qc-ok') as HTMLButtonElement).onclick = save;
-    titleInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
-  }
-
   /* ---------- 外部 api（供快捷指令 / AI 建议组件） ---------- */
   paste(cmd: string): void {
     if (this.failed || this.exited) return;
@@ -545,6 +517,7 @@ class TermSession {
 
   /* ---------- 关闭清理（tab.onClose 由 renderer 接管） ---------- */
   destroy(): void {
+    liveTerms.delete(this);
     this.resizer?.disconnect();
     this.unlisteners.forEach((u) => { try { u(); } catch { /* 忽略退订异常 */ } });
     this.unlisteners = [];
@@ -559,6 +532,7 @@ class TermSession {
  */
 function renderTerminal(container: HTMLElement, tab: Tab): { paste(cmd: string): void; execute(cmd: string): void; takeSnapshot(): TermSnapshot } {
   const session = new TermSession(container, tab);
+  liveTerms.add(session);
   tab.onClose = () => session.destroy();
   return {
     paste: (cmd) => session.paste(cmd),

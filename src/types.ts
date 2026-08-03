@@ -11,7 +11,11 @@ export interface LlmConfig {
 export interface Settings {
   workspaceDir: string | null;
   llm: LlmConfig;
+  theme: Theme;
 }
+
+/** 与 store.rs Theme serde lowercase 对齐 */
+export type Theme = 'dark' | 'light';
 
 export type AuthType = 'password' | 'key';
 

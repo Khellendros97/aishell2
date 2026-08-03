@@ -4,10 +4,11 @@
  * 密码与 apiKey 表单留空提交 null（后端保持原值），显示位不打回明文；
  * 浏览按钮走 @tauri-apps/plugin-dialog；「重置演示数据」按钮本页无（见欢迎页「打开配置目录」）。
  */
-import type { AppState, LlmConfig, Server } from '../types';
-import { deleteServer, getState, openDialog, saveSettings, upsertServer } from '../api';
+import type { AppState, LlmConfig, Server, Theme } from '../types';
+import { deleteServer, getState, openDialog, saveSettings, setTheme, upsertServer } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
+import { applyTheme, currentTheme, onThemeChange } from '../theme';
 import type { PageRender } from '../main';
 import './settings.css';
 
@@ -38,6 +39,14 @@ export const renderSettings: PageRender = (root, params) => {
         </section>
         <section id="panel-system" class="settings-panel hidden">
           <div class="panel-head"><div class="panel-title">系统设置</div></div>
+          <div class="field">
+            <label>界面主题</label>
+            <select id="f-theme" class="select">
+              <option value="dark">深色</option>
+              <option value="light">亮色</option>
+            </select>
+            <div class="hint">选择后立即生效；顶栏 ☀/☾ 按钮亦可快捷切换</div>
+          </div>
           <div class="field">
             <label>Workspace 目录<span class="req">*</span></label>
             <div class="input-row">
@@ -106,8 +115,8 @@ export const renderSettings: PageRender = (root, params) => {
               <option value="key">密钥</option>
             </select>
           </div>
-          <div class="field" data-auth="password">
-            <label>账号</label>
+          <div class="field">
+            <label>账号<span class="req">*</span></label>
             <input id="f-username" class="input" placeholder="例如：deploy">
           </div>
           <div class="field" data-auth="password">
@@ -152,6 +161,7 @@ export const renderSettings: PageRender = (root, params) => {
   const fKeyPath = root.querySelector('#f-keypath') as HTMLInputElement;
   let editingId: string | null = null;
 
+  const fTheme = root.querySelector('#f-theme') as HTMLSelectElement;
   const fWorkspace = root.querySelector('#f-workspace') as HTMLInputElement;
   const fModelId = root.querySelector('#f-model-id') as HTMLInputElement;
   const fBaseUrl = root.querySelector('#f-base-url') as HTMLInputElement;
@@ -160,7 +170,7 @@ export const renderSettings: PageRender = (root, params) => {
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'medium' } },
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'medium' }, theme: 'dark' },
     servers: [], projects: [], sessions: {},
   };
 
@@ -332,8 +342,8 @@ export const renderSettings: PageRender = (root, params) => {
     if (!name) { toast('请填写服务器名称', 'error'); return; }
     if (!host) { toast('请填写 IP 地址', 'error'); return; }
     if (!fPort.value || isNaN(port) || port < 1 || port > 65535) { toast('请填写有效的 SSH 端口（1-65535）', 'error'); return; }
+    if (!username) { toast('请填写账号', 'error'); return; }
     if (authType === 'password') {
-      if (!username) { toast('请填写账号', 'error'); return; }
       // 新建必须填密码；编辑留空 = 不修改已保存的密码
       if (!editingId && !password) { toast('请填写密码', 'error'); return; }
     } else if (!keyPath) {
@@ -344,7 +354,7 @@ export const renderSettings: PageRender = (root, params) => {
     const server: Server = {
       id: editingId ?? uid('srv'),
       name, host, port, authType,
-      username: authType === 'password' ? username : '',
+      username,
       keyPath: authType === 'key' ? keyPath : '',
     };
     const passwordOrNull = authType === 'password' ? (password || null) : null;
@@ -372,6 +382,8 @@ export const renderSettings: PageRender = (root, params) => {
      ============================================================ */
   function loadSystemSettings() {
     const s = db.settings;
+    /* 主题取内存当前值:顶栏即时切换后 db 缓存已过期,不能用 s.theme */
+    fTheme.value = currentTheme();
     fWorkspace.value = s.workspaceDir || '';
     fModelId.value = s.llm.modelId || '';
     fBaseUrl.value = s.llm.baseUrl || '';
@@ -394,6 +406,15 @@ export const renderSettings: PageRender = (root, params) => {
     btnToggleKey.title = visible ? '显示 / 隐藏' : '隐藏 / 显示';
   });
 
+  /* 主题选择即时生效(与顶栏按钮同语义),保存按钮不再负责主题 */
+  fTheme.addEventListener('change', () => {
+    const t = fTheme.value as Theme;
+    applyTheme(t);
+    setTheme(t).catch((err) => toast(`主题保存失败: ${String(err)}`, 'error'));
+  });
+  /* 顶栏切换时同步 select 显示(仅在本页存活期) */
+  const offTheme = onThemeChange((t) => { fTheme.value = t; });
+
   (root.querySelector('#btn-save-system') as HTMLElement).addEventListener('click', () => void saveSystemSettings());
 
   async function saveSystemSettings() {
@@ -409,9 +430,11 @@ export const renderSettings: PageRender = (root, params) => {
       effort: fEffort.value as LlmConfig['effort'],
     };
     const apiKey = fApiKey.value.trim();
+    /* theme 带内存当前值:避免本页打开期间顶栏切换的主题被表单旧值覆盖 */
+    const settings = { workspaceDir, llm, theme: currentTheme() };
     try {
-      await saveSettings({ workspaceDir, llm }, apiKey || null);
-      db.settings = { workspaceDir, llm };
+      await saveSettings(settings, apiKey || null);
+      db.settings = settings;
       toast('设置已保存', 'success');
     } catch (err) {
       toast(String(err), 'error');
@@ -429,5 +452,6 @@ export const renderSettings: PageRender = (root, params) => {
 
   return () => {
     document.removeEventListener('keydown', onKeydown);
+    offTheme();
   };
 };

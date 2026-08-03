@@ -136,6 +136,12 @@ impl SshManager {
         server: &store::Server,
         password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        if server.username.trim().is_empty() {
+            return Err(format!(
+                "服务器「{}」未配置登录用户名，请在设置中补充",
+                server.name
+            ));
+        }
         let config = Arc::new(client::Config::default());
         let addr = (server.host.as_str(), server.port);
         let mut handle = tokio::time::timeout(

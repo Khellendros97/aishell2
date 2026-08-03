@@ -6,7 +6,7 @@
  *   - 数据源为真实 fs_read / fs_write（后端 fsops），载入失败 toast 错误原文并显示空文档
  * import 即完成注册（副作用），由 workbench.ts 引入。
  */
-import { EditorState, Prec, StateEffect, type Extension } from '@codemirror/state';
+import { EditorState, Prec, StateEffect, Compartment, type Extension } from '@codemirror/state';
 import { EditorView, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { LanguageDescription, indentUnit } from '@codemirror/language';
@@ -15,7 +15,15 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { fsRead, fsWrite } from '../../api';
 import { toast } from '../../ui';
 import { bus, registerRenderer, setTabTitle, type Tab } from './core';
+import { currentTheme, onThemeChange } from '../../theme';
 import './editor.css';
+
+/* CodeMirror 主题随全局主题切换:Compartment 运行时重配,亮色用 CM 默认亮色(样式见 editor.css) */
+const cmTheme = new Compartment();
+const cmThemeExt = () => (currentTheme() === 'dark' ? oneDark : []);
+onThemeChange(() => {
+  entries.forEach((e) => e.view.dispatch({ effects: cmTheme.reconfigure(cmThemeExt()) }));
+});
 
 /** 单个编辑器标签的运行状态 */
 interface EditorEntry {
@@ -136,7 +144,7 @@ registerRenderer('editor', (container, tab) => {
           run: () => { void queueSave(entry, false); return true; },
         }])),
         keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
-        oneDark,
+        cmTheme.of(cmThemeExt()),
         EditorView.updateListener.of((update) => { if (update.docChanged) markDirty(entry); }),
       ],
     }),

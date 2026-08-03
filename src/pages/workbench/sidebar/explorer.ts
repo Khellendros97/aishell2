@@ -5,11 +5,11 @@
  * 契约：mountExplorerPanel(container) 由 workbench.ts 侧栏框架挂载（container = #sidebar-content，
  * 面板不碰 #sidebar-head）；explorerHead 描述符由框架渲染标题与 actions 区。
  */
-import { bus, openTab, Workbench } from '../core';
+import { bus, getTabs, openTab, Workbench } from '../core';
 import { confirmDialog, toast } from '../../../ui';
-import { fsCreate, fsDelete, fsImport, fsList, sftpDownload } from '../../../api';
+import { fsCopy, fsCreate, fsDelete, fsImport, fsList, fsMove, fsReveal, sftpDownload } from '../../../api';
 import type { FsEntry } from '../../../types';
-import { icon as iconSvg } from '../../../icons';
+import { icon as iconSvg, type IconName } from '../../../icons';
 import './explorer.css';
 
 /** 侧栏框架渲染 #sidebar-head 用（标题 + actions 按钮） */
@@ -58,6 +58,10 @@ let rootNode: TreeNode | null = null;
 const expanded = new Set<string>();
 /** 全局加载序号：异步结果只接受最新一次（防止乱序渲染） */
 let loadSeq = 0;
+/** 拖拽中的本地节点（dragover 据此决定 move/copy 光标；守卫在 moveNode 内） */
+let draggingNode: TreeNode | null = null;
+/** 复制/剪切剪贴板：剪切粘贴成功后清空，复制可多次粘贴 */
+let fsClipboard: { path: string; name: string; isDir: boolean; mode: 'copy' | 'cut' } | null = null;
 
 const joinPath = (parent: string, name: string): string => `${parent}/${name}`;
 const normPath = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -210,16 +214,34 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
     });
     row.appendChild(del);
 
-    /* 拖拽：local 源（DND 契约），供远端面板接收 */
+    /* 拖拽：local 源（DND 契约）——树内拖到目录=移动，供远端 SFTP 面板接收=上传 */
     row.draggable = true;
     row.addEventListener('dragstart', (e) => {
       if (!e.dataTransfer) return;
       e.dataTransfer.setData(Workbench.DND_MIME, JSON.stringify({
         source: 'local', path: node.path, name: node.name, isDir: node.isDir,
       }));
-      e.dataTransfer.effectAllowed = 'copy';
+      e.dataTransfer.effectAllowed = 'copyMove';
+      draggingNode = node;
+    });
+    row.addEventListener('dragend', () => { draggingNode = null; });
+
+    /* 右键菜单 */
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showNodeMenu(e.clientX, e.clientY, node, row);
+    });
+  } else {
+    /* 根行右键：仅粘贴 / 系统资源管理器打开 */
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      showRootMenu(e.clientX, e.clientY, node);
     });
   }
+
+  /* 剪切中的行半透明（剪切粘贴成功前） */
+  if (fsClipboard?.mode === 'cut' && fsClipboard.path === node.path) row.classList.add('wbs-cut');
 
   /* 目录行是 remote 拖入的下载目标，也是 OS 文件拖入的上传目标 */
   if (node.isDir) {
@@ -228,7 +250,8 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
       const types = Array.from(e.dataTransfer.types);
       if (!types.includes(Workbench.DND_MIME) && !types.includes('Files')) return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = 'copy';
+      /* 本地树内拖拽=移动；远端 / OS 文件=复制 */
+      e.dataTransfer.dropEffect = draggingNode ? 'move' : 'copy';
       row.classList.add('wbs-explorer-drop');
     });
     row.addEventListener('dragleave', (e) => {
@@ -242,7 +265,13 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
         e.preventDefault();
         let data: { source: string; path: string; name: string; isDir: boolean; serverId?: string } | null = null;
         try { data = JSON.parse(raw); } catch { return; }
-        if (!data || data.source !== 'remote') return;
+        if (!data) return;
+        /* 树内移动（此前缺失：local 载荷只有远端接收逻辑，拖到目录上被静默丢弃） */
+        if (data.source === 'local') {
+          void moveNode(data.path, data.name, data.isDir, node);
+          return;
+        }
+        if (data.source !== 'remote') return;
         const serverId = data.serverId;
         if (!serverId) return;
         void downloadTo({ path: data.path, name: data.name, serverId }, node);
@@ -257,25 +286,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
     });
   }
 
-  row.addEventListener('click', () => {
-    if (node.isDir) {
-      if (expanded.has(node.path)) {
-        expanded.delete(node.path);
-        render();
-      } else {
-        expanded.add(node.path);
-        if (node.children) render();
-        else void loadDir(node);
-      }
-    } else {
-      openTab({
-        id: `editor:${node.path}`,
-        type: 'editor',
-        title: node.name,
-        data: { path: node.path, name: node.name },
-      });
-    }
-  });
+  row.addEventListener('click', () => openNode(node));
   return row;
 }
 
@@ -299,6 +310,236 @@ async function deleteNode(node: TreeNode): Promise<void> {
   } catch (err) {
     toast(String(err), 'error');
   }
+}
+
+/* ---------- 打开（单击 / 菜单「打开」共用） ---------- */
+function openNode(node: TreeNode): void {
+  if (node.isDir) {
+    if (expanded.has(node.path)) {
+      expanded.delete(node.path);
+      render();
+    } else {
+      expanded.add(node.path);
+      if (node.children) render();
+      else void loadDir(node);
+    }
+  } else {
+    openTab({
+      id: `editor:${node.path}`,
+      type: 'editor',
+      title: node.name,
+      data: { path: node.path, name: node.name },
+    });
+  }
+}
+
+/* ---------- 编辑器占用保护 ---------- */
+/** 正在编辑器打开的文件路径（editor tab id = editor:<path>） */
+function editingPaths(): string[] {
+  return getTabs().filter((t) => t.type === 'editor').map((t) => t.id.slice('editor:'.length));
+}
+
+/** path 或其子孙正被编辑时提示并返回 true——移动/重命名后旧标签写盘会在旧路径重建文件，抵消操作 */
+function blockedByEditor(path: string): boolean {
+  const hit = editingPaths().some((p) => p === path || p.startsWith(`${path}/`));
+  if (hit) toast('该文件正在编辑器中打开，请先关闭对应标签页', 'error');
+  return hit;
+}
+
+/* ---------- 树内移动（拖拽）与剪贴板粘贴 ---------- */
+async function moveNode(srcPath: string, name: string, isDir: boolean, targetDir: TreeNode): Promise<void> {
+  if (srcPath === targetDir.path) return; // 拖到自身
+  if (isDir && targetDir.path.startsWith(`${srcPath}/`)) {
+    toast('不能把目录移动到它自身内部', 'error');
+    return;
+  }
+  const srcParent = srcPath.slice(0, srcPath.length - name.length - 1);
+  if (normPath(srcParent) === normPath(targetDir.path)) return; // 原地拖放
+  if (blockedByEditor(srcPath)) return;
+  try {
+    await fsMove(srcPath, joinPath(targetDir.path, name));
+    expanded.add(targetDir.path);
+    await refreshAll();
+  } catch (err) {
+    toast(String(err), 'error');
+  }
+}
+
+async function pasteInto(targetDir: TreeNode): Promise<void> {
+  const clip = fsClipboard;
+  if (!clip) return;
+  if (clip.isDir && (targetDir.path === clip.path || targetDir.path.startsWith(`${clip.path}/`))) {
+    toast('不能把目录粘贴到它自身内部', 'error');
+    return;
+  }
+  try {
+    if (clip.mode === 'cut') {
+      const srcParent = clip.path.slice(0, clip.path.length - clip.name.length - 1);
+      if (normPath(srcParent) === normPath(targetDir.path)) return; // 同目录剪切 = 无操作
+      if (blockedByEditor(clip.path)) return;
+      await fsMove(clip.path, joinPath(targetDir.path, clip.name));
+      fsClipboard = null;
+    } else {
+      await fsCopy(clip.path, targetDir.path);
+    }
+    expanded.add(targetDir.path);
+    await refreshAll();
+  } catch (err) {
+    toast(String(err), 'error');
+  }
+}
+
+/* ---------- 重命名（行内输入，风格同新建输入行） ---------- */
+function startRename(node: TreeNode, row: HTMLElement): void {
+  if (blockedByEditor(node.path)) return; // 编辑中的文件直接拒绝进入重命名
+  const nameEl = row.querySelector('.wbs-explorer-name');
+  if (!nameEl) return;
+  const input = document.createElement('input');
+  input.className = 'input wbs-explorer-rename';
+  input.value = node.name;
+  nameEl.replaceWith(input);
+  input.focus();
+  /* 选中主名（文件不含扩展名），与系统资源管理器一致 */
+  const dot = node.isDir ? -1 : node.name.lastIndexOf('.');
+  input.setSelectionRange(0, dot > 0 ? dot : node.name.length);
+  let done = false;
+  const finish = (commit: boolean): void => {
+    if (done) return;
+    done = true;
+    const newName = input.value.trim();
+    if (!commit || !newName || newName === node.name) { render(); return; }
+    if (/[\\/]/.test(newName)) {
+      toast('名称不能包含路径分隔符', 'error');
+      render();
+      return;
+    }
+    if (blockedByEditor(node.path)) { render(); return; }
+    const parent = node.path.slice(0, node.path.length - node.name.length - 1);
+    void fsMove(node.path, joinPath(parent, newName))
+      .then(() => refreshAll())
+      .catch((err: unknown) => { toast(String(err), 'error'); render(); });
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') finish(true);
+    else if (e.key === 'Escape') finish(false);
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+}
+
+/* ---------- 剪贴板复制文本（系统剪贴板，失败降级 execCommand） ---------- */
+async function copyText(text: string, okMsg: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+  toast(okMsg, 'success');
+}
+
+/** 相对项目根的路径（根自身返回空串时不应出现——根行菜单不提供此项） */
+function relativePath(path: string): string {
+  const root = getRoot();
+  if (root && path.startsWith(`${root.path}/`)) return path.slice(root.path.length + 1);
+  return path;
+}
+
+/* ---------- 右键菜单（模块级单例；点击外部 / Esc / 窗口失焦关闭） ---------- */
+interface MenuEntry {
+  label: string;
+  iconName: IconName;
+  danger?: boolean;
+  disabled?: boolean;
+  disabledTip?: string;
+  action?: () => void;
+}
+type MenuItem = MenuEntry | 'sep';
+
+let menuEl: HTMLElement | null = null;
+
+function closeMenu(): void {
+  menuEl?.remove();
+  menuEl = null;
+  document.removeEventListener('mousedown', onMenuOutside, true);
+  document.removeEventListener('keydown', onMenuKey, true);
+  window.removeEventListener('blur', closeMenu);
+}
+function onMenuOutside(e: MouseEvent): void {
+  if (menuEl && !menuEl.contains(e.target as Node)) closeMenu();
+}
+function onMenuKey(e: KeyboardEvent): void {
+  if (e.key === 'Escape') closeMenu();
+}
+
+function showMenu(x: number, y: number, items: MenuItem[]): void {
+  closeMenu();
+  const el = document.createElement('div');
+  el.className = 'ctx-menu';
+  for (const item of items) {
+    if (item === 'sep') {
+      const sep = document.createElement('div');
+      sep.className = 'ctx-menu-sep';
+      el.appendChild(sep);
+      continue;
+    }
+    const btn = document.createElement('button');
+    btn.className = `ctx-menu-item${item.danger ? ' danger' : ''}${item.disabled ? ' disabled' : ''}`;
+    btn.innerHTML = `${iconSvg(item.iconName)}<span>${item.label}</span>`;
+    if (item.disabled || !item.action) {
+      btn.disabled = true;
+      if (item.disabledTip) btn.title = item.disabledTip;
+    } else {
+      const { action } = item;
+      btn.onclick = () => { closeMenu(); action(); };
+    }
+    el.appendChild(btn);
+  }
+  document.body.appendChild(el);
+  /* 防出屏：先渲染取尺寸再定位 */
+  const rect = el.getBoundingClientRect();
+  el.style.left = `${Math.max(4, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  el.style.top = `${Math.max(4, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+  menuEl = el;
+  document.addEventListener('mousedown', onMenuOutside, true);
+  document.addEventListener('keydown', onMenuKey, true);
+  window.addEventListener('blur', closeMenu);
+}
+
+function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): void {
+  const pasteTarget = node.isDir ? node : node.parent;
+  /* 编辑中的文件禁止移动类操作——旧标签写盘会在旧路径重建文件,抵消操作;防线前置为禁用态 */
+  const editing = editingPaths().some((p) => p === node.path || p.startsWith(`${node.path}/`));
+  const editingTip = '文件正在编辑器中打开,请先关闭对应标签页';
+  showMenu(x, y, [
+    { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => openNode(node) },
+    'sep',
+    { label: '复制', iconName: 'copy', action: () => { fsClipboard = { path: node.path, name: node.name, isDir: node.isDir, mode: 'copy' }; render(); } },
+    { label: '剪切', iconName: 'scissors', disabled: editing, disabledTip: editingTip, action: () => { fsClipboard = { path: node.path, name: node.name, isDir: node.isDir, mode: 'cut' }; render(); } },
+    { label: '粘贴', iconName: 'clipboard', disabled: !fsClipboard || !pasteTarget, action: () => { if (pasteTarget) void pasteInto(pasteTarget); } },
+    'sep',
+    { label: '重命名', iconName: 'pencil', disabled: editing, disabledTip: editingTip, action: () => startRename(node, row) },
+    { label: '删除', iconName: 'trash', danger: true, action: () => void deleteNode(node) },
+    'sep',
+    { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(node.path).catch((err) => toast(String(err), 'error')) },
+    { label: '复制文件路径', iconName: 'link', action: () => void copyText(node.path.replace(/\//g, '\\'), '已复制文件路径') },
+    { label: '复制相对路径', iconName: 'link', action: () => void copyText(relativePath(node.path), '已复制相对路径') },
+  ]);
+}
+
+function showRootMenu(x: number, y: number, root: TreeNode): void {
+  showMenu(x, y, [
+    { label: '粘贴', iconName: 'clipboard', disabled: !fsClipboard, action: () => void pasteInto(root) },
+    'sep',
+    { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(root.path).catch((err) => toast(String(err), 'error')) },
+  ]);
 }
 
 /* ---------- 新建（根目录下，内联输入行，照原型） ---------- */
@@ -444,6 +685,9 @@ function appendNode(parent: HTMLElement, node: TreeNode, depth: number, isRoot: 
       wait.style.paddingLeft = `${6 + (depth + 1) * 14}px`;
       wait.textContent = '加载中…';
       parent.appendChild(wait);
+    } else {
+      /* 展开但未加载（移动/粘贴把目标目录置为 expanded 时即此场景）→ 自动加载 */
+      void loadDir(node);
     }
     return;
   }
@@ -491,7 +735,7 @@ function startPolling(): void {
   if (pollTimer !== null) window.clearInterval(pollTimer);
   pollTimer = window.setInterval(() => {
     if (!container?.isConnected || document.hidden) return; // 面板已切走 / 窗口不可见
-    if (container.querySelector('.wbs-explorer-inline-input')) return; // 新建输入中不打断
+    if (container.querySelector('.wbs-explorer-inline-input, .wbs-explorer-rename')) return; // 输入中不打断
     if (!getRoot()) return;
     void refreshAll();
   }, POLL_MS);

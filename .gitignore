@@ -26,3 +26,4 @@ dist-ssr
 # pi runtime（scripts/fetch-pi.sh 拉取）
 src-tauri/resources/pi/
 src-tauri/target
+tmp/

@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AppState, ChatSession, FsEntry, Project, Server, Settings,
+  AppState, ChatSession, FsEntry, Project, Server, Settings, Theme,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -19,6 +19,8 @@ export const isConfigComplete = () => call<boolean>('is_config_complete');
 export const getState = () => call<AppState>('get_state');
 export const saveSettings = (settings: Settings, apiKey: string | null) =>
   call<void>('save_settings', { settings, apiKey });
+/** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */
+export const setTheme = (theme: Theme) => call<void>('set_theme', { theme });
 export const upsertServer = (server: Server, password: string | null) =>
   call<void>('upsert_server', { server, password });
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
@@ -57,6 +59,12 @@ export const fsDelete = (path: string) => call<void>('fs_delete', { path });
 /** OS 拖入导入：返回落地后的最终名称（重名自动改名）；文件内容 base64，目录传 null。 */
 export const fsImport = (dir: string, name: string, isDir: boolean, data: string | null) =>
   call<string>('fs_import', { dir, name, isDir, data });
+/** 移动/重命名：to 为完整目标路径；目标已存在会 reject。 */
+export const fsMove = (from: string, to: string) => call<void>('fs_move', { from, to });
+/** 复制进 toDir（重名自动改名）；返回落地路径。 */
+export const fsCopy = (from: string, toDir: string) => call<string>('fs_copy', { from, toDir });
+/** 在系统文件资源管理器中定位 */
+export const fsReveal = (path: string) => call<void>('fs_reveal', { path });
 
 /* ---------------- sftp ---------------- */
 export const sftpList = (serverId: string, path: string) =>
@@ -69,6 +77,8 @@ export const sftpDownload = (serverId: string, remotePath: string, localDir: str
 /* ---------------- ai ---------------- */
 export type AiEvent =
   | { type: 'delta'; text: string }
+  | { type: 'tool'; tool: string; label: string }
+  | { type: 'segment' }
   | { type: 'done' }
   | { type: 'error'; message: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */

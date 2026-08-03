@@ -151,7 +151,7 @@ export const renderWelcome: PageRender = (root) => {
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'medium' } },
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'medium' }, theme: 'dark' },
     servers: [], projects: [], sessions: {},
   };
   let editingId: string | null = null;       // null = 新建；否则为正在编辑的项目 id

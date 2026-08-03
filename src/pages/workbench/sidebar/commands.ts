@@ -126,13 +126,17 @@ function render(): void {
     const card = document.createElement('div');
     card.className = 'card wbs-commands-qc-card';
     card.innerHTML =
-      `<div class="wbs-commands-qc-title ellipsis" title="${esc(qc.title)}">${esc(qc.title)}</div>` +
+      '<div class="wbs-commands-qc-head">' +
+        `<div class="wbs-commands-qc-title ellipsis" title="${esc(qc.title)}">${esc(qc.title)}</div>` +
+        '<span class="wbs-commands-qc-icons">' +
+          `<button class="icon-btn wbs-commands-edit" title="编辑">${icon('pencil')}</button>` +
+          `<button class="icon-btn danger wbs-commands-del" title="删除">${icon('trash')}</button>` +
+        '</span>' +
+      '</div>' +
       `<div class="wbs-commands-qc-cmd mono" title="${esc(qc.command)}">${esc(qc.command)}</div>` +
       '<div class="wbs-commands-qc-actions">' +
         '<button class="btn small wbs-commands-copy">复制到终端</button>' +
         '<button class="btn small wbs-commands-run">立即执行</button>' +
-        '<button class="btn small wbs-commands-edit">编辑</button>' +
-        '<button class="btn small danger wbs-commands-del">删除</button>' +
       '</div>';
     (card.querySelector('.wbs-commands-copy') as HTMLButtonElement).onclick = () => runOnTerminal('paste', qc.command);
     (card.querySelector('.wbs-commands-run') as HTMLButtonElement).onclick = () => runOnTerminal('execute', qc.command);

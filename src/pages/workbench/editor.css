@@ -17,3 +17,16 @@
   font-size: 13px;
   line-height: 1.6;
 }
+
+/* 亮色主题:CM 默认样式打底,显式对齐应用变量(oneDark 由 Compartment 卸载) */
+[data-theme='light'] .ed-root .cm-editor { background: var(--bg-0); color: var(--text-0); }
+[data-theme='light'] .ed-root .cm-gutters {
+  background: var(--bg-0); color: var(--text-2); border-right: 1px solid var(--border);
+}
+[data-theme='light'] .ed-root .cm-activeLine { background: rgba(0, 0, 0, 0.045); }
+[data-theme='light'] .ed-root .cm-activeLineGutter { background: rgba(0, 0, 0, 0.06); }
+[data-theme='light'] .ed-root .cm-cursor { border-left-color: var(--text-0); }
+[data-theme='light'] .ed-root .cm-selectionBackground,
+[data-theme='light'] .ed-root .cm-editor.cm-focused .cm-selectionBackground {
+  background: rgba(59, 118, 225, 0.25) !important;
+}

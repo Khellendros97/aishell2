@@ -1,7 +1,8 @@
 /** 应用入口：hash 路由 + 启动缺配跳转（语义同 .proto/index.html）。 */
 import './styles/design.css';
+import { getState, isConfigComplete } from './api';
 import { navigate, onRoute, parseHash } from './router';
-import { isConfigComplete } from './api';
+import { applyTheme } from './theme';
 import { renderTopbar } from './components/topbar';
 import { renderWelcome } from './pages/welcome';
 import { renderSettings } from './pages/settings';
@@ -32,6 +33,8 @@ async function render(): Promise<void> {
 }
 
 async function boot(): Promise<void> {
+  /* 先取 settings.theme 应用,避免首屏亮暗闪烁;失败保持默认深色 */
+  try { const s = await getState(); applyTheme(s.settings.theme); } catch { /* 后端未就绪 */ }
   if (!location.hash) {
     let ok = false;
     try { ok = await isConfigComplete(); } catch { /* 后端未就绪时按缺配处理 */ }
