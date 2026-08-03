@@ -1,5 +1,6 @@
 //! SSH 连接管理 —— 连接复用（同一 server 的终端与 SFTP 共享一条 TCP 连接，russh 多路复用）、
-//! 密码认证走 keyring `server:<id>`、密钥走 russh-keys load_secret_key（带短语明确报错）、
+//! 密码认证走 keyring `server:<id>`、密钥走 russh-keys load_secret_key；
+//! Xshell 专用 NSSSH 私钥在加载前给出可执行的 OpenSSH 导出提示，带密码短语密钥亦明确报错；
 //! check_server_key MVP 直接信任（A5 已知限制）、连接与认证各自 10s 超时。
 //!
 //! façade 签名即跨模块契约（term.rs / sftp.rs 依赖），实现时不得更改。
@@ -7,6 +8,8 @@
 //! 下次 `get_or_connect` 自动重连。
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +17,38 @@ use russh::client;
 use tokio::sync::Mutex;
 
 use crate::store;
+
+const NSSSH_PRIVATE_KEY_HEADER: &[u8] = b"---- BEGIN NSSSH PRIVATE KEY ----";
+
+fn has_nsssh_header(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let Some(rest) = bytes.strip_prefix(NSSSH_PRIVATE_KEY_HEADER) else {
+        return false;
+    };
+    rest.is_empty() || matches!(rest.first(), Some(b'\r' | b'\n'))
+}
+
+/// 固定长度读取文件头，不加载或输出私钥正文。
+fn is_nsssh_private_key(path: &str) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0_u8; NSSSH_PRIVATE_KEY_HEADER.len() + 4];
+    let Ok(read) = file.read(&mut prefix) else {
+        return false;
+    };
+    has_nsssh_header(&prefix[..read])
+}
+
+fn reject_unsupported_key_format(server: &store::Server) -> Result<(), String> {
+    if !is_nsssh_private_key(&server.key_path) {
+        return Ok(());
+    }
+    Err(format!(
+        "服务器「{}」使用的是 Xshell 专用 NSSSH 私钥（{}），AIShell 无法直接读取。请在 Xshell 中打开「工具 → 用户密钥管理器」，选中对应密钥并导出为无密码短语的 OpenSSH 私钥，然后在 AIShell 的服务器配置中替换密钥路径",
+        server.name, server.key_path
+    ))
+}
 
 /// 客户端事件处理器。MVP 接受任意 host key（计划 A5：不做 known_hosts 校验，后续版本补）。
 pub struct CliHandler;
@@ -142,6 +177,9 @@ impl SshManager {
                 server.name
             ));
         }
+        if server.auth_type == store::AuthType::Key {
+            reject_unsupported_key_format(server)?;
+        }
         let config = Arc::new(client::Config::default());
         let addr = (server.host.as_str(), server.port);
         let mut handle = tokio::time::timeout(
@@ -254,5 +292,55 @@ impl SshManager {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_server(path: &str) -> store::Server {
+        store::Server {
+            id: "srv-nsssh".to_string(),
+            name: "Xshell 导入会话".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            auth_type: store::AuthType::Key,
+            username: "tester".to_string(),
+            key_path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn detects_only_complete_nsssh_header() {
+        assert!(has_nsssh_header(
+            b"---- BEGIN NSSSH PRIVATE KEY ----\r\npayload"
+        ));
+        assert!(has_nsssh_header(
+            b"\xEF\xBB\xBF---- BEGIN NSSSH PRIVATE KEY ----\n"
+        ));
+        assert!(!has_nsssh_header(
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\npayload"
+        ));
+        assert!(!has_nsssh_header(b"---- BEGIN NSSSH PRIVATE KEY ----x"));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_nsssh_before_network_with_actionable_error() {
+        let suffix = std::process::id();
+        let path = std::env::temp_dir().join(format!("aishell-nsssh-key-test-{suffix}.pri"));
+        let store_dir = std::env::temp_dir().join(format!("aishell-nsssh-store-test-{suffix}"));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        std::fs::write(&path, b"---- BEGIN NSSSH PRIVATE KEY ----\r\npayload").unwrap();
+        let server = key_server(&path.to_string_lossy());
+        let manager = SshManager::new(Arc::new(store::test_store(store_dir.clone())));
+
+        let err = manager.connect_handle(&server, None).await.err().unwrap();
+        assert!(err.contains("Xshell 专用 NSSSH 私钥"));
+        assert!(err.contains("工具 → 用户密钥管理器"));
+        assert!(err.contains("无密码短语的 OpenSSH 私钥"));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(store_dir);
     }
 }

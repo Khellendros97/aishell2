@@ -4,6 +4,7 @@ pub mod sftp;
 pub mod ssh;
 pub mod store;
 pub mod term;
+pub mod xshell;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ pub fn run() {
             store::ensure_project_dirs,
             store::sessions_get,
             store::session_upsert,
+            xshell::import_xshell_sessions,
             term::term_create,
             term::term_input,
             term::term_resize,

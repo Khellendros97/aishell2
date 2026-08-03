@@ -5,7 +5,7 @@
  * 浏览按钮走 @tauri-apps/plugin-dialog；「重置演示数据」按钮本页无（见欢迎页「打开配置目录」）。
  */
 import type { AppState, LlmConfig, Server, Theme } from '../types';
-import { deleteServer, getState, openDialog, saveSettings, setTheme, upsertServer } from '../api';
+import { deleteServer, getState, importXshellSessions, openDialog, saveSettings, setTheme, upsertServer } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
 import { applyTheme, currentTheme, onThemeChange } from '../theme';
@@ -29,8 +29,12 @@ export const renderSettings: PageRender = (root, params) => {
         <section id="panel-servers" class="settings-panel">
           <div class="panel-head">
             <div class="panel-title">服务器 <span id="server-count" class="tag">0</span></div>
-            <button id="btn-new-server" class="btn primary">${icon('plus')} 新建服务器</button>
+            <div class="panel-actions">
+              <button id="btn-import-xshell" class="btn">${icon('folder')} 从 Xshell 导入</button>
+              <button id="btn-new-server" class="btn primary">${icon('plus')} 新建服务器</button>
+            </div>
           </div>
+          <div id="import-note" class="import-note hidden" role="status"></div>
           <div id="server-grid" class="server-grid"></div>
           <div id="server-empty" class="empty-state hidden">
             <div class="icon">${icon('monitor')}</div>
@@ -328,6 +332,34 @@ export const renderSettings: PageRender = (root, params) => {
   });
 
   (root.querySelector('#btn-new-server') as HTMLElement).addEventListener('click', () => openServerModal(null));
+
+  /* ---------- 从 Xshell 一键导入 ---------- */
+  const btnImportXshell = root.querySelector('#btn-import-xshell') as HTMLButtonElement;
+  const importNote = root.querySelector('#import-note') as HTMLElement;
+  btnImportXshell.addEventListener('click', () => void importXshellFlow());
+
+  async function importXshellFlow() {
+    // 进行态：禁用按钮并替换内容，成功/失败都恢复
+    const originalHtml = btnImportXshell.innerHTML;
+    btnImportXshell.disabled = true;
+    btnImportXshell.innerHTML = `${icon('loader')} 正在扫描 Xshell 会话…`;
+    try {
+      const r = await importXshellSessions();
+      db = await getState();
+      renderServers();
+      toast(`Xshell 导入完成：新增 ${r.imported}，更新 ${r.updated}，未变化 ${r.unchanged}，跳过 ${r.skipped}`, 'success');
+      // needsAttention>0 时用面板内持久提示（toast 仅 2.2s 读不完长文案）；=0 时隐藏
+      importNote.classList.toggle('hidden', r.needsAttention === 0);
+      if (r.needsAttention > 0) {
+        importNote.innerHTML = `${icon('alert')} 已导入，但有 ${r.needsAttention} 个会话需处理：Xshell 密码不会迁移；NSSSH 专用密钥请在 Xshell 的「工具 → 用户密钥管理器」中导出为无密码短语的 OpenSSH 私钥，再编辑服务器替换密钥路径`;
+      }
+    } catch (err) {
+      toast(String(err), 'error');
+    } finally {
+      btnImportXshell.disabled = false;
+      btnImportXshell.innerHTML = originalHtml;
+    }
+  }
   (root.querySelector('#server-modal-save') as HTMLElement).addEventListener('click', () => void saveServer());
 
   async function saveServer() {

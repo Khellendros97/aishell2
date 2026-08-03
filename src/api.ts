@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AppState, ChatSession, FsEntry, Project, Server, Settings, Theme,
+  AppState, ChatSession, FsEntry, Project, Server, Settings, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -24,6 +24,9 @@ export const setTheme = (theme: Theme) => call<void>('set_theme', { theme });
 export const upsertServer = (server: Server, password: string | null) =>
   call<void>('upsert_server', { server, password });
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
+/** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；
+ *  密码永不迁移；无可用会话目录时 reject 中文错误串。 */
+export const importXshellSessions = () => call<XshellImportResult>('import_xshell_sessions');
 export const upsertProject = (project: Project) => call<void>('upsert_project', { project });
 export const deleteProject = (id: string) => call<void>('delete_project', { id });
 /** path 为 null 时回退到 <workspaceDir>/<name>；返回最终项目路径 */

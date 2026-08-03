@@ -83,6 +83,22 @@ pub struct Server {
     pub key_path: String,
 }
 
+/// Xshell 一键导入结果（camelCase 与前端 src/types.ts 的 XshellImportResult 对齐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct XshellImportResult {
+    /// 本次新增的会话数
+    pub imported: usize,
+    /// 本次覆盖更新的会话数
+    pub updated: usize,
+    /// 已存在且配置完全一致的会话数
+    pub unchanged: usize,
+    /// 非 SSH / 字段无效 / 无法解析而被跳过的 .xsh 数
+    pub skipped: usize,
+    /// 本次发现、需要用户后续处理的会话数（密码认证、用户名空、密钥缺失、NSSSH 私钥等）
+    pub needs_attention: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuickCommand {
@@ -225,6 +241,12 @@ impl SecretStore for MemorySecrets {
     }
 }
 
+/// 测试专用：内存密钥后端构造 Store，绝不触碰真实 keyring（生产路径禁止使用）。
+#[cfg(test)]
+pub fn test_store(dir: PathBuf) -> Store {
+    Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap()
+}
+
 // ---------------------------------------------------------------- Store
 
 /// 线程安全（Send+Sync）：PathBuf + Mutex<AppState>。ssh/term 等模块持有 `Arc<Store>`。
@@ -335,6 +357,28 @@ impl Store {
                 p.server_ids.retain(|sid| sid != id);
             }
             Ok(())
+        })
+    }
+
+    /// 批量合并 Xshell 导入的服务器：一次 with_state 原子持久化，不触碰 SecretStore。
+    /// ID 已存在且配置完全相同 → unchanged；存在但有变化 → 覆盖并计 updated；不存在 → imported。
+    pub(crate) fn merge_xshell_servers(&self, servers: &[Server]) -> Result<XshellImportResult, String> {
+        let mut result = XshellImportResult::default();
+        self.with_state(|s| {
+            for sv in servers {
+                match s.servers.iter_mut().find(|x| x.id == sv.id) {
+                    Some(slot) if *slot == *sv => result.unchanged += 1,
+                    Some(slot) => {
+                        *slot = sv.clone();
+                        result.updated += 1;
+                    }
+                    None => {
+                        s.servers.push(sv.clone());
+                        result.imported += 1;
+                    }
+                }
+            }
+            Ok(result)
         })
     }
 
@@ -530,10 +574,6 @@ pub async fn session_upsert(
 mod tests {
     use super::*;
 
-    /// 测试专用:内存密钥后端,绝不触碰真实 keyring。
-    fn test_store(dir: PathBuf) -> Store {
-        Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap()
-    }
 
     /// 造一个独立的临时配置目录（按 pid+tag 命名，测试间不冲突；不触碰真实用户配置）。
     fn temp_config_dir(tag: &str) -> PathBuf {
@@ -932,5 +972,89 @@ mod tests {
         // project_path()
         assert_eq!(store.project_path("proj-a").as_deref(), Some("D:\\proj"));
         assert_eq!(store.project_path("proj-missing"), None);
+    }
+
+    #[test]
+    fn merge_xshell_servers_counts_imported_updated_unchanged() {
+        let dir = temp_config_dir("xshell-merge-count");
+        let store = test_store(dir.clone());
+        let srv = |id: &str, port: u16| Server {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: format!("10.0.0.{}", port % 250 + 1),
+            port,
+            auth_type: AuthType::Password,
+            username: "root".to_string(),
+            key_path: String::new(),
+        };
+        // 首次：全部 imported
+        let r = store
+            .merge_xshell_servers(&[srv("xshell-aaa", 22), srv("xshell-bbb", 2222)])
+            .unwrap();
+        assert_eq!((r.imported, r.updated, r.unchanged), (2, 0, 0));
+        // 原样再导：全部 unchanged（幂等）
+        let r = store
+            .merge_xshell_servers(&[srv("xshell-aaa", 22), srv("xshell-bbb", 2222)])
+            .unwrap();
+        assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
+        // 配置有变化：覆盖并计 updated（不新增重复项）
+        let r = store.merge_xshell_servers(&[srv("xshell-bbb", 22)]).unwrap();
+        assert_eq!((r.imported, r.updated, r.unchanged), (0, 1, 0));
+        // 新会话：imported；旧会话原样仍 unchanged
+        let r = store
+            .merge_xshell_servers(&[srv("xshell-aaa", 22), srv("xshell-ccc", 2200)])
+            .unwrap();
+        assert_eq!((r.imported, r.updated, r.unchanged), (1, 0, 1));
+        // 内存状态与落盘一致
+        assert_eq!(store.state.lock().unwrap().servers.len(), 3);
+        let saved: AppState =
+            serde_json::from_str(&fs::read_to_string(dir.join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(saved.servers.len(), 3);
+        assert_eq!(
+            saved.servers.iter().find(|s| s.id == "xshell-bbb").unwrap().port,
+            22,
+            "更新的配置应已持久化"
+        );
+    }
+
+    #[test]
+    fn merge_xshell_servers_does_not_touch_secrets() {
+        let dir = temp_config_dir("xshell-merge-secrets");
+        let store = test_store(dir);
+        // 预置一条真实密钥，合并后必须原样保留（merge 绝不读写 SecretStore）
+        store.secrets.set("server:xshell-keep", "pw").unwrap();
+        store
+            .merge_xshell_servers(&[Server {
+                id: "xshell-keep".to_string(),
+                name: "K".to_string(),
+                host: "h".to_string(),
+                port: 22,
+                auth_type: AuthType::Password,
+                username: "u".to_string(),
+                key_path: String::new(),
+            }])
+            .unwrap();
+        assert_eq!(store.secrets.get("server:xshell-keep").unwrap(), "pw");
+    }
+
+    #[test]
+    fn xshell_import_result_serializes_camelcase() {
+        let r = XshellImportResult {
+            imported: 1,
+            updated: 2,
+            unchanged: 3,
+            skipped: 4,
+            needs_attention: 5,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        for key in [
+            "\"imported\":1",
+            "\"updated\":2",
+            "\"unchanged\":3",
+            "\"skipped\":4",
+            "\"needsAttention\":5",
+        ] {
+            assert!(json.contains(key), "序列化缺少字段 {key}: {json}");
+        }
     }
 }

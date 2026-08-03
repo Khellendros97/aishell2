@@ -77,3 +77,12 @@ export interface FsEntry {
   size: number;
   mtime: number;
 }
+
+/** Xshell 会话导入结果 —— 与 Rust import_xshell_sessions 返回值 serde camelCase 对齐 */
+export interface XshellImportResult {
+  imported: number;
+  updated: number;
+  unchanged: number;
+  skipped: number;
+  needsAttention: number;
+}
