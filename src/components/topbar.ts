@@ -1,8 +1,8 @@
 /**
  * 顶栏组件:移植自 .proto/shared/mock.js 的 renderTopbar,导航改走 hash 路由。
- * 无边框窗口(decorations:false)下兼作自绘标题栏:整条 bar 标记 data-tauri-drag-region 拖拽,
- * 右侧内嵌最小化 / 最大化-还原 / 关闭按钮;双击空白区切换最大化。
- * 按钮是交互元素,Tauri 拖拽判定自动排除,不会误拖。
+ * 无边框窗口(decorations:false)下兼作自绘标题栏:整条 bar 标记 data-tauri-drag-region 拖拽；
+ * Windows 会原生处理拖拽区双击最大化，前端不再重复调用 toggleMaximize；
+ * 右侧内嵌最小化 / 最大化-还原 / 关闭按钮，交互元素不会误拖。
  */
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { icon } from '../icons';
@@ -72,11 +72,6 @@ export function renderTopbar(root: HTMLElement, activePage: TopbarPage): HTMLEle
   (bar.querySelector('.tb-win-min') as HTMLButtonElement).onclick = () => { void appWin.minimize(); };
   (bar.querySelector('.tb-win-max') as HTMLButtonElement).onclick = () => { void appWin.toggleMaximize(); };
   (bar.querySelector('.tb-win-close') as HTMLButtonElement).onclick = () => { void appWin.close(); };
-  /* 双击空白区(非按钮)切换最大化 */
-  bar.ondblclick = (e) => {
-    if ((e.target as HTMLElement).closest('button')) return;
-    void appWin.toggleMaximize();
-  };
   void appWin.isMaximized().then(syncMaxIcon);
 
   root.prepend(bar);
