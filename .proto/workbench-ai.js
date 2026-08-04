@@ -31,7 +31,11 @@
     }
     .ai-msg.user .ai-bubble { background: var(--accent-dim); border-bottom-right-radius: 3px; }
     .ai-msg.ai .ai-bubble { background: var(--bg-2); border-bottom-left-radius: 3px; }
-    .ai-text { white-space: pre-wrap; }
+    .ai-text { white-space: normal; overflow-wrap: anywhere; }
+    .ai-text ul, .ai-text ol { margin: 0 0 6px; padding-left: 0; list-style-position: inside; }
+    .ai-text li { margin: 2px 0; padding-left: 0; }
+    .ai-text li > ul, .ai-text li > ol { margin-top: 2px; margin-bottom: 0; padding-left: 1.25em; }
+    .ai-text a { color: var(--link); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
     .ai-para { margin: 0 0 6px; }
     .ai-para:last-child { margin-bottom: 0; }
 
@@ -158,9 +162,15 @@
       <div id="ai-mode-bar">
         <span class="ai-mode-label">AI 模式</span>
         <select id="ai-mode-select" class="select" title="AI 执行模式（按项目持久化）">
-          <option value="suggest">建议</option>
+          <option value="suggest">Suggest</option>
           <option value="agent">Agent</option>
           <option value="yolo">YOLO</option>
+        </select>
+        <span class="ai-effort-label">思考强度</span>
+        <select id="ai-effort-select" class="select" title="思考强度（立即生效）">
+          <option value="low">low</option>
+          <option value="high">high</option>
+          <option value="max">max</option>
         </select>
         <span class="ai-mode-hint"></span>
       </div>
@@ -203,7 +213,7 @@
     }
     aiMode = next;
     modeHint.textContent = MODE_HINTS[aiMode];
-    A.toast('AI 模式已切换为 ' + (next === 'suggest' ? '建议' : next === 'agent' ? 'Agent' : 'YOLO'), 'success');
+    A.toast('AI 模式已切换为 ' + (next === 'suggest' ? 'Suggest' : next === 'agent' ? 'Agent' : 'YOLO'), 'success');
   };
 
   /* ---------- 动作卡（Agent 逐项审批 / YOLO 自动执行；历史只读复用同一卡片） ---------- */
@@ -347,7 +357,7 @@
         const c = actionCards.get(a.id) || { ...a, status: a.status };
         return renderActionCard(a.id);
       }).join('');
-      wrap.innerHTML = `<div class="ai-bubble">${m.html}${actionsHtml}</div>`;
+      wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${m.html}</div>${actionsHtml}</div>`;
     }
     return wrap;
   }

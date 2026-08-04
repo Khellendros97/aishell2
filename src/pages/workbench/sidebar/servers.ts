@@ -177,10 +177,13 @@ export function mountServersPanel(container: HTMLElement): void {
     localCard.className = 'card wbs-server-card wbs-local-card clickable';
     localCard.innerHTML =
       '<div class="wbs-server-top">' +
-        '<span class="wbs-server-name">本地 Git Bash</span>' +
-        '<span class="tag blue">' + icon('terminal') + ' 本地</span>' +
-      '</div>' +
-      '<div class="wbs-server-addr mono">本地终端 · 点击打开</div>';
+        '<span class="wbs-server-icon">' + icon('terminal') + '</span>' +
+        '<span class="wbs-server-main">' +
+          '<span class="wbs-server-name">本地 Git Bash</span>' +
+          '<span class="wbs-server-addr mono">本地终端 · 点击打开</span>' +
+        '</span>' +
+        '<span class="tag blue">本地</span>' +
+      '</div>';
     localCard.onclick = () => {
       openTab({
         id: 'term-local',
@@ -216,20 +219,27 @@ export function mountServersPanel(container: HTMLElement): void {
     bound.forEach((s) => {
       const card = document.createElement('div');
       card.className = 'card wbs-server-card';
+      const lockTitle = s.locked
+        ? 'AI 远程操作已锁定，点击解锁（手动 SSH/SFTP 不受影响）'
+        : 'AI 远程操作未锁定，点击锁定（手动 SSH/SFTP 不受影响）';
       card.innerHTML =
         '<div class="wbs-server-top">' +
-          '<span class="wbs-server-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
-          '<span class="wbs-server-tags">' +
-            // 认证 tag：密钥用 key 图标，密码用纯文字（lock 图标专属于 AI 操作锁）
-            '<span class="tag">' + (s.authType === 'key' ? icon('key') + ' 密钥' : '密码') + '</span>' +
-            (s.locked ? '<span class="tag red" title="AI 不能执行远程操作；手动 SSH/SFTP 不受影响">' + icon('lock') + ' AI 已锁定</span>' : '') +
+          '<span class="wbs-server-icon">' + icon('server') + '</span>' +
+          '<span class="wbs-server-main">' +
+            '<span class="wbs-server-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
+            '<span class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</span>' +
           '</span>' +
+          '<button class="icon-btn wbs-lock' + (s.locked ? ' locked' : '') + '" title="' + lockTitle + '" aria-label="' + lockTitle + '" aria-pressed="' + String(s.locked) + '">' +
+            icon(s.locked ? 'lock' : 'unlock') +
+          '</button>' +
         '</div>' +
-        '<div class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</div>' +
+        // 认证 tag 独立一行，避免与右上角 AI 锁按钮挤在一起
+        '<div class="wbs-server-tags">' +
+          '<span class="tag">' + (s.authType === 'key' ? icon('key') + ' 密钥' : '密码') + '</span>' +
+        '</div>' +
         '<div class="wbs-server-actions">' +
-          '<button class="btn small wbs-lock" title="仅约束 AI 发起的远程操作，手动 SSH/SFTP 不受影响">' + (s.locked ? '解锁 AI' : '锁定 AI') + '</button>' +
-          '<button class="btn small wbs-ssh">SSH 连接</button>' +
-          '<button class="btn small wbs-sftp">SFTP 文件管理</button>' +
+          '<button class="icon-btn wbs-ssh" title="SSH 连接" aria-label="SSH 连接">' + icon('terminal') + '</button>' +
+          '<button class="icon-btn wbs-sftp" title="SFTP 文件管理" aria-label="SFTP 文件管理">' + icon('folder') + '</button>' +
         '</div>';
       (card.querySelector('.wbs-lock') as HTMLButtonElement).onclick = (e) => {
         e.stopPropagation();

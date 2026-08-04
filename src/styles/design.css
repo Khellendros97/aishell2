@@ -19,7 +19,8 @@
   --accent: #4f8ef7;
   --accent-hover: #6ba1f8;
   --accent-dim: rgba(79, 142, 247, 0.16);
-  --green: #4ec98a;
+  --link: #8db9ff;           /* 深色背景上的正文链接 */
+  --syntax-accent: #8db9ff;  /* 编辑器语法高亮强调色 */
   --green-dim: rgba(78, 201, 138, 0.14);
   --yellow: #e5c07b;
   --red: #e5626a;
@@ -67,6 +68,8 @@
   --accent: #3b76e1;
   --accent-hover: #2f66c9;
   --accent-dim: rgba(59, 118, 225, 0.12);
+  --link: #2f66c9;
+  --syntax-accent: #2f66c9;
   --green: #1e9e62;
   --green-dim: rgba(30, 158, 98, 0.12);
   --yellow: #a5711b;
@@ -223,8 +226,7 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 .page-topbar .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
 .page-topbar .brand .logo {
   width: 22px; height: 22px; border-radius: 6px;
-  background: linear-gradient(135deg, var(--accent), var(--purple));
-  display: flex; align-items: center; justify-content: center; font-size: 12px; color: #fff;
+  display: block; object-fit: contain; flex: none;
 }
 .page-topbar .spacer { flex: 1; }
 

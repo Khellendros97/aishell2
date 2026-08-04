@@ -23,6 +23,8 @@ const PATHS = {
     '<path d="M2 12s3.5-7 10-7c1.8 0 3.4.5 4.8 1.2M22 12s-3.5 7-10 7c-1.8 0-3.4-.5-4.8-1.2"/><path d="M3 3l18 18"/>',
   monitor:
     '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>',
+  server:
+    '<rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><path d="M6 6.5h.01"/><path d="M6 17.5h.01"/>',
   zap: '<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',
   bot: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="13" r="0.5"/><circle cx="15" cy="13" r="0.5"/><path d="M9 17h6"/>',
   terminal: '<path d="M4 17l6-5-6-5"/><path d="M12 19h8"/>',
@@ -56,6 +58,7 @@ const PATHS = {
   list: '<path d="M9 6h12"/><path d="M9 12h12"/><path d="M9 18h12"/><path d="M4 6h1"/><path d="M4 12h1"/><path d="M4 18h1"/>',
   key: '<circle cx="7.5" cy="16.5" r="4.5"/><path d="M10.7 13.3 21 3"/><path d="M16 8l3 3"/>',
   lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  unlock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.8-1.3"/>',
   globe:
     '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.5 3.8 5.6 3.8 9s-1.3 6.5-3.8 9c-2.5-2.5-3.8-5.6-3.8-9s1.3-6.5 3.8-9z"/>',
   message:

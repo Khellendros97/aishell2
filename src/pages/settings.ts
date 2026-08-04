@@ -249,11 +249,11 @@ export const renderSettings: PageRender = (root, params) => {
 
       // AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP
       const lockBtn = document.createElement('button');
-      lockBtn.className = 'icon-btn' + (s.locked ? ' active' : '');
+      lockBtn.className = 'icon-btn' + (s.locked ? ' locked' : '');
       lockBtn.title = s.locked
         ? `「${s.name}」的 AI 远程操作已锁定，点击解锁`
         : `锁定「${s.name}」的 AI 远程操作（手动 SSH/SFTP 不受影响）`;
-      lockBtn.innerHTML = icon('lock');
+      lockBtn.innerHTML = icon(s.locked ? 'lock' : 'unlock');
       lockBtn.dataset.act = 'lock';
       lockBtn.dataset.id = s.id;
 

@@ -85,7 +85,7 @@ const STYLE = `
 .ai-msg.user .ai-bubble { background: var(--accent-dim); border-bottom-right-radius: 3px; }
 .ai-msg.ai .ai-bubble { background: var(--bg-2); border-bottom-left-radius: 3px; }
 .ai-msg.ai .ai-bubble.error { border: 1px solid var(--red); }
-.ai-text { white-space: pre-wrap; }
+.ai-text { white-space: normal; overflow-wrap: anywhere; }
 /* Markdown 渲染元素（md 输出嵌在 .ai-text 内） */
 .ai-text h1, .ai-text h2, .ai-text h3, .ai-text h4 {
   font-weight: 600; margin: 10px 0 6px; line-height: 1.4;
@@ -96,14 +96,16 @@ const STYLE = `
 .ai-text h4 { font-size: 13px; }
 .ai-text p { margin: 0 0 6px; }
 .ai-text p:last-child, .ai-text ul:last-child, .ai-text ol:last-child, .ai-text blockquote:last-child { margin-bottom: 0; }
-.ai-text ul, .ai-text ol { margin: 0 0 6px; padding-left: 22px; }
-.ai-text li { margin: 2px 0; }
+/* 列表标记放入气泡内容区，避免 marker 溢出边界；嵌套列表保留层级缩进。 */
+.ai-text ul, .ai-text ol { margin: 0 0 6px; padding-left: 0; list-style-position: inside; }
+.ai-text li { margin: 2px 0; padding-left: 0; }
+.ai-text li > ul, .ai-text li > ol { margin-top: 2px; margin-bottom: 0; padding-left: 1.25em; }
 .ai-text blockquote {
   border-left: 3px solid var(--border-strong); margin: 6px 0; padding: 2px 10px;
   color: var(--text-1);
 }
 .ai-text hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
-.ai-text a { color: var(--accent); text-decoration: underline; }
+.ai-text a { color: var(--link); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
 .ai-text :not(pre) > code { background: var(--inline-code-bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; font-family: var(--font-mono); font-size: 11.5px; color: var(--yellow); }
 .ai-text table { border-collapse: collapse; margin: 6px 0; }
 .ai-text th, .ai-text td { border: 1px solid var(--border); padding: 4px 10px; font-size: 12.5px; }
@@ -298,7 +300,7 @@ let effortSaving = false;
 /** AI 模式切换防抖（YOLO 确认弹窗期间防重复触发） */
 let modeSaving = false;
 
-const MODE_LABEL: Record<AiMode, string> = { suggest: '建议', agent: 'Agent', yolo: 'YOLO' };
+const MODE_LABEL: Record<AiMode, string> = { suggest: 'Suggest', agent: 'Agent', yolo: 'YOLO' };
 
 /**
  * 切换 AI 模式：YOLO 先弹危险确认（取消回退原模式）；确认后调 setAiMode 落盘
@@ -352,17 +354,17 @@ export function mountAiPanel(container: HTMLElement): void {
     <div id="ai-chat"></div>
     <div id="ai-input-area">
       <div id="ai-effort-bar">
+        <span class="ai-mode-label">${icon('bot')} AI 模式</span>
+        <select id="ai-mode-select" class="select" title="AI 执行模式（按项目持久化）">
+          <option value="suggest">Suggest</option>
+          <option value="agent">Agent</option>
+          <option value="yolo">YOLO</option>
+        </select>
         <span class="ai-effort-label">${icon('zap')} 思考强度</span>
         <select id="ai-effort-select" class="select" title="思考强度（立即生效）">
           <option value="low">low</option>
           <option value="high">high</option>
           <option value="max">max</option>
-        </select>
-        <span class="ai-mode-label">${icon('bot')} AI 模式</span>
-        <select id="ai-mode-select" class="select" title="AI 执行模式（按项目持久化）">
-          <option value="suggest">建议</option>
-          <option value="agent">Agent</option>
-          <option value="yolo">YOLO</option>
         </select>
       </div>
       <div id="ai-chip-row"></div>
@@ -732,7 +734,7 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
         status: a.status,
       }, { collapsible: true, expandKey: key, expanded: expandedCards.has(key) });
     }).join('');
-    wrap.innerHTML = `<div class="ai-bubble">${renderAI(m.content)}${actionsHtml}</div>`;
+    wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${renderAI(m.content)}</div>${actionsHtml}</div>`;
   }
   return wrap;
 }
@@ -749,7 +751,7 @@ function renderPending(p: Pending): HTMLElement {
   } else if (p.phase === 'error') {
     wrap.innerHTML = `<div class="ai-bubble error"><div class="ai-text">${escapeHtml(p.error ?? '')}</div></div>`;
   } else {
-    wrap.innerHTML = `<div class="ai-bubble">${toolLines}${actionCards}${renderAI(p.text)}</div>`;
+    wrap.innerHTML = `<div class="ai-bubble">${toolLines}${actionCards}<div class="ai-text">${renderAI(p.text)}</div></div>`;
   }
   return wrap;
 }

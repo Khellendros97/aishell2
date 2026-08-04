@@ -16,6 +16,8 @@ import { navigate } from '../router';
 import type { PageRender } from '../main';
 import './welcome.css';
 
+const welcomeLogoUrl = new URL('../assets/logo.svg', import.meta.url).href;
+
 function esc(s: unknown): string {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -28,6 +30,7 @@ export const renderWelcome: PageRender = (root) => {
   /* ---------- 页面骨架（同 .proto/welcome.html） ---------- */
   root.insertAdjacentHTML('beforeend', `
     <main>
+      <img class="welcome-logo-watermark" src="${welcomeLogoUrl}" alt="" aria-hidden="true">
       <div class="page-head">
         <h2>我的项目</h2>
         <span class="tag" id="proj-count">0 个项目</span>

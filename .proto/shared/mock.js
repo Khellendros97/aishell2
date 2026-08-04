@@ -11,9 +11,9 @@
       llm: { modelId: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1', apiKey: 'sk-proto-demo-key-********', effort: 'medium' },
     },
     servers: [
-      { id: 'srv-1', name: '生产-Web-01', host: '47.102.118.66', port: 22, authType: 'password', username: 'deploy', password: '••••••••', keyPath: '' },
-      { id: 'srv-2', name: '测试-K8s-Node', host: '192.168.10.21', port: 2222, authType: 'key', username: 'ubuntu', password: '', keyPath: 'C:\\Users\\demo\\.ssh\\id_ed25519' },
-      { id: 'srv-3', name: 'GPU训练机', host: '10.8.0.5', port: 22, authType: 'key', username: 'root', password: '', keyPath: 'C:\\Users\\demo\\.ssh\\gpu_key.pem' },
+      { id: 'srv-1', name: '生产-Web-01', host: '47.102.118.66', port: 22, authType: 'password', username: 'deploy', password: '••••••••', keyPath: '', locked: false },
+      { id: 'srv-2', name: '测试-K8s-Node', host: '192.168.10.21', port: 2222, authType: 'key', username: 'ubuntu', password: '', keyPath: 'C:\\Users\\demo\\.ssh\\id_ed25519', locked: false },
+      { id: 'srv-3', name: 'GPU训练机', host: '10.8.0.5', port: 22, authType: 'key', username: 'root', password: '', keyPath: 'C:\\Users\\demo\\.ssh\\gpu_key.pem', locked: false },
     ],
     projects: [
       {
@@ -84,7 +84,7 @@
     const bar = document.createElement('div');
     bar.className = 'page-topbar';
     bar.innerHTML = `
-      <div class="brand"><span class="logo">⌁</span><span>AIShell</span><span class="tag">Prototype</span></div>
+      <div class="brand"><img class="logo" src="shared/logo.svg" alt="AIShell Logo"><span>AIShell</span><span class="tag">Prototype</span></div>
       <div class="spacer"></div>
       <button class="btn ghost small" data-nav="welcome">项目</button>
       <button class="btn ghost small" data-nav="settings">设置</button>`;

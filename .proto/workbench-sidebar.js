@@ -29,12 +29,21 @@
     .wbs-row:hover .wbs-del { visibility: visible; }
     .wbs-inline-input { height: 22px; padding: 2px 8px; font-size: 12px; }
     .wbs-content { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
-    .wbs-server-card { padding: 12px 14px; display: flex; flex-direction: column; gap: 9px; }
-    .wbs-server-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+    .wbs-server-card { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+    .wbs-server-top { display: flex; align-items: center; gap: 9px; min-width: 0; }
+    .wbs-server-icon { width: 30px; height: 30px; flex: none; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; background: var(--accent-dim); color: var(--accent-hover); font-size: 16px; }
+    .wbs-server-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
     .wbs-server-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .wbs-server-addr { font-size: 11.5px; color: var(--text-2); }
-    .wbs-server-actions { display: flex; gap: 8px; }
-    .wbs-server-actions .btn { flex: 1; }
+    .wbs-server-addr { font-size: 11.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .wbs-server-tags { display: flex; align-items: center; gap: 4px; min-width: 0; margin-left: 39px; }
+    .wbs-server-tags .tag { display: inline-flex; align-items: center; gap: 3px; }
+    .wbs-lock { margin-left: auto; width: 26px; height: 26px; font-size: 14px; }
+    .wbs-lock.locked { background: var(--red-dim); color: var(--red); }
+    .wbs-lock.locked:hover { background: var(--red-dim); color: var(--red); }
+    .wbs-server-actions { display: flex; justify-content: flex-end; gap: 6px; }
+    .wbs-server-actions .icon-btn { width: 26px; height: 26px; font-size: 14px; border: 1px solid var(--border); background: var(--bg-1); }
+    .wbs-server-actions .icon-btn:hover { background: var(--bg-3); border-color: var(--border-strong); }
+    .wbs-server-card .ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
     .wbs-qc-card { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
     .wbs-qc-title { font-size: 13px; font-weight: 600; }
     .wbs-qc-cmd { font-size: 11.5px; color: var(--text-1); line-height: 1.5; word-break: break-all;
@@ -55,6 +64,15 @@
 
   /* ---------- 工具 ---------- */
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const WBS_ICON_PATHS = {
+    server: '<rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><path d="M6 6.5h.01"/><path d="M6 17.5h.01"/>',
+    terminal: '<path d="M4 17l6-5-6-5"/><path d="M12 19h8"/>',
+    folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>',
+    key: '<circle cx="7.5" cy="16.5" r="4.5"/><path d="M10.7 13.3 21 3"/><path d="M16 8l3 3"/>',
+    lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+    unlock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.8-1.3"/>',
+  };
+  const svgIcon = (name) => `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${WBS_ICON_PATHS[name]}</svg>`;
 
   /* ============================================================
      面板 1：文件资源管理器（模拟文件树）
@@ -289,13 +307,6 @@
   /* ============================================================
      面板 2：服务器列表
      ============================================================ */
-  /* 在线状态：模块加载时随机确定并保持 */
-  const serverStatus = {};
-  function getStatus(id) {
-    if (!(id in serverStatus)) serverStatus[id] = Math.random() < 0.6 ? 'online' : 'offline';
-    return serverStatus[id];
-  }
-
   function renderServers() {
     actionsEl.innerHTML = '';
     const project = WB.state.project;
@@ -321,22 +332,36 @@
       return;
     }
     servers.forEach((s) => {
-      const online = getStatus(s.id) === 'online';
       const card = document.createElement('div');
       card.className = 'card wbs-server-card';
+      const lockTitle = s.locked
+        ? 'AI 远程操作已锁定，点击解锁（手动 SSH/SFTP 不受影响）'
+        : 'AI 远程操作未锁定，点击锁定（手动 SSH/SFTP 不受影响）';
       card.innerHTML =
         '<div class="wbs-server-top">' +
-          '<span class="wbs-server-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
-          '<span class="tag ' + (online ? 'green' : 'red') + '">' + (online ? '🟢 在线' : '🔴 离线') + '</span>' +
+          '<span class="wbs-server-icon">' + svgIcon('server') + '</span>' +
+          '<span class="wbs-server-main">' +
+            '<span class="wbs-server-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
+            '<span class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</span>' +
+          '</span>' +
+          '<button class="icon-btn wbs-lock' + (s.locked ? ' locked' : '') + '" title="' + lockTitle + '" aria-label="' + lockTitle + '" aria-pressed="' + String(!!s.locked) + '">' +
+            svgIcon(s.locked ? 'lock' : 'unlock') +
+          '</button>' +
         '</div>' +
-        '<div class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</div>' +
-        (s.locked
-          ? '<div class="wbs-ai-lock"><span class="tag red">🔒 AI 操作已锁定</span><span class="hint">AI 不能执行远程操作；手动 SSH/SFTP 不受影响</span></div>'
-          : '') +
+        '<div class="wbs-server-tags">' +
+          '<span class="tag">' + (s.authType === 'key' ? svgIcon('key') + ' 密钥' : '密码') + '</span>' +
+        '</div>' +
         '<div class="wbs-server-actions">' +
-          '<button class="btn small primary wbs-ssh">SSH 连接</button>' +
-          '<button class="btn small wbs-sftp">SFTP 文件管理</button>' +
+          '<button class="icon-btn wbs-ssh" title="SSH 连接" aria-label="SSH 连接">' + svgIcon('terminal') + '</button>' +
+          '<button class="icon-btn wbs-sftp" title="SFTP 文件管理" aria-label="SFTP 文件管理">' + svgIcon('folder') + '</button>' +
         '</div>';
+      card.querySelector('.wbs-lock').onclick = (e) => {
+        e.stopPropagation();
+        s.locked = !s.locked;
+        A.save(WB.state.db);
+        renderServers();
+        A.toast(s.locked ? `已锁定「${s.name}」的 AI 远程操作` : `已解锁「${s.name}」的 AI 远程操作`, 'success');
+      };
       card.querySelector('.wbs-ssh').onclick = () => {
         WB.openTab({ id: 'term:' + s.id, type: 'terminal', title: s.name, data: { kind: 'ssh', serverId: s.id } });
       };

@@ -2,6 +2,12 @@
 .page-root { display: flex; flex-direction: column; height: 100vh; }
 
 .welcome-page main { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 32px; }
+.welcome-page .welcome-logo-watermark {
+  position: fixed; z-index: 0; pointer-events: none; opacity: 0.08;
+  left: 50vw; top: calc(var(--topbar-h) + (100vh - var(--topbar-h)) / 2);
+  width: min(44vw, 420px); transform: translate(-50%, -50%);
+}
+.welcome-page main > :not(.welcome-logo-watermark) { position: relative; z-index: 1; }
 
 /* ---------- 页面标题栏 ---------- */
 .welcome-page .page-head { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }

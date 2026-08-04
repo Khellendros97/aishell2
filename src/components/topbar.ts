@@ -14,6 +14,7 @@ import { toast } from '../ui';
 export type TopbarPage = 'welcome' | 'settings' | null;
 
 const appWin = getCurrentWindow();
+const appLogoUrl = new URL('../assets/logo.svg', import.meta.url).href;
 
 /** 按当前最大化状态切换 max 按钮图标(topbar 随路由重建,故每次从 document 现查按钮) */
 function syncMaxIcon(maximized: boolean): void {
@@ -31,7 +32,7 @@ export function renderTopbar(root: HTMLElement, activePage: TopbarPage): HTMLEle
   bar.className = 'page-topbar';
   bar.setAttribute('data-tauri-drag-region', '');
   bar.innerHTML = `
-    <div class="brand"><span class="logo">⌁</span><span>AIShell</span></div>
+    <div class="brand"><img class="logo" src="${appLogoUrl}" alt="AIShell"><span>AIShell</span></div>
     <div class="spacer"></div>
     <button class="btn ghost small" data-nav="welcome">项目</button>
     <button class="btn ghost small" data-nav="settings">设置</button>
