@@ -72,7 +72,15 @@
       delBtn.dataset.act = 'del';
       delBtn.dataset.id = s.id;
 
-      actions.append(editBtn, delBtn);
+      // AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP
+      const lockBtn = document.createElement('button');
+      lockBtn.className = 'icon-btn' + (s.locked ? ' active' : '');
+      lockBtn.title = s.locked ? 'AI 操作已锁定：点击解锁' : '锁定 AI 远程操作（手动 SSH/SFTP 不受影响）';
+      lockBtn.textContent = s.locked ? '🔒' : '🔓';
+      lockBtn.dataset.act = 'lock';
+      lockBtn.dataset.id = s.id;
+
+      actions.append(editBtn, lockBtn, delBtn);
       head.append(name, actions);
 
       const host = document.createElement('div');
@@ -94,7 +102,7 @@
     });
   }
 
-  // 事件委托：编辑 / 删除
+  // 事件委托：编辑 / 删除 / AI 锁切换
   grid.addEventListener('click', async (e) => {
     const btn = e.target.closest('.icon-btn');
     if (!btn) return;
@@ -102,6 +110,13 @@
     if (!server) return;
     if (btn.dataset.act === 'edit') openServerModal(server);
     else if (btn.dataset.act === 'del') await deleteServer(server);
+    else if (btn.dataset.act === 'lock') {
+      // AI 锁只影响 AI 发起的远程动作；用户手动 SSH/SFTP 不受影响
+      server.locked = !server.locked;
+      A.save(db);
+      renderServers();
+      A.toast(server.locked ? `已锁定「${server.name}」的 AI 远程操作` : `已解锁「${server.name}」的 AI 远程操作`, 'success');
+    }
   });
 
   async function deleteServer(server) {

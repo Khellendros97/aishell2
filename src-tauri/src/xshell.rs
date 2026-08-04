@@ -240,6 +240,8 @@ fn parse_session_file(path: &Path, rel: &Path, user_keys_dir: &Path) -> Option<(
         auth_type,
         username: fields.username.unwrap_or_default(),
         key_path,
+        // 新导入服务器默认未锁定（锁定是用户显式行为）
+        locked: false,
     };
     let needs = session_needs_attention(&server, user_key, user_keys_dir);
     Some((server, needs))

@@ -319,8 +319,8 @@ impl TermManager {
 
 /// 探测顺序：env AISHELL_GIT_BASH → %PROGRAMFILES%\Git\bin\bash.exe →
 /// %PROGRAMFILES(X86)%\Git\bin\bash.exe → `where.exe bash` 输出中首个含 "Git" 的行
-/// （排除 System32 的 WSL bash）。
-fn find_bash() -> Option<String> {
+/// （排除 System32 的 WSL bash）。pub(crate)：ai_actions 本地命令复用。
+pub(crate) fn find_bash() -> Option<String> {
     if let Some(p) = std::env::var("AISHELL_GIT_BASH").ok().map(|s| s.trim().to_string()) {
         if !p.is_empty() && PathBuf::from(&p).is_file() {
             return Some(p);

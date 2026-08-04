@@ -330,6 +330,9 @@
           '<span class="tag ' + (online ? 'green' : 'red') + '">' + (online ? '🟢 在线' : '🔴 离线') + '</span>' +
         '</div>' +
         '<div class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</div>' +
+        (s.locked
+          ? '<div class="wbs-ai-lock"><span class="tag red">🔒 AI 操作已锁定</span><span class="hint">AI 不能执行远程操作；手动 SSH/SFTP 不受影响</span></div>'
+          : '') +
         '<div class="wbs-server-actions">' +
           '<button class="btn small primary wbs-ssh">SSH 连接</button>' +
           '<button class="btn small wbs-sftp">SFTP 文件管理</button>' +

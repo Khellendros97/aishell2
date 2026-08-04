@@ -77,7 +77,8 @@ pub async fn sftp_upload(
 }
 
 /// 递归上传一个本地文件或目录（async 递归需装箱，见 inner）。
-async fn upload_one(sftp: &SftpSession, local: &Path, remote_dir: &str) -> Result<(), String> {
+/// pub(crate)：ai_actions 的 AI 上传复用（不改变手动 sftp_upload 语义）。
+pub(crate) async fn upload_one(sftp: &SftpSession, local: &Path, remote_dir: &str) -> Result<(), String> {
     async fn inner(sftp: &SftpSession, local: &Path, remote_dir: &str) -> Result<(), String> {
         let md = std::fs::metadata(local)
             .map_err(|e| format!("读取本地 {} 失败: {e}", local.display()))?;
@@ -140,7 +141,8 @@ pub async fn sftp_download(
 }
 
 /// 递归下载一个远端文件或目录（async 递归需装箱，见 inner）。
-async fn download_one(
+/// pub(crate)：ai_actions 的 AI 下载复用（不改变手动 sftp_download 语义）。
+pub(crate) async fn download_one(
     sftp: &SftpSession,
     remote_path: &str,
     local_dir: &Path,

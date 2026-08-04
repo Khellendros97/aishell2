@@ -17,15 +17,15 @@
     ],
     projects: [
       {
-        id: 'proj-1', name: 'AIShell 主仓库', path: 'D:\\projects\\AIShell2', serverIds: ['srv-1', 'srv-2'],
+        id: 'proj-1', name: 'AIShell 主仓库', path: 'D:\\projects\\AIShell2', serverIds: ['srv-1', 'srv-2'], aiMode: 'suggest',
         quickCommands: [
           { id: 'qc-1', title: '查看 Git 状态', command: 'git status && git log --oneline -5' },
           { id: 'qc-2', title: '前端热更新', command: 'npm run dev -- --host 0.0.0.0' },
           { id: 'qc-3', title: '磁盘占用排查', command: 'du -sh ./* | sort -rh | head -20' },
         ],
       },
-      { id: 'proj-2', name: '数据中台 ETL', path: '', serverIds: ['srv-2'], quickCommands: [{ id: 'qc-4', title: '重启 Airflow', command: 'systemctl restart airflow-webserver' }] },
-      { id: 'proj-3', name: '个人博客', path: 'D:\\blog', serverIds: [], quickCommands: [] },
+      { id: 'proj-2', name: '数据中台 ETL', path: '', serverIds: ['srv-2'], aiMode: 'suggest', quickCommands: [{ id: 'qc-4', title: '重启 Airflow', command: 'systemctl restart airflow-webserver' }] },
+      { id: 'proj-3', name: '个人博客', path: 'D:\\blog', serverIds: [], aiMode: 'suggest', quickCommands: [] },
     ],
   };
 

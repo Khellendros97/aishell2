@@ -37,12 +37,15 @@ impl russh::server::Server for EchoServer {
     type Handler = EchoSession;
 
     fn new_client(&mut self, _peer_addr: Option<SocketAddr>) -> Self::Handler {
-        EchoSession
+        EchoSession::default()
     }
 }
 
 #[derive(Default)]
-struct EchoSession;
+struct EchoSession {
+    /// 已申请 sftp 子系统的通道（首包回复版本握手后移除）
+    sftp_channels: std::collections::HashSet<ChannelId>,
+}
 
 impl russh::server::Handler for EchoSession {
     type Error = russh::Error;
@@ -92,14 +95,57 @@ impl russh::server::Handler for EchoSession {
         Ok(())
     }
 
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if name == "sftp" {
+            self.sftp_channels.insert(channel);
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
+
     async fn data(
         &mut self,
         channel: ChannelId,
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // 原样回显到同一 channel（to_vec：Bytes 借用要求 'static）
-        session.data(channel, data.to_vec())?;
+        if self.sftp_channels.remove(&channel) {
+            // SFTP 版本握手：回复 SSH_FXP_VERSION（type=2, version=3），仅首包
+            session.data(channel, [0, 0, 0, 5, 2, 0, 0, 0, 3].to_vec())?;
+        } else {
+            // 原样回显到同一 channel（to_vec：Bytes 借用要求 'static）
+            session.data(channel, data.to_vec())?;
+        }
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // 模拟常见命令输出：`printf <text>` → stdout 为 <text>；其余命令原样回显命令串；
+        // stderr 恒空，退出码恒 0。SSH 惯例：data → exit-status → eof → close
+        session.channel_success(channel)?;
+        let cmd = String::from_utf8_lossy(data);
+        let out: Vec<u8> = match cmd.strip_prefix("printf ") {
+            Some(text) => text.trim().as_bytes().to_vec(),
+            None => data.to_vec(),
+        };
+        if !out.is_empty() {
+            session.data(channel, out)?;
+        }
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
         Ok(())
     }
 }
@@ -145,6 +191,7 @@ async fn shell_echo_roundtrip() {
             auth_type: AuthType::Password,
             username: "test".to_string(),
             key_path: String::new(),
+            locked: false,
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -184,6 +231,207 @@ async fn shell_echo_roundtrip() {
 
         ssh.disconnect("s1").await;
         // 关停 echo server，使 join! 两端都结束
+        shutdown.shutdown("test done".into());
+    };
+
+    let (server_res, ()) = tokio::join!(running, test_body);
+    server_res.expect("echo server 异常退出");
+}
+
+/// 远程 exec 集成测试：`ssh.exec` 复用连接执行单条命令，
+/// 断言 stdout/stderr/退出码（echo server 的 exec 分支：`printf X` → stdout X，stderr 空，exit 0）。
+#[tokio::test]
+async fn remote_exec_roundtrip() {
+    let socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 127.0.0.1:0 失败");
+    let addr = socket.local_addr().expect("取监听地址失败");
+    let config = Arc::new(russh::server::Config {
+        keys: vec![
+            russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM.as_bytes())
+                .expect("解析测试 host key 失败"),
+        ],
+        ..Default::default()
+    });
+    let mut server = EchoServer;
+    let running = server.run_on_socket(config, &socket);
+    let shutdown = running.handle();
+
+    let test_body = async {
+        let config_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-exec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let ssh = Arc::new(SshManager::new(store));
+
+        let server = Server {
+            id: "s1".to_string(),
+            name: "loopback".to_string(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            auth_type: AuthType::Password,
+            username: "test".to_string(),
+            key_path: String::new(),
+            locked: false,
+        };
+        ssh.connect_direct(server, Some("test"))
+            .await
+            .expect("连接 + 密码认证应成功");
+
+        // exec 复用 connect_direct 入池的连接
+        let result = ssh
+            .exec("s1", "printf ai-shell")
+            .await
+            .expect("exec 应成功");
+        assert_eq!(result.stdout, "ai-shell", "stdout 应为命令输出");
+        assert!(result.stderr.is_empty(), "stderr 应为空");
+        assert_eq!(result.exit_code, Some(0), "退出码应为 0");
+
+        // 空命令在建连/建通道前拒绝（复用已建连接，直接返回错误）
+        let err = ssh.exec("s1", "  ").await.expect_err("空命令应报错");
+        assert!(err.contains("命令不能为空"), "错误串不符: {err}");
+
+        ssh.disconnect("s1").await;
+        shutdown.shutdown("test done".into());
+    };
+
+    let (server_res, ()) = tokio::join!(running, test_body);
+    server_res.expect("echo server 异常退出");
+}
+
+/// 服务器 AI 锁硬边界：锁定服务器的 AI 远程动作在任何网络请求前返回固定拒绝错误；
+/// 同一服务器的用户手动 open_shell / open_sftp 路径不受影响。
+#[tokio::test]
+async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
+    let socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 127.0.0.1:0 失败");
+    let addr = socket.local_addr().expect("取监听地址失败");
+    let config = Arc::new(russh::server::Config {
+        keys: vec![
+            russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM.as_bytes())
+                .expect("解析测试 host key 失败"),
+        ],
+        ..Default::default()
+    });
+    let mut server = EchoServer;
+    let running = server.run_on_socket(config, &socket);
+    let shutdown = running.handle();
+
+    let test_body = async {
+        let config_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        // 服务器登记进 Store 并锁定（upsert_server None = 不触碰 keyring）
+        let server = Server {
+            id: "s-lock".to_string(),
+            name: "锁定服务器".to_string(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            auth_type: AuthType::Password,
+            username: "test".to_string(),
+            key_path: String::new(),
+            locked: true,
+        };
+        store
+            .upsert_server(server.clone(), None)
+            .expect("登记服务器应成功");
+        let ssh = Arc::new(SshManager::new(Arc::clone(&store)));
+        let actions = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store), Arc::clone(&ssh));
+
+        // AI 远程命令：锁检查先于任何网络请求（服务器从未被连接过，直接返回固定错误）
+        let project_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-lock-proj-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&project_dir).expect("创建项目目录应成功");
+        store
+            .upsert_project(aishell_lib::store::Project {
+                id: "p-lock".to_string(),
+                name: "P".to_string(),
+                path: Some(project_dir.to_string_lossy().into_owned()),
+                server_ids: vec!["s-lock".to_string()],
+                quick_commands: vec![],
+                ai_mode: aishell_lib::store::AiMode::Yolo,
+            })
+            .expect("登记项目应成功");
+
+        let err = actions
+            .run_command("p-lock", "测试".to_string(), "printf hi".to_string(), "remote".to_string(), Some("s-lock".to_string()))
+            .await
+            .expect_err("锁定服务器应拒绝 AI 远程命令");
+        assert!(
+            err.contains("已锁定，AI 无权执行远程操作") && err.contains("锁定服务器"),
+            "错误串不符: {err}"
+        );
+        // AI SFTP 上传 / 下载同样在连接前被拒
+        let err = actions
+            .sftp_upload("p-lock", "s-lock".to_string(), "a.txt".to_string(), "/tmp".to_string())
+            .await
+            .expect_err("锁定服务器应拒绝 AI 上传");
+        assert!(err.contains("已锁定，AI 无权执行远程操作"), "错误串不符: {err}");
+        let err = actions
+            .sftp_download("p-lock", "s-lock".to_string(), "/tmp/a.txt".to_string(), project_dir.to_string_lossy().into_owned())
+            .await
+            .expect_err("锁定服务器应拒绝 AI 下载");
+        assert!(err.contains("已锁定，AI 无权执行远程操作"), "错误串不符: {err}");
+
+        // 用户手动路径不受锁影响：connect_direct + open_shell / open_sftp 仍可连接
+        ssh.connect_direct(server, Some("test"))
+            .await
+            .expect("锁定服务器的手动连接应成功");
+        let mut channel = ssh
+            .open_shell("s-lock", 80, 24)
+            .await
+            .expect("锁定服务器的手动 shell 应可用");
+        channel
+            .data(&b"echo hello\n"[..])
+            .await
+            .expect("向 channel 写数据应成功");
+        let mut got = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !got.contains("hello") {
+            let msg = tokio::time::timeout(Duration::from_secs(5), channel.wait())
+                .await
+                .expect("等待回显超时");
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    let bytes: &[u8] = &data;
+                    got.push_str(&String::from_utf8_lossy(bytes));
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(got.contains("hello"), "手动 shell 回显缺失: {got:?}");
+        let _sftp = ssh
+            .open_sftp("s-lock")
+            .await
+            .expect("锁定服务器的手动 SFTP 应可用");
+        // 解锁后 AI 远程命令恢复（同一连接池，无需重连）
+        store.set_server_locked("s-lock", false).expect("解锁应成功");
+        let result = actions
+            .run_command("p-lock", "测试".to_string(), "printf ai-unlocked".to_string(), "remote".to_string(), Some("s-lock".to_string()))
+            .await
+            .expect("解锁后 AI 远程命令应恢复");
+        assert_eq!(result.stdout, "ai-unlocked");
+
+        ssh.disconnect("s-lock").await;
         shutdown.shutdown("test done".into());
     };
 

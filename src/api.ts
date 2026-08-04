@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AppState, ChatSession, FsEntry, Project, Server, Settings, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, FsEntry, Project, Server, Settings, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -36,6 +36,12 @@ export const sessionsGet = (projectId: string) =>
   call<ChatSession[]>('sessions_get', { projectId });
 export const sessionUpsert = (projectId: string, session: ChatSession) =>
   call<void>('session_upsert', { projectId, session });
+/** 原子切换项目 AI 模式（只改目标字段；后端同时向该项目存活 pi 进程热推 /aishell-mode） */
+export const setAiMode = (projectId: string, mode: AiMode) =>
+  call<void>('set_ai_mode', { projectId, mode });
+/** 原子切换服务器 AI 操作锁（只改目标字段；仅约束 AI 远程动作） */
+export const setServerLocked = (id: string, locked: boolean) =>
+  call<void>('set_server_locked', { id, locked });
 
 /* ---------------- term ----------------
    id 由前端生成、先订阅事件再调 term_create，避免输出竞态丢失。
@@ -78,12 +84,19 @@ export const sftpDownload = (serverId: string, remotePath: string, localDir: str
   call<void>('sftp_download', { serverId, remotePath, localDir });
 
 /* ---------------- ai ---------------- */
+/** 后端发出的 AI 回合事件（key = `<projectId>:<sessionId>`）：
+ *  - approval：Agent 模式逐调用审批请求（对应 pi extension_ui_request/confirm）；
+ *  - actionStart/actionEnd：受控工具（write/edit/delete_path/run_command/sftp_upload/sftp_download）
+ *    执行生命周期（来自 tool_execution_start/end，toolCallId 关联审批卡）。 */
 export type AiEvent =
   | { type: 'delta'; text: string }
   | { type: 'tool'; tool: string; label: string }
   | { type: 'segment' }
   | { type: 'done' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'approval'; requestId: string; toolCallId: string; action: string; intent: string; summary: string }
+  | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
+  | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
 export const aiChat = (key: string, prompt: string) => call<void>('ai_chat', { key, prompt });
 export const aiAbort = (key: string) => call<void>('ai_abort', { key });
@@ -92,6 +105,10 @@ export const aiKillProject = (projectId: string) => call<void>('ai_kill_project'
 /** 动态切换项目内 AI 进程的思考强度（立即生效；无存活进程时静默，下次提问按新档位 spawn） */
 export const aiSetThinking = (projectId: string, level: string) =>
   call<void>('ai_set_thinking', { projectId, level });
+/** 回复待审批动作：confirmed=true 批准 / false 拒绝；仅接受该 key 当前待处理的 requestId，
+ *  重复或过期回复返回中文错误。 */
+export const aiRespondApproval = (key: string, requestId: string, confirmed: boolean) =>
+  call<void>('ai_respond_approval', { key, requestId, confirmed });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 

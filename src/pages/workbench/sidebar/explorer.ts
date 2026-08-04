@@ -6,10 +6,10 @@
  * 面板不碰 #sidebar-head）；explorerHead 描述符由框架渲染标题与 actions 区。
  */
 import { bus, getTabs, openTab, Workbench } from '../core';
-import { confirmDialog, toast } from '../../../ui';
+import { confirmDialog, copyText, showContextMenu, toast, type CtxItem } from '../../../ui';
 import { fsCopy, fsCreate, fsDelete, fsImport, fsList, fsMove, fsReveal, sftpDownload } from '../../../api';
 import type { FsEntry } from '../../../types';
-import { icon as iconSvg, type IconName } from '../../../icons';
+import { icon as iconSvg } from '../../../icons';
 import './explorer.css';
 
 /** 侧栏框架渲染 #sidebar-head 用（标题 + actions 按钮） */
@@ -20,12 +20,12 @@ export const explorerHead = {
     newFile.className = 'icon-btn';
     newFile.title = '新建文件';
     newFile.innerHTML = iconSvg('filePlus');
-    newFile.onclick = () => startInlineInput(false);
+    newFile.onclick = () => startInlineInput(false, null, null);
     const newDir = document.createElement('button');
     newDir.className = 'icon-btn';
     newDir.title = '新建目录';
     newDir.innerHTML = iconSvg('folderPlus');
-    newDir.onclick = () => startInlineInput(true);
+    newDir.onclick = () => startInlineInput(true, null, null);
     el.append(newFile, newDir);
   },
 };
@@ -428,98 +428,25 @@ function startRename(node: TreeNode, row: HTMLElement): void {
   input.addEventListener('click', (e) => e.stopPropagation());
 }
 
-/* ---------- 剪贴板复制文本（系统剪贴板，失败降级 execCommand） ---------- */
-async function copyText(text: string, okMsg: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
-  }
-  toast(okMsg, 'success');
-}
-
 /** 相对项目根的路径（根自身返回空串时不应出现——根行菜单不提供此项） */
 function relativePath(path: string): string {
   const root = getRoot();
   if (root && path.startsWith(`${root.path}/`)) return path.slice(root.path.length + 1);
   return path;
 }
-
-/* ---------- 右键菜单（模块级单例；点击外部 / Esc / 窗口失焦关闭） ---------- */
-interface MenuEntry {
-  label: string;
-  iconName: IconName;
-  danger?: boolean;
-  disabled?: boolean;
-  disabledTip?: string;
-  action?: () => void;
-}
-type MenuItem = MenuEntry | 'sep';
-
-let menuEl: HTMLElement | null = null;
-
-function closeMenu(): void {
-  menuEl?.remove();
-  menuEl = null;
-  document.removeEventListener('mousedown', onMenuOutside, true);
-  document.removeEventListener('keydown', onMenuKey, true);
-  window.removeEventListener('blur', closeMenu);
-}
-function onMenuOutside(e: MouseEvent): void {
-  if (menuEl && !menuEl.contains(e.target as Node)) closeMenu();
-}
-function onMenuKey(e: KeyboardEvent): void {
-  if (e.key === 'Escape') closeMenu();
-}
-
-function showMenu(x: number, y: number, items: MenuItem[]): void {
-  closeMenu();
-  const el = document.createElement('div');
-  el.className = 'ctx-menu';
-  for (const item of items) {
-    if (item === 'sep') {
-      const sep = document.createElement('div');
-      sep.className = 'ctx-menu-sep';
-      el.appendChild(sep);
-      continue;
-    }
-    const btn = document.createElement('button');
-    btn.className = `ctx-menu-item${item.danger ? ' danger' : ''}${item.disabled ? ' disabled' : ''}`;
-    btn.innerHTML = `${iconSvg(item.iconName)}<span>${item.label}</span>`;
-    if (item.disabled || !item.action) {
-      btn.disabled = true;
-      if (item.disabledTip) btn.title = item.disabledTip;
-    } else {
-      const { action } = item;
-      btn.onclick = () => { closeMenu(); action(); };
-    }
-    el.appendChild(btn);
-  }
-  document.body.appendChild(el);
-  /* 防出屏：先渲染取尺寸再定位 */
-  const rect = el.getBoundingClientRect();
-  el.style.left = `${Math.max(4, Math.min(x, window.innerWidth - rect.width - 8))}px`;
-  el.style.top = `${Math.max(4, Math.min(y, window.innerHeight - rect.height - 8))}px`;
-  menuEl = el;
-  document.addEventListener('mousedown', onMenuOutside, true);
-  document.addEventListener('keydown', onMenuKey, true);
-  window.addEventListener('blur', closeMenu);
-}
-
 function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): void {
   const pasteTarget = node.isDir ? node : node.parent;
   /* 编辑中的文件禁止移动类操作——旧标签写盘会在旧路径重建文件,抵消操作;防线前置为禁用态 */
   const editing = editingPaths().some((p) => p === node.path || p.startsWith(`${node.path}/`));
   const editingTip = '文件正在编辑器中打开,请先关闭对应标签页';
-  showMenu(x, y, [
+  /* 目录行右键：新建文件/目录（在选中目录下创建） */
+  const newItems: CtxItem[] = node.isDir ? [
+    { label: '新建文件', iconName: 'filePlus', action: () => startInlineInput(false, node, row) },
+    { label: '新建目录', iconName: 'folderPlus', action: () => startInlineInput(true, node, row) },
+  ] : [];
+  showContextMenu(x, y, [
     { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => openNode(node) },
+    ...(newItems.length ? ['sep' as const, ...newItems] : []),
     'sep',
     { label: '复制', iconName: 'copy', action: () => { fsClipboard = { path: node.path, name: node.name, isDir: node.isDir, mode: 'copy' }; render(); } },
     { label: '剪切', iconName: 'scissors', disabled: editing, disabledTip: editingTip, action: () => { fsClipboard = { path: node.path, name: node.name, isDir: node.isDir, mode: 'cut' }; render(); } },
@@ -529,25 +456,36 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
     { label: '删除', iconName: 'trash', danger: true, action: () => void deleteNode(node) },
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(node.path).catch((err) => toast(String(err), 'error')) },
-    { label: '复制文件路径', iconName: 'link', action: () => void copyText(node.path.replace(/\//g, '\\'), '已复制文件路径') },
-    { label: '复制相对路径', iconName: 'link', action: () => void copyText(relativePath(node.path), '已复制相对路径') },
+    { label: '复制文件路径', iconName: 'link', action: () => { void copyText(node.path.replace(/\//g, '\\')).then(() => toast('已复制文件路径', 'success')); } },
+    { label: '复制相对路径', iconName: 'link', action: () => { void copyText(relativePath(node.path)).then(() => toast('已复制相对路径', 'success')); } },
   ]);
 }
 
 function showRootMenu(x: number, y: number, root: TreeNode): void {
-  showMenu(x, y, [
+  showContextMenu(x, y, [
+    { label: '新建文件', iconName: 'filePlus', action: () => startInlineInput(false, root, null) },
+    { label: '新建目录', iconName: 'folderPlus', action: () => startInlineInput(true, root, null) },
+    'sep',
     { label: '粘贴', iconName: 'clipboard', disabled: !fsClipboard, action: () => void pasteInto(root) },
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(root.path).catch((err) => toast(String(err), 'error')) },
   ]);
 }
 
-/* ---------- 新建（根目录下，内联输入行，照原型） ---------- */
-function startInlineInput(isDir: boolean): void {
+/* ---------- 新建（内联输入行；parent 为空 = 根目录，afterRow 指定输入行插入位置） ---------- */
+const depthOf = (n: TreeNode): number => {
+  let d = 0;
+  while (n.parent) { d++; n = n.parent; }
+  return d;
+};
+
+function startInlineInput(isDir: boolean, parent: TreeNode | null, afterRow: HTMLElement | null): void {
   if (!container || container.querySelector('.wbs-explorer-inline-input')) return;
+  const p = parent ?? getRoot();
+  if (!p) return;
   const row = document.createElement('div');
   row.className = 'wbs-explorer-row';
-  row.style.paddingLeft = `${6 + 14}px`;
+  row.style.paddingLeft = `${6 + (depthOf(p) + 1) * 14}px`;
   const input = document.createElement('input');
   input.className = 'input wbs-explorer-inline-input';
   input.placeholder = isDir ? '目录名' : '文件名';
@@ -558,7 +496,7 @@ function startInlineInput(isDir: boolean): void {
     done = true;
     const name = input.value.trim();
     row.remove();
-    if (commit && name) void createAtRoot(name, isDir);
+    if (commit && name) void createIn(p, name, isDir);
   };
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); finish(true); }
@@ -566,19 +504,20 @@ function startInlineInput(isDir: boolean): void {
   });
   input.addEventListener('blur', () => finish(false));
   row.appendChild(input);
-  const rootRow = container.querySelector('.wbs-explorer-row');
-  if (rootRow) rootRow.after(row);
+  const anchor = afterRow ?? container.querySelector('.wbs-explorer-row');
+  if (anchor) anchor.after(row);
   else container.appendChild(row);
   input.focus();
 }
 
-async function createAtRoot(name: string, isDir: boolean): Promise<void> {
-  const root = getRoot();
-  if (!root) return;
+async function createIn(parent: TreeNode, name: string, isDir: boolean): Promise<void> {
+  const target = joinPath(parent.path, name);
   try {
-    await fsCreate(joinPath(root.path, name), isDir);
-    if (isDir) expanded.add(joinPath(root.path, name));
-    await refreshDir(root);
+    await fsCreate(target, isDir);
+    if (isDir) expanded.add(target);
+    // 父目录展开（含未展开过的情况）保证新项目立即可见
+    expanded.add(parent.path);
+    await refreshDir(parent);
   } catch (err) {
     toast(String(err), 'error');
   }

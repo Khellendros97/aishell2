@@ -3,7 +3,7 @@
  * 逐行翻译自 .proto/workbench-core.js —— 本文件是所有工作台模块的协作契约，接口不得破坏。
  * 与原型唯一差异：DOM 容器由 init() 注入（workbench.ts 建好布局后调用），项目数据由 workbench.ts 异步装载。
  */
-import type { Project, TermSnapshot } from '../../types';
+import type { FileRef, Project, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
 
 export type TabData = Record<string, unknown>;
@@ -37,6 +37,8 @@ export interface TerminalApi {
 
 export interface AiHandle {
   addSnapshot(snap: TermSnapshot): void;
+  /** 编辑器选区引用（@文件名_起始行_结束行号） */
+  addFileRef?(ref: FileRef): void;
 }
 
 /** fn(container, tab) 返回可选 tabApi 对象（供其他模块调用） */

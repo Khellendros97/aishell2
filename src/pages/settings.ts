@@ -5,7 +5,7 @@
  * 浏览按钮走 @tauri-apps/plugin-dialog；「重置演示数据」按钮本页无（见欢迎页「打开配置目录」）。
  */
 import type { AppState, LlmConfig, Server, Theme } from '../types';
-import { deleteServer, getState, importXshellSessions, openDialog, saveSettings, setTheme, upsertServer } from '../api';
+import { deleteServer, getState, importXshellSessions, openDialog, saveSettings, setServerLocked, setTheme, upsertServer } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -247,7 +247,17 @@ export const renderSettings: PageRender = (root, params) => {
       delBtn.dataset.act = 'del';
       delBtn.dataset.id = s.id;
 
-      actions.append(editBtn, delBtn);
+      // AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP
+      const lockBtn = document.createElement('button');
+      lockBtn.className = 'icon-btn' + (s.locked ? ' active' : '');
+      lockBtn.title = s.locked
+        ? `「${s.name}」的 AI 远程操作已锁定，点击解锁`
+        : `锁定「${s.name}」的 AI 远程操作（手动 SSH/SFTP 不受影响）`;
+      lockBtn.innerHTML = icon('lock');
+      lockBtn.dataset.act = 'lock';
+      lockBtn.dataset.id = s.id;
+
+      actions.append(editBtn, lockBtn, delBtn);
       head.append(name, actions);
 
       const host = document.createElement('div');
@@ -270,7 +280,7 @@ export const renderSettings: PageRender = (root, params) => {
     });
   }
 
-  // 事件委托：编辑 / 删除
+  // 事件委托：编辑 / 删除 / AI 锁切换
   grid.addEventListener('click', (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLElement>('.icon-btn');
     if (!btn) return;
@@ -278,7 +288,22 @@ export const renderSettings: PageRender = (root, params) => {
     if (!server) return;
     if (btn.dataset.act === 'edit') openServerModal(server);
     else if (btn.dataset.act === 'del') void deleteServerFlow(server);
+    else if (btn.dataset.act === 'lock') void toggleServerLock(server);
   });
+
+  /** AI 锁切换：原子 API 成功后原地更新 db.servers，失败回退并 toast */
+  async function toggleServerLock(server: Server): Promise<void> {
+    const next = !server.locked;
+    try {
+      await setServerLocked(server.id, next);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    server.locked = next;
+    renderServers();
+    toast(next ? `已锁定「${server.name}」的 AI 远程操作` : `已解锁「${server.name}」的 AI 远程操作`, 'success');
+  }
 
   async function deleteServerFlow(server: Server) {
     const bound = db.projects.filter((p) => p.serverIds.includes(server.id)).map((p) => p.name);
@@ -408,6 +433,8 @@ export const renderSettings: PageRender = (root, params) => {
       name, host, port, authType,
       username,
       keyPath: authType === 'key' ? keyPath : '',
+      // 编辑时保留原 AI 锁，新建默认未锁定
+      locked: editingId ? (db.servers.find((s) => s.id === editingId)?.locked ?? false) : false,
     };
     const passwordOrNull = authType === 'password' ? (password || null) : null;
 

@@ -331,6 +331,8 @@ export const renderWelcome: PageRender = (root) => {
           path: finalPath,
           serverIds,
           quickCommands: [],
+          // 新项目默认建议模式（不扩大权限；模式按项目持久化）
+          aiMode: 'suggest',
         };
         await upsertProject(proj);
       } catch (err) {
@@ -449,6 +451,7 @@ export const renderWelcome: PageRender = (root) => {
       authType: auth,
       username: els.miniUser.value.trim(),
       keyPath: auth === 'key' ? secret : '',
+      locked: false,
     };
 
     try {

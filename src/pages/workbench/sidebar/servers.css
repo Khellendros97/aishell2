@@ -4,8 +4,11 @@
 .wbs-server-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .wbs-server-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wbs-server-addr { font-size: 11.5px; color: var(--text-2); }
+.wbs-server-tags { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.wbs-server-tags .tag { display: inline-flex; align-items: center; gap: 3px; }
 .wbs-server-actions { display: flex; gap: 8px; }
 .wbs-server-actions .btn { flex: 1; }
+.wbs-server-actions .wbs-lock { flex: 0 0 auto; font-size: 11px; }
 /* 远程服务器标题行（含新建按钮） */
 .wbs-server-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;

@@ -48,6 +48,7 @@ const PATHS = {
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
   home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/>',
   arrowUp: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>',
+  arrowDown: '<path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/>',
   arrowLeft: '<path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>',
   arrowRight: '<path d="M5 12h14"/><path d="M12 5l7 7-7 7"/>',
   slash: '<path d="M17 5 7 19"/>',

@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod ai_actions;
 pub mod fsops;
 pub mod sftp;
 pub mod ssh;
@@ -41,6 +42,7 @@ pub fn run() {
                 store.clone(),
                 pi_dir,
                 config_dir.join("pi-agent"),
+                ssh.clone(),
             ));
             app.manage(store);
             app.manage(ssh);
@@ -68,6 +70,7 @@ pub fn run() {
             store::ensure_project_dirs,
             store::sessions_get,
             store::session_upsert,
+            store::set_server_locked,
             xshell::import_xshell_sessions,
             term::term_create,
             term::term_input,
@@ -89,6 +92,8 @@ pub fn run() {
             ai::ai_abort,
             ai::ai_kill_project,
             ai::ai_set_thinking,
+            ai::set_ai_mode,
+            ai::ai_respond_approval,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

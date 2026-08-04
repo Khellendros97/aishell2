@@ -8,7 +8,7 @@
  */
 import type { Server } from '../../../types';
 import { icon } from '../../../icons';
-import { getState, upsertProject, upsertServer } from '../../../api';
+import { getState, setServerLocked, upsertProject, upsertServer } from '../../../api';
 import { bus, openTab, Workbench } from '../core';
 import { toast, uid } from '../../../ui';
 import './servers.css';
@@ -121,6 +121,7 @@ export function mountServersPanel(container: HTMLElement): void {
       authType: fAuth.value as Server['authType'],
       username: fUsername.value.trim(),
       keyPath: fAuth.value === 'key' ? fKeyPath.value.trim() : '',
+      locked: false,
     };
     const password = fAuth.value === 'password' ? fPassword.value : null;
     try {
@@ -218,13 +219,24 @@ export function mountServersPanel(container: HTMLElement): void {
       card.innerHTML =
         '<div class="wbs-server-top">' +
           '<span class="wbs-server-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
-          '<span class="tag">' + icon(s.authType === 'key' ? 'key' : 'lock') + ' ' + (s.authType === 'key' ? '密钥' : '密码') + '</span>' +
+          '<span class="wbs-server-tags">' +
+            // 认证 tag：密钥用 key 图标，密码用纯文字（lock 图标专属于 AI 操作锁）
+            '<span class="tag">' + (s.authType === 'key' ? icon('key') + ' 密钥' : '密码') + '</span>' +
+            (s.locked ? '<span class="tag red" title="AI 不能执行远程操作；手动 SSH/SFTP 不受影响">' + icon('lock') + ' AI 已锁定</span>' : '') +
+          '</span>' +
         '</div>' +
         '<div class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</div>' +
         '<div class="wbs-server-actions">' +
+          '<button class="btn small wbs-lock" title="仅约束 AI 发起的远程操作，手动 SSH/SFTP 不受影响">' + (s.locked ? '解锁 AI' : '锁定 AI') + '</button>' +
           '<button class="btn small wbs-ssh">SSH 连接</button>' +
           '<button class="btn small wbs-sftp">SFTP 文件管理</button>' +
         '</div>';
+      (card.querySelector('.wbs-lock') as HTMLButtonElement).onclick = (e) => {
+        e.stopPropagation();
+        void setServerLocked(s.id, !s.locked)
+          .then(() => bus.emit('project-changed'))
+          .catch((err) => toast(`切换 AI 锁失败: ${String(err)}`, 'error'));
+      };
       (card.querySelector('.wbs-ssh') as HTMLButtonElement).onclick = () => {
         openTab({
           id: 'term:' + s.id,

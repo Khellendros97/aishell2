@@ -8,13 +8,14 @@
  */
 import { EditorState, Prec, StateEffect, Compartment, type Extension } from '@codemirror/state';
 import { EditorView, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view';
-import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { LanguageDescription, indentUnit } from '@codemirror/language';
+import { defaultKeymap, history, historyKeymap, indentWithTab, selectAll } from '@codemirror/commands';
+import { LanguageDescription, indentUnit, syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { fsRead, fsWrite } from '../../api';
-import { toast } from '../../ui';
-import { bus, registerRenderer, setTabTitle, type Tab } from './core';
+import { copyText, showContextMenu, toast, uid } from '../../ui';
+import type { FileRef } from '../../types';
+import { bus, registerRenderer, setTabTitle, Workbench, type Tab } from './core';
 import { currentTheme, onThemeChange } from '../../theme';
 import './editor.css';
 
@@ -111,6 +112,84 @@ async function loadFile(entry: EditorEntry): Promise<void> {
   }
 }
 
+/* ---------- 编辑器右键菜单：全选 / 复制 / 剪切 / 粘贴 / 添加到chat ---------- */
+function showEditorMenu(x: number, y: number, entry: EditorEntry, path: string): void {
+  const view = entry.view;
+  const { from, to, empty } = view.state.selection.main;
+  const hasSel = !empty && from !== to;
+  const selText = hasSel ? view.state.sliceDoc(from, to) : '';
+
+  showContextMenu(x, y, [
+    { label: '全选', iconName: 'square', action: () => selectAll(view) },
+    'sep',
+    {
+      label: '复制', iconName: 'copy', disabled: !hasSel, disabledTip: '请先框选一段文字',
+      action: () => { void copyText(selText).then(() => toast('已复制', 'success')); },
+    },
+    {
+      label: '剪切', iconName: 'scissors', disabled: !hasSel, disabledTip: '请先框选一段文字',
+      action: () => {
+        void copyText(selText).then(() => {
+          view.dispatch({ changes: { from, to } });
+          toast('已剪切', 'success');
+        });
+      },
+    },
+    {
+      label: '删除', iconName: 'trash', danger: true, disabled: !hasSel, disabledTip: '请先框选一段文字',
+      action: () => { view.dispatch({ changes: { from, to } }); },
+    },
+    {
+      label: '粘贴', iconName: 'clipboard',
+      action: () => {
+        void navigator.clipboard.readText().then((text) => {
+          const pos = view.state.selection.main.from;
+          view.dispatch({
+            changes: { from: pos, insert: text },
+            selection: { anchor: pos + text.length },
+          });
+        }).catch(() => toast('读取剪贴板失败', 'error'));
+      },
+    },
+    'sep',
+    {
+      label: '添加到chat', iconName: 'chatPlus', disabled: !hasSel, disabledTip: '请先框选一段文字',
+      action: () => addCurrentSelectionToAI(view, path),
+    },
+  ]);
+}
+
+/** 取当前选区（菜单/Ctrl+L 共用入口）：无选区时提示 */
+function addCurrentSelectionToAI(view: EditorView, path: string): boolean {
+  const { from, to, empty } = view.state.selection.main;
+  if (empty || from === to) {
+    toast('请先框选一段文字', 'error');
+    return false;
+  }
+  addSelectionToAI(view, path, from, to, view.state.sliceDoc(from, to));
+  return true;
+}
+
+/** 选区 → @文件名_起始行_结束行号 标签（内容随标签压缩，发送时展开） */
+function addSelectionToAI(view: EditorView, path: string, from: number, to: number, content: string): void {
+  const doc = view.state.doc;
+  const fromLine = doc.lineAt(from);
+  let toLine = doc.lineAt(to);
+  // 选区结束恰落在行首 → 不含该行内容
+  if (to === toLine.from && toLine.number > fromLine.number) toLine = doc.line(toLine.number - 1);
+  const ref: FileRef = {
+    id: uid('ref'), path,
+    startLine: fromLine.number, endLine: toLine.number,
+    content, ts: Date.now(),
+  };
+  if (Workbench.ai?.addFileRef) {
+    Workbench.ai.addFileRef(ref);
+    toast('已添加到 AI 对话', 'success');
+  } else {
+    toast('AI 面板未就绪', 'error');
+  }
+}
+
 /* ---------- 渲染器 ---------- */
 registerRenderer('editor', (container, tab) => {
   const path = String(tab.data.path ?? '');
@@ -137,12 +216,21 @@ registerRenderer('editor', (container, tab) => {
         history(),
         indentUnit.of('  '),
         EditorState.tabSize.of(2),
-        // Ctrl+S：立即保存（取消防抖计时器直接写）
-        Prec.highest(keymap.of([{
-          key: 'Mod-s',
-          preventDefault: true,
-          run: () => { void queueSave(entry, false); return true; },
-        }])),
+        // 亮色高亮配色常驻（深色由 oneDark 覆盖；无此扩展时亮色主题语言解析不出颜色）
+        syntaxHighlighting(defaultHighlightStyle),
+        // Ctrl+S：立即保存（取消防抖计时器直接写）；Ctrl+L：框选内容添加到 AI 对话
+        Prec.highest(keymap.of([
+          {
+            key: 'Mod-s',
+            preventDefault: true,
+            run: () => { void queueSave(entry, false); return true; },
+          },
+          {
+            key: 'Mod-l',
+            preventDefault: true,
+            run: () => addCurrentSelectionToAI(entry.view, path),
+          },
+        ])),
         keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
         cmTheme.of(cmThemeExt()),
         EditorView.updateListener.of((update) => { if (update.docChanged) markDirty(entry); }),
@@ -152,6 +240,12 @@ registerRenderer('editor', (container, tab) => {
   });
 
   entries.set(tab.id, entry);
+
+  /* 自定义右键菜单：替换浏览器默认菜单（全选/复制/剪切/粘贴/添加到chat） */
+  entry.view.dom.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showEditorMenu(e.clientX, e.clientY, entry, path);
+  });
 
   // 链式保留打开方传入的 onClose：先静默落盘未保存缓冲，再放行（原型语义）
   const originalOnClose = tab.onClose;

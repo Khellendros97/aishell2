@@ -1,10 +1,23 @@
 //! AI 助手（pi 子进程 RPC 嵌入）。
-//! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)`；
-//! 事件 `ai:event:<key>` payload `{type:"delta",text}|{type:"tool",tool,label}|{type:"segment"}|{type:"done"}|{type:"error",message}`；
+//! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)` /
+//! `ai_set_thinking(project_id, level)` / `set_ai_mode(project_id, mode)` /
+//! `ai_respond_approval(key, request_id, confirmed)`；
+//! 事件 `ai:event:<key>` payload：
+//!   - `{type:"delta",text}` / `{type:"tool",tool,label}` / `{type:"segment"}`
+//!   - `{type:"done"}` / `{type:"error",message}`
+//!   - `{type:"approval",requestId,toolCallId,action,intent,summary}`
+//!   - `{type:"actionStart",toolCallId,tool,args}` / `{type:"actionEnd",toolCallId,tool,isError,result}`
+//!
 //! key = "<projectId>:<sessionId>"，每 key 一个长驻 pi 进程。
-//! 工具边界：read/grep/find/ls/write/edit/web_search 白名单（无 bash），由 pi_ext/aishell-guard.ts
-//! 门控——写仅限项目 .aishell/ 目录，读仅限项目目录内；web_search 为只读联网搜索（Brave，
-//! 见 pi_ext/aishell-search.ts）；扩展每次 spawn 重写进 agent_dir。
+//!
+//! 三档模式（按项目持久化，见 store.rs AiMode）：suggest / agent / yolo。权限事实源在
+//! pi_ext/aishell-guard.ts（每次 spawn 重写进 agent_dir 并显式 --extension 加载）：
+//!   - suggest：read/grep/find/ls/write/edit(+web_search)，写仅限 .aishell/；
+//!   - agent/yolo：读写限项目根 + delete_path/run_command/sftp_upload/sftp_download；
+//!   - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；yolo 跳过；suggest 直接阻止。
+//!
+//! 动作执行经内部协议 `AISHELL_ACTION:` input 交给 ai_actions.rs（唯一后端入口：项目根校验 +
+//! 服务器 AI 锁检查，锁只拦 AI，不影响用户手动 SSH/SFTP）。
 //!
 //! 与计划唯一偏差：`procs` 字段为 `Arc<Mutex<HashMap<...>>>`（计划给的是裸 `Mutex`）——
 //! 因为 stdout 读取线程必须在进程退出/管道破裂时「从 map 摘除」条目，裸 Mutex 无法被线程共享。
@@ -19,10 +32,11 @@ use std::thread;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::store::Store;
+use crate::ai_actions::AiActions;
+use crate::store::{AiMode, Store};
 
-/// `--append-system-prompt` 的值。
-const SYSTEM_PROMPT: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
+/// suggest 模式的系统提示（保持现状：无 bash，写仅 .aishell/）。
+const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
 文件工具边界（硬性，越界调用会被门控拒绝）：
 - read/grep/find/ls：只能读当前项目目录内的文件，项目外一律不可读。
 - write/edit：只能写项目下 .aishell/ 目录内的文件（可用于保存笔记、记忆、计划；父目录不存在会自动创建）。
@@ -31,6 +45,22 @@ const SYSTEM_PROMPT: &str = "你是 AIShell 的内置终端助手。用户围绕
 - 用户要求修改项目源码等 .aishell/ 之外的文件时：不要调用 write/edit（会被拒），改为给出命令或补丁文本让用户自行处理。
 输出协议（必须严格遵守）：
 1. 建议用户在终端执行的命令：每条命令单独放在一个 ```command 围栏代码块中，块内只有命令本身，不加解释。
+2. 给用户直接复用的文本（说明、模板等）：放在 ```text 围栏代码块中。
+3. 普通代码示例使用对应语言的围栏代码块。
+4. 用中文回复，简洁直接。";
+
+/// agent / yolo 模式的系统提示（有执行权限；Agent 逐调用审批，YOLO 已获用户显式授权）。
+const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
+你有执行权限（Agent 模式每次操作需用户批准；YOLO 模式自动执行，用户已显式授权）：
+- read/grep/find/ls/write/edit/delete_path：只能操作当前项目目录内的文件，项目外一律被拒。
+- run_command：在本地 Git Bash（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。
+- list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
+- sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
+- 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
+- web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
+- 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
+输出协议（必须严格遵守）：
+1. 需要用户手动执行的命令：每条命令单独放在一个 ```command 围栏代码块中，块内只有命令本身，不加解释。
 2. 给用户直接复用的文本（说明、模板等）：放在 ```text 围栏代码块中。
 3. 普通代码示例使用对应语言的围栏代码块。
 4. 用中文回复，简洁直接。";
@@ -44,12 +74,28 @@ const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 const BASE_TOOLS: &str = "read,grep,find,ls,write,edit";
 
+/// 需要动作卡 / 审批的受控工具（与 aishell-guard.ts 的 CONTROLLED_TOOLS 保持一致）。
+const CONTROLLED_TOOLS: [&str; 6] = [
+    "write",
+    "edit",
+    "delete_path",
+    "run_command",
+    "sftp_upload",
+    "sftp_download",
+];
+
+/// 内部动作返回给模型的结果截断上限（pi docs 要求工具必须截断输出，防上下文溢出）。
+const MAX_RESULT_CHARS: usize = 30_000;
+
 /// 单个 key 的 pi 进程。
 pub struct AiProc {
     child: Child,
-    stdin: ChildStdin,
+    /// stdin 可被读取线程（动作结果回写）与 Tauri 命令（审批回复/abort/热推）共享。
+    stdin: Arc<Mutex<ChildStdin>>,
     busy: Arc<AtomicBool>,
     killed: Arc<AtomicBool>,
+    /// 待处理审批：extension_ui_request id -> toolCallId（ai_respond_approval 校验用）。
+    approvals: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// AI 进程管理器：每 key 一个长驻 pi 进程，进程生命周随工作台（ai_kill_project / Drop）结束。
@@ -58,15 +104,18 @@ pub struct AiManager {
     pub pi_dir: PathBuf,
     pub agent_dir: PathBuf,
     pub procs: Arc<Mutex<HashMap<String, AiProc>>>,
+    actions: Arc<AiActions>,
 }
 
 impl AiManager {
-    pub fn new(store: Arc<Store>, pi_dir: PathBuf, agent_dir: PathBuf) -> Self {
+    pub fn new(store: Arc<Store>, pi_dir: PathBuf, agent_dir: PathBuf, ssh: Arc<crate::ssh::SshManager>) -> Self {
+        let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh));
         AiManager {
             store,
             pi_dir,
             agent_dir,
             procs: Arc::new(Mutex::new(HashMap::new())),
+            actions,
         }
     }
 
@@ -102,7 +151,8 @@ impl AiManager {
         Ok(())
     }
 
-    /// 为 key 拉起 pi 进程并启动 stdout 读取线程（读线程负责 done/error 事件与异常退出摘除）。
+    /// 为 key 拉起 pi 进程并启动 stdout 读取线程（读线程负责 done/error 事件、审批转发、
+    /// 内部动作执行与异常退出摘除）。
     fn spawn(&self, app: &AppHandle, key: &str, project_id: &str) -> Result<(), String> {
         let pi_exe = self.pi_dir.join("pi.exe");
         if !pi_exe.is_file() {
@@ -118,6 +168,11 @@ impl AiManager {
             .map_err(|e| format!("effort 序列化失败: {e}"))?
             .trim_matches('"')
             .to_string();
+        let mode = self.store.ai_mode(project_id).unwrap_or_default();
+        let system_prompt = match mode {
+            AiMode::Suggest => SYSTEM_PROMPT_SUGGEST,
+            AiMode::Agent | AiMode::Yolo => SYSTEM_PROMPT_AGENT,
+        };
         let cwd = self
             .store
             .project_path(project_id)
@@ -133,6 +188,17 @@ impl AiManager {
         // 搜索 key 未配置时不注入 env：工具仍挂载，调用时由扩展返回中文引导错误
         let brave_key = self.store.read_secret("brave:apikey").ok();
 
+        // 初始工具集按模式下发（agent/yolo 直接启用变更工具，避免依赖扩展加载期 setActiveTools）；
+        // 热切换仍由 /aishell-mode 命令 + 扩展 applyToolset 增量同步。
+        let mut tools = if mode == AiMode::Suggest {
+            BASE_TOOLS.to_string()
+        } else {
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers")
+        };
+        if search_enabled {
+            tools.push_str(",web_search");
+        }
+
         let mut cmd = Command::new(&pi_exe);
         cmd.args([
             "--mode",
@@ -145,11 +211,7 @@ impl AiManager {
             &effort,
             "--tools",
         ])
-        .arg(if search_enabled {
-            format!("{BASE_TOOLS},web_search")
-        } else {
-            BASE_TOOLS.to_string()
-        })
+        .arg(tools)
         .args(["--no-extensions", "--extension"])
         .arg(&guard_path)
         .args(["--extension"])
@@ -159,10 +221,11 @@ impl AiManager {
             "--no-session",
             "--no-context-files",
             "--append-system-prompt",
-            SYSTEM_PROMPT,
+            system_prompt,
         ])
         .env("PI_CODING_AGENT_DIR", &self.agent_dir)
-        .env("DEEPSEEK_API_KEY", &api_key);
+        .env("DEEPSEEK_API_KEY", &api_key)
+        .env("AISHELL_AI_MODE", mode.as_str());
         if let Some(key) = brave_key {
             cmd.env("BRAVE_API_KEY", key);
         }
@@ -171,17 +234,24 @@ impl AiManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = cmd.spawn().map_err(|e| format!("启动 pi 进程失败: {e}"))?;
-        let stdin = child.stdin.take().ok_or_else(|| "pi 进程 stdin 不可用".to_string())?;
+        let stdin = Arc::new(Mutex::new(
+            child.stdin.take().ok_or_else(|| "pi 进程 stdin 不可用".to_string())?,
+        ));
         let stdout = child.stdout.take().ok_or_else(|| "pi 进程 stdout 不可用".to_string())?;
 
         let busy = Arc::new(AtomicBool::new(false));
         let killed = Arc::new(AtomicBool::new(false));
+        let approvals: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let app2 = app.clone();
         let key2 = key.to_string();
         let event = format!("ai:event:{key2}");
         let busy2 = busy.clone();
         let killed2 = killed.clone();
         let procs2 = self.procs.clone();
+        let stdin2 = Arc::clone(&stdin);
+        let approvals2 = Arc::clone(&approvals);
+        let actions = Arc::clone(&self.actions);
+        let project_id2 = project_id.to_string();
         thread::spawn(move || {
             // 是否已收到过终止性事件（done/error）：正常收尾后退出不再报「异常退出」
             let mut settled = false;
@@ -189,6 +259,8 @@ impl AiManager {
             let mut terminal_emitted = false;
             // 当前 assistant 消息是否已流过文本增量（工具来回多段消息时分段用）
             let mut text_started = false;
+            // 内部动作需要 async 执行：懒建 tokio runtime（进程内动作次数极少）
+            let mut rt: Option<tokio::runtime::Runtime> = None;
             let reader = BufReader::new(stdout);
             // LF 是 pi RPC 协议唯一分隔符；BufRead::lines 按 \n 切行（并剥离 \r），勿换 U+2028 类切行器
             for line in reader.lines() {
@@ -238,20 +310,64 @@ impl AiManager {
                             let _ = app2.emit(&event, json!({"type": "done"}));
                         }
                     }
-                    // 工具活动透传：前端在流式气泡里显示一行小字（只进瞬时 Pending，不落盘）
+                    // 工具活动：受控工具在 agent/yolo 下以动作卡（actionStart/actionEnd）呈现，
+                    // 其余工具仍走瞬时小字行（tool）。
                     "tool_execution_start" => {
                         let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
-                        let label = ev
-                            .get("args")
-                            .and_then(|a| {
-                                a.get("path")
-                                    .or_else(|| a.get("pattern"))
-                                    .or_else(|| a.get("command"))
-                                    .or_else(|| a.get("query"))
-                            })
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("");
-                        let _ = app2.emit(&event, json!({"type": "tool", "tool": tool, "label": label}));
+                        if mode != AiMode::Suggest && CONTROLLED_TOOLS.contains(&tool) {
+                            let tool_call_id = ev
+                                .get("toolCallId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            // args 剥离 content（文件正文不进事件，避免 UI/审计膨胀）
+                            let mut args = ev.get("args").cloned().unwrap_or_else(|| json!({}));
+                            if let Some(obj) = args.as_object_mut() {
+                                obj.remove("content");
+                            }
+                            let _ = app2.emit(
+                                &event,
+                                json!({"type": "actionStart", "toolCallId": tool_call_id, "tool": tool, "args": args}),
+                            );
+                        } else {
+                            let label = ev
+                                .get("args")
+                                .and_then(|a| {
+                                    a.get("path")
+                                        .or_else(|| a.get("pattern"))
+                                        .or_else(|| a.get("command"))
+                                        .or_else(|| a.get("query"))
+                                })
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let _ = app2.emit(&event, json!({"type": "tool", "tool": tool, "label": label}));
+                        }
+                    }
+                    "tool_execution_end" => {
+                        let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        if mode != AiMode::Suggest && CONTROLLED_TOOLS.contains(&tool) {
+                            let tool_call_id = ev
+                                .get("toolCallId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let is_error = ev.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            // 结果正文：优先 result.content[0].text；错误时回退 errorMessage
+                            let result = ev
+                                .get("result")
+                                .and_then(|r| r.get("content"))
+                                .and_then(|c| c.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|b| b.get("text"))
+                                .and_then(serde_json::Value::as_str)
+                                .or_else(|| ev.get("errorMessage").and_then(serde_json::Value::as_str))
+                                .unwrap_or(if is_error { "动作执行失败" } else { "" })
+                                .to_string();
+                            let _ = app2.emit(
+                                &event,
+                                json!({"type": "actionEnd", "toolCallId": tool_call_id, "tool": tool, "isError": is_error, "result": result}),
+                            );
+                        }
                     }
                     "turn_start" => {
                         terminal_emitted = false;
@@ -315,6 +431,20 @@ impl AiManager {
                             let _ = app2.emit(&event, json!({"type": "error", "message": err_message(&ev)}));
                         }
                     }
+                    // 扩展 UI 请求：`AISHELL_APPROVAL:` confirm 转发前端审批；
+                    // `AISHELL_ACTION:` input 为内部动作桥，就地执行并回写（不透传前端）。
+                    "extension_ui_request" => {
+                        handle_extension_ui_request(
+                            &ev,
+                            &event,
+                            &app2,
+                            &stdin2,
+                            &approvals2,
+                            &actions,
+                            &project_id2,
+                            &mut rt,
+                        );
+                    }
                     _ => {
                         // 兜底：非 message_update 信封里携带 assistantMessageEvent.error 的事件
                         if terminal_emitted {
@@ -350,7 +480,10 @@ impl AiManager {
         self.procs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(key.to_string(), AiProc { child, stdin, busy, killed });
+            .insert(
+                key.to_string(),
+                AiProc { child, stdin, busy, killed, approvals },
+            );
         Ok(())
     }
 
@@ -384,6 +517,180 @@ impl Drop for AiManager {
     }
 }
 
+/// 处理 pi 发来的 extension_ui_request（审批转发 + 内部动作桥）。
+#[allow(clippy::too_many_arguments)]
+fn handle_extension_ui_request(
+    ev: &serde_json::Value,
+    event: &str,
+    app2: &AppHandle,
+    stdin2: &Arc<Mutex<ChildStdin>>,
+    approvals2: &Arc<Mutex<HashMap<String, String>>>,
+    actions: &Arc<AiActions>,
+    project_id: &str,
+    rt: &mut Option<tokio::runtime::Runtime>,
+) {
+    let Some(id) = ev.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
+        return;
+    };
+    let method = ev.get("method").and_then(serde_json::Value::as_str).unwrap_or("");
+    let title = ev.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+
+    if method == "input" && title.starts_with("AISHELL_ACTION:") {
+        // 内部动作：执行并回写结果（不透传前端）。
+        // ctx.ui.input(title, placeholder) → extension_ui_request 的默认值在 placeholder 字段
+        let payload: serde_json::Value = ev
+            .get("placeholder")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| json!({}));
+        let runtime = rt.get_or_insert_with(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("创建动作执行 runtime 失败")
+        });
+        let result = runtime.block_on(run_internal_action(actions, project_id, &payload));
+        write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}));
+    } else if method == "confirm" && title.starts_with("AISHELL_APPROVAL:") {
+        // 审批：登记待处理项并转发前端
+        let tool_call_id = title["AISHELL_APPROVAL:".len()..].to_string();
+        if let Ok(mut map) = approvals2.lock() {
+            map.insert(id.clone(), tool_call_id.clone());
+        }
+        let info: serde_json::Value = ev
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| json!({}));
+        let action = info.get("action").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        let intent = info.get("intent").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        let summary = info.get("summary").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        let _ = app2.emit(
+            event,
+            json!({
+                "type": "approval",
+                "requestId": id,
+                "toolCallId": tool_call_id,
+                "action": action,
+                "intent": intent,
+                "summary": summary,
+            }),
+        );
+    }
+    // 其余 UI 请求（notify/setStatus 等）不转发也不响应（fire-and-forget）
+}
+
+/// 执行扩展内部动作请求，返回回写扩展的结果 JSON（{ok:true,text}|{ok:false,error}）。
+async fn run_internal_action(
+    actions: &Arc<AiActions>,
+    project_id: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let action = payload.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+    let str_field = |k: &str| {
+        payload
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let result = match action {
+        "list_servers" => actions
+            .list_servers(project_id)
+            .map(|text| json!({"ok": true, "text": text})),
+        "run_command" => {
+            let intent = str_field("intent");
+            let command = str_field("command");
+            let target = str_field("target");
+            let server_id = payload
+                .get("serverId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            actions
+                .run_command(project_id, intent, command, target, server_id)
+                .await
+                .map(|r| {
+                    let mut text = String::new();
+                    if !r.stdout.is_empty() {
+                        text.push_str(&r.stdout);
+                    }
+                    if !r.stderr.is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&r.stderr);
+                    }
+                    if text.len() > MAX_RESULT_CHARS {
+                        text.truncate(MAX_RESULT_CHARS);
+                        text.push_str("\n…(输出已截断)");
+                    }
+                    if text.is_empty() {
+                        text = "（命令无输出）".to_string();
+                    }
+                    let code = r
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    json!({"ok": true, "text": format!("退出码 {code}\n{text}")})
+                })
+        }
+        "sftp_upload" => {
+            let server_id = str_field("serverId");
+            let local_path = str_field("localPath");
+            let remote_dir = str_field("remoteDir");
+            actions
+                .sftp_upload(project_id, server_id.clone(), local_path.clone(), remote_dir.clone())
+                .await
+                .map(|_| {
+                    json!({"ok": true, "text": format!("上传完成：{local_path} → {remote_dir}（服务器 {server_id}）")})
+                })
+        }
+        "sftp_download" => {
+            let server_id = str_field("serverId");
+            let remote_path = str_field("remotePath");
+            let local_dir = str_field("localDir");
+            actions
+                .sftp_download(project_id, server_id.clone(), remote_path.clone(), local_dir.clone())
+                .await
+                .map(|_| {
+                    json!({"ok": true, "text": format!("下载完成：{remote_path} → {local_dir}（服务器 {server_id}）")})
+                })
+        }
+        other => Err(format!("未知动作：{other}")),
+    };
+    match result {
+        Ok(v) => v,
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+/// 向 pi stdin 写一条 JSONL（严格单个 LF 结尾；不手拼 JSON）。
+fn write_stdin_json(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {
+    let mut buf = serde_json::to_vec(value).unwrap_or_default();
+    buf.push(b'\n');
+    if let Ok(mut w) = stdin.lock() {
+        let _ = w.write_all(&buf);
+    }
+}
+
+/// 对该 key 所有待审批项回复 cancelled:true（避免 pi 永久等待）。
+fn cancel_approvals(proc: &mut AiProc) {
+    let ids: Vec<String> = proc
+        .approvals
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain()
+        .map(|(id, _)| id)
+        .collect();
+    for id in ids {
+        write_stdin_json(
+            &proc.stdin,
+            &json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
+        );
+    }
+}
+
 /// 提取 `response` 事件里 error 字段原文。
 fn err_message(ev: &serde_json::Value) -> String {
     match ev.get("error") {
@@ -392,7 +699,7 @@ fn err_message(ev: &serde_json::Value) -> String {
     }
 }
 
-/// 发送一条 prompt：进程不存在则先 spawn；上一轮未完成（busy）先写 abort 再发。
+/// 发送一条 prompt：进程不存在则先 spawn；上一轮未完成（busy）先取消审批并写 abort 再发。
 #[tauri::command]
 pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String, prompt: String) -> Result<(), String> {
     let project_id = key
@@ -416,25 +723,31 @@ pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String
         return Err("pi 进程未就绪".to_string());
     };
     if proc.busy.swap(true, Ordering::SeqCst) {
-        proc.stdin
-            .write_all(b"{\"type\":\"abort\"}\n")
+        cancel_approvals(proc);
+        let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+        w.write_all(b"{\"type\":\"abort\"}\n")
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
     }
     // 用 JSON 序列化生成，勿手拼
     let mut buf = serde_json::to_vec(&json!({"type": "prompt", "message": prompt}))
         .map_err(|e| e.to_string())?;
     buf.push(b'\n');
-    proc.stdin.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    proc.stdin
+        .lock()
+        .map_err(|e| e.to_string())?
+        .write_all(&buf)
+        .map_err(|e| format!("pi 进程已退出: {e}"))?;
     Ok(())
 }
 
-/// 中止当前生成（进程不存在时静默成功）。
+/// 中止当前生成（进程不存在时静默成功）；顺带取消该 key 待审批项。
 #[tauri::command]
 pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(), String> {
     let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     if let Some(proc) = procs.get_mut(&key) {
-        proc.stdin
-            .write_all(b"{\"type\":\"abort\"}\n")
+        cancel_approvals(proc);
+        let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+        w.write_all(b"{\"type\":\"abort\"}\n")
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
     }
     Ok(())
@@ -467,8 +780,67 @@ pub async fn ai_set_thinking(
             let mut buf = msg.clone();
             buf.push(b'\n');
             // 写失败（进程已死）忽略，读取线程会自行摘除
-            let _ = proc.stdin.write_all(&buf);
+            let _ = proc.stdin.lock().ok().and_then(|mut w| w.write_all(&buf).ok());
         }
     }
+    Ok(())
+}
+
+/// 原子切换项目 AI 模式：先落盘（store.set_ai_mode），再向该项目全部存活 pi 进程热推
+/// `/aishell-mode <mode>`（扩展命令，流式期间也能立即执行）；无存活进程时静默，下次 spawn 生效。
+#[tauri::command]
+pub async fn set_ai_mode(
+    mgr: State<'_, Arc<AiManager>>,
+    project_id: String,
+    mode: String,
+) -> Result<(), String> {
+    let parsed: AiMode = serde_json::from_str(&format!("\"{mode}\""))
+        .map_err(|_| format!("未知 AI 模式: {mode}，可选 suggest|agent|yolo"))?;
+    mgr.store.set_ai_mode(&project_id, parsed)?;
+    let msg = serde_json::to_vec(&json!({
+        "type": "prompt",
+        "message": format!("/aishell-mode {}", parsed.as_str()),
+    }))
+    .map_err(|e| format!("aishell-mode 序列化失败: {e}"))?;
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+    let prefix = format!("{project_id}:");
+    for (key, proc) in procs.iter_mut() {
+        if key.starts_with(&prefix) {
+            let mut buf = msg.clone();
+            buf.push(b'\n');
+            // 写失败（进程已死）忽略，读取线程会自行摘除
+            let _ = proc.stdin.lock().ok().and_then(|mut w| w.write_all(&buf).ok());
+        }
+    }
+    Ok(())
+}
+
+/// 回复待审批动作：仅接受该 key 当前待处理 requestId；重复或过期回复返回中文错误。
+/// confirmed=true 回复批准；false 回复拒绝（扩展以「用户拒绝了该操作」阻止工具）。
+#[tauri::command]
+pub async fn ai_respond_approval(
+    mgr: State<'_, Arc<AiManager>>,
+    key: String,
+    request_id: String,
+    confirmed: bool,
+) -> Result<(), String> {
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+    let Some(proc) = procs.get_mut(&key) else {
+        return Err("pi 进程不存在".to_string());
+    };
+    let mut approvals = proc.approvals.lock().map_err(|e| e.to_string())?;
+    let Some(_tool_call_id) = approvals.remove(&request_id) else {
+        return Err("审批请求已过期或不存在".to_string());
+    };
+    drop(approvals);
+    let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+    let mut buf = serde_json::to_vec(&json!({
+        "type": "extension_ui_response",
+        "id": request_id,
+        "confirmed": confirmed,
+    }))
+    .map_err(|e| e.to_string())?;
+    buf.push(b'\n');
+    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
     Ok(())
 }

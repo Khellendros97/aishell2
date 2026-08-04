@@ -97,6 +97,29 @@ pub enum AuthType {
     Key,
 }
 
+/// AI 助手执行模式（按项目持久化）：
+/// - Suggest：只给建议（现状），写仅限 .aishell/，无删除/命令/SFTP 工具；
+/// - Agent：每次受控工具调用单独审批；
+/// - Yolo：跳过审批自动执行（仍受项目根与服务器 AI 锁约束）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AiMode {
+    #[default]
+    Suggest,
+    Agent,
+    Yolo,
+}
+
+impl AiMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiMode::Suggest => "suggest",
+            AiMode::Agent => "agent",
+            AiMode::Yolo => "yolo",
+        }
+    }
+}
+
 /// 服务器配置。**没有密码字段**——密码只存 keyring（account `server:<id>`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +131,9 @@ pub struct Server {
     pub auth_type: AuthType,
     pub username: String,
     pub key_path: String,
+    /// AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP；旧配置无此字段按未锁定。
+    #[serde(default)]
+    pub locked: bool,
 }
 
 /// Xshell 一键导入结果（camelCase 与前端 src/types.ts 的 XshellImportResult 对齐）。
@@ -142,6 +168,21 @@ pub struct Project {
     pub path: Option<String>,
     pub server_ids: Vec<String>,
     pub quick_commands: Vec<QuickCommand>,
+    /// AI 助手模式（suggest/agent/yolo）；旧配置无此字段按 suggest（不扩大权限）。
+    #[serde(default)]
+    pub ai_mode: AiMode,
+}
+
+/// AI 动作审计记录（随 assistant 消息持久化，历史只读展示）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiActionRecord {
+    pub tool_call_id: String,
+    pub tool: String,
+    pub intent: String,
+    pub summary: String,
+    /// approved | rejected | succeeded | failed（前端按此渲染状态）
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -153,12 +194,30 @@ pub struct TermSnapshot {
     pub ts: i64,
 }
 
+/// 编辑器选区引用：@文件名_起始行_结束行号 标签对应的压缩内容
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileRef {
+    pub id: String,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub content: String,
+    pub ts: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMsg {
     pub role: String,
     pub content: String,
     pub snapshots: Vec<TermSnapshot>,
+    /// 旧会话无此字段时按空处理
+    #[serde(default)]
+    pub file_refs: Vec<FileRef>,
+    /// AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话按空。
+    #[serde(default)]
+    pub actions: Vec<AiActionRecord>,
     pub ts: i64,
 }
 
@@ -371,7 +430,7 @@ impl Store {
     }
 
     /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
-    fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
+    pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
         if let Some(pw) = password {
             self.secrets.set(&keyring_account_server(&server.id), pw)?;
         }
@@ -397,16 +456,22 @@ impl Store {
     }
 
     /// 批量合并 Xshell 导入的服务器：一次 with_state 原子持久化，不触碰 SecretStore。
-    /// ID 已存在且配置完全相同 → unchanged；存在但有变化 → 覆盖并计 updated；不存在 → imported。
+    /// ID 已存在 → 连接配置以导入为准，但**保留现有 AI 锁**（重新导入绝不能解锁）；
+    /// 配置完全一致（含锁位）→ unchanged；存在差异 → 覆盖并计 updated；不存在 → imported。
     pub(crate) fn merge_xshell_servers(&self, servers: &[Server]) -> Result<XshellImportResult, String> {
         let mut result = XshellImportResult::default();
         self.with_state(|s| {
             for sv in servers {
                 match s.servers.iter_mut().find(|x| x.id == sv.id) {
-                    Some(slot) if *slot == *sv => result.unchanged += 1,
                     Some(slot) => {
-                        *slot = sv.clone();
-                        result.updated += 1;
+                        let mut merged = sv.clone();
+                        merged.locked = slot.locked;
+                        if *slot == merged {
+                            result.unchanged += 1;
+                        } else {
+                            *slot = merged;
+                            result.updated += 1;
+                        }
                     }
                     None => {
                         s.servers.push(sv.clone());
@@ -418,7 +483,7 @@ impl Store {
         })
     }
 
-    fn upsert_project(&self, project: Project) -> Result<(), String> {
+    pub fn upsert_project(&self, project: Project) -> Result<(), String> {
         self.with_state(|s| {
             match s.projects.iter_mut().find(|p| p.id == project.id) {
                 Some(slot) => *slot = project,
@@ -523,6 +588,48 @@ impl Store {
             .find(|p| p.id == project_id)
             .and_then(|p| p.path.clone())
     }
+
+    /// 项目配置（clone 返回）；不存在返回 None。
+    pub fn project(&self, project_id: &str) -> Option<Project> {
+        let guard = self.state.lock().ok()?;
+        guard.projects.iter().find(|p| p.id == project_id).cloned()
+    }
+
+    /// 项目 AI 模式；项目不存在返回 None。
+    pub fn ai_mode(&self, project_id: &str) -> Option<AiMode> {
+        let guard = self.state.lock().ok()?;
+        guard
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.ai_mode)
+    }
+
+    /// 原子更新单个项目的 ai_mode（只改目标字段，不回传整个 Project）。
+    pub fn set_ai_mode(&self, project_id: &str, mode: AiMode) -> Result<(), String> {
+        self.with_state(|s| {
+            let p = s
+                .projects
+                .iter_mut()
+                .find(|p| p.id == project_id)
+                .ok_or_else(|| format!("项目不存在：{project_id}"))?;
+            p.ai_mode = mode;
+            Ok(())
+        })
+    }
+
+    /// 原子更新单个服务器的 AI 锁（只改目标字段）。
+    pub fn set_server_locked(&self, id: &str, locked: bool) -> Result<(), String> {
+        self.with_state(|s| {
+            let sv = s
+                .servers
+                .iter_mut()
+                .find(|sv| sv.id == id)
+                .ok_or_else(|| format!("服务器不存在：{id}"))?;
+            sv.locked = locked;
+            Ok(())
+        })
+    }
 }
 
 // ---------------------------------------------------------------- Tauri commands
@@ -615,6 +722,15 @@ pub async fn session_upsert(
     store.session_upsert(&project_id, session)
 }
 
+#[tauri::command]
+pub async fn set_server_locked(
+    store: State<'_, Arc<Store>>,
+    id: String,
+    locked: bool,
+) -> Result<(), String> {
+    store.set_server_locked(&id, locked)
+}
+
 // ---------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -650,6 +766,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "deploy".to_string(),
                     key_path: String::new(),
+                    locked: false,
                 },
                 Server {
                     id: "srv-2".to_string(),
@@ -659,6 +776,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "ubuntu".to_string(),
                     key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
+                    locked: false,
                 },
             ],
             projects: vec![Project {
@@ -671,6 +789,7 @@ mod tests {
                     title: "查看 Git 状态".to_string(),
                     command: "git status && git log --oneline -5".to_string(),
                 }],
+                ai_mode: AiMode::Suggest,
             }],
             sessions: {
                 let mut m = HashMap::new();
@@ -687,6 +806,21 @@ mod tests {
                                 command: "tail -20 app.log".to_string(),
                                 content: "INFO ...".to_string(),
                                 ts: 1_752_000_000_000,
+                            }],
+                            file_refs: vec![FileRef {
+                                id: "ref-1".to_string(),
+                                path: "C:/demo/app.ts".to_string(),
+                                start_line: 3,
+                                end_line: 7,
+                                content: "const a = 1;".to_string(),
+                                ts: 1_752_000_000_001,
+                            }],
+                            actions: vec![AiActionRecord {
+                                tool_call_id: "call-1".to_string(),
+                                tool: "run_command".to_string(),
+                                intent: "查看版本".to_string(),
+                                summary: "执行命令：node -v".to_string(),
+                                status: "succeeded".to_string(),
                             }],
                             ts: 1_752_000_000_001,
                         }],
@@ -709,10 +843,13 @@ mod tests {
             "\"effort\"",
             "\"authType\"",
             "\"keyPath\"",
+            "\"aiMode\"",
+            "\"locked\"",
+            "\"toolCallId\"",
         ] {
             assert!(json.contains(key), "序列化 JSON 缺少字段 {key}: {json}");
         }
-        // 往返一致（含嵌套 sessions / snapshots）
+        // 往返一致（含嵌套 sessions / snapshots / actions）
         let back: AppState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, sample_state());
     }
@@ -867,6 +1004,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    locked: false,
                 },
                 Some("pw-1"),
             )
@@ -881,6 +1019,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
+                    locked: false,
                 },
                 None,
             )
@@ -892,6 +1031,7 @@ mod tests {
                 path: None,
                 server_ids: vec!["srv-c-1".to_string(), "srv-c-2".to_string()],
                 quick_commands: vec![],
+                ai_mode: AiMode::Suggest,
             })
             .unwrap();
 
@@ -923,6 +1063,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            locked: false,
         };
         store.upsert_server(base.clone(), None).unwrap();
         let mut updated = base;
@@ -958,6 +1099,7 @@ mod tests {
                 path: None,
                 server_ids: vec![],
                 quick_commands: vec![],
+                ai_mode: AiMode::Suggest,
             })
             .unwrap();
         store.delete_project("proj-x").unwrap();
@@ -966,6 +1108,16 @@ mod tests {
             "delete_project 应清理 sessions"
         );
         assert!(store.state.lock().unwrap().projects.is_empty());
+    }
+
+    #[test]
+    fn old_chat_msg_without_file_refs_parses_with_empty_vec() {
+        // 旧版会话消息无 fileRefs 字段 → serde(default) 兜底为空（无感升级）
+        let old = r#"{"role":"user","content":"看看日志","snapshots":[{"id":"snap-1","command":"tail -20 app.log","content":"INFO","ts":1752000000000}],"ts":1752000000001}"#;
+        let msg: ChatMsg = serde_json::from_str(old).unwrap();
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.snapshots.len(), 1);
+        assert!(msg.file_refs.is_empty(), "旧数据应兼容为空引用列表");
     }
 
     #[test]
@@ -998,6 +1150,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    locked: false,
                 },
                 Some("pw-a"),
             )
@@ -1009,6 +1162,7 @@ mod tests {
                 path: Some("D:\\proj".to_string()),
                 server_ids: vec![],
                 quick_commands: vec![],
+                ai_mode: AiMode::Agent,
             })
             .unwrap();
 
@@ -1040,6 +1194,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "root".to_string(),
             key_path: String::new(),
+            locked: false,
         };
         // 首次：全部 imported
         let r = store
@@ -1086,6 +1241,7 @@ mod tests {
                 auth_type: AuthType::Password,
                 username: "u".to_string(),
                 key_path: String::new(),
+                locked: false,
             }])
             .unwrap();
         assert_eq!(store.secrets.get("server:xshell-keep").unwrap(), "pw");
@@ -1161,5 +1317,172 @@ mod tests {
         let old = r#"{"workspaceDir":"C:\\ws","llm":{"modelId":"deepseek-chat","baseUrl":"https://api.deepseek.com/v1","effort":"medium"},"theme":"dark"}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
         assert!(!s.search.enabled);
+    }
+
+    #[test]
+    fn legacy_json_defaults_ai_mode_locked_actions() {
+        // 旧版数据缺 aiMode / locked / actions → 分别默认 suggest / false / 空（无感升级，不扩大权限）
+        let old = r#"{
+            "settings": {"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark"},
+            "servers":[{"id":"s1","name":"S","host":"h","port":22,"authType":"password","username":"u","keyPath":""}],
+            "projects":[{"id":"p1","name":"P","path":null,"serverIds":[],"quickCommands":[]}],
+            "sessions":{}
+        }"#;
+        let state: AppState = serde_json::from_str(old).unwrap();
+        assert!(!state.servers[0].locked, "旧服务器默认未锁定");
+        assert_eq!(state.projects[0].ai_mode, AiMode::Suggest, "旧项目默认 suggest");
+        // 旧 ChatMsg 无 actions → 空
+        let old_msg = r#"{"role":"assistant","content":"hi","snapshots":[],"fileRefs":[],"ts":1}"#;
+        let msg: ChatMsg = serde_json::from_str(old_msg).unwrap();
+        assert!(msg.actions.is_empty(), "旧消息默认无动作记录");
+    }
+
+    #[test]
+    fn ai_mode_roundtrips_and_serializes_lowercase() {
+        for (mode, literal) in [
+            (AiMode::Suggest, "\"suggest\""),
+            (AiMode::Agent, "\"agent\""),
+            (AiMode::Yolo, "\"yolo\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), literal);
+            let back: AiMode = serde_json::from_str(literal).unwrap();
+            assert_eq!(back, mode);
+        }
+        assert_eq!(AiMode::default(), AiMode::Suggest);
+        // 非法字面量拒绝（fail-closed）
+        assert!(serde_json::from_str::<AiMode>("\"yolo2\"").is_err());
+        assert!(serde_json::from_str::<AiMode>("\"YOLO\"").is_err());
+    }
+
+    #[test]
+    fn set_ai_mode_updates_only_target_project() {
+        let dir = temp_config_dir("ai-mode");
+        let store = test_store(dir.clone());
+        store
+            .upsert_project(Project {
+                id: "p-a".to_string(),
+                name: "A".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+        store
+            .upsert_project(Project {
+                id: "p-b".to_string(),
+                name: "B".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+
+        store.set_ai_mode("p-a", AiMode::Yolo).unwrap();
+        assert_eq!(store.ai_mode("p-a"), Some(AiMode::Yolo));
+        assert_eq!(
+            store.ai_mode("p-b"),
+            Some(AiMode::Suggest),
+            "只改目标项目，其他项目不受影响"
+        );
+        // 落盘持久化
+        let store2 = test_store(dir);
+        assert_eq!(store2.ai_mode("p-a"), Some(AiMode::Yolo));
+        // 项目不存在 → 中文错误
+        let err = store2.set_ai_mode("p-missing", AiMode::Agent).unwrap_err();
+        assert!(err.contains("项目不存在：p-missing"), "错误串不符: {err}");
+    }
+
+    #[test]
+    fn set_server_locked_updates_only_target_server() {
+        let dir = temp_config_dir("server-lock");
+        let store = test_store(dir.clone());
+        let srv = |id: &str| Server {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+        };
+        store.upsert_server(srv("sv-a"), None).unwrap();
+        store.upsert_server(srv("sv-b"), None).unwrap();
+
+        store.set_server_locked("sv-a", true).unwrap();
+        assert!(store.server("sv-a").unwrap().locked);
+        assert!(
+            !store.server("sv-b").unwrap().locked,
+            "只改目标服务器"
+        );
+        // 落盘持久化
+        let store2 = test_store(dir);
+        assert!(store2.server("sv-a").unwrap().locked);
+        // 解锁
+        store2.set_server_locked("sv-a", false).unwrap();
+        assert!(!store2.server("sv-a").unwrap().locked);
+        // 不存在 → 中文错误
+        let err = store2.set_server_locked("sv-missing", true).unwrap_err();
+        assert!(err.contains("服务器不存在：sv-missing"), "错误串不符: {err}");
+    }
+
+    #[test]
+    fn merge_xshell_servers_keeps_existing_lock() {
+        let dir = temp_config_dir("xshell-merge-lock");
+        let store = test_store(dir);
+        // 预置一条已锁定的服务器
+        store
+            .upsert_server(
+                Server {
+                    id: "xshell-lock".to_string(),
+                    name: "K".to_string(),
+                    host: "h".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    locked: true,
+                },
+                None,
+            )
+            .unwrap();
+        // Xshell 导入的同 ID 服务器 locked=false：连接配置合并，锁必须保留
+        let r = store
+            .merge_xshell_servers(&[Server {
+                id: "xshell-lock".to_string(),
+                name: "K".to_string(),
+                host: "h".to_string(),
+                port: 22,
+                auth_type: AuthType::Password,
+                username: "u".to_string(),
+                key_path: String::new(),
+                locked: false,
+            }])
+            .unwrap();
+        assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 1));
+        assert!(
+            store.server("xshell-lock").unwrap().locked,
+            "重新导入绝不能解锁"
+        );
+        // 连接配置变化时同样保留锁
+        let r = store
+            .merge_xshell_servers(&[Server {
+                id: "xshell-lock".to_string(),
+                name: "K2".to_string(),
+                host: "h".to_string(),
+                port: 2222,
+                auth_type: AuthType::Password,
+                username: "u".to_string(),
+                key_path: String::new(),
+                locked: false,
+            }])
+            .unwrap();
+        assert_eq!((r.imported, r.updated, r.unchanged), (0, 1, 0));
+        let sv = store.server("xshell-lock").unwrap();
+        assert_eq!(sv.name, "K2");
+        assert_eq!(sv.port, 2222);
+        assert!(sv.locked, "配置更新后锁仍保留");
     }
 }

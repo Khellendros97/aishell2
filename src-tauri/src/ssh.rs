@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client;
+use russh::ChannelMsg;
 use tokio::sync::Mutex;
 
 use crate::store;
@@ -146,6 +147,44 @@ impl SshManager {
         russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| format!("初始化 SFTP 会话失败：{e}"))
+    }
+
+    /// 执行单条远程命令并收集 stdout/stderr/退出码（复用底层连接；channel 用完即弃）。
+    /// 空命令在建连前拒绝。AI 远程动作的锁检查在 ai_actions 入口，不在本方法内。
+    pub async fn exec(
+        self: &Arc<Self>,
+        server_id: &str,
+        command: &str,
+    ) -> Result<crate::ai_actions::CommandResult, String> {
+        if command.trim().is_empty() {
+            return Err("命令不能为空".to_string());
+        }
+        let handle = self.get_or_connect(server_id).await?;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("打开服务器会话通道失败：{e}"))?;
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .map_err(|e| format!("启动远端命令失败：{e}"))?;
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut exit_code: Option<i32> = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        Ok(crate::ai_actions::CommandResult {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            exit_code,
+        })
     }
 
     /// 断开并清理该 server 的连接（下次操作自动重连）。
@@ -308,6 +347,7 @@ mod tests {
             auth_type: store::AuthType::Key,
             username: "tester".to_string(),
             key_path: path.to_string(),
+            locked: false,
         }
     }
 

@@ -25,21 +25,5 @@
 /* 重命名行内输入 */
 .wbs-explorer-rename { flex: 1; min-width: 0; height: 22px; padding: 1px 6px; font-size: 12.5px; }
 
-/* ---------- 右键菜单 ---------- */
-.ctx-menu {
-  position: fixed; z-index: 1500; min-width: 200px; padding: 4px;
-  background: var(--bg-2); border: 1px solid var(--border-strong); border-radius: var(--radius-m);
-  box-shadow: var(--shadow-m); display: flex; flex-direction: column;
-}
-.ctx-menu-item {
-  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
-  border: none; background: none; border-radius: var(--radius-s);
-  color: var(--text-0); font-size: 12.5px; font-family: var(--font-ui);
-  cursor: pointer; text-align: left; user-select: none;
-}
-.ctx-menu-item:hover { background: var(--bg-hover); }
-.ctx-menu-item:disabled { color: var(--text-2); cursor: default; }
-.ctx-menu-item:disabled:hover { background: none; }
-.ctx-menu-item.danger { color: var(--red); }
-.ctx-menu-item.danger:hover { background: var(--red-dim); }
-.ctx-menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+/* 右键菜单样式已上移 design.css（.ctx-menu 共享，编辑器通用） */
+

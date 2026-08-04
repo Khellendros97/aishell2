@@ -70,6 +70,37 @@
       flex: none; border-top: 1px solid var(--border);
       padding: 8px; display: flex; flex-direction: column; gap: 6px;
     }
+    /* AI 模式栏（suggest/agent/yolo，按项目持久化） */
+    #ai-mode-bar {
+      display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-2);
+    }
+    #ai-mode-bar .select { height: 22px; width: 88px; font-size: 11px; padding: 0 20px 0 6px; color: var(--text-0); }
+    #ai-mode-bar .ai-mode-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* 动作卡（Agent 审批卡 / YOLO 自动执行卡 / 历史只读审计卡） */
+    .ai-action-card {
+      background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 10px; margin: 6px 0; display: flex; flex-direction: column; gap: 5px;
+    }
+    .ai-action-card .ai-action-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px; }
+    .ai-action-card .ai-action-name { font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+    .ai-action-card .ai-action-intent { font-size: 12px; color: var(--text-1); }
+    .ai-action-card .ai-action-cmd {
+      background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+      padding: 6px 8px; font-family: var(--font-mono); font-size: 11.5px; color: var(--green);
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .ai-action-card .ai-action-actions { display: flex; gap: 6px; }
+    .ai-action-card .ai-action-status { font-size: 11px; color: var(--text-2); display: inline-flex; align-items: center; gap: 4px; }
+    .ai-action-card.succeeded { border-left: 3px solid var(--green); }
+    .ai-action-card.failed { border-left: 3px solid var(--red); }
+    .ai-action-card.rejected { border-left: 3px solid var(--yellow); opacity: 0.75; }
+    /* 历史只读动作卡：默认折叠，点击头部展开/收起 */
+    .ai-action-card[data-collapsible] { cursor: pointer; }
+    .ai-action-card .ai-action-detail { display: flex; flex-direction: column; gap: 5px; }
+    .ai-action-card.collapsed .ai-action-detail { display: none; }
+    .ai-action-toggle { font-size: 10px; color: var(--text-2); margin-left: 4px; }
+
     #ai-chip-row { display: flex; flex-wrap: wrap; gap: 4px; }
     #ai-input-row { display: flex; gap: 6px; align-items: flex-end; }
     #ai-input {
@@ -124,6 +155,15 @@
     </div>
     <div id="ai-chat"></div>
     <div id="ai-input-area">
+      <div id="ai-mode-bar">
+        <span class="ai-mode-label">AI 模式</span>
+        <select id="ai-mode-select" class="select" title="AI 执行模式（按项目持久化）">
+          <option value="suggest">建议</option>
+          <option value="agent">Agent</option>
+          <option value="yolo">YOLO</option>
+        </select>
+        <span class="ai-mode-hint"></span>
+      </div>
       <div id="ai-chip-row"></div>
       <div id="ai-input-row">
         <textarea id="ai-input" placeholder="向 AI 提问，Enter 发送，Shift+Enter 换行"></textarea>
@@ -138,6 +178,113 @@
   const input = el('input');
   const sendBtn = el('send');
   const chipRow = el('chip-row');
+  const modeSelect = el('mode-select');
+  const modeHint = el('mode-hint');
+
+  /* ---------- AI 模式（suggest/agent/yolo，按项目持久化） ---------- */
+  let aiMode = 'suggest';
+  const MODE_HINTS = {
+    suggest: '只给建议，不执行任何操作',
+    agent: '每次操作需要你逐项批准',
+    yolo: '自动执行所有操作（请勿在生产环境开启）',
+  };
+  modeSelect.value = aiMode;
+  modeHint.textContent = MODE_HINTS[aiMode];
+  modeSelect.onchange = async () => {
+    const next = modeSelect.value;
+    if (next === 'yolo') {
+      const ok = await A.confirmDialog({
+        title: '开启 YOLO 模式',
+        message: 'AI助手会获得所有权限并自动执行操作，请勿在生产环境中开启',
+        danger: true,
+        okText: '仍要开启',
+      });
+      if (!ok) { modeSelect.value = aiMode; return; } // 取消 → 回退原模式
+    }
+    aiMode = next;
+    modeHint.textContent = MODE_HINTS[aiMode];
+    A.toast('AI 模式已切换为 ' + (next === 'suggest' ? '建议' : next === 'agent' ? 'Agent' : 'YOLO'), 'success');
+  };
+
+  /* ---------- 动作卡（Agent 逐项审批 / YOLO 自动执行；历史只读复用同一卡片） ---------- */
+  const actionCards = new Map(); // id -> { tool, intent, command, status, summary }
+  let actionSeq = 0;
+  const ACTION_NAMES = {
+    write: '写文件', edit: '编辑文件', delete_path: '删除文件',
+    run_command: '执行命令', sftp_upload: '上传文件', sftp_download: '下载文件',
+  };
+  const ACTION_STATUS = {
+    approving: '等待批准', running: '执行中…', succeeded: '成功',
+    failed: '失败', rejected: '已拒绝',
+  };
+
+  /** 模拟一次动作：Agent 模式先进入 approving（等待批准），YOLO 直接 running 自动完成 */
+  function mockAction({ tool, intent, command }) {
+    const id = 'act-' + (++actionSeq);
+    actionCards.set(id, {
+      tool,
+      intent,
+      command: command || '',
+      summary: intent,
+      status: aiMode === 'yolo' ? 'running' : 'approving',
+    });
+    if (aiMode === 'yolo') {
+      setTimeout(() => {
+        const c = actionCards.get(id);
+        if (c) { c.status = 'succeeded'; renderHistory(); }
+      }, 900);
+    }
+    return id;
+  }
+
+  function renderActionCard(id) {
+    const c = actionCards.get(id);
+    if (!c) return '';
+    const statusText = ACTION_STATUS[c.status] || c.status;
+    // 历史只读卡默认折叠（仅标题+状态），点击展开详情；审批中保持展开
+    const collapsible = c.status !== 'approving';
+    const cls = [
+      c.status === 'succeeded' || c.status === 'failed' || c.status === 'rejected' ? c.status : '',
+      collapsible ? 'collapsed' : '',
+    ].filter(Boolean).join(' ');
+    const toggleHtml = collapsible
+      ? `<span class="ai-action-toggle" title="展开详情">▾</span>`
+      : '';
+    return `
+      <div class="ai-action-card ${cls}"${collapsible ? ` data-collapsible="${id}"` : ''}>
+        <div class="ai-action-head">
+          <span class="ai-action-name">${ACTION_NAMES[c.tool] || c.tool}</span>
+          <span class="ai-action-status">${statusText}${toggleHtml}</span>
+        </div>
+        <div class="ai-action-detail">
+          <div class="ai-action-intent">意图：${escapeHtml(c.intent)}</div>
+          ${c.command ? `<code class="ai-action-cmd">${escapeHtml(c.command)}</code>` : ''}
+          ${c.status === 'approving' ? `
+            <div class="ai-action-actions">
+              <button class="btn small primary" data-act-approve="${id}">批准</button>
+              <button class="btn small" data-act-reject="${id}">拒绝</button>
+            </div>` : ''}
+        </div>
+      </div>`;
+  }
+
+  // 批准 → 执行中 → 1.5s 后成功；拒绝 → 保持拒绝态（命令卡不执行）
+  function approveAction(id) {
+    const c = actionCards.get(id);
+    if (!c || c.status !== 'approving') return;
+    c.status = 'running';
+    renderHistory();
+    setTimeout(() => {
+      const cc = actionCards.get(id);
+      if (cc) { cc.status = 'succeeded'; renderHistory(); }
+    }, 1500);
+  }
+  function rejectAction(id) {
+    const c = actionCards.get(id);
+    if (!c || c.status !== 'approving') return;
+    c.status = 'rejected';
+    renderHistory();
+  }
 
   /* ---------- 会话管理（模块内存储，不持久化） ---------- */
   const sessions = new Map(); // id -> { id, title, messages: [] }
@@ -195,7 +342,12 @@
         `<div class="ai-text">${escapeHtml(m.text)}</div></div>`;
     } else {
       wrap.className = 'ai-msg ai';
-      wrap.innerHTML = `<div class="ai-bubble">${m.html}</div>`;
+      // 历史只读审计：动作卡复用同一渲染，不显示审批按钮（approving 态视为 approved）
+      const actionsHtml = (m.actions || []).map((a) => {
+        const c = actionCards.get(a.id) || { ...a, status: a.status };
+        return renderActionCard(a.id);
+      }).join('');
+      wrap.innerHTML = `<div class="ai-bubble">${m.html}${actionsHtml}</div>`;
     }
     return wrap;
   }
@@ -260,6 +412,18 @@
 
   /* ---------- 建议卡片点击（事件委托） ---------- */
   chat.addEventListener('click', (e) => {
+    const approveBtn = e.target.closest('[data-act-approve]');
+    if (approveBtn) { approveAction(approveBtn.dataset.actApprove); return; }
+    const rejectBtn = e.target.closest('[data-act-reject]');
+    if (rejectBtn) { rejectAction(rejectBtn.dataset.actReject); return; }
+    /* 历史动作卡：点击切换折叠/展开 */
+    const actionCard = e.target.closest('[data-collapsible]');
+    if (actionCard && !e.target.closest('button')) {
+      actionCard.classList.toggle('collapsed');
+      const toggle = actionCard.querySelector('.ai-action-toggle');
+      if (toggle) toggle.textContent = actionCard.classList.contains('collapsed') ? '▾' : '▴';
+      return;
+    }
     const card = e.target.closest('[data-action]');
     if (card) {
       if (card.dataset.action === 'paste') {
@@ -398,7 +562,21 @@
 
     const s = sessions.get(sid);
     if (!s) return;
-    s.messages.push({ role: 'ai', html: renderAI(generateReply(p.text, p.snaps)) });
+    const reply = generateReply(p.text, p.snaps);
+    const actions = [];
+    // 非建议模式：回复中的每条命令先以动作卡呈现（Agent 需批准，YOLO 自动执行）
+    if (aiMode !== 'suggest') {
+      const re = /```command\r?\n([\s\S]*?)(?:```|$)/g;
+      let m;
+      while ((m = re.exec(reply))) {
+        actions.push(mockAction({
+          tool: 'run_command',
+          intent: '执行用户请求的命令',
+          command: m[1].replace(/\r?\n$/, ''),
+        }));
+      }
+    }
+    s.messages.push({ role: 'ai', html: renderAI(reply), actions });
     if (activeSessionId === sid) renderHistory();
   }
 

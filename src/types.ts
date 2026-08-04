@@ -34,6 +34,8 @@ export interface Server {
   authType: AuthType;
   username: string;
   keyPath: string;
+  /** AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP */
+  locked: boolean;
 }
 
 export interface QuickCommand {
@@ -42,12 +44,26 @@ export interface QuickCommand {
   command: string;
 }
 
+/** 与 store.rs AiMode serde lowercase 对齐 */
+export type AiMode = 'suggest' | 'agent' | 'yolo';
+
 export interface Project {
   id: string;
   name: string;
   path: string | null;
   serverIds: string[];
   quickCommands: QuickCommand[];
+  /** AI 助手模式；旧数据无此字段按 suggest */
+  aiMode: AiMode;
+}
+
+/** AI 动作审计记录（随 assistant 消息持久化，历史只读展示） */
+export interface AiActionRecord {
+  toolCallId: string;
+  tool: string;
+  intent: string;
+  summary: string;
+  status: 'approved' | 'rejected' | 'succeeded' | 'failed';
 }
 
 export interface TermSnapshot {
@@ -57,10 +73,23 @@ export interface TermSnapshot {
   ts: number;
 }
 
+/** 编辑器选区引用：UI 以 @文件名_起始行_结束行号 标签呈现，发送时展开为内容 */
+export interface FileRef {
+  id: string;
+  path: string;
+  startLine: number;
+  endLine: number;
+  content: string;
+  ts: number;
+}
+
 export interface ChatMsg {
   role: 'user' | 'assistant';
   content: string;
   snapshots: TermSnapshot[];
+  fileRefs: FileRef[];
+  /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
+  actions: AiActionRecord[];
   ts: number;
 }
 
