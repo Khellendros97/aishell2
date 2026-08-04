@@ -48,10 +48,12 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
         <div id="sidebar-head"><span id="sidebar-title">文件资源管理器</span><span id="sidebar-actions"></span></div>
         <div id="sidebar-content"></div>
       </div>
+      <div id="sidebar-resizer" class="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整左侧边栏宽度" tabindex="0"></div>
       <div id="center">
         <div id="tab-bar"></div>
         <div id="tab-content"></div>
       </div>
+      <div id="ai-resizer" class="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整 AI 面板宽度" tabindex="0"></div>
       <div id="ai-panel"></div>
     </div>`);
 
@@ -61,6 +63,77 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
   const aiPanel = root.querySelector('#ai-panel') as HTMLElement;
   const tabBar = root.querySelector('#tab-bar') as HTMLElement;
   const tabContent = root.querySelector('#tab-content') as HTMLElement;
+  const workbench = root.querySelector('#workbench') as HTMLElement;
+  const sidebar = root.querySelector('#sidebar') as HTMLElement;
+  const sidebarResizer = root.querySelector('#sidebar-resizer') as HTMLElement;
+  const aiResizer = root.querySelector('#ai-resizer') as HTMLElement;
+  const resizeCleanups: Array<() => void> = [];
+
+  function bindPanelResize(handle: HTMLElement, panel: HTMLElement, side: 'left' | 'right'): void {
+    const minimum = side === 'left' ? 180 : 280;
+    const maximum = side === 'left' ? 520 : 560;
+    const property = side === 'left' ? '--sidebar-w' : '--ai-panel-w';
+    let dragging = false;
+    let startX = 0;
+    let startWidth = 0;
+
+    const clampWidth = (width: number): number => {
+      const occupiedByOther = activityBar.offsetWidth
+        + (side === 'left' ? aiPanel.offsetWidth : sidebar.offsetWidth)
+        + sidebarResizer.offsetWidth + aiResizer.offsetWidth;
+      const availableMaximum = Math.max(minimum, workbench.clientWidth - occupiedByOther - 360);
+      return Math.round(Math.max(minimum, Math.min(maximum, Math.min(width, availableMaximum))));
+    };
+
+    const applyWidth = (width: number): void => {
+      const next = clampWidth(width);
+      workbench.style.setProperty(property, `${next}px`);
+      handle.setAttribute('aria-valuenow', String(next));
+    };
+
+    const onPointerMove = (event: PointerEvent): void => {
+      if (!dragging) return;
+      const delta = event.clientX - startX;
+      applyWidth(startWidth + (side === 'left' ? delta : -delta));
+    };
+    const onPointerUp = (): void => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove('active');
+      document.body.classList.remove('wb-resizing');
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+    const onPointerDown = (event: PointerEvent): void => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      dragging = true;
+      startX = event.clientX;
+      startWidth = panel.getBoundingClientRect().width;
+      handle.classList.add('active');
+      document.body.classList.add('wb-resizing');
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerup', onPointerUp);
+    };
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      const direction = event.key === 'ArrowRight' ? 1 : -1;
+      applyWidth(panel.getBoundingClientRect().width + direction * (side === 'left' ? 16 : -16));
+    };
+
+    handle.addEventListener('pointerdown', onPointerDown);
+    handle.addEventListener('keydown', onKeyDown);
+    applyWidth(panel.getBoundingClientRect().width);
+    resizeCleanups.push(() => {
+      onPointerUp();
+      handle.removeEventListener('pointerdown', onPointerDown);
+      handle.removeEventListener('keydown', onKeyDown);
+    });
+  }
+
+  bindPanelResize(sidebarResizer, sidebar, 'left');
+  bindPanelResize(aiResizer, aiPanel, 'right');
 
   initWorkbench({ tabBar, tabContent });
 
@@ -94,6 +167,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
   function setAiVisible(visible: boolean): void {
     if (!aiMounted) { mountAiPanel(aiPanel); aiMounted = true; }
     aiPanel.classList.toggle('hidden', !visible);
+    aiResizer.classList.toggle('hidden', !visible);
     activityBar.querySelector('.ai-toggle')?.classList.toggle('active', visible);
   }
 
@@ -126,6 +200,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     toast('没有可用项目，请先在欢迎页创建项目', 'error');
     navigate('#/welcome');
     return () => {
+      resizeCleanups.forEach((cleanup) => cleanup());
       getTabs().forEach((t) => closeTab(t.id));
     };
   }
@@ -144,8 +219,9 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
   });
 
   return () => {
+    resizeCleanups.forEach((cleanup) => cleanup());
     // 关闭全部标签（closeTab 触发各渲染器 onClose → term_close 等后端清理）
     getTabs().forEach((t) => closeTab(t.id));
-    // bus 监听无 off API：已用 root.isConnected 守卫，页面卸载后为 no-op
+    // bus 监听无 off API：已用 root.isConnected 守卫，换页后自动失效
   };
 }

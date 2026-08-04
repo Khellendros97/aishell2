@@ -30,6 +30,20 @@
 }
 #sidebar-content { flex: 1; overflow-y: auto; }
 
+/* 左右面板可调宽分隔条；支持鼠标拖拽与键盘方向键微调 */
+.wb-resize-handle {
+  position: relative; z-index: 4; flex: none; width: 6px; height: 100%;
+  cursor: col-resize; touch-action: none; background: transparent;
+  transition: background 0.12s;
+}
+.wb-resize-handle::after {
+  content: ''; position: absolute; inset: 0 2px; background: var(--border-strong); opacity: 0;
+  transition: opacity 0.12s;
+}
+.wb-resize-handle:hover, .wb-resize-handle.active { background: var(--bg-hover); }
+.wb-resize-handle:hover::after, .wb-resize-handle.active::after { opacity: 1; }
+body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-select: none !important; }
+
 /* 中央工作区 */
 #center { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg-0); }
 #tab-bar {

@@ -30,6 +30,17 @@
   }
   #sidebar-content { flex: 1; overflow-y: auto; }
 
+  /* 左右面板可调宽分隔条 */
+  .wb-resize-handle {
+    position: relative; z-index: 4; flex: none; width: 6px; height: 100%;
+    cursor: col-resize; touch-action: none; background: transparent;
+  }
+  .wb-resize-handle::after {
+    content: ''; position: absolute; inset: 0 2px; background: var(--border-strong); opacity: 0;
+  }
+  .wb-resize-handle:hover::after, .wb-resize-handle.active::after { opacity: 1; }
+  body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-select: none !important; }
+
   /* 中央工作区 */
   #center { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg-0); }
   #tab-bar {
@@ -70,12 +81,64 @@
     <div id="sidebar-head"><span id="sidebar-title">文件资源管理器</span><span id="sidebar-actions"></span></div>
     <div id="sidebar-content"></div>
   </div>
+  <div id="sidebar-resizer" class="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整左侧边栏宽度" tabindex="0"></div>
   <div id="center">
     <div id="tab-bar"></div>
     <div id="tab-content"></div>
   </div>
+  <div id="ai-resizer" class="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整 AI 面板宽度" tabindex="0"></div>
   <div id="ai-panel"></div>
 </div>
+
+<script>
+  (() => {
+    const root = document.getElementById('workbench');
+    const activity = document.getElementById('activity-bar');
+    if (!root || !activity) return;
+    const bind = (handle, panel, side) => {
+      if (!handle || !panel) return;
+      const min = side === 'left' ? 180 : 280;
+      const max = side === 'left' ? 520 : 560;
+      const prop = side === 'left' ? '--sidebar-w' : '--ai-panel-w';
+      const apply = (value) => {
+        const other = side === 'left' ? document.getElementById('ai-panel') : document.getElementById('sidebar');
+        const handles = [...root.querySelectorAll('.wb-resize-handle')].reduce((sum, el) => sum + el.offsetWidth, 0);
+        const upper = Math.max(min, root.clientWidth - activity.offsetWidth - (other ? other.offsetWidth : 0) - handles - 360);
+        const width = Math.round(Math.max(min, Math.min(max, Math.min(value, upper))));
+        root.style.setProperty(prop, width + 'px');
+        handle.setAttribute('aria-valuenow', String(width));
+      };
+      let startX = 0;
+      let startWidth = 0;
+      const move = (e) => apply(startWidth + (side === 'left' ? e.clientX - startX : startX - e.clientX));
+      const up = () => {
+        handle.classList.remove('active');
+        document.body.classList.remove('wb-resizing');
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+      };
+      handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        startX = e.clientX;
+        startWidth = panel.getBoundingClientRect().width;
+        handle.classList.add('active');
+        document.body.classList.add('wb-resizing');
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', up);
+      });
+      handle.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        e.preventDefault();
+        const delta = e.key === 'ArrowRight' ? 16 : -16;
+        apply(panel.getBoundingClientRect().width + (side === 'left' ? delta : -delta));
+      });
+      apply(panel.getBoundingClientRect().width);
+    };
+    bind(document.getElementById('sidebar-resizer'), document.getElementById('sidebar'), 'left');
+    bind(document.getElementById('ai-resizer'), document.getElementById('ai-panel'), 'right');
+  })();
+</script>
 
 <script src="workbench-core.js"></script>
 <script src="workbench-sidebar.js"></script>

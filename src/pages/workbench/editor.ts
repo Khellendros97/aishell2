@@ -9,22 +9,53 @@
 import { EditorState, Prec, StateEffect, Compartment, type Extension } from '@codemirror/state';
 import { EditorView, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab, selectAll } from '@codemirror/commands';
-import { LanguageDescription, indentUnit, syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
+import { HighlightStyle, LanguageDescription, indentUnit, syntaxHighlighting } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
-import { oneDark } from '@codemirror/theme-one-dark';
+import { tags } from '@lezer/highlight';
+import { oneDarkTheme } from '@codemirror/theme-one-dark';
 import { fsRead, fsWrite } from '../../api';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
 import type { FileRef } from '../../types';
-import { bus, registerRenderer, setTabTitle, Workbench, type Tab } from './core';
+import { registerRenderer, bus, setTabTitle, Workbench, type Tab } from './core';
 import { currentTheme, onThemeChange } from '../../theme';
 import './editor.css';
 
-/* CodeMirror 主题随全局主题切换:Compartment 运行时重配,亮色用 CM 默认亮色(样式见 editor.css) */
+/* 两套编辑器语法色均避开默认的纯蓝 #0000ff，保证浅色/深色背景上的对比度。 */
+const darkHighlightStyle = HighlightStyle.define([
+  { tag: tags.keyword, color: '#ff8bd4' },
+  { tag: [tags.name, tags.deleted, tags.character, tags.propertyName, tags.macroName], color: '#ff9f9f' },
+  { tag: [tags.function(tags.variableName), tags.labelName], color: '#8bd5ff' },
+  { tag: [tags.color, tags.constant(tags.name), tags.standard(tags.name)], color: '#ffd580' },
+  { tag: [tags.definition(tags.name), tags.separator], color: '#f0f3f6' },
+  { tag: [tags.typeName, tags.className, tags.number, tags.changed, tags.annotation, tags.modifier, tags.self, tags.namespace], color: '#ffe08a' },
+  { tag: [tags.operator, tags.operatorKeyword, tags.url, tags.escape, tags.regexp, tags.link, tags.special(tags.string)], color: '#80d8ff' },
+  { tag: [tags.meta, tags.comment], color: '#8d99aa' },
+  { tag: [tags.atom, tags.bool, tags.special(tags.variableName)], color: '#ffc777' },
+  { tag: [tags.processingInstruction, tags.string, tags.inserted], color: '#a6e3a1' },
+  { tag: tags.invalid, color: '#ff6b6b' },
+  { tag: tags.link, color: '#8bd5ff', textDecoration: 'underline' },
+], { themeType: 'dark' });
+
+const lightHighlightStyle = HighlightStyle.define([
+  { tag: tags.keyword, color: '#7a3e9d' },
+  { tag: [tags.name, tags.deleted, tags.character, tags.propertyName, tags.macroName], color: '#a31515' },
+  { tag: [tags.function(tags.variableName), tags.labelName], color: '#075985' },
+  { tag: [tags.color, tags.constant(tags.name), tags.standard(tags.name)], color: '#7a4f01' },
+  { tag: [tags.definition(tags.name), tags.separator], color: '#374151' },
+  { tag: [tags.typeName, tags.className, tags.number, tags.changed, tags.annotation, tags.modifier, tags.self, tags.namespace], color: '#7c4a03' },
+  { tag: [tags.operator, tags.operatorKeyword, tags.url, tags.escape, tags.regexp, tags.link, tags.special(tags.string)], color: '#006d77' },
+  { tag: [tags.meta, tags.comment], color: '#5f6b7a' },
+  { tag: [tags.atom, tags.bool, tags.special(tags.variableName)], color: '#8a4b08' },
+  { tag: [tags.processingInstruction, tags.string, tags.inserted], color: '#18794e' },
+  { tag: tags.invalid, color: '#b42318' },
+  { tag: tags.link, color: '#0b5cad', textDecoration: 'underline' },
+], { themeType: 'light' });
+
+/* CodeMirror 主题随全局主题切换：两套高亮配色都显式重配。 */
 const cmTheme = new Compartment();
-const cmThemeExt = () => (currentTheme() === 'dark' ? oneDark : []);
-onThemeChange(() => {
-  entries.forEach((e) => e.view.dispatch({ effects: cmTheme.reconfigure(cmThemeExt()) }));
-});
+const cmThemeExt = (): Extension => currentTheme() === 'dark'
+  ? [oneDarkTheme, syntaxHighlighting(darkHighlightStyle)]
+  : syntaxHighlighting(lightHighlightStyle);
 
 /** 单个编辑器标签的运行状态 */
 interface EditorEntry {
@@ -43,6 +74,9 @@ interface EditorEntry {
 }
 
 const entries = new Map<string, EditorEntry>();
+onThemeChange(() => {
+  entries.forEach((e) => e.view.dispatch({ effects: cmTheme.reconfigure(cmThemeExt()) }));
+});
 
 /* ---------- 保存：防抖自动保存与 Ctrl+S / 关闭落盘共用，写盘串行化 ---------- */
 function queueSave(entry: EditorEntry, silent: boolean): Promise<void> {
@@ -216,8 +250,6 @@ registerRenderer('editor', (container, tab) => {
         history(),
         indentUnit.of('  '),
         EditorState.tabSize.of(2),
-        // 亮色高亮配色常驻（深色由 oneDark 覆盖；无此扩展时亮色主题语言解析不出颜色）
-        syntaxHighlighting(defaultHighlightStyle),
         // Ctrl+S：立即保存（取消防抖计时器直接写）；Ctrl+L：框选内容添加到 AI 对话
         Prec.highest(keymap.of([
           {

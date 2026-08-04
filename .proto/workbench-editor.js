@@ -28,7 +28,7 @@
       '.c-string{color:var(--green);}',
       '.c-keyword{color:var(--purple);}',
       '.c-number{color:var(--yellow);}',
-      '.c-accent{color:var(--accent);}',
+      '.c-accent{color:var(--syntax-accent);}',
     ].join('\n');
     document.head.appendChild(st);
   }
