@@ -4,10 +4,11 @@
  * 并 aiKillProject 清理该项目的 pi 进程。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { ChatMsg, ChatSession, Project, TermSnapshot } from '../../types';
+import type { AppState, ChatMsg, ChatSession, LlmConfig, Project, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
 import {
-  aiAbort, aiChat, aiKillProject, onAiEvent, sessionUpsert, sessionsGet,
+  aiAbort, aiChat, aiKillProject, aiSetThinking, getState, onAiEvent, saveSettings,
+  sessionUpsert, sessionsGet,
   type AiEvent,
 } from '../../api';
 import { Workbench, getActiveTerminalApi } from './core';
@@ -21,6 +22,16 @@ const STYLE = `
   padding: 0 8px; border-bottom: 1px solid var(--border);
 }
 #ai-session-bar .select { flex: 1; height: 26px; font-size: 12px; padding: 0 28px 0 8px; }
+/* 思考强度快捷入口（输入区上方一行） */
+#ai-effort-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px 0; font-size: 11px; color: var(--text-2);
+}
+#ai-effort-bar .ai-effort-label { display: inline-flex; align-items: center; gap: 4px; }
+#ai-effort-bar .select {
+  height: 22px; width: 78px; font-size: 11px; padding: 0 20px 0 6px;
+  color: var(--text-0);
+}
 #ai-chat {
   flex: 1; overflow-y: auto; padding: 12px 10px;
   display: flex; flex-direction: column; gap: 10px;
@@ -139,6 +150,9 @@ let newSessionBtn: HTMLButtonElement;
 let input: HTMLTextAreaElement;
 let sendBtn: HTMLButtonElement;
 let chipRow: HTMLElement;
+let effortSelect: HTMLSelectElement;
+/** 思考强度切换防抖：快速连续切换只允许一个保存流程 */
+let effortSaving = false;
 
 /* ---------- 面板挂载 / 卸载 ---------- */
 export function mountAiPanel(container: HTMLElement): void {
@@ -156,6 +170,14 @@ export function mountAiPanel(container: HTMLElement): void {
     </div>
     <div id="ai-chat"></div>
     <div id="ai-input-area">
+      <div id="ai-effort-bar">
+        <span class="ai-effort-label">${icon('zap')} 思考强度</span>
+        <select id="ai-effort-select" class="select" title="思考强度（立即生效）">
+          <option value="low">low</option>
+          <option value="high">high</option>
+          <option value="max">max</option>
+        </select>
+      </div>
       <div id="ai-chip-row"></div>
       <div id="ai-input-row">
         <textarea id="ai-input" placeholder="向 AI 提问，Enter 发送，Shift+Enter 换行"></textarea>
@@ -170,6 +192,7 @@ export function mountAiPanel(container: HTMLElement): void {
   input = el('input') as HTMLTextAreaElement;
   sendBtn = el('send') as HTMLButtonElement;
   chipRow = el('chip-row');
+  effortSelect = el('effort-select') as HTMLSelectElement;
 
   /* 容器被移除（工作台页面卸载）→ 取消订阅、置空 Workbench.ai、杀掉本项目 pi 进程 */
   observer = new MutationObserver(() => {
@@ -181,6 +204,7 @@ export function mountAiPanel(container: HTMLElement): void {
 
   bindEvents();
   void loadSessions();
+  void loadEffort();
 }
 
 function cleanup(): void {
@@ -220,7 +244,8 @@ async function loadSessions(): Promise<void> {
   try {
     const list = await sessionsGet(project.id);
     for (const s of list) sessions.set(s.id, s);
-    if (list.length > 0) activeSessionId = list[0].id;
+    // Rust 按插入序返回（旧→新，session_upsert 原地更新不换位）：默认选最新的会话
+    if (list.length > 0) activeSessionId = list[list.length - 1].id;
   } catch (err) {
     toast(`会话加载失败：${String(err)}`, 'error');
   }
@@ -240,6 +265,35 @@ async function subscribe(key: string): Promise<void> {
     unlisten = await onAiEvent(key, (ev) => handleEvent(key, ev));
   } catch (err) {
     console.error('AI 事件订阅失败:', err);
+  }
+}
+
+/** 读取当前思考强度回显到快捷入口（后端 settings 为事实源） */
+async function loadEffort(): Promise<void> {
+  try {
+    const st = await getState();
+    effortSelect.value = st.settings.llm.effort || 'low';
+  } catch {
+    /* 读取失败保持默认 low */
+  }
+}
+
+/** 快捷切换思考强度：先落盘配置，再动态下发到存活 pi 进程（set_thinking_level，不打断生成、不丢上下文） */
+async function switchEffort(level: LlmConfig['effort']): Promise<void> {
+  if (effortSaving || !project) return;
+  effortSaving = true;
+  let st: AppState | null = null;
+  try {
+    st = await getState();
+    st.settings.llm.effort = level;
+    await saveSettings(st.settings, null, null);
+    await aiSetThinking(project.id, level);
+    toast(`思考强度已切换为 ${level}`, 'success');
+  } catch (err) {
+    effortSelect.value = st?.settings.llm.effort ?? 'low';
+    toast(`切换思考强度失败: ${String(err)}`, 'error');
+  } finally {
+    effortSaving = false;
   }
 }
 
@@ -607,4 +661,7 @@ function bindEvents(): void {
     }
   });
   sendBtn.onclick = send;
+  effortSelect.onchange = () => {
+    void switchEffort(effortSelect.value as LlmConfig['effort']);
+  };
 }

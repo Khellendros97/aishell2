@@ -88,6 +88,7 @@ pub fn run() {
             ai::ai_chat,
             ai::ai_abort,
             ai::ai_kill_project,
+            ai::ai_set_thinking,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

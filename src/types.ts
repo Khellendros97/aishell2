@@ -5,12 +5,19 @@
 export interface LlmConfig {
   modelId: string;
   baseUrl: string;
-  effort: 'low' | 'medium' | 'high';
+  /** v4 系列思考档位；旧配置的 medium 后端已兼容映射为 low */
+  effort: 'low' | 'high' | 'max';
+}
+
+export interface SearchConfig {
+  enabled: boolean;
 }
 
 export interface Settings {
   workspaceDir: string | null;
   llm: LlmConfig;
+  /** 联网搜索配置；旧配置无此字段时按关闭处理 */
+  search: SearchConfig;
   theme: Theme;
 }
 

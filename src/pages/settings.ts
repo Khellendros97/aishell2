@@ -8,6 +8,7 @@ import type { AppState, LlmConfig, Server, Theme } from '../types';
 import { deleteServer, getState, importXshellSessions, openDialog, saveSettings, setTheme, upsertServer } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../theme';
 import type { PageRender } from '../main';
 import './settings.css';
@@ -63,7 +64,7 @@ export const renderSettings: PageRender = (root, params) => {
             <legend>大模型配置</legend>
             <div class="field">
               <label>模型 ID</label>
-              <input id="f-model-id" class="input" placeholder="deepseek-chat">
+              <input id="f-model-id" class="input" placeholder="deepseek-v4-flash">
             </div>
             <div class="field">
               <label>Base URL</label>
@@ -75,14 +76,31 @@ export const renderSettings: PageRender = (root, params) => {
                 <input id="f-api-key" class="input mono" type="password" placeholder="已保存则不显示，留空表示不修改">
                 <button id="btn-toggle-key" class="icon-btn" title="显示 / 隐藏">${icon('eye')}</button>
               </div>
+              <div class="hint">获取 API Key：<a href="https://platform.deepseek.com/api_keys" data-open-url="https://platform.deepseek.com/api_keys">platform.deepseek.com/api_keys</a></div>
             </div>
             <div class="field">
               <label>思考强度</label>
               <select id="f-effort" class="select">
                 <option value="low">low</option>
-                <option value="medium">medium</option>
                 <option value="high">high</option>
+                <option value="max">max</option>
               </select>
+            </div>
+          </fieldset>
+          <fieldset class="llm-group">
+            <legend>联网搜索</legend>
+            <div class="field">
+              <label>启用 AI 联网搜索</label>
+              <input id="f-search-enabled" type="checkbox">
+              <div class="hint">启用后 AI 助手可通过 Brave Search 获取最新信息（问时效性问题时自动使用）</div>
+            </div>
+            <div class="field">
+              <label>Brave Search API Key</label>
+              <div class="input-row">
+                <input id="f-brave-key" class="input mono" type="password" placeholder="已保存则不显示，留空表示不修改">
+                <button id="btn-toggle-brave" class="icon-btn" title="显示 / 隐藏">${icon('eye')}</button>
+              </div>
+              <div class="hint">免费额度 2000 次/月，<a href="https://api-dashboard.search.brave.com/app/keys" data-open-url="https://api-dashboard.search.brave.com/app/keys">获取 Brave Search API Key</a></div>
             </div>
           </fieldset>
           <div class="form-actions">
@@ -171,10 +189,12 @@ export const renderSettings: PageRender = (root, params) => {
   const fBaseUrl = root.querySelector('#f-base-url') as HTMLInputElement;
   const fApiKey = root.querySelector('#f-api-key') as HTMLInputElement;
   const fEffort = root.querySelector('#f-effort') as HTMLSelectElement;
+  const fSearchEnabled = root.querySelector('#f-search-enabled') as HTMLInputElement;
+  const fBraveKey = root.querySelector('#f-brave-key') as HTMLInputElement;
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'medium' }, theme: 'dark' },
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark' },
     servers: [], projects: [], sessions: {},
   };
 
@@ -420,7 +440,9 @@ export const renderSettings: PageRender = (root, params) => {
     fModelId.value = s.llm.modelId || '';
     fBaseUrl.value = s.llm.baseUrl || '';
     fApiKey.value = ''; // 已保存的 key 永不回传，留空 = 不修改
-    fEffort.value = s.llm.effort || 'medium';
+    fEffort.value = s.llm.effort || 'low';
+    fSearchEnabled.checked = s.search?.enabled ?? false;
+    fBraveKey.value = ''; // 同上：Brave key 永不回传
   }
 
   // Workspace 浏览…：真实目录选择
@@ -436,6 +458,25 @@ export const renderSettings: PageRender = (root, params) => {
     fApiKey.type = visible ? 'password' : 'text';
     btnToggleKey.innerHTML = visible ? icon('eye') : icon('eyeOff');
     btnToggleKey.title = visible ? '显示 / 隐藏' : '隐藏 / 显示';
+  });
+
+  // Brave API Key 显隐切换
+  const btnToggleBrave = root.querySelector('#btn-toggle-brave') as HTMLElement;
+  btnToggleBrave.addEventListener('click', () => {
+    const visible = fBraveKey.type === 'text';
+    fBraveKey.type = visible ? 'password' : 'text';
+    btnToggleBrave.innerHTML = visible ? icon('eye') : icon('eyeOff');
+    btnToggleBrave.title = visible ? '显示 / 隐藏' : '隐藏 / 显示';
+  });
+
+  // hint 链接：外部浏览器打开（webview 内点击导航会离开页面，必须拦截）
+  root.querySelectorAll<HTMLElement>('a[data-open-url]').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      const url = el.dataset.openUrl;
+      if (!url) return;
+      void openUrl(url).catch((err) => toast(`无法打开链接: ${String(err)}`, 'error'));
+    });
   });
 
   /* 主题选择即时生效(与顶栏按钮同语义),保存按钮不再负责主题 */
@@ -462,10 +503,11 @@ export const renderSettings: PageRender = (root, params) => {
       effort: fEffort.value as LlmConfig['effort'],
     };
     const apiKey = fApiKey.value.trim();
+    const braveKey = fBraveKey.value.trim();
     /* theme 带内存当前值:避免本页打开期间顶栏切换的主题被表单旧值覆盖 */
-    const settings = { workspaceDir, llm, theme: currentTheme() };
+    const settings = { workspaceDir, llm, search: { enabled: fSearchEnabled.checked }, theme: currentTheme() };
     try {
-      await saveSettings(settings, apiKey || null);
+      await saveSettings(settings, apiKey || null, braveKey || null);
       db.settings = settings;
       toast('设置已保存', 'success');
     } catch (err) {
@@ -479,6 +521,8 @@ export const renderSettings: PageRender = (root, params) => {
       db = s;
       renderServers();
       loadSystemSettings();
+      // ?new=server：服务器面板「新建」快捷入口直达——数据就绪后立即弹出新建模态框
+      if (params.get('new') === 'server') openServerModal(null);
     })
     .catch((err) => toast(String(err), 'error'));
 

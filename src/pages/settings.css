@@ -78,3 +78,11 @@
 }
 
 .settings-page .form-actions { margin-top: 18px; display: flex; justify-content: flex-end; }
+
+/* hint 内超链接：外部浏览器打开（点击事件在 settings.ts 拦截并 openUrl） */
+.settings-page .hint a {
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.settings-page .hint a:hover { opacity: 0.85; }

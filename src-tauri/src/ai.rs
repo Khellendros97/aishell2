@@ -2,8 +2,9 @@
 //! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)`；
 //! 事件 `ai:event:<key>` payload `{type:"delta",text}|{type:"tool",tool,label}|{type:"segment"}|{type:"done"}|{type:"error",message}`；
 //! key = "<projectId>:<sessionId>"，每 key 一个长驻 pi 进程。
-//! 工具边界：read/grep/find/ls/write/edit 白名单（无 bash），由 pi_ext/aishell-guard.ts
-//! 门控——写仅限项目 .aishell/ 目录，读仅限项目目录内；扩展每次 spawn 重写进 agent_dir。
+//! 工具边界：read/grep/find/ls/write/edit/web_search 白名单（无 bash），由 pi_ext/aishell-guard.ts
+//! 门控——写仅限项目 .aishell/ 目录，读仅限项目目录内；web_search 为只读联网搜索（Brave，
+//! 见 pi_ext/aishell-search.ts）；扩展每次 spawn 重写进 agent_dir。
 //!
 //! 与计划唯一偏差：`procs` 字段为 `Arc<Mutex<HashMap<...>>>`（计划给的是裸 `Mutex`）——
 //! 因为 stdout 读取线程必须在进程退出/管道破裂时「从 map 摘除」条目，裸 Mutex 无法被线程共享。
@@ -26,6 +27,7 @@ const SYSTEM_PROMPT: &str = "你是 AIShell 的内置终端助手。用户围绕
 - read/grep/find/ls：只能读当前项目目录内的文件，项目外一律不可读。
 - write/edit：只能写项目下 .aishell/ 目录内的文件（可用于保存笔记、记忆、计划；父目录不存在会自动创建）。
 - 没有 bash 工具，不能执行任何命令。
+- web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
 - 用户要求修改项目源码等 .aishell/ 之外的文件时：不要调用 write/edit（会被拒），改为给出命令或补丁文本让用户自行处理。
 输出协议（必须严格遵守）：
 1. 建议用户在终端执行的命令：每条命令单独放在一个 ```command 围栏代码块中，块内只有命令本身，不加解释。
@@ -35,6 +37,12 @@ const SYSTEM_PROMPT: &str = "你是 AIShell 的内置终端助手。用户围绕
 
 /// 门控扩展源码（spawn 时重写进 agent_dir，与 models.json 同模式）。
 const GUARD_EXT: &str = include_str!("pi_ext/aishell-guard.ts");
+
+/// 联网搜索扩展源码（web_search 工具，Brave Search；spawn 时重写进 agent_dir）。
+const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
+
+/// 默认工具白名单；settings.search.enabled 时追加 web_search。
+const BASE_TOOLS: &str = "read,grep,find,ls,write,edit";
 
 /// 单个 key 的 pi 进程。
 pub struct AiProc {
@@ -66,6 +74,11 @@ impl AiManager {
     fn write_models_json(&self) -> Result<(), String> {
         let cfg = self.store.llm_config();
         let model_id = &cfg.model_id;
+        // v4 系列与 reasoner 支持思考档位；deepseek-chat 等旧模型不支持（pi 会强制 thinking off）
+        let reasoning = {
+            let id = model_id.to_lowercase();
+            id.contains("reasoner") || id.contains("v4")
+        };
         let models = json!({
             "providers": {
                 "deepseek": {
@@ -75,7 +88,7 @@ impl AiManager {
                     "models": [{
                         "id": model_id,
                         "name": model_id,
-                        "reasoning": model_id.to_lowercase().contains("reasoner"),
+                        "reasoning": reasoning,
                         "contextWindow": 64000,
                     }],
                 }
@@ -113,6 +126,12 @@ impl AiManager {
         std::fs::create_dir_all(&self.agent_dir).map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
         let guard_path = self.agent_dir.join("aishell-guard.ts");
         std::fs::write(&guard_path, GUARD_EXT).map_err(|e| format!("写入门控扩展失败: {e}"))?;
+        // 联网搜索扩展落盘（enabled 开关决定是否挂载，与 key 是否配置无关）
+        let search_path = self.agent_dir.join("aishell-search.ts");
+        std::fs::write(&search_path, SEARCH_EXT).map_err(|e| format!("写入搜索扩展失败: {e}"))?;
+        let search_enabled = self.store.settings().search.enabled;
+        // 搜索 key 未配置时不注入 env：工具仍挂载，调用时由扩展返回中文引导错误
+        let brave_key = self.store.read_secret("brave:apikey").ok();
 
         let mut cmd = Command::new(&pi_exe);
         cmd.args([
@@ -125,11 +144,16 @@ impl AiManager {
             "--thinking",
             &effort,
             "--tools",
-            "read,grep,find,ls,write,edit",
-            "--no-extensions",
-            "--extension",
         ])
+        .arg(if search_enabled {
+            format!("{BASE_TOOLS},web_search")
+        } else {
+            BASE_TOOLS.to_string()
+        })
+        .args(["--no-extensions", "--extension"])
         .arg(&guard_path)
+        .args(["--extension"])
+        .arg(&search_path)
         .args([
             "--no-approve",
             "--no-session",
@@ -138,11 +162,14 @@ impl AiManager {
             SYSTEM_PROMPT,
         ])
         .env("PI_CODING_AGENT_DIR", &self.agent_dir)
-        .env("DEEPSEEK_API_KEY", &api_key)
-        .current_dir(&cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .env("DEEPSEEK_API_KEY", &api_key);
+        if let Some(key) = brave_key {
+            cmd.env("BRAVE_API_KEY", key);
+        }
+        cmd.current_dir(&cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = cmd.spawn().map_err(|e| format!("启动 pi 进程失败: {e}"))?;
         let stdin = child.stdin.take().ok_or_else(|| "pi 进程 stdin 不可用".to_string())?;
         let stdout = child.stdout.take().ok_or_else(|| "pi 进程 stdout 不可用".to_string())?;
@@ -220,6 +247,7 @@ impl AiManager {
                                 a.get("path")
                                     .or_else(|| a.get("pattern"))
                                     .or_else(|| a.get("command"))
+                                    .or_else(|| a.get("query"))
                             })
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
@@ -416,5 +444,31 @@ pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(),
 #[tauri::command]
 pub async fn ai_kill_project(mgr: State<'_, Arc<AiManager>>, project_id: String) -> Result<(), String> {
     mgr.kill_project(&project_id);
+    Ok(())
+}
+
+/// 动态切换项目内全部 pi 进程的思考强度（RPC set_thinking_level，立即生效且不打断当前生成、
+/// 不丢对话上下文）；无存活进程时静默成功，下次 spawn 时按 settings 里的新档位启动。
+#[tauri::command]
+pub async fn ai_set_thinking(
+    mgr: State<'_, Arc<AiManager>>,
+    project_id: String,
+    level: String,
+) -> Result<(), String> {
+    if !matches!(level.as_str(), "low" | "high" | "max") {
+        return Err(format!("未知思考强度档位: {level}"));
+    }
+    let msg = serde_json::to_vec(&json!({"type": "set_thinking_level", "level": level}))
+        .map_err(|e| format!("set_thinking_level 序列化失败: {e}"))?;
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+    let prefix = format!("{project_id}:");
+    for (key, proc) in procs.iter_mut() {
+        if key.starts_with(&prefix) {
+            let mut buf = msg.clone();
+            buf.push(b'\n');
+            // 写失败（进程已死）忽略，读取线程会自行摘除
+            let _ = proc.stdin.write_all(&buf);
+        }
+    }
     Ok(())
 }

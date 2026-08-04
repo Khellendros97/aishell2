@@ -123,7 +123,7 @@ class TermSession {
         <span class="term-info-spacer"></span>
         <button class="btn small term-toggle-drawer" title="历史区块">${icon('history')} 历史区块</button>
         <button class="btn small term-pin">${icon('pin')} 快捷指令</button>
-        <button class="btn small term-addchat">添加到chat</button>
+        <button class="btn small term-addchat">${icon('chatPlus')} 添加到chat</button>
       </div>
       <div class="term-main">
         <div class="term-xterm"></div>
@@ -412,7 +412,7 @@ class TermSession {
       pin.onclick = () => addQuickCommandModal(block.command);
       const chat = document.createElement('button');
       chat.className = 'btn small';
-      chat.textContent = '添加到chat';
+      chat.innerHTML = `${icon('chatPlus')} 添加到chat`;
       chat.onclick = () => this.sendToAI(this.snapshotOf(block));
       actions.append(pin, chat);
       item.append(cmd, out, actions);

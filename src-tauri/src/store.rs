@@ -18,13 +18,30 @@ use tauri::State;
 
 // ---------------------------------------------------------------- 数据模型
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
-    Low,
     #[default]
-    Medium,
+    Low,
     High,
+    Max,
+}
+
+/// 手动反序列化：v4 系列思考档位为 low/high/max；旧配置的 medium 档按 low 处理（无感升级）。
+impl<'de> Deserialize<'de> for Effort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "low" => Ok(Effort::Low),
+            "high" => Ok(Effort::High),
+            "max" => Ok(Effort::Max),
+            "medium" => Ok(Effort::Low),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["low", "high", "max"])),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,9 +55,9 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            model_id: "deepseek-chat".to_string(),
+            model_id: "deepseek-v4-flash".to_string(),
             base_url: "https://api.deepseek.com/v1".to_string(),
-            effort: Effort::Medium,
+            effort: Effort::Low,
         }
     }
 }
@@ -53,11 +70,21 @@ pub enum Theme {
     Light,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchConfig {
+    /// 是否向 AI 助手挂载 web_search 工具；key 未配置时仍挂载，调用时返回中文引导错误。
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub workspace_dir: Option<String>,
     pub llm: LlmConfig,
+    /// 联网搜索配置；旧配置无此字段时按关闭处理
+    #[serde(default)]
+    pub search: SearchConfig,
     /// 界面主题；旧配置无此字段时按深色处理
     #[serde(default)]
     pub theme: Theme,
@@ -157,6 +184,7 @@ pub struct AppState {
 
 const KEYRING_SERVICE: &str = "AIShell";
 const KEYRING_ACCOUNT_LLM: &str = "llm:apikey";
+const KEYRING_ACCOUNT_BRAVE: &str = "brave:apikey";
 
 fn keyring_account_server(id: &str) -> String {
     format!("server:{id}")
@@ -315,10 +343,18 @@ impl Store {
             .is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// 保存设置；api_key 为 Some 时写入 keyring（空串也写，视为覆盖），None 保持原值。
-    fn save_settings(&self, settings: Settings, api_key: Option<&str>) -> Result<(), String> {
+    /// 保存设置；api_key / brave_key 为 Some 时写入 keyring（空串也写，视为覆盖），None 保持原值。
+    fn save_settings(
+        &self,
+        settings: Settings,
+        api_key: Option<&str>,
+        brave_key: Option<&str>,
+    ) -> Result<(), String> {
         if let Some(key) = api_key {
             self.secrets.set(KEYRING_ACCOUNT_LLM, key)?;
+        }
+        if let Some(key) = brave_key {
+            self.secrets.set(KEYRING_ACCOUNT_BRAVE, key)?;
         }
         self.with_state(|s| {
             s.settings = settings;
@@ -468,6 +504,16 @@ impl Store {
         guard.settings.llm.clone()
     }
 
+    /// 当前全局设置（clone）。
+    pub fn settings(&self) -> Settings {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())
+            .expect("store 状态锁损坏");
+        guard.settings.clone()
+    }
+
     /// 项目本地路径；未设置或项目不存在返回 None。
     pub fn project_path(&self, project_id: &str) -> Option<String> {
         let guard = self.state.lock().ok()?;
@@ -509,8 +555,9 @@ pub async fn save_settings(
     store: State<'_, Arc<Store>>,
     settings: Settings,
     api_key: Option<String>,
+    brave_key: Option<String>,
 ) -> Result<(), String> {
-    store.save_settings(settings, api_key.as_deref())
+    store.save_settings(settings, api_key.as_deref(), brave_key.as_deref())
 }
 
 #[tauri::command]
@@ -591,6 +638,7 @@ mod tests {
             settings: Settings {
                 workspace_dir: Some("D:\\AIShellWorkspace".to_string()),
                 llm: LlmConfig::default(),
+                search: SearchConfig::default(),
                 theme: Theme::Dark,
             },
             servers: vec![
@@ -675,9 +723,9 @@ mod tests {
         let store = test_store(dir);
         let guard = store.state.lock().unwrap();
         assert_eq!(guard.settings.workspace_dir, None);
-        assert_eq!(guard.settings.llm.model_id, "deepseek-chat");
+        assert_eq!(guard.settings.llm.model_id, "deepseek-v4-flash");
         assert_eq!(guard.settings.llm.base_url, "https://api.deepseek.com/v1");
-        assert_eq!(guard.settings.llm.effort, Effort::Medium);
+        assert_eq!(guard.settings.llm.effort, Effort::Low);
         assert!(guard.servers.is_empty());
         assert!(guard.projects.is_empty());
         assert!(guard.sessions.is_empty());
@@ -720,6 +768,7 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                None,
             )
             .unwrap();
         assert!(store.is_config_complete());
@@ -739,6 +788,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.theme, Theme::Dark);
+        // 旧档位 medium 兼容映射为 low（v4 系列无 medium 档）
+        assert_eq!(legacy.llm.effort, Effort::Low);
     }
 
     #[test]
@@ -776,6 +827,7 @@ mod tests {
                     workspace_dir: Some(ws.to_string_lossy().into_owned()),
                     ..Default::default()
                 },
+                None,
                 None,
             )
             .unwrap();
@@ -929,9 +981,11 @@ mod tests {
                         base_url: "https://api.deepseek.com/v1".to_string(),
                         effort: Effort::High,
                     },
+                    search: SearchConfig { enabled: false },
                     theme: Theme::Dark,
                 },
                 Some("sk-test-key"),
+                None,
             )
             .unwrap();
         store
@@ -1056,5 +1110,56 @@ mod tests {
         ] {
             assert!(json.contains(key), "序列化缺少字段 {key}: {json}");
         }
+    }
+
+    #[test]
+    fn save_settings_brave_key_semantics() {
+        let dir = temp_config_dir("brave-key");
+        let store = test_store(dir);
+        // 未配置时 read_secret 报错
+        assert!(store.read_secret("brave:apikey").is_err());
+        // 保存 brave key（Some 覆盖）+ search.enabled 持久化
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: None,
+                    llm: LlmConfig::default(),
+                    search: SearchConfig { enabled: true },
+                    theme: Theme::Dark,
+                },
+                None,
+                Some("bsk-1"),
+            )
+            .unwrap();
+        assert_eq!(store.read_secret("brave:apikey").unwrap(), "bsk-1");
+        assert!(store.settings().search.enabled);
+        // None 保持原值
+        store
+            .save_settings(
+                Settings {
+                    search: SearchConfig { enabled: false },
+                    ..store.settings()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_secret("brave:apikey").unwrap(),
+            "bsk-1",
+            "None 应保持原值"
+        );
+        assert!(!store.settings().search.enabled);
+        // 空串视为覆盖（与 api_key 语义一致）
+        store.save_settings(store.settings(), None, Some("")).unwrap();
+        assert_eq!(store.read_secret("brave:apikey").unwrap(), "");
+    }
+
+    #[test]
+    fn old_settings_json_defaults_search_disabled() {
+        // 旧版 aishell.json 无 search 字段 → 反序列化默认 enabled=false（无感升级）
+        let old = r#"{"workspaceDir":"C:\\ws","llm":{"modelId":"deepseek-chat","baseUrl":"https://api.deepseek.com/v1","effort":"medium"},"theme":"dark"}"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert!(!s.search.enabled);
     }
 }

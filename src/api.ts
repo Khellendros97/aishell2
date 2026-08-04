@@ -14,11 +14,11 @@ export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
 }
 
 /* ---------------- store ----------------
-   apiKey / password 传 null 表示「不修改已保存的密钥」。 */
+   apiKey / braveKey / password 传 null 表示「不修改已保存的密钥」。 */
 export const isConfigComplete = () => call<boolean>('is_config_complete');
 export const getState = () => call<AppState>('get_state');
-export const saveSettings = (settings: Settings, apiKey: string | null) =>
-  call<void>('save_settings', { settings, apiKey });
+export const saveSettings = (settings: Settings, apiKey: string | null, braveKey: string | null) =>
+  call<void>('save_settings', { settings, apiKey, braveKey });
 /** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */
 export const setTheme = (theme: Theme) => call<void>('set_theme', { theme });
 export const upsertServer = (server: Server, password: string | null) =>
@@ -89,6 +89,9 @@ export const aiChat = (key: string, prompt: string) => call<void>('ai_chat', { k
 export const aiAbort = (key: string) => call<void>('ai_abort', { key });
 /** 工作台卸载/切项目时调用：kill 该项目全部 pi 进程 */
 export const aiKillProject = (projectId: string) => call<void>('ai_kill_project', { projectId });
+/** 动态切换项目内 AI 进程的思考强度（立即生效；无存活进程时静默，下次提问按新档位 spawn） */
+export const aiSetThinking = (projectId: string, level: string) =>
+  call<void>('ai_set_thinking', { projectId, level });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 

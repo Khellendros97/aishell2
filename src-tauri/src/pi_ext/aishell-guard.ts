@@ -43,6 +43,9 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				return undefined;
+			case "web_search":
+				// 只读网络调用,无文件路径语义(aishell-search.ts 注册)
+				return undefined;
 			default:
 				return { block: true, reason: `AIShell 权限边界:工具 ${event.toolName} 不可用。` };
 		}
