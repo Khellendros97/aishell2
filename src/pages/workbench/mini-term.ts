@@ -158,14 +158,16 @@ export function openMiniTerm(host: HTMLElement, serverId: string, cwd: string, o
   /* ---------- 初始化：先订阅事件、再创建后端（避免输出竞态丢失） ---------- */
   let autoBuf = '';
   let auto: MiniTermAutoRun | null = opts.autoRun ?? null;
-  let autoLabel = '';
+  // 完成标记必须在订阅前生成：termCreate 期间 MOTD 已在输出（如时间 04:25:40 含 :25），
+  // 空标记会使正则退化为 /:(\d+)/ 误匹配 MOTD → onDone(false) 提前触发且命令不再发送
+  let autoLabel = auto ? doneLabel() : '';
 
   void (async () => {
     try {
       unlisteners.push(await onTermData(id, (d) => {
         if (destroyed) return;
         term.write(d);
-        if (!auto) return;
+        if (!auto || !autoLabel) return;
         autoBuf += d;
         if (autoBuf.length > 8192) autoBuf = autoBuf.slice(-2048);
         const m = autoBuf.match(new RegExp(`${autoLabel}:(\\d+)`));
@@ -182,7 +184,6 @@ export function openMiniTerm(host: HTMLElement, serverId: string, cwd: string, o
       term.focus();
       if (auto) {
         // 抑制命令回显（否则回显中的标记会误触发完成判定），命令尾带退出码标记
-        autoLabel = doneLabel();
         const payload = `stty -echo\r${auto.command}; echo ${autoLabel}:$?\rstty echo\r`;
         void termInput(id, payload);
       }
