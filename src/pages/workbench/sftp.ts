@@ -384,6 +384,13 @@ function isArchive(name: string): boolean {
   return lower.endsWith('.tar.gz') || lower.endsWith('.tgz') || lower.endsWith('.zip');
 }
 
+/** 条目图标：目录/文件/压缩包分色 + 填充，比线框更醒目（颜色走 icon() 的 opts，不进 CSS 以便随图标库统一调整） */
+function entryIcon(it: RemoteEntry): string {
+  if (it.isDir) return iconSvg('folder', { stroke: '#2563eb', fill: '#93c5fd' });
+  if (isArchive(it.name)) return iconSvg('archive', { stroke: '#c2410c', fill: '#fdba74' });
+  return iconSvg('file', { stroke: '#64748b', fill: '#e2e8f0' });
+}
+
 /** 打开迷你终端自动执行远端命令；完成标记（含退出码）触发后关闭终端、刷新目录并 toast。 */
 function runRemoteCommand(st: SftpTabState, command: string, doneToast: string, focusPath: string | null): void {
   st.mini?.destroy(); // 已有实例先关闭（onClose 会把 st.mini 置空）
@@ -718,7 +725,7 @@ function buildGrid(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[]):
     el.dataset.path = it.path; // 框选相交判定用
     const iconEl = document.createElement('div');
     iconEl.className = 'sf-icon';
-    iconEl.innerHTML = iconSvg(it.isDir ? 'folder' : isArchive(it.name) ? 'archive' : 'file');
+    iconEl.innerHTML = entryIcon(it);
     const name = document.createElement('div');
     name.className = 'sf-name';
     name.textContent = it.name;
@@ -844,7 +851,7 @@ function buildTable(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[])
     const span = document.createElement('span');
     span.className = 'sf-t-name';
     const ic = document.createElement('span');
-    ic.innerHTML = iconSvg(it.isDir ? 'folder' : isArchive(it.name) ? 'archive' : 'file');
+    ic.innerHTML = entryIcon(it);
     const nm = document.createElement('span');
     nm.className = 'nm';
     nm.textContent = it.name;

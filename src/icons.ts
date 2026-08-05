@@ -54,7 +54,7 @@ const PATHS = {
   folderOpen:
     '<path d="M6 14l1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>',
   archive:
-    '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 11h6"/><path d="M9 15h6"/><path d="M9 19h6"/>',
+    '<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
   history:
     '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 3"/>',
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
@@ -84,6 +84,9 @@ const PATHS = {
 
 export type IconName = keyof typeof PATHS;
 
-export function icon(name: IconName): string {
-  return `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${PATHS[name]}</svg>`;
+/** opts.stroke / opts.fill 指定时覆盖默认的 currentColor 描边与无填充（SFTP 条目彩色图标用） */
+export function icon(name: IconName, opts?: { stroke?: string; fill?: string }): string {
+  const stroke = opts?.stroke ?? 'currentColor';
+  const fill = opts?.fill ?? 'none';
+  return `<svg class="ic" viewBox="0 0 24 24" fill="${fill}" stroke="${stroke}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${PATHS[name]}</svg>`;
 }
