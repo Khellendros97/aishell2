@@ -30,7 +30,12 @@ export const explorerHead = {
     newDir.title = '新建目录';
     newDir.innerHTML = iconSvg('folderPlus');
     newDir.onclick = () => startInlineInput(true, null, null);
-    el.append(newFile, newDir);
+    const refresh = document.createElement('button');
+    refresh.className = 'icon-btn';
+    refresh.title = '刷新';
+    refresh.innerHTML = iconSvg('refresh');
+    refresh.onclick = () => void refreshAll();
+    el.append(newFile, newDir, refresh);
   },
 };
 
@@ -478,10 +483,11 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
   /* 编辑中的文件禁止移动类操作——旧标签写盘会在旧路径重建文件,抵消操作;防线前置为禁用态 */
   const editing = editingPaths().some((p) => p === node.path || p.startsWith(`${node.path}/`));
   const editingTip = '文件正在编辑器中打开,请先关闭对应标签页';
-  /* 目录行右键：新建文件/目录（在选中目录下创建） */
+  /* 目录行右键：新建文件/目录（在选中目录下创建）+ 刷新该目录 */
   const newItems: CtxItem[] = node.isDir ? [
     { label: '新建文件', iconName: 'filePlus', action: () => startInlineInput(false, node, row) },
     { label: '新建目录', iconName: 'folderPlus', action: () => startInlineInput(true, node, row) },
+    { label: '刷新', iconName: 'refresh', action: () => void refreshDir(node) },
   ] : [];
   /* 上传到 SFTP：仅当工作区激活标签为 SFTP 时显示（目标 = 该 SFTP 标签当前目录） */
   const sftpTab = getActiveTab();
@@ -539,6 +545,7 @@ function showRootMenu(x: number, y: number, root: TreeNode): void {
   showContextMenu(x, y, [
     { label: '新建文件', iconName: 'filePlus', action: () => startInlineInput(false, root, null) },
     { label: '新建目录', iconName: 'folderPlus', action: () => startInlineInput(true, root, null) },
+    { label: '刷新', iconName: 'refresh', action: () => void refreshAll() },
     'sep',
     { label: '粘贴', iconName: 'clipboard', disabled: !getClip(), action: () => void pasteInto(root) },
     ...(uploadItems.length ? ['sep' as const, ...uploadItems] : []),

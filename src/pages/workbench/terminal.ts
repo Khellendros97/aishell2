@@ -24,7 +24,7 @@ import { icon } from '../../icons';
 import { activateTab, bus, getActiveTab, registerRenderer, Workbench } from './core';
 import { addQuickCommandModal } from './quickcommand';
 import type { Tab } from './core';
-import { toast, uid } from '../../ui';
+import { copyText, showContextMenu, toast, uid } from '../../ui';
 import { currentTheme, onThemeChange } from '../../theme';
 
 /* ---------- 终端配色：暗 / 亮两套（background 与 workbench.css --term-bg 一致） ---------- */
@@ -163,6 +163,29 @@ class TermSession {
     this.term.open(this.host);
     this.term.onData((data) => this.onUserInput(data));
 
+    /* 自定义右键菜单（原生菜单已全局禁用）：复制 / 粘贴 */
+    this.host.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showContextMenu(e.clientX, e.clientY, [
+        { label: '复制', iconName: 'copy', disabled: !this.term.hasSelection(), action: () => this.copySelection() },
+        { label: '粘贴', iconName: 'clipboard', action: () => void this.pasteClipboard() },
+      ]);
+    });
+    /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴 */
+    this.term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true;
+      if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
+        this.copySelection();
+        return false;
+      }
+      if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
+        void this.pasteClipboard();
+        return false;
+      }
+      return true;
+    });
+
     // 激活本标签时聚焦终端（与原型 input.focus 语义一致）。
     // bus 无 off API：用 tab.el.isConnected 守卫，关闭/换页后的残留监听自动失效。
     bus.on('tab-activated', (t) => {
@@ -196,6 +219,20 @@ class TermSession {
   }
 
   /* ---------- 输入：转发后端 + 区块追踪 ---------- */
+  /** 复制当前选区到系统剪贴板（无选区时静默） */
+  private copySelection(): void {
+    const sel = this.term.getSelection();
+    if (sel) void copyText(sel);
+  }
+
+  /** 读系统剪贴板并粘贴进终端（走 xterm paste 路径，保留 bracketed paste 语义与区块追踪） */
+  private async pasteClipboard(): Promise<void> {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) this.term.paste(text);
+    } catch { /* 剪贴板读取失败（权限等）静默 */ }
+  }
+
   private onUserInput(data: string): void {
     if (!this.ready || this.failed) return;
     void termInput(this.tab.id, data).catch(() => { /* 终端已关闭等后端错误忽略 */ });

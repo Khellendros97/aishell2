@@ -14,7 +14,7 @@ import '@xterm/xterm/css/xterm.css';
 
 import { onTermData, onTermExit, termClose, termCreate, termInput, termResize } from '../../api';
 import { icon } from '../../icons';
-import { toast, uid } from '../../ui';
+import { copyText, showContextMenu, toast, uid } from '../../ui';
 
 /** 配色与 terminal.ts 暗色主题一致（迷你终端固定暗色，悬浮层不跟随亮色主题） */
 const MINI_THEME = {
@@ -104,6 +104,39 @@ export function openMiniTerm(host: HTMLElement, serverId: string, cwd: string, o
   close.addEventListener('click', destroy);
 
   term.onData((data) => { void termInput(id, data); });
+
+  /* 自定义右键菜单（原生菜单已全局禁用）：复制 / 粘贴 */
+  body.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    showContextMenu(e.clientX, e.clientY, [
+      { label: '复制', iconName: 'copy', disabled: !term.hasSelection(), action: () => copySelection() },
+      { label: '粘贴', iconName: 'clipboard', action: () => void pasteClipboard() },
+    ]);
+  });
+  /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴 */
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true;
+    if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
+      copySelection();
+      return false;
+    }
+    if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
+      void pasteClipboard();
+      return false;
+    }
+    return true;
+  });
+  const copySelection = (): void => {
+    const sel = term.getSelection();
+    if (sel) void copyText(sel);
+  };
+  const pasteClipboard = async (): Promise<void> => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) term.paste(text);
+    } catch { /* 剪贴板读取失败（权限等）静默 */ }
+  };
   const fitTerm = (): void => {
     if (destroyed) return;
     try {

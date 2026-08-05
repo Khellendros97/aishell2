@@ -51,4 +51,13 @@ onRoute(() => { void render(); });
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => e.preventDefault());
 
+/* 禁用 WebView2 原生右键菜单（刷新/检查等浏览器项与应用无关）。
+   输入框放行原生菜单（拼写/撤销/粘贴是刚需）；
+   各面板自定义菜单（explorer/sftp/terminal）在目标元素上 preventDefault + stopPropagation，
+   冒泡不到这里，不受影响。 */
+document.addEventListener('contextmenu', (e) => {
+  if ((e.target as HTMLElement).closest('input, textarea:not(.xterm-helper-textarea)')) return;
+  e.preventDefault();
+});
+
 void boot();
