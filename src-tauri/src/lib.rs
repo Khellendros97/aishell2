@@ -24,20 +24,21 @@ pub fn run() {
             );
             let ssh = Arc::new(ssh::SshManager::new(store.clone()));
             let terms = Arc::new(term::TermManager::new(ssh.clone()));
-            // pi 运行时目录：安装版 <resource_dir>/pi；dev 回退 src-tauri/resources/pi
-            let resource_pi = app
-                .path()
-                .resource_dir()
-                .map(|d| d.join("pi"))
-                .unwrap_or_default();
+            // pi 运行时目录：tauri 2 Windows 把 bundle.resources 装到 exe 旁 resources/
+            // 子目录（<resource_dir>/resources/pi），resource_dir() 返回的是 exe 目录本身；
+            // 依次探测：安装布局 → 扁平布局（兼容）→ dev 源目录
+            let resource_dir = app.path().resource_dir().unwrap_or_default();
             let dev_pi = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
                 .join("pi");
-            let pi_dir = if resource_pi.join("pi.exe").exists() {
-                resource_pi
-            } else {
-                dev_pi
-            };
+            let pi_dir = [
+                resource_dir.join("resources").join("pi"),
+                resource_dir.join("pi"),
+                dev_pi.clone(),
+            ]
+            .into_iter()
+            .find(|p| p.join("pi.exe").is_file())
+            .unwrap_or(dev_pi);
             let ai = Arc::new(ai::AiManager::new(
                 store.clone(),
                 pi_dir,
