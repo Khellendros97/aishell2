@@ -8,6 +8,9 @@
 //!   - `{type:"approval",requestId,toolCallId,action,intent,summary}`
 //!   - `{type:"actionStart",toolCallId,tool,args}` / `{type:"actionEnd",toolCallId,tool,isError,result}`
 //!
+//! 另发全局事件 `fs:changed` payload `{path}`：AI 的 write/edit 工具成功落盘后广播
+//! 规范化绝对路径，前端编辑器据此刷新已打开的对应文件（见 editor.ts）。
+//!
 //! key = "<projectId>:<sessionId>"，每 key 一个长驻 pi 进程。
 //!
 //! 三档模式（按项目持久化，见 store.rs AiMode）：suggest / agent / yolo。权限事实源在
@@ -23,7 +26,7 @@
 //! 因为 stdout 读取线程必须在进程退出/管道破裂时「从 map 摘除」条目，裸 Mutex 无法被线程共享。
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,6 +248,7 @@ impl AiManager {
         let app2 = app.clone();
         let key2 = key.to_string();
         let event = format!("ai:event:{key2}");
+        let cwd2 = cwd.clone();
         let busy2 = busy.clone();
         let killed2 = killed.clone();
         let procs2 = self.procs.clone();
@@ -253,6 +257,8 @@ impl AiManager {
         let actions = Arc::clone(&self.actions);
         let project_id2 = project_id.to_string();
         thread::spawn(move || {
+            // 已开始执行的 write/edit 工具 → 规范化绝对路径（end 成功时据此发 fs:changed）
+            let mut pending_paths: HashMap<String, String> = HashMap::new();
             // 是否已收到过终止性事件（done/error）：正常收尾后退出不再报「异常退出」
             let mut settled = false;
             // 本轮生成是否已发过终态事件（done 或 error 只发一次；turn_start 重置）
@@ -314,6 +320,25 @@ impl AiManager {
                     // 其余工具仍走瞬时小字行（tool）。
                     "tool_execution_start" => {
                         let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        // write/edit 的目标路径（相对项目根）先登记：end 成功时据此广播 fs:changed
+                        if tool == "write" || tool == "edit" {
+                            let raw = ev
+                                .get("args")
+                                .and_then(|a| a.get("path"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            if !raw.is_empty() {
+                                let abs = std::path::absolute(Path::new(&cwd2).join(raw))
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| Path::new(&cwd2).join(raw).to_string_lossy().into_owned());
+                                let id = ev
+                                    .get("toolCallId")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                pending_paths.insert(id, abs);
+                            }
+                        }
                         if mode != AiMode::Suggest && CONTROLLED_TOOLS.contains(&tool) {
                             let tool_call_id = ev
                                 .get("toolCallId")
@@ -345,6 +370,19 @@ impl AiManager {
                     }
                     "tool_execution_end" => {
                         let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        // AI 写文件成功落盘 → 全局广播，前端刷新已打开的对应编辑器标签
+                        if (tool == "write" || tool == "edit")
+                            && !ev.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                        {
+                            let id = ev
+                                .get("toolCallId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(abs) = pending_paths.remove(&id) {
+                                let _ = app2.emit("fs:changed", json!({"path": abs}));
+                            }
+                        }
                         if mode != AiMode::Suggest && CONTROLLED_TOOLS.contains(&tool) {
                             let tool_call_id = ev
                                 .get("toolCallId")

@@ -5,7 +5,7 @@ export function uid(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export function toast(msg: string, type?: 'error' | 'success'): void {
+export function toast(msg: string, type?: 'error' | 'success' | 'info'): void {
   let root = document.getElementById('toast-root');
   if (!root) {
     root = document.createElement('div');

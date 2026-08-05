@@ -68,6 +68,9 @@ export const fsDelete = (path: string) => call<void>('fs_delete', { path });
 /** OS 拖入导入：返回落地后的最终名称（重名自动改名）；文件内容 base64，目录传 null。 */
 export const fsImport = (dir: string, name: string, isDir: boolean, data: string | null) =>
   call<string>('fs_import', { dir, name, isDir, data });
+/** 本地文件被外部修改（AI write/edit 落盘）通知：path 为规范化绝对路径 */
+export const onFsChanged = (cb: (path: string) => void): Promise<UnlistenFn> =>
+  listen<{ path: string }>('fs:changed', (e) => cb(e.payload.path));
 /** 移动/重命名：to 为完整目标路径；目标已存在会 reject。 */
 export const fsMove = (from: string, to: string) => call<void>('fs_move', { from, to });
 /** 复制进 toDir（重名自动改名）；返回落地路径。 */
@@ -76,6 +79,9 @@ export const fsCopy = (from: string, toDir: string) => call<string>('fs_copy', {
 export const fsReveal = (path: string) => call<void>('fs_reveal', { path });
 
 /* ---------------- sftp ---------------- */
+/** 解析远端会话 home 目录（canonicalize(".")） */
+export const sftpHome = (serverId: string) =>
+  call<string>('sftp_home', { serverId });
 export const sftpList = (serverId: string, path: string) =>
   call<FsEntry[]>('sftp_list', { serverId, path });
 export const sftpUpload = (serverId: string, localPath: string, remoteDir: string) =>

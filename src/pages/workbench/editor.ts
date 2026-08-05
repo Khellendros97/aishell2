@@ -13,7 +13,7 @@ import { HighlightStyle, LanguageDescription, indentUnit, syntaxHighlighting } f
 import { languages } from '@codemirror/language-data';
 import { tags } from '@lezer/highlight';
 import { oneDarkTheme } from '@codemirror/theme-one-dark';
-import { fsRead, fsWrite } from '../../api';
+import { fsRead, fsWrite, onFsChanged } from '../../api';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
 import type { FileRef } from '../../types';
 import { registerRenderer, bus, setTabTitle, Workbench, type Tab } from './core';
@@ -78,6 +78,11 @@ onThemeChange(() => {
   entries.forEach((e) => e.view.dispatch({ effects: cmTheme.reconfigure(cmThemeExt()) }));
 });
 
+/** Windows 路径比较键：统一分隔符与大小写，避免 Rust PathBuf 的 `\\` 与前端项目路径的 `/` 不匹配 */
+function filePathKey(path: string): string {
+  return path.replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase();
+}
+
 /* ---------- 保存：防抖自动保存与 Ctrl+S / 关闭落盘共用，写盘串行化 ---------- */
 function queueSave(entry: EditorEntry, silent: boolean): Promise<void> {
   clearTimeout(entry.timer);
@@ -116,15 +121,19 @@ function markDirty(entry: EditorEntry): void {
 }
 
 /* ---------- 异步载入：文档内容 + 语言高亮（一次性应用） ---------- */
-async function loadFile(entry: EditorEntry): Promise<void> {
+/** skipIfSame：外部刷新用 —— 磁盘内容与当前文档一致时跳过，不打扰光标与撤销历史 */
+async function loadFile(entry: EditorEntry, skipIfSame = false): Promise<void> {
   const path = String(entry.tab.data.path ?? '');
   let text = '';
+  let ok = false;
   try {
     text = await fsRead(path);
+    ok = true;
   } catch (err) {
     toast(String(err), 'error');
     // 载入失败：显示空文档（视图已为空）
   }
+  if (skipIfSame && (!ok || entry.view.state.doc.toString() === text)) return;
   const name = path.split(/[\\/]/).pop() ?? '';
   const desc = LanguageDescription.matchFilename(languages, name);
   let langExt: Extension[] = [];
@@ -306,4 +315,21 @@ bus.on('tab-closed', (tab) => {
   if (!entry) return;
   entries.delete(tab.id);
   entry.view.destroy();
+});
+
+/* ---------- 外部修改同步：AI write/edit 落盘（fs:changed）后刷新同路径标签 ---------- */
+void onFsChanged((changedPath) => {
+  const changedKey = filePathKey(changedPath);
+  entries.forEach((entry) => {
+    const path = String(entry.tab.data.path ?? '');
+    if (filePathKey(path) !== changedKey) return;
+    if (entry.dirty) {
+      // 本地有未保存改动：不覆盖用户输入，仅提示手动处理
+      toast(`「${entry.baseTitle}」已被 AI 修改，但本地有未保存改动，已保留你的编辑`, 'info');
+      return;
+    }
+    void loadFile(entry, true);
+  });
+}).catch((err) => {
+  console.warn('订阅 fs:changed 失败:', err);
 });
