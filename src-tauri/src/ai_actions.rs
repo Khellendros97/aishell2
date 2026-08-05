@@ -197,9 +197,14 @@ impl AiActions {
         let bash = crate::term::find_bash().ok_or_else(|| {
             "未找到 Git Bash，请安装 Git for Windows 或设置 AISHELL_GIT_BASH".to_string()
         })?;
-        let out = tokio::process::Command::new(&bash)
-            .args(["--login", "-c", command])
-            .current_dir(root)
+        let mut cmd = tokio::process::Command::new(&bash);
+        cmd.args(["--login", "-c", command]).current_dir(root);
+        // Windows 下隐藏 Git Bash 的临时控制台窗口（与 ai.rs 的 pi 启动一致）
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = cmd
             .output()
             .await
             .map_err(|e| format!("启动 Git Bash 失败：{e}"))?;

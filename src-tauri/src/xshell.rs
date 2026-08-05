@@ -383,6 +383,44 @@ fn scan_all() -> Result<(Vec<Server>, usize, usize), String> {
     scan_roots(&xshell_roots())
 }
 
+/// 扫描用户手动指定的目录：自动定位 Sessions 会话目录。
+///
+/// 探测顺序（dir 为任意深度均可）：
+///   1. dir 本身是 Sessions 目录（目录名不区分大小写）；
+///   2. dir/Xshell/Sessions（版本目录，如「文档\NetSarang Computer\7」）；
+///   3. dir/Sessions；
+///   4. dir 是 NetSarang Computer 根（其直接子目录为版本目录），取版本号最高者。
+///
+/// 全部未命中时返回中文可执行错误（说明应选择哪个目录）。
+fn scan_from_dir(dir: &Path) -> Result<(Vec<Server>, usize, usize), String> {
+    let is_sessions_dir = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("Sessions"))
+            .unwrap_or(false)
+    };
+    let dir_sessions = dir.join("Sessions");
+    let sessions = if is_sessions_dir(dir) {
+        Some(dir.to_path_buf())
+    } else if dir.join("Xshell").join("Sessions").is_dir() {
+        Some(dir.join("Xshell").join("Sessions"))
+    } else if dir_sessions.is_dir() {
+        Some(dir_sessions)
+    } else {
+        None
+    };
+    if let Some(s) = sessions {
+        return Ok(scan_sessions_dir(&s));
+    }
+    // 兜底：当作 NetSarang Computer 根目录（直接子目录为版本目录）
+    if let Some((_, _, vdir)) = collect_version_candidates(dir).into_iter().next() {
+        return Ok(scan_sessions_dir(&vdir.join("Xshell").join("Sessions")));
+    }
+    Err(format!(
+        "所选目录「{}」下未找到 Xshell 会话目录。请选择包含 .xsh 会话文件的目录，例如「文档\\NetSarang Computer\\<版本>\\Xshell\\Sessions」或其上级目录",
+        dir.display()
+    ))
+}
+
 // ---------------------------------------------------------------- Tauri 命令
 
 /// 一键导入 Xshell 会话：扫描 → 解析 → 批量合并进 aishell.json（一次原子持久化，不触碰密钥库）。
@@ -391,6 +429,22 @@ pub async fn import_xshell_sessions(
     store: State<'_, Arc<Store>>,
 ) -> Result<XshellImportResult, String> {
     let (servers, attention, skipped) = scan_all()?;
+    let mut result = store.merge_xshell_servers(&servers)?;
+    result.needs_attention = attention;
+    result.skipped = skipped;
+    Ok(result)
+}
+
+/// 从用户手动指定的目录导入 Xshell 会话（自动定位 Sessions 子目录，失败时给出可执行提示）。
+#[tauri::command]
+pub async fn import_xshell_from_dir(
+    store: State<'_, Arc<Store>>,
+    dir: String,
+) -> Result<XshellImportResult, String> {
+    if dir.trim().is_empty() {
+        return Err("未选择目录".to_string());
+    }
+    let (servers, attention, skipped) = scan_from_dir(Path::new(dir.trim()))?;
     let mut result = store.merge_xshell_servers(&servers)?;
     result.needs_attention = attention;
     result.skipped = skipped;
@@ -734,5 +788,55 @@ mod tests {
         // 内存状态可通过生产只读 API 查询，避免测试跨模块触碰 Store 私有字段
         assert_eq!(store.server(&web01.id), Some(web01.clone()));
         assert_eq!(store.server(&web02.id), Some(web02.clone()));
+    }
+
+    #[test]
+    fn scan_from_dir_locates_sessions_at_any_depth() {
+        let root = temp_dir("fromdir");
+        let sessions = root
+            .join("NetSarang Computer")
+            .join("Xshell 7")
+            .join("Xshell")
+            .join("Sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("a.xsh"),
+            "[CONNECTION]\nHost=1.1.1.1\nPort=22\nProtocol=SSH\n",
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("b.xsh"),
+            "[CONNECTION]\nHost=2.2.2.2\nPort=22\nProtocol=SSH\n",
+        )
+        .unwrap();
+
+        // 选到 Sessions 目录本身
+        let (servers, _, _) = scan_from_dir(&sessions).unwrap();
+        assert_eq!(servers.len(), 2);
+        // 选到版本目录（...\Xshell 7）
+        let (servers, _, _) = scan_from_dir(sessions.parent().unwrap().parent().unwrap()).unwrap();
+        assert_eq!(servers.len(), 2);
+        // 选到 NetSarang Computer 根（版本目录是其直接子目录）
+        let (servers, _, _) = scan_from_dir(&root.join("NetSarang Computer")).unwrap();
+        assert_eq!(servers.len(), 2);
+        // 选到完全无关的目录 → 可执行错误
+        let err = scan_from_dir(&root).unwrap_err();
+        assert!(err.contains("未找到 Xshell 会话目录"), "{err}");
+        assert!(err.contains("Sessions"), "{err}");
+    }
+
+    #[test]
+    fn scan_from_dir_accepts_bare_sessions_subdir() {
+        let root = temp_dir("fromdir-bare");
+        let sessions = root.join("Sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("c.xsh"),
+            "[CONNECTION]\nHost=3.3.3.3\nPort=22\nProtocol=SSH\n",
+        )
+        .unwrap();
+        let (servers, _, _) = scan_from_dir(&root).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].host, "3.3.3.3");
     }
 }

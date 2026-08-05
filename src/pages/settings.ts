@@ -4,8 +4,8 @@
  * 密码与 apiKey 表单留空提交 null（后端保持原值），显示位不打回明文；
  * 浏览按钮走 @tauri-apps/plugin-dialog；「重置演示数据」按钮本页无（见欢迎页「打开配置目录」）。
  */
-import type { AppState, LlmConfig, Server, Theme } from '../types';
-import { deleteServer, getState, importXshellSessions, openDialog, saveSettings, setServerLocked, setTheme, upsertServer } from '../api';
+import type { AppState, LlmConfig, Server, Theme, XshellImportResult } from '../types';
+import { deleteServer, getState, importXshellFromDir, importXshellSessions, openDialog, saveSettings, setServerLocked, setTheme, upsertServer } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -386,10 +386,12 @@ export const renderSettings: PageRender = (root, params) => {
   async function importXshellFlow() {
     // 进行态：禁用按钮并替换内容，成功/失败都恢复
     const originalHtml = btnImportXshell.innerHTML;
-    btnImportXshell.disabled = true;
-    btnImportXshell.innerHTML = `${icon('loader')} 正在扫描 Xshell 会话…`;
-    try {
-      const r = await importXshellSessions();
+    const setBusy = (busy: boolean) => {
+      btnImportXshell.disabled = busy;
+      btnImportXshell.innerHTML = busy ? `${icon('loader')} 正在扫描 Xshell 会话…` : originalHtml;
+    };
+    // 导入结果落库并刷新（自动扫描与手动重试共用）
+    const applyResult = async (r: XshellImportResult) => {
       db = await getState();
       renderServers();
       toast(`Xshell 导入完成：新增 ${r.imported}，更新 ${r.updated}，未变化 ${r.unchanged}，跳过 ${r.skipped}`, 'success');
@@ -398,11 +400,28 @@ export const renderSettings: PageRender = (root, params) => {
       if (r.needsAttention > 0) {
         importNote.innerHTML = `${icon('alert')} 已导入，但有 ${r.needsAttention} 个会话需处理：Xshell 密码不会迁移；NSSSH 专用密钥请在 Xshell 的「工具 → 用户密钥管理器」中导出为无密码短语的 OpenSSH 私钥，再编辑服务器替换密钥路径`;
       }
+    };
+    setBusy(true);
+    try {
+      await applyResult(await importXshellSessions());
     } catch (err) {
-      toast(String(err), 'error');
+      // 自动扫描失败（通常 Xshell 装在非默认位置）→ 弹目录选择器让用户手动指定会话目录重试
+      const dir = await openDialog({
+        directory: true,
+        title: '选择 Xshell 会话目录',
+      });
+      if (dir) {
+        setBusy(true);
+        try {
+          await applyResult(await importXshellFromDir(dir));
+        } catch (err2) {
+          toast(String(err2), 'error');
+        }
+      } else {
+        toast(String(err), 'error');
+      }
     } finally {
-      btnImportXshell.disabled = false;
-      btnImportXshell.innerHTML = originalHtml;
+      setBusy(false);
     }
   }
   (root.querySelector('#server-modal-save') as HTMLElement).addEventListener('click', () => void saveServer());

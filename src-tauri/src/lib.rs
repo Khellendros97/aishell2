@@ -73,6 +73,7 @@ pub fn run() {
             store::session_upsert,
             store::set_server_locked,
             xshell::import_xshell_sessions,
+            xshell::import_xshell_from_dir,
             term::term_create,
             term::term_input,
             term::term_resize,

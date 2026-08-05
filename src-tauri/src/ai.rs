@@ -236,6 +236,12 @@ impl AiManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Windows 下隐藏 pi 的控制台窗口（pi.exe 是控制台程序，不设标志会弹出黑色终端窗口）
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         let mut child = cmd.spawn().map_err(|e| format!("启动 pi 进程失败: {e}"))?;
         let stdin = Arc::new(Mutex::new(
             child.stdin.take().ok_or_else(|| "pi 进程 stdin 不可用".to_string())?,

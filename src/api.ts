@@ -27,6 +27,9 @@ export const deleteServer = (id: string) => call<void>('delete_server', { id });
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；
  *  密码永不迁移；无可用会话目录时 reject 中文错误串。 */
 export const importXshellSessions = () => call<XshellImportResult>('import_xshell_sessions');
+/** 从用户手动指定的目录导入（自动定位 Sessions 子目录），用于自动扫描失败后的重试。 */
+export const importXshellFromDir = (dir: string) =>
+  call<XshellImportResult>('import_xshell_from_dir', { dir });
 export const upsertProject = (project: Project) => call<void>('upsert_project', { project });
 export const deleteProject = (id: string) => call<void>('delete_project', { id });
 /** path 为 null 时回退到 <workspaceDir>/<name>；返回最终项目路径 */
