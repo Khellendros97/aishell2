@@ -400,7 +400,8 @@ function runRemoteCommand(st: SftpTabState, command: string, doneToast: string, 
       command,
       onDone: (success) => {
         toast(success ? doneToast : `${doneToast}失败，请查看终端输出`, success ? 'success' : 'error');
-        st.mini?.destroy();
+        // 失败时保留迷你终端（用户需查看 tar/unzip 的错误输出）；成功才自动关闭
+        if (success) st.mini?.destroy();
         st.sel.clear();
         if (success && focusPath) focusAfterRefresh(st, focusPath);
         else void loadDir(st);
