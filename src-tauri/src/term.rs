@@ -147,7 +147,7 @@ impl TermManager {
             "local" => self.create_local(app, id, cwd),
             "ssh" => {
                 let sid = server_id.ok_or_else(|| "SSH 终端缺少 serverId".to_string())?;
-                self.create_ssh(app, id, &sid).await
+                self.create_ssh(app, id, &sid, cwd).await
             }
             other => Err(format!("未知终端类型: {other}")),
         }
@@ -244,10 +244,19 @@ impl TermManager {
         app: AppHandle,
         id: String,
         server_id: &str,
+        cwd: Option<String>,
     ) -> Result<(), String> {
         let channel = self.ssh.open_shell(server_id, 80, 24).await?;
         let (read_half, write_half) = channel.split();
         let write_half = Arc::new(write_half);
+
+        // 迷你终端等场景要求登录后直接落到指定目录：shell 就绪前写入 PTY 缓冲即可
+        if let Some(dir) = cwd.as_deref().filter(|d| !d.trim().is_empty()) {
+            let quoted = format!("'{}'", dir.replace('\'', "'\\''"));
+            let _ = write_half
+                .data_bytes(format!("cd {quoted}\r"))
+                .await;
+        }
 
         self.map.lock().map_err(|e| e.to_string())?.insert(
             id.clone(),

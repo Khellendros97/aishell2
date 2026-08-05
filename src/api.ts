@@ -84,10 +84,33 @@ export const sftpHome = (serverId: string) =>
   call<string>('sftp_home', { serverId });
 export const sftpList = (serverId: string, path: string) =>
   call<FsEntry[]>('sftp_list', { serverId, path });
+/** 读取远端文本文件：>5MB 或二进制会 reject（与 fs_read 同一编辑约束） */
+export const sftpRead = (serverId: string, remotePath: string) =>
+  call<string>('sftp_read', { serverId, remotePath });
+/** 覆写远端文本文件（保存场景允许覆盖） */
+export const sftpWrite = (serverId: string, remotePath: string, content: string) =>
+  call<void>('sftp_write', { serverId, remotePath, content });
+/** 上传本地文件/目录到远端目录（重名自动改名）；返回最终落地名称 */
 export const sftpUpload = (serverId: string, localPath: string, remoteDir: string) =>
-  call<void>('sftp_upload', { serverId, localPath, remoteDir });
+  call<string>('sftp_upload', { serverId, localPath, remoteDir });
+/** 下载远端文件/目录到本地目录（重名自动改名）；返回最终落地的完整本地路径 */
 export const sftpDownload = (serverId: string, remotePath: string, localDir: string) =>
-  call<void>('sftp_download', { serverId, remotePath, localDir });
+  call<string>('sftp_download', { serverId, remotePath, localDir });
+/** 远端移动/重命名：to 为完整目标路径；目标已存在会 reject */
+export const sftpRename = (serverId: string, from: string, to: string) =>
+  call<void>('sftp_rename', { serverId, from, to });
+/** 复制远端文件/目录进 toDir（重名自动改名）；返回落地名称 */
+export const sftpCopy = (serverId: string, from: string, toDir: string) =>
+  call<string>('sftp_copy', { serverId, from, toDir });
+/** 删除远端文件或目录（目录递归删除） */
+export const sftpDelete = (serverId: string, path: string) =>
+  call<void>('sftp_delete', { serverId, path });
+/** dir 内不冲突的远端名称（重名自动 `name (1).ext`）——压缩包目标名防覆盖用 */
+export const sftpUniqueName = (serverId: string, dir: string, name: string) =>
+  call<string>('sftp_unique_name', { serverId, dir, name });
+/** 创建远端空文件或目录（目标已存在会 reject） */
+export const sftpCreate = (serverId: string, path: string, isDir: boolean) =>
+  call<void>('sftp_create', { serverId, path, isDir });
 
 /* ---------------- ai ---------------- */
 /** 后端发出的 AI 回合事件（key = `<projectId>:<sessionId>`）：

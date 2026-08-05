@@ -99,7 +99,9 @@ impl AiActions {
             return Err(format!("上传源既不是文件也不是目录：{}", local.display()));
         }
         let sftp = self.ssh.open_sftp(&server_id).await?;
-        crate::sftp::upload_one(&sftp, &local, &remote_dir).await
+        crate::sftp::upload_one(&sftp, &local, &remote_dir)
+            .await
+            .map(|_| ())
     }
 
     /// SFTP 下载：本地目标目录必须在项目根内且**已存在**（AI 不自动创建目录）。
@@ -125,7 +127,9 @@ impl AiActions {
             return Err(format!("下载目标不是目录：{}", dir.display()));
         }
         let sftp = self.ssh.open_sftp(&server_id).await?;
-        crate::sftp::download_one(&sftp, &remote_path, &dir).await
+        crate::sftp::download_one(&sftp, &remote_path, &dir)
+            .await
+            .map(|_| ())
     }
 
     /// 查询项目绑定的可操作服务器列表（只读；供 LLM 在远程动作前确认 serverId）。

@@ -56,8 +56,10 @@ pub fn fs_list(path: String) -> Result<Vec<FsEntry>, String> {
     Ok(entries)
 }
 
-const MAX_EDIT_BYTES: u64 = 5 * 1024 * 1024;
-const BINARY_SCAN_BYTES: usize = 8 * 1024;
+/// 编辑器文件大小上限（sftp_read 复用同一约束）。
+pub(crate) const MAX_EDIT_BYTES: u64 = 5 * 1024 * 1024;
+/// 二进制探测字节数（sftp_read 复用同一约束）。
+pub(crate) const BINARY_SCAN_BYTES: usize = 8 * 1024;
 
 /// 读取文本文件；>5MB 或前 8KB 含 NUL 字节 → 报错（不可编辑）。
 #[tauri::command]
