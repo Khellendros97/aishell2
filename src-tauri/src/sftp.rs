@@ -1,4 +1,4 @@
-//! SFTP 文件管理 —— sftp_list / sftp_upload / sftp_download。
+//! SFTP 文件管理 —— sftp_home / sftp_list / sftp_upload / sftp_download。
 //! 连接一律经 ssh::SshManager::open_sftp 获取（连接复用由 SshManager 负责）；
 //! SftpSession 每次命令新建、用完即弃。目录递归在后端完成，重名自动 `name (1).ext`。
 //! FsEntry 复用 fsops::FsEntry（serde camelCase，与 src/types.ts 对齐）。
@@ -15,6 +15,18 @@ use crate::ssh::SshManager;
 
 /// 流式拷贝缓冲大小（64KB）。
 const COPY_BUF: usize = 64 * 1024;
+
+/// 解析远端会话的 home 目录（canonicalize(".")）：前端初始定位与 home 按钮都指向它。
+#[tauri::command]
+pub async fn sftp_home(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+) -> Result<String, String> {
+    let sftp = ssh.inner().open_sftp(&server_id).await?;
+    sftp.canonicalize(".")
+        .await
+        .map_err(|e| format!("解析远端 home 失败: {e}"))
+}
 
 /// 列出远端目录。path 为 "." 或空串时先 canonicalize(".") 取远端 home。
 #[tauri::command]

@@ -133,6 +133,8 @@ html, body {
 }
 .icon-btn:hover { background: var(--bg-hover); color: var(--text-0); }
 .icon-btn.danger:hover { background: var(--red-dim); color: var(--red); }
+.icon-btn:disabled { opacity: 0.4; cursor: default; }
+.icon-btn:disabled:hover { background: transparent; color: var(--text-1); }
 
 /* SVG 图标（src/icons.ts）：尺寸 1em 随容器字号，颜色随 currentColor（含 hover/active/danger） */
 svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }

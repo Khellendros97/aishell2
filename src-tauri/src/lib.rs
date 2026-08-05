@@ -85,6 +85,7 @@ pub fn run() {
             fsops::fs_move,
             fsops::fs_copy,
             fsops::fs_reveal,
+            sftp::sftp_home,
             sftp::sftp_list,
             sftp::sftp_upload,
             sftp::sftp_download,

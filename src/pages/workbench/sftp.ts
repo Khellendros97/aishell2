@@ -1,7 +1,7 @@
 /**
  * SFTP 标签渲染器 —— 移植自 .proto/workbench-sftp.js，数据源换成真实后端命令。
- * - 每个 tab 独立维护 cwd / history / forward 栈；初始路径 '/'（后端 home 语义并入根）
- * - 顶栏：后退 / 前进 / 上级 / home / 根 + 面包屑（每段可点、当前段禁用）+ 平铺/列表视图切换
+ * - 每个 tab 独立维护 cwd / history / forward 栈；打开时先解析远端 home（sftp_home）作为初始路径
+ * - 顶栏：后退 / 前进 / 上级 / home（~ 主目录）/ 根（/）+ 可编辑路径输入框（回车或「跳转」直达）+ 平铺/列表视图切换
  * - 平铺/列表双视图；单击目录进入、双击文件提示；条目可拖拽（source:'remote' + serverId）
  * - 容器 drop 收 source:'local' → sftp_upload → toast → 刷新
  * - OS 文件拖入（dataTransfer.files）在此面板刻意不接收：系统文件只进本地文件资源管理器
@@ -9,7 +9,7 @@
  */
 import './sftp.css';
 import type { FsEntry } from '../../types';
-import { sftpList, sftpUpload } from '../../api';
+import { sftpHome, sftpList, sftpUpload } from '../../api';
 import { toast } from '../../ui';
 import { bus, registerRenderer, Workbench, type Tab } from './core';
 import { icon, icon as iconSvg } from '../../icons';
@@ -21,13 +21,16 @@ interface SftpEls {
   upBtn: HTMLButtonElement;
   homeBtn: HTMLButtonElement;
   rootBtn: HTMLButtonElement;
-  crumbs: HTMLElement;
+  pathInput: HTMLInputElement;
+  goBtn: HTMLButtonElement;
   gridBtn: HTMLButtonElement;
   listBtn: HTMLButtonElement;
 }
 
 interface SftpTabState {
   serverId: string;
+  /** 远端 home（sftp_home 解析，失败时回退 '/'） */
+  home: string;
   cwd: string;
   back: string[];
   fwd: string[];
@@ -71,6 +74,19 @@ function parentOf(path: string): string {
   return idx <= 0 ? '/' : path.slice(0, idx);
 }
 
+/** 用户输入的远程路径归一化：统一 '/'、折叠重复分隔符、解析 . / ..，非法输入返回 null */
+function normalizeRemotePath(p: string): string | null {
+  const raw = p.trim().replace(/\\/g, '/');
+  if (!raw) return null;
+  const segs: string[] = [];
+  for (const seg of raw.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') segs.pop();
+    else segs.push(seg);
+  }
+  return '/' + segs.join('/');
+}
+
 function emptyState(iconName: Parameters<typeof icon>[0], text: string): HTMLElement {
   const es = document.createElement('div');
   es.className = 'empty-state';
@@ -102,6 +118,17 @@ async function loadDir(st: SftpTabState): Promise<void> {
     toast(String(err), 'error');
   }
   renderView(st);
+}
+
+/** 打开标签先解析远端 home：成功则初始定位 home，失败回退 '/' 并 toast（home 语义仍可用） */
+async function initHome(st: SftpTabState): Promise<void> {
+  try {
+    st.home = await sftpHome(st.serverId);
+    st.cwd = st.home;
+  } catch (err) {
+    toast(String(err), 'error');
+  }
+  void loadDir(st);
 }
 
 function goTo(st: SftpTabState, path: string, push: boolean): void {
@@ -182,18 +209,6 @@ function bindDrop(root: HTMLElement, st: SftpTabState): void {
 }
 
 /* ---------- 视图渲染 ---------- */
-function buildCrumbs(cwd: string): Array<{ label: string; path: string }> {
-  const crumbs = [{ label: '/', path: '/' }];
-  if (cwd !== '/') {
-    let acc = '';
-    for (const seg of cwd.split('/').filter(Boolean)) {
-      acc = acc ? acc + '/' + seg : '/' + seg;
-      crumbs.push({ label: seg, path: acc });
-    }
-  }
-  return crumbs;
-}
-
 function buildToolbar(st: SftpTabState): HTMLElement {
   const bar = document.createElement('div');
   bar.className = 'sf-toolbar';
@@ -205,13 +220,44 @@ function buildToolbar(st: SftpTabState): HTMLElement {
     b.addEventListener('click', fn);
     return b;
   };
+  const jump = (): void => {
+    // ~ / ~/xxx 展开为远端 home
+    const raw = st.els.pathInput.value.trim();
+    const expanded = raw === '~' ? st.home : raw.startsWith('~/') ? st.home + raw.slice(1) : raw;
+    const p = normalizeRemotePath(expanded);
+    if (p === null) {
+      st.els.pathInput.value = st.cwd;
+      return;
+    }
+    // 先失焦：renderView 只在输入框非聚焦时同步 value，否则用户输入会被覆盖
+    st.els.pathInput.blur();
+    goTo(st, p, true);
+  };
   st.els.backBtn = mk('', icon('arrowLeft'), '后退', () => goBack(st));
   st.els.fwdBtn = mk('', icon('arrowRight'), '前进', () => goForward(st));
   st.els.upBtn = mk('', icon('arrowUp'), '上一级', () => goTo(st, parentOf(st.cwd), true));
-  st.els.homeBtn = mk('', icon('home'), '回到根目录 /', () => goTo(st, '/', true));
+  st.els.homeBtn = mk('', icon('home'), '回到主目录 ~', () => goTo(st, st.home, true));
   st.els.rootBtn = mk('', icon('slash'), '根目录 /', () => goTo(st, '/', true));
-  st.els.crumbs = document.createElement('div');
-  st.els.crumbs.className = 'sf-crumb';
+  const input = document.createElement('input');
+  input.className = 'input sf-path';
+  input.type = 'text';
+  input.spellcheck = false;
+  input.placeholder = '输入远程路径，回车跳转';
+  input.title = '远程路径（自动归一化 . / ..），回车或点击「跳转」进入';
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') jump();
+    else if (e.key === 'Escape') {
+      input.value = st.cwd;
+      input.blur();
+    }
+  });
+  const goBtn = document.createElement('button');
+  goBtn.className = 'btn sf-go';
+  goBtn.textContent = '跳转';
+  goBtn.title = '跳转到输入框中的路径';
+  goBtn.addEventListener('click', jump);
+  st.els.pathInput = input;
+  st.els.goBtn = goBtn;
   st.els.gridBtn = mk('sf-view', icon('grid'), '平铺视图', () => setViewMode('grid'));
   st.els.listBtn = mk('sf-view', icon('list'), '列表视图', () => setViewMode('list'));
   bar.appendChild(st.els.backBtn);
@@ -219,7 +265,8 @@ function buildToolbar(st: SftpTabState): HTMLElement {
   bar.appendChild(st.els.upBtn);
   bar.appendChild(st.els.homeBtn);
   bar.appendChild(st.els.rootBtn);
-  bar.appendChild(st.els.crumbs);
+  bar.appendChild(input);
+  bar.appendChild(goBtn);
   bar.appendChild(st.els.gridBtn);
   bar.appendChild(st.els.listBtn);
   return bar;
@@ -308,25 +355,13 @@ function renderView(st: SftpTabState): void {
   st.els.backBtn.disabled = st.back.length === 0;
   st.els.fwdBtn.disabled = st.fwd.length === 0;
   st.els.upBtn.disabled = st.cwd === '/';
+  st.els.homeBtn.disabled = st.cwd === st.home;
+  st.els.rootBtn.disabled = st.cwd === '/';
+  st.els.homeBtn.title = '回到主目录 ' + st.home;
   st.els.gridBtn.classList.toggle('active', viewMode === 'grid');
   st.els.listBtn.classList.toggle('active', viewMode === 'list');
-
-  const crumbs = buildCrumbs(st.cwd);
-  const crumbBox = st.els.crumbs;
-  crumbBox.textContent = '';
-  crumbs.forEach((c, i) => {
-    if (i > 0) {
-      const sep = document.createElement('span');
-      sep.className = 'sf-crumb-sep';
-      sep.textContent = '/';
-      crumbBox.appendChild(sep);
-    }
-    const btn = document.createElement('button');
-    btn.className = 'sf-crumb-item' + (i === crumbs.length - 1 ? ' cur' : '');
-    btn.textContent = c.label;
-    if (i < crumbs.length - 1) btn.addEventListener('click', () => goTo(st, c.path, true));
-    crumbBox.appendChild(btn);
-  });
+  // 输入框聚焦编辑中不覆盖用户输入；其余时刻与当前路径保持同步
+  if (document.activeElement !== st.els.pathInput) st.els.pathInput.value = st.cwd;
 
   const body = st.els.body;
   body.textContent = '';
@@ -368,6 +403,7 @@ function renderView(st: SftpTabState): void {
 registerRenderer('sftp', (container, tab) => {
   const st: SftpTabState = {
     serverId: String(tab.data.serverId ?? ''),
+    home: '/',
     cwd: '/',
     back: [],
     fwd: [],
@@ -390,7 +426,7 @@ registerRenderer('sftp', (container, tab) => {
 
   container.appendChild(root);
   bindDrop(root, st);
-  void loadDir(st);
+  void initHome(st);
 
   return {
     getCwd: () => st.cwd,
