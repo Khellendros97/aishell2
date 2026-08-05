@@ -13,7 +13,7 @@ import { HighlightStyle, LanguageDescription, indentUnit, syntaxHighlighting } f
 import { languages } from '@codemirror/language-data';
 import { tags } from '@lezer/highlight';
 import { oneDarkTheme } from '@codemirror/theme-one-dark';
-import { fsRead, fsWrite, onFsChanged } from '../../api';
+import { fsRead, fsWrite, onFsChanged, sftpRead, sftpWrite } from '../../api';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
 import type { FileRef } from '../../types';
 import { registerRenderer, bus, setTabTitle, Workbench, type Tab } from './core';
@@ -88,9 +88,14 @@ function queueSave(entry: EditorEntry, silent: boolean): Promise<void> {
   clearTimeout(entry.timer);
   entry.timer = undefined;
   const path = String(entry.tab.data.path ?? '');
+  const sftp = entry.tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
+  const remote = Boolean(sftp?.serverId && sftp.remotePath);
   const content = entry.view.state.doc.toString();
   const version = entry.version;
-  const run = entry.chain.then(() => fsWrite(path, content));
+  // 远端文件（SFTP 打开）保存走 sftp_write，否则本地 fs_write
+  const run = remote
+    ? entry.chain.then(() => sftpWrite(sftp!.serverId!, sftp!.remotePath!, content))
+    : entry.chain.then(() => fsWrite(path, content));
   entry.chain = run.catch(() => undefined); // 失败不阻断后续写盘
   return run.then(
     () => {
@@ -99,7 +104,7 @@ function queueSave(entry: EditorEntry, silent: boolean): Promise<void> {
         entry.dirty = false;
         setTabTitle(entry.tab.id, entry.baseTitle);
       }
-      if (!silent) toast('已自动保存', 'success');
+      if (!silent) toast(remote ? '已保存到远端' : '已自动保存', 'success');
     },
     (err: unknown) => {
       // 失败：toast 错误原文，保留脏标
@@ -124,10 +129,14 @@ function markDirty(entry: EditorEntry): void {
 /** skipIfSame：外部刷新用 —— 磁盘内容与当前文档一致时跳过，不打扰光标与撤销历史 */
 async function loadFile(entry: EditorEntry, skipIfSame = false): Promise<void> {
   const path = String(entry.tab.data.path ?? '');
+  const sftp = entry.tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
   let text = '';
   let ok = false;
   try {
-    text = await fsRead(path);
+    // 远端文件（SFTP 打开）读取走 sftp_read，否则本地 fs_read
+    text = sftp?.serverId && sftp.remotePath
+      ? await sftpRead(sftp.serverId, sftp.remotePath)
+      : await fsRead(path);
     ok = true;
   } catch (err) {
     toast(String(err), 'error');
@@ -235,7 +244,9 @@ function addSelectionToAI(view: EditorView, path: string, from: number, to: numb
 
 /* ---------- 渲染器 ---------- */
 registerRenderer('editor', (container, tab) => {
-  const path = String(tab.data.path ?? '');
+  const sftp = tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
+  // 远端文件无本地 path：用远端路径承担文件名/语言/选区引用展示
+  const path = String(tab.data.path ?? '') || (sftp?.remotePath ?? '');
   const name = path.split(/[\\/]/).pop() ?? '';
   const baseTitle = tab.title || name || '未命名';
 
@@ -321,6 +332,7 @@ bus.on('tab-closed', (tab) => {
 void onFsChanged((changedPath) => {
   const changedKey = filePathKey(changedPath);
   entries.forEach((entry) => {
+    if (entry.tab.data.sftp) return; // 远端文件无本地路径，不参与本地 fs:changed
     const path = String(entry.tab.data.path ?? '');
     if (filePathKey(path) !== changedKey) return;
     if (entry.dirty) {

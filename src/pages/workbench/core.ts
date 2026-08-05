@@ -173,6 +173,10 @@ export function getActiveTerminalApi(): TerminalApi | null {
 export const Workbench = {
   state: { project: null as Project | null },
   ai: null as AiHandle | null,
+  /** 侧栏面板切换（workbench.ts 挂载后注入）：sftp 下载完成切回文件资源管理器用 */
+  switchPanel: null as ((panel: string) => void) | null,
+  /** 当前显示的侧栏面板（explorer | servers | commands），快捷键按面板分发用 */
+  activePanel: null as string | null,
   // 拖拽数据契约：dataTransfer 类型 'application/x-aishell'，
   // JSON: { source: 'local'|'remote', path: string, name: string, isDir: boolean, serverId?: string }
   DND_MIME: 'application/x-aishell',

@@ -152,6 +152,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     activityBar.querySelectorAll('.activity-icon').forEach((el) => {
       el.classList.toggle('active', el.getAttribute('data-panel') === panel);
     });
+    Workbench.activePanel = panel;
   }
 
   function setPanel(panel: string): void {
@@ -163,6 +164,8 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     currentPanel = panel;
     mountPanel(panel);
   }
+  // 供其他模块（如 SFTP 下载完成）程序化切换面板
+  Workbench.switchPanel = (panel: string) => setPanel(panel);
 
   function setAiVisible(visible: boolean): void {
     if (!aiMounted) { mountAiPanel(aiPanel); aiMounted = true; }

@@ -5,9 +5,13 @@
  * 契约：mountExplorerPanel(container) 由 workbench.ts 侧栏框架挂载（container = #sidebar-content，
  * 面板不碰 #sidebar-head）；explorerHead 描述符由框架渲染标题与 actions 区。
  */
-import { bus, getTabs, openTab, Workbench } from '../core';
+import { bus, getActiveTab, getTabs, openTab, Workbench } from '../core';
 import { confirmDialog, copyText, showContextMenu, toast, type CtxItem } from '../../../ui';
-import { fsCopy, fsCreate, fsDelete, fsImport, fsList, fsMove, fsReveal, sftpDownload } from '../../../api';
+import {
+  fsCopy, fsCreate, fsDelete, fsImport, fsList, fsMove, fsReveal,
+  sftpDelete, sftpDownload, sftpUpload,
+} from '../../../api';
+import { clearClip, getClip, setClip } from '../clipboard';
 import type { FsEntry } from '../../../types';
 import { icon as iconSvg } from '../../../icons';
 import './explorer.css';
@@ -55,13 +59,13 @@ interface TreeNode {
 let container: HTMLElement | null = null;
 let mounted = false;
 let rootNode: TreeNode | null = null;
+/** 单击聚焦的当前行路径（快捷键操作目标；渲染时行加 .sel） */
+let selectedPath: string | null = null;
 const expanded = new Set<string>();
 /** 全局加载序号：异步结果只接受最新一次（防止乱序渲染） */
 let loadSeq = 0;
 /** 拖拽中的本地节点（dragover 据此决定 move/copy 光标；守卫在 moveNode 内） */
 let draggingNode: TreeNode | null = null;
-/** 复制/剪切剪贴板：剪切粘贴成功后清空，复制可多次粘贴 */
-let fsClipboard: { path: string; name: string; isDir: boolean; mode: 'copy' | 'cut' } | null = null;
 
 const joinPath = (parent: string, name: string): string => `${parent}/${name}`;
 const normPath = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -174,6 +178,8 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
   row.className = 'wbs-explorer-row';
   row.style.paddingLeft = `${6 + depth * 14}px`;
   row.title = node.path;
+  row.dataset.path = node.path; // 快捷键定位行元素用
+  if (selectedPath === node.path) row.classList.add('sel');
 
   const arrow = document.createElement('span');
   arrow.className = 'wbs-explorer-arrow';
@@ -241,7 +247,10 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
   }
 
   /* 剪切中的行半透明（剪切粘贴成功前） */
-  if (fsClipboard?.mode === 'cut' && fsClipboard.path === node.path) row.classList.add('wbs-cut');
+  const clipMark = getClip();
+  if (clipMark?.mode === 'cut' && clipMark.items.some((i) => i.path === node.path)) {
+    row.classList.add('wbs-cut');
+  }
 
   /* 目录行是 remote 拖入的下载目标，也是 OS 文件拖入的上传目标 */
   if (node.isDir) {
@@ -286,7 +295,14 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
     });
   }
 
-  row.addEventListener('click', () => openNode(node));
+  /* 单击聚焦、双击打开（与 SFTP 面板统一；目录双击才展开/折叠）。
+     点击同时把焦点从终端 xterm 隐藏输入框移走，让面板快捷键可响应。 */
+  row.addEventListener('click', () => {
+    selectedPath = node.path;
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    render();
+  });
+  row.addEventListener('dblclick', () => openNode(node));
   return row;
 }
 
@@ -366,21 +382,44 @@ async function moveNode(srcPath: string, name: string, isDir: boolean, targetDir
 }
 
 async function pasteInto(targetDir: TreeNode): Promise<void> {
-  const clip = fsClipboard;
+  const clip = getClip();
   if (!clip) return;
-  if (clip.isDir && (targetDir.path === clip.path || targetDir.path.startsWith(`${clip.path}/`))) {
+  /* 远端源：下载到本地目标目录（重名自动改名）；剪切 = 下载 + 删除远端源 */
+  if (clip.source === 'remote') {
+    if (!clip.serverId) return;
+    if (clip.items.some((i) => i.isDir && (targetDir.path === i.path || targetDir.path.startsWith(`${i.path}/`)))) {
+      toast('不能把目录粘贴到它自身内部', 'error');
+      return;
+    }
+    try {
+      for (const it of clip.items) await sftpDownload(clip.serverId, it.path, targetDir.path);
+      if (clip.mode === 'cut') {
+        for (const it of clip.items) await sftpDelete(clip.serverId, it.path);
+        clearClip();
+      }
+      expanded.add(targetDir.path);
+      await refreshDir(targetDir);
+      toast('粘贴成功', 'success');
+    } catch (err) {
+      toast(String(err), 'error');
+    }
+    return;
+  }
+  if (clip.items.some((i) => i.isDir && (targetDir.path === i.path || targetDir.path.startsWith(`${i.path}/`)))) {
     toast('不能把目录粘贴到它自身内部', 'error');
     return;
   }
   try {
     if (clip.mode === 'cut') {
-      const srcParent = clip.path.slice(0, clip.path.length - clip.name.length - 1);
-      if (normPath(srcParent) === normPath(targetDir.path)) return; // 同目录剪切 = 无操作
-      if (blockedByEditor(clip.path)) return;
-      await fsMove(clip.path, joinPath(targetDir.path, clip.name));
-      fsClipboard = null;
+      for (const it of clip.items) {
+        const srcParent = it.path.slice(0, it.path.length - it.name.length - 1);
+        if (normPath(srcParent) === normPath(targetDir.path)) continue; // 同目录剪切 = 无操作
+        if (blockedByEditor(it.path)) continue;
+        await fsMove(it.path, joinPath(targetDir.path, it.name));
+      }
+      clearClip();
     } else {
-      await fsCopy(clip.path, targetDir.path);
+      for (const it of clip.items) await fsCopy(it.path, targetDir.path);
     }
     expanded.add(targetDir.path);
     await refreshAll();
@@ -444,13 +483,31 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
     { label: '新建文件', iconName: 'filePlus', action: () => startInlineInput(false, node, row) },
     { label: '新建目录', iconName: 'folderPlus', action: () => startInlineInput(true, node, row) },
   ] : [];
+  /* 上传到 SFTP：仅当工作区激活标签为 SFTP 时显示（目标 = 该 SFTP 标签当前目录） */
+  const sftpTab = getActiveTab();
+  const uploadItems: CtxItem[] = sftpTab && sftpTab.type === 'sftp' && sftpTab.data.serverId ? [
+    {
+      label: '上传到服务器', iconName: 'upload',
+      action: () => {
+        const api = sftpTab.api as { getCwd?: () => string; focus?: (name: string) => void } | null;
+        const cwd = api?.getCwd?.() ?? '/';
+        void sftpUpload(String(sftpTab.data.serverId), node.path, cwd)
+          .then((landed) => {
+            toast(`已上传 ${node.name}`, 'success');
+            api?.focus?.(landed); // 刷新 SFTP 面板并聚焦落地文件
+          })
+          .catch((err: unknown) => toast(String(err), 'error'));
+      },
+    },
+  ] : [];
   showContextMenu(x, y, [
     { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => openNode(node) },
     ...(newItems.length ? ['sep' as const, ...newItems] : []),
     'sep',
-    { label: '复制', iconName: 'copy', action: () => { fsClipboard = { path: node.path, name: node.name, isDir: node.isDir, mode: 'copy' }; render(); } },
-    { label: '剪切', iconName: 'scissors', disabled: editing, disabledTip: editingTip, action: () => { fsClipboard = { path: node.path, name: node.name, isDir: node.isDir, mode: 'cut' }; render(); } },
-    { label: '粘贴', iconName: 'clipboard', disabled: !fsClipboard || !pasteTarget, action: () => { if (pasteTarget) void pasteInto(pasteTarget); } },
+    { label: '复制', iconName: 'copy', action: () => { setClip({ source: 'local', items: [{ path: node.path, name: node.name, isDir: node.isDir }], mode: 'copy' }); render(); } },
+    { label: '剪切', iconName: 'scissors', disabled: editing, disabledTip: editingTip, action: () => { setClip({ source: 'local', items: [{ path: node.path, name: node.name, isDir: node.isDir }], mode: 'cut' }); render(); } },
+    { label: '粘贴', iconName: 'clipboard', disabled: !getClip() || !pasteTarget, action: () => { if (pasteTarget) void pasteInto(pasteTarget); } },
+    ...(uploadItems.length ? ['sep' as const, ...uploadItems] : []),
     'sep',
     { label: '重命名', iconName: 'pencil', disabled: editing, disabledTip: editingTip, action: () => startRename(node, row) },
     { label: '删除', iconName: 'trash', danger: true, action: () => void deleteNode(node) },
@@ -462,11 +519,29 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
 }
 
 function showRootMenu(x: number, y: number, root: TreeNode): void {
+  /* 上传到 SFTP：仅当工作区激活标签为 SFTP 时显示 */
+  const sftpTab = getActiveTab();
+  const uploadItems: CtxItem[] = sftpTab && sftpTab.type === 'sftp' && sftpTab.data.serverId ? [
+    {
+      label: '上传到服务器', iconName: 'upload',
+      action: () => {
+        const api = sftpTab.api as { getCwd?: () => string; focus?: (name: string) => void } | null;
+        const cwd = api?.getCwd?.() ?? '/';
+        void sftpUpload(String(sftpTab.data.serverId), root.path, cwd)
+          .then((landed) => {
+            toast(`已上传 ${root.name}`, 'success');
+            api?.focus?.(landed); // 刷新 SFTP 面板并聚焦落地文件
+          })
+          .catch((err: unknown) => toast(String(err), 'error'));
+      },
+    },
+  ] : [];
   showContextMenu(x, y, [
     { label: '新建文件', iconName: 'filePlus', action: () => startInlineInput(false, root, null) },
     { label: '新建目录', iconName: 'folderPlus', action: () => startInlineInput(true, root, null) },
     'sep',
-    { label: '粘贴', iconName: 'clipboard', disabled: !fsClipboard, action: () => void pasteInto(root) },
+    { label: '粘贴', iconName: 'clipboard', disabled: !getClip(), action: () => void pasteInto(root) },
+    ...(uploadItems.length ? ['sep' as const, ...uploadItems] : []),
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(root.path).catch((err) => toast(String(err), 'error')) },
   ]);
@@ -535,6 +610,45 @@ async function downloadTo(
     await refreshDir(targetDir);
   } catch (err) {
     toast(String(err), 'error');
+  }
+}
+
+/* ---------- 下载后定位高亮（SFTP 面板下载完成调用） ---------- */
+/** 等待 node.children 就绪：未加载则发起，在途加载则轮询等其落地。 */
+async function ensureChildren(node: TreeNode): Promise<void> {
+  for (;;) {
+    if (node.children) return;
+    if (node.loading) {
+      await new Promise((r) => setTimeout(r, 40));
+      continue;
+    }
+    await loadDir(node);
+    return;
+  }
+}
+
+/** 展开祖先链、滚动到可见并短暂高亮目标本地路径；路径不在项目内时静默忽略。 */
+export async function revealLocalPath(path: string): Promise<void> {
+  const root = getRoot();
+  if (!container || !root || !path.startsWith(`${root.path}/`)) return;
+  const segs = path.slice(root.path.length + 1).split('/');
+  let node = root;
+  // 逐级展开父目录（每层确保 children 已加载）
+  for (let i = 0; i < segs.length - 1; i++) {
+    expanded.add(node.path);
+    await ensureChildren(node);
+    const child = (node.children ?? []).find((c) => c.name === segs[i]);
+    if (!child) return;
+    node = child;
+  }
+  expanded.add(node.path);
+  render();
+  const row = Array.from(container.querySelectorAll('.wbs-explorer-row'))
+    .find((el) => el.getAttribute('title') === path);
+  if (row) {
+    row.scrollIntoView({ block: 'nearest' });
+    row.classList.add('wbs-explorer-highlight');
+    window.setTimeout(() => row.classList.remove('wbs-explorer-highlight'), 2500);
   }
 }
 
@@ -679,6 +793,85 @@ function startPolling(): void {
     void refreshAll();
   }, POLL_MS);
 }
+
+/* ---------- 快捷键：Ctrl+C 复制 / Ctrl+X 剪切 / Ctrl+V 粘贴 / F2 重命名 / Delete 删除 ----------
+   与 SFTP 面板同套语义；仅当侧栏显示文件资源管理器时生效；编辑控件聚焦时不劫持。 */
+function findNode(path: string): TreeNode | null {
+  const root = getRoot();
+  if (!root) return null;
+  if (root.path === path) return root;
+  const stack: TreeNode[] = [root];
+  while (stack.length) {
+    const n = stack.pop()!;
+    for (const c of n.children ?? []) {
+      if (c.path === path) return c;
+      if (c.isDir) stack.push(c);
+    }
+  }
+  return null;
+}
+
+/** 粘贴目标：选中目录自身 / 选中文件（或未选中）的父目录 / 根 */
+function pasteTargetNode(): TreeNode | null {
+  const root = getRoot();
+  if (!root) return null;
+  if (!selectedPath) return root;
+  const n = findNode(selectedPath);
+  if (!n) return root;
+  return n.isDir ? n : (n.parent ?? root);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (Workbench.activePanel !== 'explorer') return;
+  const ae = document.activeElement;
+  const typing = ae instanceof HTMLInputElement
+    || ae instanceof HTMLTextAreaElement
+    || (ae instanceof HTMLElement && ae.isContentEditable);
+  if (typing) return;
+  const root = getRoot();
+  if (!root) return;
+  const node = selectedPath ? findNode(selectedPath) : null;
+  if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+    const k = e.key.toLowerCase();
+    if (k === 'v') {
+      // 粘贴不要求有选中
+      if (getClip()) {
+        e.preventDefault();
+        const target = pasteTargetNode();
+        if (target) void pasteInto(target);
+      }
+      return;
+    }
+    if (!node || node === root) return;
+    if (k === 'c') {
+      e.preventDefault();
+      setClip({ source: 'local', items: [{ path: node.path, name: node.name, isDir: node.isDir }], mode: 'copy' });
+      render();
+      return;
+    }
+    if (k === 'x') {
+      if (blockedByEditor(node.path)) return;
+      e.preventDefault();
+      setClip({ source: 'local', items: [{ path: node.path, name: node.name, isDir: node.isDir }], mode: 'cut' });
+      render();
+      return;
+    }
+    return;
+  }
+  if (e.ctrlKey || e.metaKey || e.altKey || !node || node === root) return;
+  if (e.key === 'F2') {
+    if (blockedByEditor(node.path)) return;
+    e.preventDefault();
+    const row = Array.from(container?.querySelectorAll<HTMLElement>('.wbs-explorer-row') ?? [])
+      .find((el) => el.dataset.path === node.path);
+    if (row) startRename(node, row);
+    return;
+  }
+  if (e.key === 'Delete') {
+    e.preventDefault();
+    void deleteNode(node);
+  }
+});
 
 /* ---------- 挂载 ---------- */
 export function mountExplorerPanel(el: HTMLElement): void {

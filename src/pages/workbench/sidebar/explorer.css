@@ -5,6 +5,8 @@
   cursor: pointer; user-select: none; border-radius: 3px;
 }
 .wbs-explorer-row:hover { background: var(--bg-hover); }
+.wbs-explorer-row.sel { background: var(--bg-active); }
+.wbs-explorer-row.sel .wbs-explorer-name { color: var(--text-0); }
 .wbs-explorer-arrow { width: 14px; flex: none; text-align: center; font-size: 10px; color: var(--text-2); }
 .wbs-explorer-file-tag { width: 26px; flex: none; text-align: center; font-size: 12px; line-height: 24px; }
 .wbs-explorer-name {
@@ -21,6 +23,9 @@
 /* 剪切中的行（粘贴成功前半透明） */
 .wbs-explorer-row.wbs-cut .wbs-explorer-name,
 .wbs-explorer-row.wbs-cut .wbs-explorer-file-tag { opacity: 0.45; }
+
+/* 下载完成定位高亮（SFTP 面板下载后短暂标记，2.5s 后由 JS 移除） */
+.wbs-explorer-row.wbs-explorer-highlight { background: var(--accent-dim); outline: 1px solid var(--accent); outline-offset: -1px; }
 
 /* 重命名行内输入 */
 .wbs-explorer-rename { flex: 1; min-width: 0; height: 22px; padding: 1px 6px; font-size: 12.5px; }
