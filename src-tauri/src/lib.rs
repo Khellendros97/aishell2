@@ -31,19 +31,46 @@ pub fn run() {
             let dev_pi = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
                 .join("pi");
-            let pi_dir = [
+            let candidates = [
                 resource_dir.join("resources").join("pi"),
                 resource_dir.join("pi"),
                 dev_pi.clone(),
-            ]
-            .into_iter()
-            .find(|p| p.join("pi.exe").is_file())
-            .unwrap_or(dev_pi);
+            ];
+            let pi_dir = candidates
+                .iter()
+                .find(|p| p.join("pi.exe").is_file())
+                .cloned()
+                .unwrap_or(dev_pi);
+            // pi 诊断：候选命中情况 + resource_dir 实际内容（排查安装版「pi 运行时不存在」）
+            let pi_debug = {
+                let mut s = format!("resource_dir: {}\n", resource_dir.display());
+                for c in &candidates {
+                    s.push_str(&format!(
+                        "候选: {} (pi.exe 存在: {})\n",
+                        c.display(),
+                        c.join("pi.exe").is_file()
+                    ));
+                }
+                s.push_str(&format!("选中: {}\n", pi_dir.display()));
+                match std::fs::read_dir(&resource_dir) {
+                    Ok(rd) => {
+                        let names: Vec<String> = rd
+                            .flatten()
+                            .take(30)
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect();
+                        s.push_str(&format!("resource_dir 内容: {}\n", names.join(", ")));
+                    }
+                    Err(e) => s.push_str(&format!("resource_dir 读取失败: {e}\n")),
+                }
+                s
+            };
             let ai = Arc::new(ai::AiManager::new(
                 store.clone(),
                 pi_dir,
                 config_dir.join("pi-agent"),
                 ssh.clone(),
+                pi_debug,
             ));
             app.manage(store);
             app.manage(ssh);
@@ -100,6 +127,7 @@ pub fn run() {
             sftp::sftp_create,
             ai::ai_chat,
             ai::ai_abort,
+            ai::ai_debug_info,
             ai::ai_kill_project,
             ai::ai_set_thinking,
             ai::set_ai_mode,

@@ -132,6 +132,8 @@ export type AiEvent =
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
 export const aiChat = (key: string, prompt: string) => call<void>('ai_chat', { key, prompt });
 export const aiAbort = (key: string) => call<void>('ai_abort', { key });
+/** pi 运行时诊断（候选路径命中情况 + 安装目录实际内容），供控制台输出排查安装版问题 */
+export const aiDebugInfo = () => call<string>('ai_debug_info');
 /** 工作台卸载/切项目时调用：kill 该项目全部 pi 进程 */
 export const aiKillProject = (projectId: string) => call<void>('ai_kill_project', { projectId });
 /** 动态切换项目内 AI 进程的思考强度（立即生效；无存活进程时静默，下次提问按新档位 spawn） */

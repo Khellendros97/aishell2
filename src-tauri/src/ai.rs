@@ -106,17 +106,21 @@ pub struct AiManager {
     pub store: Arc<Store>,
     pub pi_dir: PathBuf,
     pub agent_dir: PathBuf,
+    /// pi 运行时诊断（lib.rs 探测候选的命中情况 + resource_dir 实际内容）；
+    /// spawn 报错与 ai_debug_info 命令输出,便于排查安装版资源布局差异。
+    pub pi_debug: String,
     pub procs: Arc<Mutex<HashMap<String, AiProc>>>,
     actions: Arc<AiActions>,
 }
 
 impl AiManager {
-    pub fn new(store: Arc<Store>, pi_dir: PathBuf, agent_dir: PathBuf, ssh: Arc<crate::ssh::SshManager>) -> Self {
+    pub fn new(store: Arc<Store>, pi_dir: PathBuf, agent_dir: PathBuf, ssh: Arc<crate::ssh::SshManager>, pi_debug: String) -> Self {
         let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh));
         AiManager {
             store,
             pi_dir,
             agent_dir,
+            pi_debug,
             procs: Arc::new(Mutex::new(HashMap::new())),
             actions,
         }
@@ -159,7 +163,11 @@ impl AiManager {
     fn spawn(&self, app: &AppHandle, key: &str, project_id: &str) -> Result<(), String> {
         let pi_exe = self.pi_dir.join("pi.exe");
         if !pi_exe.is_file() {
-            return Err("pi 运行时不存在，请先执行 scripts/fetch-pi.sh".to_string());
+            return Err(format!(
+                "pi 运行时不存在：{}（安装可能不完整，请重新安装；以下诊断信息可反馈给开发者）\n{}",
+                pi_exe.display(),
+                self.pi_debug
+            ));
         }
         self.write_models_json()?;
         let api_key = self
@@ -795,6 +803,12 @@ pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(),
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
     }
     Ok(())
+}
+
+/// pi 运行时诊断信息：前端控制台输出，用于排查安装版资源布局问题。
+#[tauri::command]
+pub async fn ai_debug_info(mgr: State<'_, Arc<AiManager>>) -> Result<String, String> {
+    Ok(mgr.pi_debug.clone())
 }
 
 /// 工作台卸载/切换项目时调用：杀掉该项目全部 pi 进程。

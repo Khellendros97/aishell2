@@ -9,7 +9,7 @@ import MarkdownIt from 'markdown-it';
 import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, LlmConfig, Project, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
 import {
-  aiAbort, aiChat, aiKillProject, aiRespondApproval, aiSetThinking, getState, onAiEvent, saveSettings,
+  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiSetThinking, getState, onAiEvent, saveSettings,
   sessionUpsert, sessionsGet, setAiMode,
   type AiEvent,
 } from '../../api';
@@ -393,6 +393,9 @@ export function mountAiPanel(container: HTMLElement): void {
 
   Workbench.ai = aiHandle;
 
+  // pi 运行时诊断输出到控制台（F12 可查），便于排查安装版「pi 运行时不存在」
+  void aiDebugInfo().then((info) => console.log('[AI] pi 运行时诊断:\n' + info));
+
   bindEvents();
   void loadSessions();
   void loadEffort();
@@ -566,6 +569,7 @@ function handleEvent(key: string, ev: AiEvent): void {
   } else if (ev.type === 'done') {
     finalize(sid);
   } else {
+    console.error('[AI] 事件错误:', ev.message);
     pendingBy.set(sid, { phase: 'error', text: '', error: ev.message, tools: [], actions: new Map() });
   }
   if (sid === activeSessionId) {
@@ -1056,7 +1060,8 @@ function send(): void {
     .map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`)
     .join('');
   aiChat(`${project.id}:${sid}`, prompt).catch((err: unknown) => {
-    // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边
+    // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
+    console.error('[AI] ai_chat 失败:', err);
     pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
     if (sid === activeSessionId) {
       renderHistory();
