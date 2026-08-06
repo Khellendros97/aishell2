@@ -267,7 +267,9 @@ export function mountServersPanel(container: HTMLElement): void {
         data: { kind: 'local', cwd: project?.path ?? null },
       });
     };
-    wrap.appendChild(localCard);
+    /* 必须 prepend：持久搜索框（searchWrap）在重渲染时保留在 wrap 内，
+       appendChild 会把本地卡追加到搜索框/列表之后，目录展开时卡片沉底 */
+    wrap.prepend(localCard);
 
     // 「远程服务器」标题行 + 新建服务器快捷入口（空列表也可新建）
     const head = document.createElement('div');

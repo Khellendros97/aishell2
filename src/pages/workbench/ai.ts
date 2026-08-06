@@ -62,16 +62,26 @@ const STYLE = `
 .ai-action-card.succeeded { border-left: 3px solid var(--green); }
 .ai-action-card.failed { border-left: 3px solid var(--red); }
 .ai-action-card.rejected { border-left: 3px solid var(--yellow); opacity: 0.75; }
-/* 历史只读动作卡：默认折叠，点击头部展开/收起 */
-.ai-action-card[data-collapsible] { cursor: pointer; }
-.ai-action-card[data-collapsible] .ai-action-head { user-select: none; }
-.ai-action-card .ai-action-detail { display: flex; flex-direction: column; gap: 5px; }
-.ai-action-card.collapsed .ai-action-detail { display: none; }
-.ai-action-toggle {
-  display: inline-flex; align-items: center; margin-left: 4px;
+/* 回合结束后的一串工具调用：整组折叠，点击组头展开/收起 */
+.ai-action-group { margin: 6px 0; }
+.ai-action-group-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px;
+  padding: 7px 10px; font-size: 11.5px; cursor: pointer; user-select: none;
+}
+.ai-action-group-title { font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+.ai-action-group-title svg { flex: none; }
+.ai-action-group-meta { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); }
+.ai-action-group-bad { color: var(--red); }
+.ai-action-group-warn { color: var(--yellow); }
+.ai-action-group-body { display: flex; flex-direction: column; }
+.ai-action-group.collapsed .ai-action-group-body { display: none; }
+.ai-action-group-toggle {
+  display: inline-flex; align-items: center;
   color: var(--text-2); vertical-align: -2px;
 }
-.ai-action-toggle svg { width: 12px; height: 12px; }
+.ai-action-group-toggle svg { width: 12px; height: 12px; }
+.ai-action-card .ai-action-detail { display: flex; flex-direction: column; gap: 5px; }
 #ai-chat {
   flex: 1; overflow-y: auto; padding: 12px 10px;
   display: flex; flex-direction: column; gap: 10px;
@@ -278,8 +288,8 @@ const emptyPending = (): Pending => ({ phase: 'typing', text: '', tools: [], act
 let project: Project | null = null;
 const sessions = new Map<string, ChatSession>(); // id -> ChatSession（含历史）
 const pendingBy = new Map<string, Pending | null>(); // 会话 id -> 瞬时气泡状态
-/** 用户手动展开的历史动作卡（key = `<sid>:<toolCallId>`；renderHistory 全量重渲染时保持状态） */
-const expandedCards = new Set<string>();
+/** 用户手动展开的工具调用组（key = `<sid>:<消息ts>`；renderHistory 全量重渲染时保持状态） */
+const expandedGroups = new Set<string>();
 const snapshots = new Map<string, TermSnapshot>(); // 快照 id -> 全文（输入区 chip + 历史消息 chip 共用）
 const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编辑器选区，@文件名_起_止 标签）
 let activeSessionId = '';
@@ -665,18 +675,10 @@ function renderHistory(): void {
 }
 
 /** 动作卡渲染：Agent 审批态带批准/拒绝按钮；执行中/终态/历史只读无按钮。
- *  collapsible（历史只读）：默认折叠，仅显示工具名与状态，点击展开详情。 */
-function renderActionCard(
-  a: ActionCard,
-  opts: { collapsible?: boolean; expandKey?: string; expanded?: boolean } = {},
-): string {
-  const collapsible = !!opts.collapsible;
-  const collapsed = collapsible && !opts.expanded;
+ *  历史一串动作卡的折叠由 renderActionGroup 整组负责，单卡不再单独折叠。 */
+function renderActionCard(a: ActionCard): string {
   const statusText = ACTION_STATUS[a.status] ?? a.status;
-  const cls = [
-    ...(a.status === 'succeeded' || a.status === 'failed' || a.status === 'rejected' ? [a.status] : []),
-    ...(collapsed ? ['collapsed'] : []),
-  ].join(' ');
+  const cls = a.status === 'succeeded' || a.status === 'failed' || a.status === 'rejected' ? a.status : '';
   const isCmd = a.tool === 'run_command';
   const buttons = a.status === 'approving' && a.requestId
     ? `<div class="ai-action-actions">
@@ -687,13 +689,10 @@ function renderActionCard(
   const resultHtml = a.result && (a.status === 'succeeded' || a.status === 'failed')
     ? `<div class="ai-action-result">${escapeHtml(a.result)}</div>`
     : '';
-  const toggleHtml = collapsible
-    ? `<span class="ai-action-toggle" title="${collapsed ? '展开详情' : '收起详情'}">${icon(collapsed ? 'arrowDown' : 'arrowUp')}</span>`
-    : '';
-  return `<div class="ai-action-card ${cls}"${collapsible ? ` data-collapsible="1" data-expand-key="${escapeHtml(opts.expandKey ?? '')}"` : ''}>
+  return `<div class="ai-action-card ${cls}">
     <div class="ai-action-head">
       <span class="ai-action-name">${icon('wrench')} ${ACTION_NAMES[a.tool] ?? a.tool}</span>
-      <span class="ai-action-status">${statusText}${toggleHtml}</span>
+      <span class="ai-action-status">${statusText}</span>
     </div>
     <div class="ai-action-detail">
       ${a.intent ? `<div class="ai-action-intent">意图：${escapeHtml(a.intent)}</div>` : ''}
@@ -703,6 +702,26 @@ function renderActionCard(
       ${buttons}
       ${resultHtml}
     </div>
+  </div>`;
+}
+
+/** 回合结束后的历史动作卡整组折叠：默认收起为「工具调用 (N)」一行，点击组头展开全部详情。
+ *  失败/拒绝计数在组头聚合提示；展开状态以 `<sid>:<消息ts>` 为 key 跨重渲染保持。 */
+function renderActionGroup(actions: AiActionRecord[], groupKey: string): string {
+  const expanded = expandedGroups.has(groupKey);
+  const failed = actions.filter((a) => a.status === 'failed').length;
+  const rejected = actions.filter((a) => a.status === 'rejected').length;
+  const badHtml = failed ? `<span class="ai-action-group-bad">${failed} 失败</span>` : '';
+  const warnHtml = !failed && rejected ? `<span class="ai-action-group-warn">${rejected} 已拒绝</span>` : '';
+  const cards = actions
+    .map((a) => renderActionCard({ toolCallId: a.toolCallId, tool: a.tool, intent: a.intent, summary: a.summary, status: a.status }))
+    .join('');
+  return `<div class="ai-action-group${expanded ? '' : ' collapsed'}" data-group-key="${escapeHtml(groupKey)}">
+    <div class="ai-action-group-head">
+      <span class="ai-action-group-title">${icon('wrench')} 工具调用 (${actions.length})</span>
+      <span class="ai-action-group-meta">${badHtml}${warnHtml}<span class="ai-action-group-toggle" title="${expanded ? '收起' : '展开'}">${icon(expanded ? 'arrowUp' : 'arrowDown')}</span></span>
+    </div>
+    <div class="ai-action-group-body">${cards}</div>
   </div>`;
 }
 
@@ -727,17 +746,10 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
       `<div class="ai-text">${escapeHtml(m.content)}</div></div>`;
   } else {
     wrap.className = 'ai-msg ai';
-    // 历史只读审计：动作卡复用同一渲染（终态无按钮，默认折叠可点击展开）；旧会话无 actions 为空
-    const actionsHtml = (m.actions ?? []).map((a) => {
-      const key = `${sid}:${a.toolCallId}`;
-      return renderActionCard({
-        toolCallId: a.toolCallId,
-        tool: a.tool,
-        intent: a.intent,
-        summary: a.summary,
-        status: a.status,
-      }, { collapsible: true, expandKey: key, expanded: expandedCards.has(key) });
-    }).join('');
+    // 历史只读审计：一串工具调用整组折叠（组头计数 + 展开状态保持）；旧会话无 actions 为空
+    const actionsHtml = m.actions?.length
+      ? renderActionGroup(m.actions, `${sid}:${m.ts}`)
+      : '';
     wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${renderAI(m.content)}</div>${actionsHtml}</div>`;
   }
   return wrap;
@@ -849,19 +861,20 @@ function onChatClick(e: MouseEvent): void {
     void respondApproval(activeSessionId, rejectBtn.dataset.actReject ?? '', false);
     return;
   }
-  /* 历史动作卡：点击切换折叠/展开（保持 expandedCards 状态，重渲染不丢） */
-  const actionCard = target.closest('.ai-action-card[data-collapsible]') as HTMLElement | null;
-  if (actionCard && !target.closest('button, a')) {
-    const key = actionCard.dataset.expandKey ?? '';
-    if (key) {
-      const willExpand = !actionCard.classList.contains('collapsed');
-      if (willExpand) expandedCards.delete(key);
-      else expandedCards.add(key);
-      actionCard.classList.toggle('collapsed');
-      const toggle = actionCard.querySelector('.ai-action-toggle') as HTMLElement | null;
+  /* 工具调用组：点击组头切换折叠/展开（保持 expandedGroups 状态，重渲染不丢） */
+  const groupHead = target.closest('.ai-action-group-head') as HTMLElement | null;
+  if (groupHead && !target.closest('button, a')) {
+    const group = groupHead.closest('.ai-action-group') as HTMLElement | null;
+    const key = group?.dataset.groupKey ?? '';
+    if (group && key) {
+      const willExpand = group.classList.contains('collapsed');
+      if (willExpand) expandedGroups.add(key);
+      else expandedGroups.delete(key);
+      group.classList.toggle('collapsed');
+      const toggle = groupHead.querySelector('.ai-action-group-toggle') as HTMLElement | null;
       if (toggle) {
-        toggle.title = willExpand ? '展开详情' : '收起详情';
-        toggle.innerHTML = icon(willExpand ? 'arrowDown' : 'arrowUp');
+        toggle.title = willExpand ? '收起' : '展开';
+        toggle.innerHTML = icon(willExpand ? 'arrowUp' : 'arrowDown');
       }
     }
     return;
