@@ -5,7 +5,8 @@
  * macOS/Linux 是 .tar.gz（系统 tar 解压）；二进制名 Windows 为 pi.exe，其余为 pi。
  * 构建前门（tauri.conf.json beforeBuildCommand 调用）：
  * - 二进制已存在时跳过（幂等，本机构建零开销）；
- * - 缺失时自动下载并解压，保证干净环境也能出完整安装包。
+ * - 缺失时经 /releases/latest/download/ 重定向下载（不调 GitHub API，免鉴权免限流）并解压，
+ *   保证干净环境也能出完整安装包。
  * 强制更新：node scripts/fetch-pi.mjs --force（等价于手动跑 fetch-pi.sh）。
  * 不依赖 Git Bash：下载走 Node fetch，解压走系统自带组件。
  */
@@ -42,43 +43,46 @@ if (existsSync(PI_BIN) && !FORCE) {
   process.exit(0);
 }
 
-const API = 'https://api.github.com/repos/earendil-works/pi/releases/latest';
-// GitHub Actions 出口 IP 的匿名限流（60 次/小时/IP，共享 NAT 极易耗尽）会导致查询直接 403；
-// workflow 注入 GITHUB_TOKEN 后走 1000 次/小时/仓库的认证额度。本机无 token 时匿名即可。
-const GH_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
-const GH_HEADERS = {
-  'User-Agent': 'aishell-build',
-  ...(GH_TOKEN ? { Authorization: `Bearer ${GH_TOKEN}` } : {}),
-};
+/** 失败输出：GHA 下用 ::error:: 工作流命令让原因进运行注解（无日志权限也能从注解定位）。 */
+function fail(msg) {
+  if (process.env.GITHUB_ACTIONS) console.log(`::error::${msg}`);
+  console.error(`!! ${msg}`);
+  process.exit(1);
+}
+
 /** HTTP 错误时输出状态码与响应体片段（GitHub 限流/鉴权错误的体里有明确原因）。 */
 async function dumpHttpError(prefix, r) {
   const body = (await r.text().catch(() => '')).slice(0, 300);
-  console.error(`!! ${prefix}：HTTP ${r.status}${body ? ` — ${body}` : ''}`);
+  fail(`${prefix}：HTTP ${r.status}${body ? ` — ${body}` : ''}`);
 }
-console.log(`==> 查询 earendil-works/pi 最新 release（平台 ${platformKey}）...`);
-const resp = await fetch(API, { headers: GH_HEADERS });
-if (!resp.ok) {
-  await dumpHttpError('release 查询失败（可能触发了 GitHub API 限流）', resp);
-  process.exit(1);
+
+// 资产地址走 /releases/latest/download/<asset>：GitHub 302 到最新 release 的同名资产。
+// 不调 API——GHA runner 共享出口 IP 的匿名限流（60 次/小时）极易耗尽，
+// 跨仓使用 GITHUB_TOKEN 读其他仓库 release 也可能被鉴权策略拦；此路径无需任何鉴权。
+const LATEST_URL = `https://github.com/earendil-works/pi/releases/latest/download/${target.asset}`;
+const UA = { 'User-Agent': 'aishell-build' };
+console.log(`==> 解析最新 release 资产（平台 ${platformKey}）...`);
+const redir = await fetch(LATEST_URL, { headers: UA, redirect: 'manual' }).catch((e) => {
+  fail(`资产地址请求失败：${e.message}`);
+});
+if (redir.status !== 301 && redir.status !== 302) {
+  await dumpHttpError(`资产地址解析失败（确认最新 release 中存在 ${target.asset}）`, redir);
 }
-const release = await resp.json();
-const asset = (release.assets ?? []).find((a) => a.name === target.asset);
-if (!asset?.browser_download_url) {
-  console.error(`!! release 中未找到资产 ${target.asset}`);
-  process.exit(1);
-}
-console.log(`==> 最新版本：${release.tag_name}`);
+const downloadUrl = redir.headers.get('location');
+if (!downloadUrl) fail('资产地址重定向缺少 Location 头');
+// 版本 tag 从重定向 URL 提取（…/releases/download/<tag>/<asset>），仅用于 VERSION 记录
+const version = downloadUrl.match(/\/releases\/download\/([^/]+)\//)?.[1] ?? 'unknown';
+console.log(`==> 最新版本：${version}`);
 
 const isZip = target.asset.endsWith('.zip');
 const pkgPath = path.join(tmpdir(), `pi-${Date.now()}${isZip ? '.zip' : '.tar.gz'}`);
 const tmpDir = path.join(tmpdir(), `pi-extract-${Date.now()}`);
 mkdirSync(tmpDir, { recursive: true });
 try {
-  console.log(`==> 下载 ${asset.browser_download_url}`);
-  const dl = await fetch(asset.browser_download_url, { headers: GH_HEADERS });
+  console.log(`==> 下载 ${downloadUrl}`);
+  const dl = await fetch(downloadUrl, { headers: UA }).catch((e) => fail(`下载请求失败：${e.message}`));
   if (!dl.ok) {
     await dumpHttpError('下载失败', dl);
-    process.exit(1);
   }
   writeFileSync(pkgPath, Buffer.from(await dl.arrayBuffer()));
 
@@ -89,17 +93,11 @@ try {
       '-Command',
       `Expand-Archive -Force -LiteralPath '${pkgPath}' -DestinationPath '${tmpDir}'`,
     ], { stdio: 'inherit' });
-    if (r.status !== 0) {
-      console.error('!! 解压失败');
-      process.exit(1);
-    }
+    if (r.status !== 0) fail('解压失败（PowerShell Expand-Archive）');
   } else {
     console.log('==> 解压（tar）...');
     const r = spawnSync('tar', ['-xzf', pkgPath, '-C', tmpDir], { stdio: 'inherit' });
-    if (r.status !== 0) {
-      console.error('!! 解压失败');
-      process.exit(1);
-    }
+    if (r.status !== 0) fail('解压失败（tar）');
   }
 
   // 包顶层若嵌套一层目录（如 pi-darwin-arm64/）则摊平，保证二进制直接位于 DEST 下
@@ -113,8 +111,7 @@ try {
   }
 
   if (!existsSync(path.join(tmpDir, target.bin))) {
-    console.error(`!! 解压后未找到 ${target.bin}，请检查包内部结构`);
-    process.exit(1);
+    fail(`解压后未找到 ${target.bin}，请检查包内部结构`);
   }
 
   // 整体替换 DEST：先清旧目录再搬入，保证旁车资源（theme/assets/node_modules）与二进制同级且无残留
@@ -127,8 +124,8 @@ try {
   if (process.platform !== 'win32') {
     chmodSync(path.join(DEST, target.bin), 0o755);
   }
-  writeFileSync(path.join(DEST, 'VERSION'), release.tag_name);
-  console.log(`==> 完成：pi ${release.tag_name} -> ${PI_BIN}`);
+  writeFileSync(path.join(DEST, 'VERSION'), version);
+  console.log(`==> 完成：pi ${version} -> ${PI_BIN}`);
 } finally {
   rmSync(pkgPath, { force: true });
   rmSync(tmpDir, { recursive: true, force: true });
