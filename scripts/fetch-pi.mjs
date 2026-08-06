@@ -11,7 +11,7 @@
  * 不依赖 Git Bash：下载走 Node fetch，解压走系统自带组件。
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, rmSync, cpSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, cpSync, writeFileSync, chmodSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,12 +43,16 @@ if (existsSync(PI_BIN) && !FORCE) {
   process.exit(0);
 }
 
-/** 失败输出：GHA 下用 ::error:: 工作流命令让原因进运行注解（无日志权限也能从注解定位）。 */
+/** 失败输出：GHA 下用 ::error:: 工作流命令让原因进运行注解（无日志权限也能从注解定位）。
+ * 必须用 writeSync 直写 fd：POSIX 下 console 写管道是异步的，随后 process.exit 会丢弃缓冲。 */
 function fail(msg) {
-  if (process.env.GITHUB_ACTIONS) console.log(`::error::${msg}`);
-  console.error(`!! ${msg}`);
+  if (process.env.GITHUB_ACTIONS) writeSync(1, `::error::${msg}\n`);
+  writeSync(2, `!! ${msg}\n`);
   process.exit(1);
 }
+// 兜底：任何未捕获异常/拒绝（如下载中断 arrayBuffer 抛错）都走 fail 进注解
+process.on('unhandledRejection', (e) => fail(`未捕获异常：${e?.stack || e}`));
+process.on('uncaughtException', (e) => fail(`未捕获异常：${e?.stack || e}`));
 
 /** HTTP 错误时输出状态码与响应体片段（GitHub 限流/鉴权错误的体里有明确原因）。 */
 async function dumpHttpError(prefix, r) {
