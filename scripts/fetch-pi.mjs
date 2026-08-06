@@ -43,10 +43,22 @@ if (existsSync(PI_BIN) && !FORCE) {
 }
 
 const API = 'https://api.github.com/repos/earendil-works/pi/releases/latest';
+// GitHub Actions 出口 IP 的匿名限流（60 次/小时/IP，共享 NAT 极易耗尽）会导致查询直接 403；
+// workflow 注入 GITHUB_TOKEN 后走 1000 次/小时/仓库的认证额度。本机无 token 时匿名即可。
+const GH_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
+const GH_HEADERS = {
+  'User-Agent': 'aishell-build',
+  ...(GH_TOKEN ? { Authorization: `Bearer ${GH_TOKEN}` } : {}),
+};
+/** HTTP 错误时输出状态码与响应体片段（GitHub 限流/鉴权错误的体里有明确原因）。 */
+async function dumpHttpError(prefix, r) {
+  const body = (await r.text().catch(() => '')).slice(0, 300);
+  console.error(`!! ${prefix}：HTTP ${r.status}${body ? ` — ${body}` : ''}`);
+}
 console.log(`==> 查询 earendil-works/pi 最新 release（平台 ${platformKey}）...`);
-const resp = await fetch(API, { headers: { 'User-Agent': 'aishell-build' } });
+const resp = await fetch(API, { headers: GH_HEADERS });
 if (!resp.ok) {
-  console.error(`!! release 查询失败：HTTP ${resp.status}（可能触发了 GitHub API 限流）`);
+  await dumpHttpError('release 查询失败（可能触发了 GitHub API 限流）', resp);
   process.exit(1);
 }
 const release = await resp.json();
@@ -63,9 +75,9 @@ const tmpDir = path.join(tmpdir(), `pi-extract-${Date.now()}`);
 mkdirSync(tmpDir, { recursive: true });
 try {
   console.log(`==> 下载 ${asset.browser_download_url}`);
-  const dl = await fetch(asset.browser_download_url, { headers: { 'User-Agent': 'aishell-build' } });
+  const dl = await fetch(asset.browser_download_url, { headers: GH_HEADERS });
   if (!dl.ok) {
-    console.error(`!! 下载失败：HTTP ${dl.status}`);
+    await dumpHttpError('下载失败', dl);
     process.exit(1);
   }
   writeFileSync(pkgPath, Buffer.from(await dl.arrayBuffer()));

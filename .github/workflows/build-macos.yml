@@ -43,8 +43,11 @@ jobs:
       - run: npm ci
 
       # 显式拉取 pi sidecar（tauri beforeBuildCommand 会再跑一次，幂等跳过；
-      # 独立成步是为了下载/解压失败时日志定位直接）
+      # 独立成步是为了下载/解压失败时日志定位直接）。
+      # GITHUB_TOKEN：runner 出口 IP 匿名调 GitHub API 极易撞 60 次/小时限流
       - run: npm run fetch-pi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - run: npm run tauri -- build --target ${{ matrix.target }}
 
