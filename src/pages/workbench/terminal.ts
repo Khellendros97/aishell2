@@ -130,6 +130,11 @@ class TermSession {
   private failed = false;
   private exited = false;
   private resizer: ResizeObserver | null = null;
+  /** 后端会话建立前到达的输入（含 xterm 对查询序列的自动应答）缓存,就绪后按序补发。 */
+  private pendingInput: string[] = [];
+  private pendingInputLen = 0;
+  /** 重连流程吞掉旧通道的 term:exit（setTimeout 兜底,防旧任务不醒来导致永久吞事件）。 */
+  private ignoreExit = false;
 
   constructor(container: HTMLElement, tab: Tab) {
     this.tab = tab;
@@ -186,13 +191,14 @@ class TermSession {
     this.term.open(this.host);
     this.term.onData((data) => this.onUserInput(data));
 
-    /* 自定义右键菜单（原生菜单已全局禁用）：复制 / 粘贴 */
+    /* 自定义右键菜单（原生菜单已全局禁用）：复制 / 粘贴 / 重连 */
     this.host.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
       showContextMenu(e.clientX, e.clientY, [
         { label: '复制', iconName: 'copy', disabled: !this.term.hasSelection(), action: () => this.copySelection() },
         { label: '粘贴', iconName: 'clipboard', action: () => void this.pasteClipboard() },
+        { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
       ]);
     });
     /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴；
@@ -231,6 +237,10 @@ class TermSession {
       this.unlisteners.push(await onTermExit(this.tab.id, (code) => this.onExit(code)));
       await termCreate(this.tab.id, kind, data.serverId ?? null, data.cwd ?? null);
       this.ready = true;
+      // 补发建立期间缓存的输入（如终端就绪前用户已敲下的命令、xterm 的自动应答）
+      const pending = this.pendingInput.splice(0);
+      this.pendingInputLen = 0;
+      for (const s of pending) void termInput(this.tab.id, s).catch(() => { /* 忽略 */ });
       this.fitTerm();
       this.resizer = new ResizeObserver(() => this.fitTerm());
       this.resizer.observe(this.host);
@@ -260,7 +270,15 @@ class TermSession {
   }
 
   private onUserInput(data: string): void {
-    if (!this.ready || this.failed) return;
+    if (this.failed || this.exited) return;
+    if (!this.ready) {
+      // 通道尚未就绪(SSH 建连需 1-2s):缓存而非丢弃,上限 8KB 防无界增长
+      if (this.pendingInputLen + data.length <= 8192) {
+        this.pendingInput.push(data);
+        this.pendingInputLen += data.length;
+      }
+      return;
+    }
     void termInput(this.tab.id, data).catch(() => { /* 终端已关闭等后端错误忽略 */ });
     if (this.altMode || this.suppressSettle > 0) return;
     // 粘贴事件：正文计入 typedBuf，其中的 \r 只是插入换行，不结算
@@ -429,6 +447,11 @@ class TermSession {
 
   /* ---------- 退出 ---------- */
   private onExit(code: number | null): void {
+    // 重连流程：旧通道的 term:exit 是预期内事件,吞掉一次（超时兜底在 reconnect 内）
+    if (this.ignoreExit) {
+      this.ignoreExit = false;
+      return;
+    }
     if (this.exited) return;
     this.exited = true;
     this.resizer?.disconnect();
@@ -436,6 +459,44 @@ class TermSession {
     const hint = code === null ? '[进程已退出]' : `[进程已退出 code=${code}]`;
     this.term.write(`\r\n\x1b[90m${hint}\x1b[0m\r\n`);
     this.updateInfo();
+  }
+
+  /* ---------- 重连:旧通道关闭(吞掉其 term:exit),同 id 重建后端会话 ---------- */
+  private async reconnect(): Promise<void> {
+    if (this.failed) return; // 启动失败态由 init 报错路径兜底,不在此重试
+    this.ignoreExit = true;
+    setTimeout(() => { this.ignoreExit = false; }, 8000);
+    try { await termClose(this.tab.id); } catch { /* 已关闭忽略 */ }
+    this.ready = false;
+    this.exited = false;
+    this.tab.el.classList.remove('wb-tab-exited');
+    this.pendingInput = [];
+    this.pendingInputLen = 0;
+    this.term.reset();
+    // 新会话清空区块追踪（旧区块属于已中断的旧会话）
+    this.blocks = [];
+    this.altMode = false;
+    this.altLastCommand = '';
+    this.lastCommand = '';
+    const data = this.tab.data as { kind?: string; serverId?: string; cwd?: string | null };
+    const kind: TermKind = data.kind === 'ssh' ? 'ssh' : 'local';
+    try {
+      await termCreate(this.tab.id, kind, data.serverId ?? null, data.cwd ?? null);
+      this.ready = true;
+      this.resizer?.disconnect();
+      this.resizer = new ResizeObserver(() => this.fitTerm());
+      this.resizer.observe(this.host);
+      this.fitTerm();
+      this.term.focus();
+      toast('终端已重连', 'success');
+    } catch (err) {
+      this.failed = true;
+      const msg = String(err);
+      toast(msg, 'error');
+      this.term.write(`\r\n\x1b[31m[重连失败] ${msg}\x1b[0m\r\n`);
+    }
+    this.updateInfo();
+    this.renderDrawer();
   }
 
   /* ---------- 尺寸 ---------- */

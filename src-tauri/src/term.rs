@@ -52,6 +52,59 @@ enum TermBackend {
     },
 }
 
+/* ---------------- 诊断：SSH 通道收发元信息落盘（只记时间戳/方向/长度,不记内容） ---------------- */
+/// 默认开启,便于抓取现场卡死(如 SSH vi 无响应)的事后证据;AISHELL_TERM_LOG=0 显式关闭,
+/// AISHELL_TERM_LOG=<path> 改路径。体积极小(每条消息一行),启动时超 2MB 截断重建。
+fn diag_tx() -> Option<&'static std::sync::mpsc::Sender<String>> {
+    use std::sync::LazyLock;
+    static TX: LazyLock<Option<std::sync::mpsc::Sender<String>>> = LazyLock::new(|| {
+        let env = std::env::var("AISHELL_TERM_LOG").ok();
+        if env.as_deref() == Some("0") {
+            return None;
+        }
+        let path = match env.filter(|s| !s.is_empty()) {
+            Some(p) => p,
+            None => {
+                #[cfg(windows)]
+                let dir = std::env::var("APPDATA")
+                    .map(|a| format!(r"{a}\com.aishell.app\logs"))
+                    .unwrap_or_else(|_| "logs".to_string());
+                #[cfg(not(windows))]
+                let dir = std::env::var("HOME")
+                    .map(|h| format!("{h}/Library/Application Support/com.aishell.app/logs"))
+                    .unwrap_or_else(|_| "logs".to_string());
+                let _ = std::fs::create_dir_all(&dir);
+                std::path::Path::new(&dir).join("term-diag.log").to_string_lossy().into_owned()
+            }
+        };
+        if std::fs::metadata(&path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false) {
+            let _ = std::fs::remove_file(&path);
+        }
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::BufWriter;
+            let mut w = BufWriter::new(f);
+            for line in rx {
+                let _ = writeln!(w, "{line}");
+                let _ = w.flush();
+            }
+        });
+        Some(tx)
+    });
+    TX.as_ref()
+}
+
+/// 追加一行带毫秒时间戳的诊断日志；失败静默（绝不影响终端主路径）。
+fn diag(msg: &str) {
+    let Some(tx) = diag_tx() else { return };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = tx.send(format!("{ms} {msg}"));
+}
+
 /// 单个终端句柄（id -> handle 存放于 TermManager）。
 pub struct TermHandle {
     backend: TermBackend,
@@ -71,10 +124,14 @@ impl TermHandle {
                     .map_err(|e| format!("PTY 写入失败: {e}"))?;
                 w.flush().map_err(|e| format!("PTY 写入失败: {e}"))
             }
-            TermBackend::Ssh { write_half } => write_half
-                .data_bytes(data.to_string())
-                .await
-                .map_err(|e| format!("SSH 通道写入失败: {e}")),
+            TermBackend::Ssh { write_half } => {
+                let r = write_half.data_bytes(data.to_string()).await;
+                match &r {
+                    Ok(()) => diag(&format!("send ok len={}", data.len())),
+                    Err(e) => diag(&format!("send err len={} err={e}", data.len())),
+                }
+                r.map_err(|e| format!("SSH 通道写入失败: {e}"))
+            }
         }
     }
 
@@ -188,17 +245,18 @@ impl TermManager {
         let child = Arc::new(Mutex::new(child));
         let killer = Arc::new(Mutex::new(killer));
 
-        self.map.lock().map_err(|e| e.to_string())?.insert(
-            id.clone(),
-            Arc::new(TermHandle {
-                backend: TermBackend::Local {
-                    writer,
-                    master,
-                    killer,
-                },
-                closed: AtomicBool::new(false),
-            }),
-        );
+        let handle = Arc::new(TermHandle {
+            backend: TermBackend::Local {
+                writer,
+                master,
+                killer,
+            },
+            closed: AtomicBool::new(false),
+        });
+        self.map
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(id.clone(), Arc::clone(&handle));
 
         // 读线程：PTY 输出 → term:data:<id>
         if let Some(mut reader) = reader {
@@ -231,7 +289,14 @@ impl TermManager {
                     Err(_) => None,
                 }
             };
-            mgr.map.lock().ok().and_then(|mut m| m.remove(&id2));
+            // 同 id 重连后旧 wait 线程的迟到清理不得误删新句柄（见 SSH 分支同型守卫）
+            mgr.map.lock().ok().and_then(|mut m| {
+                if m.get(&id2).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+                    m.remove(&id2)
+                } else {
+                    None
+                }
+            });
             let _ = app.emit(&format!("term:exit:{id2}"), TermExitPayload { code });
         });
 
@@ -259,15 +324,16 @@ impl TermManager {
                 .await;
         }
 
-        self.map.lock().map_err(|e| e.to_string())?.insert(
-            id.clone(),
-            Arc::new(TermHandle {
-                backend: TermBackend::Ssh {
-                    write_half: Arc::clone(&write_half),
-                },
-                closed: AtomicBool::new(false),
-            }),
-        );
+        let handle = Arc::new(TermHandle {
+            backend: TermBackend::Ssh {
+                write_half: Arc::clone(&write_half),
+            },
+            closed: AtomicBool::new(false),
+        });
+        self.map
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(id.clone(), Arc::clone(&handle));
 
         let mgr = Arc::clone(self);
         let app = app.clone();
@@ -275,25 +341,43 @@ impl TermManager {
         tauri::async_runtime::spawn(async move {
             let mut read_half = read_half;
             let mut code: Option<i32> = None;
+            diag(&format!("read-task start id={id2}"));
             loop {
                 match read_half.wait().await {
                     Some(ChannelMsg::Data { data }) => {
+                        diag(&format!("recv id={id2} data len={}", data.len()));
                         let data = String::from_utf8_lossy(&data).into_owned();
-                        let _ = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
+                        let r = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
+                        if let Err(e) = r {
+                            diag(&format!("emit-err id={id2} err={e}"));
+                        }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        diag(&format!("recv id={id2} exit-status={exit_status}"));
                         code = Some(exit_status as i32);
                         break;
                     }
                     Some(ChannelMsg::Eof | ChannelMsg::Close | ChannelMsg::ExitSignal { .. }) => {
+                        diag(&format!("recv id={id2} eof/close/exit-signal"));
                         break;
                     }
                     Some(_) => {}
-                    None => break,
+                    None => {
+                        diag(&format!("recv id={id2} none(channel 关闭)"));
+                        break;
+                    }
                 }
             }
-            mgr.map.lock().ok().and_then(|mut m| m.remove(&id2));
-            let _ = app.emit(&format!("term:exit:{id2}"), TermExitPayload { code });
+            // 仅当 map 里仍是本句柄才移除：同 id 重连后旧读任务的迟到清理不得误删新句柄
+            mgr.map.lock().ok().and_then(|mut m| {
+                if m.get(&id2).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+                    m.remove(&id2)
+                } else {
+                    None
+                }
+            });
+            let r = app.emit(&format!("term:exit:{id2}"), TermExitPayload { code });
+            diag(&format!("read-task end id={id2} emit-exit={r:?}"));
         });
 
         Ok(())
