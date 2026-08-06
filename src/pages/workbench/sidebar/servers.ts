@@ -473,7 +473,11 @@ export function mountServersPanel(container: HTMLElement): void {
   });
 
   void render();
-  bus.on('project-changed', () => { void render(); });
+  /* 守卫陈旧挂载闭包：bus 无 off API（core.ts 契约），面板每次切换都重挂载并重复订阅，
+     旧闭包持有的 searchWrap 已被 innerHTML 清空（isConnected=false），无守卫时旧 render 会把
+     孤立搜索框重新 append 回活容器 —— 表现为锁切换/命令收藏后搜索框被复制一个（workbench.ts
+     同契约注释：监听器用 isConnected 守卫，换页后自动失效） */
+  bus.on('project-changed', () => { if (searchWrap.isConnected) void render(); });
   // 命令面板（Ctrl+T）等全局操作清空/变更数据后广播，侧栏常驻需同步刷新
   if (dataChangedHandler) window.removeEventListener('aishell:data-changed', dataChangedHandler);
   dataChangedHandler = () => { if (container.isConnected) void render(); };

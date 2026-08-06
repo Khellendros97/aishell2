@@ -87,6 +87,18 @@ function stripAnsi(s: string): string {
     .replace(/\u001b./g, '');
 }
 
+/**
+ * zsh 默认提示符行（macOS：`user@host 路径 % [命令回显]`）判定。
+ * `%` 必须锚定行首的 user@host 前缀——裸 `% ` 在真实输出里太常见（"100% done"、
+ * printf 格式串），无锚会误吃输出。自定义主题（oh-my-zsh 等无 % 提示符）不在覆盖范围。
+ */
+function isZshPromptLine(s: string): boolean {
+  return /^\S+@\S+(\s+[^\n]*)?\s%(\s|$)/.test(s);
+}
+
+/** zsh 提示符匹配（行首 user@host 前缀 + 非贪婪到首个 `% `），供 readCommandFromBuffer 取切点。 */
+const ZSH_PROMPT_RE = /(?:^|\n)\S+@\S+[^\n]*?% /g;
+
 class TermSession {
   /** 主题切换时模块级 liveTerms 需要重写 options.theme,不封装 */
   readonly term: Terminal;
@@ -315,7 +327,8 @@ class TermSession {
 
   /**
    * 从 xterm buffer 提取光标所在输入行的命令文本。
-   * 向上收集 wrapped 续行与多行输入的前段，切掉提示符前缀（Git Bash 默认 PS1 以 `$ `/`# ` 结尾）；
+   * 向上收集 wrapped 续行与多行输入的前段，切掉提示符前缀（Git Bash 默认 PS1 以 `$ `/`# ` 结尾；
+   * macOS zsh 默认 PS1 以 `% ` 结尾，锚定 user@host 前缀防误切命令里的百分号）；
    * 找不到提示符标记时退化为光标行全文（自定义 PS1 场景）。
    */
   private readCommandFromBuffer(): string {
@@ -331,7 +344,12 @@ class TermSession {
       const below = buf.getLine(row + 1);
       const sep = row === start ? '' : below?.isWrapped ? '' : '\n';
       text = seg + sep + text;
-      const cut = Math.max(text.lastIndexOf('$ '), text.lastIndexOf('# '));
+      // zsh：取行首锚定的最后一处提示符匹配，切点指向 `% ` 起始
+      let zCut = -1;
+      ZSH_PROMPT_RE.lastIndex = 0;
+      let zm: RegExpExecArray | null;
+      while ((zm = ZSH_PROMPT_RE.exec(text))) zCut = zm.index + zm[0].length - 2;
+      const cut = Math.max(text.lastIndexOf('$ '), text.lastIndexOf('# '), zCut);
       if (cut >= 0) return text.slice(cut + 2).trim();
     }
     return cursorLine.trim();
@@ -493,12 +511,13 @@ class TermSession {
       if (!t || (cmd && t.split(cmd).join('').trim() === '')) { lines.shift(); continue; }
       break;
     }
-    // 去行尾的 shell 提示符（Git Bash 默认 PS1 = user@host MINGW64 / 路径 / $ 三件套）
+    // 去行尾的 shell 提示符（Git Bash 默认 PS1 = user@host MINGW64 / 路径 / $ 三件套；
+    // macOS zsh 默认 PS1 = user@host 路径 % 单行）
     let poppedMingw = false;
     while (lines.length) {
       const last = lines[lines.length - 1].trim();
       if (!last) { lines.pop(); continue; }
-      if (/^[$#]\s*$/.test(last) || /@\S+\s+(MINGW64|MINGW32|MSYS|UCRT64|CLANG64)/.test(last)) {
+      if (/^[$#]\s*$/.test(last) || /@\S+\s+(MINGW64|MINGW32|MSYS|UCRT64|CLANG64)/.test(last) || isZshPromptLine(last)) {
         poppedMingw = last.includes('MINGW') || last.includes('MSYS') || last.includes('UCRT') || last.includes('CLANG');
         lines.pop();
         continue;
@@ -513,7 +532,7 @@ class TermSession {
         const normNext = nextCmd.replace(/\s/g, '');
         const normLast = last.replace(/\s/g, '');
         const below = lines.length >= 2 ? lines[lines.length - 2].trim() : '';
-        const belowIsPrompt = /^[$#](\s|$)/.test(below) || /@\S+\s+(MINGW64|MINGW32|MSYS|UCRT64|CLANG64)/.test(below);
+        const belowIsPrompt = /^[$#](\s|$)/.test(below) || /@\S+\s+(MINGW64|MINGW32|MSYS|UCRT64|CLANG64)/.test(below) || isZshPromptLine(below);
         if (normLast.length >= 3 && normNext.endsWith(normLast) && belowIsPrompt) { lines.pop(); continue; }
       }
       // PS1 中间的路径行：仅当刚弹掉 MINGW 提示行时才允许弹
