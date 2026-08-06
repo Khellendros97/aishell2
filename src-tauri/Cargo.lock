@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "aishell"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -108,6 +108,8 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tokio",
+ "webview2-com",
+ "windows 0.61.3",
 ]
 
 [[package]]

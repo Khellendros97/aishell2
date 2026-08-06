@@ -16,9 +16,9 @@ import { icon } from '../../icons';
 import type { Project } from '../../types';
 import { bus, closeTab, getActiveTab, getTabs, initWorkbench, openTab, Workbench } from './core';
 import type { Tab } from './core';
-import { mountExplorerPanel } from './sidebar/explorer';
-import { mountServersPanel } from './sidebar/servers';
-import { mountCommandsPanel } from './sidebar/commands';
+import { mountExplorerPanel, explorerHead } from './sidebar/explorer';
+import { mountServersPanel, serversHead } from './sidebar/servers';
+import { mountCommandsPanel, commandsHead } from './sidebar/commands';
 import { mountAiPanel } from './ai';
 import './terminal'; // import 即注册渲染器（模块级副作用）
 import './editor';
@@ -137,6 +137,13 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
 
   initWorkbench({ tabBar, tabContent });
 
+  /* 面板头描述符：标题 + actions 按钮（explorer 的新建/刷新、commands 的新增走这里渲染） */
+  const HEADS: Record<string, { title: string; renderActions?: (el: HTMLElement) => void }> = {
+    explorer: explorerHead,
+    servers: serversHead,
+    commands: commandsHead,
+  };
+  const sidebarActions = root.querySelector('#sidebar-actions') as HTMLElement;
   const MOUNTS: Record<string, (container: HTMLElement) => void> = {
     explorer: mountExplorerPanel,
     servers: mountServersPanel,
@@ -146,7 +153,10 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
   let aiMounted = false;
 
   function mountPanel(panel: string): void {
-    sidebarTitle.textContent = PANELS[panel] ?? panel;
+    const head = HEADS[panel];
+    sidebarTitle.textContent = head?.title ?? PANELS[panel] ?? panel;
+    sidebarActions.innerHTML = '';
+    head?.renderActions?.(sidebarActions);
     sidebarContent.innerHTML = '';
     MOUNTS[panel]?.(sidebarContent);
     activityBar.querySelectorAll('.activity-icon').forEach((el) => {

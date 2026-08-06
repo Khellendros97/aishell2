@@ -1,6 +1,6 @@
 /** 应用入口：hash 路由 + 启动缺配跳转（语义同 .proto/index.html）。 */
 import './styles/design.css';
-import { getState, isConfigComplete } from './api';
+import { getState, isConfigComplete, openDevtools } from './api';
 import { navigate, onRoute, parseHash } from './router';
 import { applyTheme } from './theme';
 import { renderTopbar } from './components/topbar';
@@ -58,6 +58,14 @@ document.addEventListener('drop', (e) => e.preventDefault());
 document.addEventListener('contextmenu', (e) => {
   if ((e.target as HTMLElement).closest('input, textarea:not(.xterm-helper-textarea)')) return;
   e.preventDefault();
+});
+
+/* F12 打开 DevTools：浏览器快捷键已被后端禁用（会劫持终端 Ctrl+Shift+C/V），改为应用自控 */
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'F12') {
+    e.preventDefault();
+    void openDevtools();
+  }
 });
 
 void boot();

@@ -28,7 +28,9 @@
   height: 34px; flex: none; display: flex; align-items: center; justify-content: space-between;
   padding: 0 10px 0 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-1); text-transform: uppercase;
 }
-#sidebar-content { flex: 1; overflow-y: auto; }
+/* flex column 布局：让面板内容（如 explorer 树）能用 flex:1 撑满可视高度，
+   百分比 min-height 在此处无效（本元素无显式 height） */
+#sidebar-content { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
 
 /* 左右面板可调宽分隔条；支持鼠标拖拽与键盘方向键微调 */
 .wb-resize-handle {

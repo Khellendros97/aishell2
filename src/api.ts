@@ -13,6 +13,9 @@ export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
   return invoke<T>(cmd, args);
 }
 
+/** 打开 DevTools（浏览器快捷键已被后端禁用，F12 由前端监听后调此命令） */
+export const openDevtools = () => call<void>('open_devtools');
+
 /* ---------------- store ----------------
    apiKey / braveKey / password 传 null 表示「不修改已保存的密钥」。 */
 export const isConfigComplete = () => call<boolean>('is_config_complete');

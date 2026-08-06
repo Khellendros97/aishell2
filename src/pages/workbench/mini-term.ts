@@ -114,14 +114,17 @@ export function openMiniTerm(host: HTMLElement, serverId: string, cwd: string, o
       { label: '粘贴', iconName: 'clipboard', action: () => void pasteClipboard() },
     ]);
   });
-  /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴 */
+  /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴；
+     preventDefault 必须调：否则浏览器默认行为（Chromium 的粘贴为纯文本）会再粘贴一遍 */
   term.attachCustomKeyEventHandler((e) => {
     if (e.type !== 'keydown') return true;
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
+      e.preventDefault();
       copySelection();
       return false;
     }
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
+      e.preventDefault();
       void pasteClipboard();
       return false;
     }

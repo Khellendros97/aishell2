@@ -172,14 +172,17 @@ class TermSession {
         { label: '粘贴', iconName: 'clipboard', action: () => void this.pasteClipboard() },
       ]);
     });
-    /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴 */
+    /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴；
+       preventDefault 必须调：否则浏览器默认行为（Chromium 的粘贴为纯文本）会再粘贴一遍 */
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
+        e.preventDefault();
         this.copySelection();
         return false;
       }
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') {
+        e.preventDefault();
         void this.pasteClipboard();
         return false;
       }

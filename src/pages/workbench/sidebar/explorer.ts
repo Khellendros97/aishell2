@@ -247,6 +247,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
     /* 根行右键：仅粘贴 / 系统资源管理器打开 */
     row.addEventListener('contextmenu', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       showRootMenu(e.clientX, e.clientY, node);
     });
   }
@@ -768,6 +769,11 @@ function render(): void {
   }
   const tree = document.createElement('div');
   tree.className = 'wbs-explorer-tree';
+  /* 树空白区右键 = 根目录菜单（行级 contextmenu 已 stopPropagation，不会重复弹） */
+  tree.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showRootMenu(e.clientX, e.clientY, root);
+  });
   /* 树空白区也是 OS 拖入落点（落到根目录）；行级 drop 已 stopPropagation，不会重复导入 */
   tree.addEventListener('dragover', (e) => {
     if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes('Files')) return;

@@ -12,6 +12,12 @@ use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// 打开 DevTools：浏览器快捷键（含 F12）已被禁用，前端监听 F12 调此命令。
+#[tauri::command]
+fn open_devtools(win: tauri::WebviewWindow) {
+    win.open_devtools();
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -77,6 +83,23 @@ pub fn run() {
             app.manage(terms);
             app.manage(ai.clone());
             if let Some(win) = app.get_webview_window("main") {
+                // 禁用 WebView2 浏览器快捷键（Ctrl+Shift+C 开 DevTools、Ctrl+滚轮缩放、F5 刷新等）：
+                // 它们在页面 keydown 之前的 accelerator 阶段被宿主拦截，JS 无法阻止，
+                // 会劫持终端的 Ctrl+Shift+C/V。F12 DevTools 改由前端监听 + open_devtools 命令。
+                #[cfg(windows)]
+                {
+                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+                    use windows::core::Interface;
+                    let _ = win.with_webview(|wv| unsafe {
+                        if let Ok(core) = wv.controller().CoreWebView2() {
+                            if let Ok(settings) = core.Settings() {
+                                if let Ok(s3) = settings.cast::<ICoreWebView2Settings3>() {
+                                    let _ = s3.SetAreBrowserAcceleratorKeysEnabled(false);
+                                }
+                            }
+                        }
+                    });
+                }
                 win.on_window_event(move |_ev| {
                     if let tauri::WindowEvent::Destroyed = _ev {
                         ai.kill_all();
@@ -86,6 +109,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            open_devtools,
             store::is_config_complete,
             store::get_state,
             store::get_config_dir,

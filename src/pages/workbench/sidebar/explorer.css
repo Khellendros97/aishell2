@@ -1,5 +1,7 @@
 /* 资源管理器面板样式 —— 移植自 .proto/workbench-sidebar.js 内联样式（wbs- 前缀改 wbs-explorer-） */
-.wbs-explorer-tree { padding: 4px 0 8px; }
+/* flex:1 0 auto 让树至少撑满可视区（#sidebar-content 为 flex column）：
+   末行下方的空白区也在 tree 内，空白区右键菜单 / OS 拖入落点才能覆盖整个面板 */
+.wbs-explorer-tree { padding: 4px 0 8px; flex: 1 0 auto; }
 .wbs-explorer-row {
   display: flex; align-items: center; gap: 3px; height: 24px; padding-right: 6px;
   cursor: pointer; user-select: none; border-radius: 3px;
