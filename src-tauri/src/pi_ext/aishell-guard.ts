@@ -289,7 +289,7 @@ export default function (pi: ExtensionAPI) {
 		name: "run_command",
 		label: "Run Command",
 		description:
-			"在本地 Git Bash（项目根目录）或远程服务器上执行命令，返回 stdout/stderr/退出码。必须提供 intent 说明命令意图。",
+			"在本地 shell（项目根目录）或远程服务器上执行命令，返回 stdout/stderr/退出码。必须提供 intent 说明命令意图。",
 		promptSnippet: "执行本地或远程命令",
 		promptGuidelines: [
 			"使用 run_command 时，intent 字段必须用一句中文说明本次命令的意图（会展示给用户审批）。",

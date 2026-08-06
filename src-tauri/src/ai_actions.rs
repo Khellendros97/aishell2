@@ -9,7 +9,7 @@
 //!   锁检查只放在本模块入口，不下沉到 SshManager——锁定不会关闭已有用户终端，
 //!   也不影响用户手动 SSH/SFTP；动作开始后再切锁不强杀已在运行的单次动作。
 //!
-//! 本地命令复用 term::find_bash（Git Bash，`--login -c`，项目根 cwd），完整捕获
+//! 本地命令复用 term::find_shell（本地 shell，`--login -c`，项目根 cwd），完整捕获
 //! stdout/stderr/退出码；远程命令复用 `SshManager::exec`（russh channel，连接复用）。
 
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ impl AiActions {
         AiActions { store, ssh }
     }
 
-    /// 执行命令：target=local 走 Git Bash（项目根 cwd），target=remote 走 SshManager::exec。
+    /// 执行命令：target=local 走本地 shell（项目根 cwd），target=remote 走 SshManager::exec。
     /// 空命令 / 空 intent 在建进程或网络前拒绝。
     pub async fn run_command(
         &self,
@@ -192,12 +192,10 @@ impl AiActions {
         Ok(normalized)
     }
 
-    /// 本地命令：Git Bash `--login -c`，项目根 cwd，完整捕获 stdout/stderr/exit code。
+    /// 本地命令：本地 shell `--login -c`，项目根 cwd，完整捕获 stdout/stderr/exit code。
     async fn run_local(&self, root: &Path, command: &str) -> Result<CommandResult, String> {
-        let bash = crate::term::find_bash().ok_or_else(|| {
-            "未找到 Git Bash，请安装 Git for Windows 或设置 AISHELL_GIT_BASH".to_string()
-        })?;
-        let mut cmd = tokio::process::Command::new(&bash);
+        let shell = crate::term::find_shell().ok_or_else(crate::term::shell_missing_msg)?;
+        let mut cmd = tokio::process::Command::new(&shell);
         cmd.args(["--login", "-c", command]).current_dir(root);
         // Windows 下隐藏 Git Bash 的临时控制台窗口（与 ai.rs 的 pi 启动一致）
         #[cfg(windows)]
@@ -207,7 +205,7 @@ impl AiActions {
         let out = cmd
             .output()
             .await
-            .map_err(|e| format!("启动 Git Bash 失败：{e}"))?;
+            .map_err(|e| format!("启动本地 shell 失败：{e}"))?;
         Ok(CommandResult {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),

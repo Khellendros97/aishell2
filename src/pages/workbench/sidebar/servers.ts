@@ -247,14 +247,14 @@ export function mountServersPanel(container: HTMLElement): void {
     }
     wrap.querySelectorAll('.wbs-local-card, .wbs-server-head, .wbs-server-list').forEach((el) => el.remove());
 
-    /* 固定卡片：本地 Git Bash，整卡点击新开独立本地终端（id `term-local:<uid>`，与启动时自动开的首个实例 'term-local' 并存） */
+    /* 固定卡片：本地终端，整卡点击新开独立本地终端（id `term-local:<uid>`，与启动时自动开的首个实例 'term-local' 并存） */
     const localCard = document.createElement('div');
     localCard.className = 'card wbs-server-card wbs-local-card clickable';
     localCard.innerHTML =
       '<div class="wbs-server-top">' +
         '<span class="wbs-server-icon">' + icon('terminal') + '</span>' +
         '<span class="wbs-server-main">' +
-          '<span class="wbs-server-name">本地 Git Bash</span>' +
+          '<span class="wbs-server-name">本地终端</span>' +
           '<span class="wbs-server-addr mono">本地终端 · 点击打开</span>' +
         '</span>' +
         '<span class="tag blue">本地</span>' +
@@ -263,7 +263,7 @@ export function mountServersPanel(container: HTMLElement): void {
       openTab({
         id: `term-local:${uid('t')}`,
         type: 'terminal',
-        title: '本地 Git Bash',
+        title: '本地终端',
         data: { kind: 'local', cwd: project?.path ?? null },
       });
     };

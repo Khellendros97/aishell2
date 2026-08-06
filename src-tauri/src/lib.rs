@@ -30,9 +30,9 @@ pub fn run() {
             );
             let ssh = Arc::new(ssh::SshManager::new(store.clone()));
             let terms = Arc::new(term::TermManager::new(ssh.clone()));
-            // pi 运行时目录：tauri 2 Windows 把 bundle.resources 装到 exe 旁 resources/
-            // 子目录（<resource_dir>/resources/pi），resource_dir() 返回的是 exe 目录本身；
-            // 依次探测：安装布局 → 扁平布局（兼容）→ dev 源目录
+            // pi 运行时目录：Windows 安装版把 bundle.resources 装到 exe 旁 resources/ 子目录，
+            // macOS 装到 AIShell.app/Contents/Resources/resources/ 子目录；resource_dir() 在各
+            // 平台都返回其根。依次探测：安装布局 → 扁平布局（兼容）→ dev 源目录
             let resource_dir = app.path().resource_dir().unwrap_or_default();
             let dev_pi = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
@@ -44,7 +44,7 @@ pub fn run() {
             ];
             let pi_dir = candidates
                 .iter()
-                .find(|p| p.join("pi.exe").is_file())
+                .find(|p| p.join(ai::PI_BIN_NAME).is_file())
                 .cloned()
                 .unwrap_or(dev_pi);
             // pi 诊断：候选命中情况 + resource_dir 实际内容（排查安装版「pi 运行时不存在」）
@@ -52,9 +52,10 @@ pub fn run() {
                 let mut s = format!("resource_dir: {}\n", resource_dir.display());
                 for c in &candidates {
                     s.push_str(&format!(
-                        "候选: {} (pi.exe 存在: {})\n",
+                        "候选: {} ({} 存在: {})\n",
                         c.display(),
-                        c.join("pi.exe").is_file()
+                        ai::PI_BIN_NAME,
+                        c.join(ai::PI_BIN_NAME).is_file()
                     ));
                 }
                 s.push_str(&format!("选中: {}\n", pi_dir.display()));

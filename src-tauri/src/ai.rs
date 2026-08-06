@@ -56,7 +56,7 @@ const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用�
 const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
 你有执行权限（Agent 模式每次操作需用户批准；YOLO 模式自动执行，用户已显式授权）：
 - read/grep/find/ls/write/edit/delete_path：只能操作当前项目目录内的文件，项目外一律被拒。
-- run_command：在本地 Git Bash（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。
+- run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。
 - list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
@@ -86,6 +86,13 @@ const CONTROLLED_TOOLS: [&str; 6] = [
     "sftp_upload",
     "sftp_download",
 ];
+
+/// pi 二进制名：Windows 发行版是 pi.exe，macOS/Linux 无扩展名。
+/// lib.rs 的资源目录探测与本模块 spawn 共用（与 scripts/fetch-pi.mjs 的 TARGETS 对应）。
+#[cfg(windows)]
+pub(crate) const PI_BIN_NAME: &str = "pi.exe";
+#[cfg(not(windows))]
+pub(crate) const PI_BIN_NAME: &str = "pi";
 
 /// 内部动作返回给模型的结果截断上限（pi docs 要求工具必须截断输出，防上下文溢出）。
 const MAX_RESULT_CHARS: usize = 30_000;
@@ -161,11 +168,11 @@ impl AiManager {
     /// 为 key 拉起 pi 进程并启动 stdout 读取线程（读线程负责 done/error 事件、审批转发、
     /// 内部动作执行与异常退出摘除）。
     fn spawn(&self, app: &AppHandle, key: &str, project_id: &str) -> Result<(), String> {
-        let pi_exe = self.pi_dir.join("pi.exe");
-        if !pi_exe.is_file() {
+        let pi_bin = self.pi_dir.join(PI_BIN_NAME);
+        if !pi_bin.is_file() {
             return Err(format!(
                 "pi 运行时不存在：{}（安装可能不完整，请重新安装；以下诊断信息可反馈给开发者）\n{}",
-                pi_exe.display(),
+                pi_bin.display(),
                 self.pi_debug
             ));
         }
@@ -210,7 +217,7 @@ impl AiManager {
             tools.push_str(",web_search");
         }
 
-        let mut cmd = Command::new(&pi_exe);
+        let mut cmd = Command::new(&pi_bin);
         cmd.args([
             "--mode",
             "rpc",

@@ -1,4 +1,5 @@
-//! 终端管理器：本地 Git Bash（portable-pty / ConPTY）与 SSH shell 同构接入。
+//! 终端管理器：本地 shell（portable-pty；Windows 起 Git Bash/ConPTY，macOS/Linux 起 $SHELL/zsh）
+//! 与 SSH shell 同构接入。
 //! 契约（与 src/api.ts 严格对齐）：
 //! - 命令 `term_create(id, kind, server_id, cwd)` / `term_input(id, data)` /
 //!   `term_resize(id, cols, rows)` / `term_close(id)`；
@@ -9,6 +10,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+// 仅 Windows 的 Git Bash 探测（where.exe）使用；macOS/Linux 走 $SHELL，用不到
+#[cfg(windows)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -153,18 +156,16 @@ impl TermManager {
         }
     }
 
-    /// 本地分支：portable-pty 起 Git Bash（--login -i），cwd 缺省用用户 home。
+    /// 本地分支：portable-pty 起本地 shell（--login -i），cwd 缺省用用户 home。
     fn create_local(self: &Arc<Self>, app: AppHandle, id: String, cwd: Option<String>) -> Result<(), String> {
-        let bash = find_bash().ok_or_else(|| {
-            "未找到 Git Bash，请安装 Git for Windows 或设置 AISHELL_GIT_BASH".to_string()
-        })?;
+        let shell = find_shell().ok_or_else(shell_missing_msg)?;
 
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("PTY 创建失败: {e}"))?;
 
-        let mut cmd = CommandBuilder::new(bash);
+        let mut cmd = CommandBuilder::new(shell);
         cmd.args(["--login", "-i"]);
         let dir = match cwd.as_deref() {
             Some(c) if !c.trim().is_empty() => PathBuf::from(c),
@@ -177,7 +178,7 @@ impl TermManager {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("启动 Git Bash 失败: {e}"))?;
+            .map_err(|e| format!("启动本地 shell 失败: {e}"))?;
         let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().ok();
         let writer = Arc::new(Mutex::new(
@@ -324,12 +325,13 @@ impl TermManager {
     }
 }
 
-/* ---------------- Git Bash 探测 ---------------- */
+/* ---------------- 本地 shell 探测 ---------------- */
 
-/// 探测顺序：env AISHELL_GIT_BASH → %PROGRAMFILES%\Git\bin\bash.exe →
+/// Windows：探测 Git Bash。顺序：env AISHELL_GIT_BASH → %PROGRAMFILES%\Git\bin\bash.exe →
 /// %PROGRAMFILES(X86)%\Git\bin\bash.exe → `where.exe bash` 输出中首个含 "Git" 的行
 /// （排除 System32 的 WSL bash）。pub(crate)：ai_actions 本地命令复用。
-pub(crate) fn find_bash() -> Option<String> {
+#[cfg(windows)]
+pub(crate) fn find_shell() -> Option<String> {
     if let Some(p) = std::env::var("AISHELL_GIT_BASH").ok().map(|s| s.trim().to_string()) {
         if !p.is_empty() && PathBuf::from(&p).is_file() {
             return Some(p);
@@ -355,6 +357,33 @@ pub(crate) fn find_bash() -> Option<String> {
             !line.is_empty() && lower.contains("git") && !lower.contains("system32")
         })
         .map(str::to_string)
+}
+
+/// macOS/Linux：登录 shell。顺序：$SHELL → /bin/zsh → /bin/bash → /usr/bin/zsh → /usr/bin/bash。
+/// macOS 默认 zsh（/bin/zsh 恒在），Linux 发行版 /bin/bash 恒在，$SHELL 覆盖绝大多数场景。
+#[cfg(not(windows))]
+pub(crate) fn find_shell() -> Option<String> {
+    if let Some(p) = std::env::var("SHELL").ok().map(|s| s.trim().to_string()) {
+        if !p.is_empty() && PathBuf::from(&p).is_file() {
+            return Some(p);
+        }
+    }
+    ["/bin/zsh", "/bin/bash", "/usr/bin/zsh", "/usr/bin/bash"]
+        .into_iter()
+        .find(|p| PathBuf::from(p).is_file())
+        .map(str::to_string)
+}
+
+/// find_shell 未命中时的用户可读错误（create_local / ai_actions 两调用点统一文案）。
+#[cfg(windows)]
+pub(crate) fn shell_missing_msg() -> String {
+    "未找到 Git Bash，请安装 Git for Windows 或设置 AISHELL_GIT_BASH".to_string()
+}
+
+/// find_shell 未命中时的用户可读错误（create_local / ai_actions 两调用点统一文案）。
+#[cfg(not(windows))]
+pub(crate) fn shell_missing_msg() -> String {
+    "未找到可用 shell：$SHELL 未设置且 /bin/zsh、/bin/bash 均不存在".to_string()
 }
 
 /* ---------------- Tauri 命令（注册由主 agent 集成） ---------------- */

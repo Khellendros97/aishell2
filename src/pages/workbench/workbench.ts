@@ -6,7 +6,7 @@
  * - 正在显示 commands 时活跃标签变为非终端 → 自动切回 explorer。
  *
  * 与原型差异：项目数据异步装载（getState），面板由 ./sidebar/*.ts 与 ./ai.ts 挂载；
- * 页面就绪后自动开一个本地 Git Bash 终端标签（id 'term-local'）。
+ * 页面就绪后自动开一个本地终端标签（id 'term-local'）。
  */
 import { getState } from '../../api';
 import { renderTopbar } from '../../components/topbar';
@@ -227,7 +227,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
   openTab({
     id: 'term-local',
     type: 'terminal',
-    title: '本地 Git Bash',
+    title: '本地终端',
     data: { kind: 'local', cwd: project.path },
   });
 

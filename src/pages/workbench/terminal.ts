@@ -1,5 +1,5 @@
 /**
- * 终端标签页渲染器：真实 PTY（本地 Git Bash / SSH）的 xterm 封装。
+ * 终端标签页渲染器：真实 PTY（本地 shell / SSH）的 xterm 封装。
  * import 即注册 registerRenderer('terminal', …)（模块级副作用，契约同 .proto/workbench-core.js）。
  * 对照规格：.proto/workbench-terminal.js（交互语义），后端接口点见 src/api.ts：
  * term_create / term_input / term_resize / term_close，事件 term:data:<id> / term:exit:<id>。

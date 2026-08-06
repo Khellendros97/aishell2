@@ -60,7 +60,7 @@ export const setServerLocked = (id: string, locked: boolean) =>
 
 /* ---------------- term ----------------
    id 由前端生成、先订阅事件再调 term_create，避免输出竞态丢失。
-   term_create 失败时错误串原样 reject（如「未找到 Git Bash」）。 */
+   term_create 失败时错误串原样 reject（如「未找到 Git Bash」「未找到可用 shell」）。 */
 export type TermKind = 'local' | 'ssh';
 export const termCreate = (id: string, kind: TermKind, serverId: string | null, cwd: string | null) =>
   call<void>('term_create', { id, kind, serverId, cwd });
