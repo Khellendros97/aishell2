@@ -347,6 +347,7 @@ mod tests {
             auth_type: store::AuthType::Key,
             username: "tester".to_string(),
             key_path: path.to_string(),
+            folder: String::new(),
             locked: false,
         }
     }

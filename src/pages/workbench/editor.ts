@@ -172,7 +172,7 @@ function showEditorMenu(x: number, y: number, entry: EditorEntry, path: string):
   const selText = hasSel ? view.state.sliceDoc(from, to) : '';
 
   showContextMenu(x, y, [
-    { label: '全选', iconName: 'square', action: () => selectAll(view) },
+    { label: '全选', iconName: 'square', action: () => { view.focus(); selectAll(view); } },
     'sep',
     {
       label: '复制', iconName: 'copy', disabled: !hasSel, disabledTip: '请先框选一段文字',

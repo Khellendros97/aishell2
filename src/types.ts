@@ -34,6 +34,8 @@ export interface Server {
   authType: AuthType;
   username: string;
   keyPath: string;
+  /** 所属目录：'/' 分隔的相对路径（如 "生产环境/Web"），空串 = 未分类；Xshell 导入按会话分组填充 */
+  folder: string;
   /** AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP */
   locked: boolean;
 }
@@ -105,6 +107,8 @@ export interface AppState {
   servers: Server[];
   projects: Project[];
   sessions: Record<string, ChatSession[]>;
+  /** 服务器分类目录清单（'/' 分隔相对路径，与 Server.folder 同语义；空目录也在此）；旧配置无此字段为空列表 */
+  serverFolders: string[];
 }
 
 export interface FsEntry {
@@ -112,6 +116,19 @@ export interface FsEntry {
   isDir: boolean;
   size: number;
   mtime: number;
+}
+
+/** fs_stat 返回的单项属性快照 —— 与 fsops.rs FsStat serde camelCase 对齐。
+ *  mode 为 unix 权限位（本地 Windows 为 null）；linkTarget 非符号链接为 null。 */
+export interface FsStat {
+  path: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  mtime: number;
+  mode: number | null;
+  readonly: boolean;
+  linkTarget: string | null;
 }
 
 /** Xshell 会话导入结果 —— 与 Rust import_xshell_sessions 返回值 serde camelCase 对齐 */

@@ -61,6 +61,36 @@
 .settings-page .sc-meta { display: flex; align-items: center; gap: 8px; }
 .settings-page .sc-user { font-size: 12px; color: var(--text-2); }
 
+/* 服务器列表搜索行：搜索框 + 全部展开/折叠切换按钮（静态骨架，不随列表重建） */
+.settings-page .search-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.settings-page .search-row #server-search { flex: 1; }
+.settings-page .search-row .icon-btn { flex: none; }
+
+/* 按所属目录分组的标题行（整行可点击折叠；按钮子元素不触发，见事件委托） */
+.settings-page .server-group { margin-bottom: 16px; }
+.settings-page .server-group:last-child { margin-bottom: 0; }
+.settings-page .server-group-title {
+  display: flex; align-items: center; gap: 6px;
+  margin: 0 2px 8px; padding: 2px 4px; border-radius: var(--radius-s);
+  font-size: 12px; font-weight: 600; color: var(--text-1);
+  cursor: pointer; user-select: none;
+}
+.settings-page .server-group-title:hover { background: var(--bg-hover); }
+/* 折叠指示文件夹图标（收起 = 闭合 / 展开 = 打开） */
+.settings-page .server-group-title .sg-folder { color: var(--text-2); flex: none; display: inline-flex; }
+.settings-page .server-group-title .tag { margin-left: auto; font-weight: 400; }
+/* 拖拽放置目标高亮 */
+.settings-page .server-group-title.drop-target {
+  background: var(--accent-dim); outline: 1px solid var(--accent); outline-offset: -1px;
+}
+/* 分组标题重命名/删除按钮：压缩尺寸，不挤占标题行 */
+.settings-page .server-group-title .icon-btn {
+  flex: none; width: 20px; height: 20px; font-size: 12px; margin-left: 2px;
+}
+
+/* 拖拽中的服务器卡片：降低透明度提示 */
+.settings-page .server-card.dragging { opacity: 0.4; }
+
 /* 密钥 tag（design.css 无 purple 变体，自定义） */
 .settings-page .tag.purple { background: rgba(182, 135, 232, 0.14); color: var(--purple); }
 

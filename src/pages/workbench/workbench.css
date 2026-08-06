@@ -76,11 +76,15 @@ body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-selec
   background: var(--bg-1); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-1); }
 .term-info-cmd { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .term-info-spacer { flex: 1; }
+/* 抽屉标题栏按钮组（清空 + 收起，右对齐） */
+.term-drawer-actions { display: flex; align-items: center; gap: 4px; }
+/* 清空历史命令按钮：破坏性操作，悬停红色提示（.icon-btn 基础样式见 styles/design.css） */
+.term-drawer-clear:hover:not(:disabled) { color: var(--red); }
 .term-main { flex: 1; min-height: 0; display: flex; }
 .term-xterm { flex: 1; min-width: 0; background: var(--term-bg); padding: 6px 0 6px 8px; position: relative; }
 .term-xterm .xterm { height: 100%; }
 
-/* 历史区块抽屉（右侧 280px，可开合） */
+/* 历史命令抽屉（右侧 280px，可开合） */
 .term-drawer { width: 280px; flex: none; display: flex; flex-direction: column; background: var(--bg-1);
   border-left: 1px solid var(--border); }
 .term-drawer-hidden { display: none; }

@@ -21,9 +21,40 @@
   border: 1px solid var(--border); background: var(--bg-1);
 }
 .wbs-server-actions .icon-btn:hover { background: var(--bg-3); border-color: var(--border-strong); }
-/* 远程服务器标题行（含新建按钮） */
+/* 远程服务器标题行（新建按钮；全部展开/折叠已移至搜索行） */
 .wbs-server-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin: 6px 2px 4px; font-size: 11px; color: var(--text-2);
 }
 .wbs-server-head .btn { flex: none; height: 22px; font-size: 11px; padding: 0 8px; }
+.wbs-server-head-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+
+/* 服务器搜索行：搜索框 + 全部展开/折叠切换按钮（持久元素，不随列表重建，避免输入焦点丢失） */
+.wbs-search { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
+.wbs-search .input { flex: 1; min-width: 0; }
+.wbs-search .icon-btn { flex: none; }
+
+/* 按所属目录分组的标题行（点击展开/收起；拖拽放置目标） */
+.wbs-server-group-title {
+  display: flex; align-items: center; gap: 6px;
+  margin: 2px 2px 6px; font-size: 11px; font-weight: 600; color: var(--text-2);
+  cursor: pointer; user-select: none; border-radius: 6px; padding: 1px 4px;
+}
+.wbs-server-group-title:hover { background: var(--bg-hover); }
+.wbs-server-group-title .wbs-server-group-ic {
+  display: inline-flex; flex: none; color: var(--text-2);
+}
+.wbs-server-group-title .wbs-server-group-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wbs-server-group-title .tag { margin-left: auto; font-weight: 400; }
+/* 拖拽悬停高亮（服务器卡片拖到组标题上） */
+.wbs-server-group-title.drop-target {
+  outline: 1px dashed var(--accent); outline-offset: -1px; background: var(--accent-dim);
+}
+/* 分组标题重命名按钮：压缩尺寸，不挤占标题行 */
+.wbs-server-group-title .icon-btn {
+  flex: none; width: 18px; height: 18px; font-size: 11px; margin-left: 2px;
+}
+/* 拖拽中的服务器卡片半透明 */
+.wbs-server-card.dragging { opacity: 0.45; }

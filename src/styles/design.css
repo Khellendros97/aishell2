@@ -154,6 +154,26 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a8adbb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat; background-position: right 10px center; padding-right: 28px;
 }
+/* 组合框（ui.ts attachCombo）：可输入 + 下拉候选，chevron 与 .select 完全对齐 */
+.combo { position: relative; }
+.combo > .input { padding-right: 28px; }
+.combo::after {
+  content: ''; position: absolute; right: 10px; top: 50%; width: 10px; height: 6px;
+  transform: translateY(-50%); pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a8adbb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: center;
+}
+.combo-list {
+  position: fixed; z-index: 1600; /* portal 到 body：摆脱模态框 overflow 裁剪 */
+  max-height: 180px; overflow-y: auto; padding: 4px;
+  background: var(--bg-2); border: 1px solid var(--border-strong); border-radius: var(--radius-s);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.combo-option {
+  padding: 6px 8px; border-radius: var(--radius-s); font-size: 13px; color: var(--text-0);
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.combo-option:hover, .combo-option.active { background: var(--accent-dim); }
 .textarea { resize: vertical; min-height: 64px; line-height: 1.5; }
 .field .hint { margin-top: 4px; font-size: 11px; color: var(--text-2); }
 
@@ -242,6 +262,31 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 }
 .tb-win-btn:hover { background: var(--bg-hover); color: var(--text-0); }
 .tb-win-close:hover { background: var(--red); color: #fff; }
+
+/* ---------- 命令面板（command-panel.ts，Ctrl+T 唤起） ---------- */
+#cmd-panel {
+  position: fixed; top: 72px; left: 50%; transform: translateX(-50%);
+  width: 560px; max-width: calc(100vw - 48px); z-index: 1400;
+  background: var(--bg-1); border: 1px solid var(--border-strong); border-radius: var(--radius-l);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45); padding: 10px 12px 12px;
+}
+#cmd-panel .cmd-row { display: flex; align-items: center; gap: 8px; }
+#cmd-panel .cmd-prompt { color: var(--accent); font-size: 15px; display: inline-flex; flex: none; }
+#cmd-panel .cmd-row .input {
+  flex: 1; border: none; background: transparent; padding: 6px 2px; font-size: 14px;
+}
+#cmd-panel .cmd-row .input:focus { border-color: transparent; box-shadow: none; }
+#cmd-panel .cmd-esc { font-size: 11px; color: var(--text-2); flex: none; }
+#cmd-panel .cmd-hints {
+  margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+#cmd-panel .cmd-hint { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--text-2); }
+#cmd-panel .cmd-hint code {
+  color: var(--text-0); background: var(--bg-2); padding: 1px 6px;
+  border-radius: 4px; font-size: 11.5px; flex: none;
+}
+#cmd-panel .cmd-error { margin-top: 6px; font-size: 12px; color: var(--red); }
 
 /* ---------- 空状态 ---------- */
 .empty-state {

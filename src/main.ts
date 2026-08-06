@@ -1,6 +1,7 @@
 /** 应用入口：hash 路由 + 启动缺配跳转（语义同 .proto/index.html）。 */
 import './styles/design.css';
 import { getState, isConfigComplete, openDevtools } from './api';
+import { initCommandPanel } from './command-panel';
 import { navigate, onRoute, parseHash } from './router';
 import { applyTheme } from './theme';
 import { renderTopbar } from './components/topbar';
@@ -69,3 +70,6 @@ document.addEventListener('keydown', (e) => {
 });
 
 void boot();
+
+/* 命令面板（Ctrl+T）：全局组件，挂载后不随页面重渲染销毁 */
+initCommandPanel();

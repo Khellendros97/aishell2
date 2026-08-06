@@ -1,17 +1,17 @@
 /**
  * 欢迎页 —— 移植自 .proto/welcome.js + welcome.html。
  * 差异：数据源为 Tauri 后端（get_state / upsert_project / delete_project / upsert_server）；
- * 「重置演示数据」按钮改为「打开配置目录」（openPath(getConfigDir())）；
  * 新建项目先 ensureProjectDirs 拿最终路径，再 upsertProject 落盘；
  * 浏览按钮走 @tauri-apps/plugin-dialog；卡片点击经 router.navigate 进入工作台。
+ * 新增（非原型）：项目对话框的服务器勾选列表支持按 名称/host/账号/目录 搜索（folder 与 store.rs Server 对齐）；
+ * 按 folder 分组折叠展示（默认折叠，组标题含组全选复选框，可全部展开/折叠）。
  */
 import type { AppState, Project, Server } from '../types';
 import {
-  deleteProject, ensureProjectDirs, getConfigDir, getState, openDialog, upsertProject, upsertServer,
+  deleteProject, ensureProjectDirs, getState, openDialog, upsertProject, upsertServer,
 } from '../api';
 import { confirmDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
-import { openPath } from '@tauri-apps/plugin-opener';
 import { navigate } from '../router';
 import type { PageRender } from '../main';
 import './welcome.css';
@@ -35,7 +35,6 @@ export const renderWelcome: PageRender = (root) => {
         <h2>我的项目</h2>
         <span class="tag" id="proj-count">0 个项目</span>
         <div class="spacer"></div>
-        <button class="btn ghost small" id="btn-reset" title="打开应用配置目录">打开配置目录</button>
         <button class="btn primary" id="btn-new">${icon('plus')} 新建项目</button>
       </div>
 
@@ -71,6 +70,10 @@ export const renderWelcome: PageRender = (root) => {
           </div>
           <div class="field">
             <label>绑定远程服务器（可多选）</label>
+            <div class="server-search-row">
+              <input class="input" id="server-search" placeholder="搜索服务器…">
+              <button class="icon-btn" id="server-toggle-folders" title="全部展开">${icon('folderOpen')}</button>
+            </div>
             <div class="server-list" id="server-list"></div>
             <div class="server-add" id="server-add-toggle">${icon('plus')} 新建服务器连接</div>
             <div class="server-mini hidden" id="server-mini">
@@ -127,7 +130,6 @@ export const renderWelcome: PageRender = (root) => {
     count: $('proj-count'),
     btnNew: $('btn-new'),
     btnEmptyNew: $('btn-empty-new'),
-    btnReset: $('btn-reset'),
     modal: $('proj-modal'),
     modalTitle: $('modal-title'),
     modalClose: $('modal-close'),
@@ -138,6 +140,8 @@ export const renderWelcome: PageRender = (root) => {
     fPath: $<HTMLInputElement>('f-path'),
     btnBrowse: $('btn-browse'),
     serverList: $('server-list'),
+    serverSearch: $<HTMLInputElement>('server-search'),
+    serverToggleFolders: $('server-toggle-folders'),
     addToggle: $('server-add-toggle'),
     mini: $('server-mini'),
     miniName: $<HTMLInputElement>('mini-name'),
@@ -155,10 +159,11 @@ export const renderWelcome: PageRender = (root) => {
   /* ---------- 状态 ---------- */
   let db: AppState = {
     settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark' },
-    servers: [], projects: [], sessions: {},
+    servers: [], projects: [], sessions: {}, serverFolders: [],
   };
   let editingId: string | null = null;       // null = 新建；否则为正在编辑的项目 id
   let selectedServerIds: string[] = [];      // 模态框中多选的服务器 id
+  const expandedGroups = new Set<string>();  // 展开的分组（键 = folder 值，空串 = 未分类）；默认全部折叠，跨重渲染保留
 
   /* ---------- 项目列表渲染 ---------- */
   function renderProjects() {
@@ -173,8 +178,13 @@ export const renderWelcome: PageRender = (root) => {
       const servers = (p.serverIds || [])
         .map((id) => db.servers.find((s) => s.id === id))
         .filter((s): s is Server => !!s);
+      // 服务器标签最多显示 5 个：超过 5 台时显示前 4 个 + 「+剩余数量」标签，避免卡片被撑大
+      const tagLimit = 5;
+      const shownServers = servers.length > tagLimit ? servers.slice(0, tagLimit - 1) : servers;
+      const hiddenCount = servers.length - shownServers.length;
       const serverTags = servers.length
-        ? servers.map((s) => `<span class="tag blue">${esc(s.name)}</span>`).join('')
+        ? shownServers.map((s) => `<span class="tag blue">${esc(s.name)}</span>`).join('')
+          + (hiddenCount > 0 ? `<span class="tag">+${hiddenCount}</span>` : '')
         : '<span class="tag">仅本地</span>';
 
       const card = document.createElement('div');
@@ -350,30 +360,118 @@ export const renderWelcome: PageRender = (root) => {
   }
   els.btnSave.onclick = () => void saveProject();
 
-  /* ---------- 服务器多选列表 ---------- */
+  /* ---------- 服务器多选列表（按 folder 分组折叠；组全选） ---------- */
   function renderServerList() {
-    const servers = db.servers || [];
-    if (!servers.length) {
+    const all = db.servers || [];
+    if (!all.length) {
       els.serverList.innerHTML = '<div class="server-empty">暂无服务器，可在下方新建</div>';
       return;
     }
-    els.serverList.innerHTML = servers.map((s) => {
-      const selected = selectedServerIds.includes(s.id);
-      const authTag = s.authType === 'key'
-        ? '<span class="tag yellow">密钥</span>'
-        : '<span class="tag green">密码</span>';
+    // 搜索过滤：名称 / host / username / folder 大小写不敏感；空串显示全部
+    const q = els.serverSearch.value.trim().toLowerCase();
+    const filtered = q
+      ? all.filter((s) => [s.name, s.host, s.username, s.folder].some((v) => v.toLowerCase().includes(q)))
+      : all;
+    if (!filtered.length) {
+      els.serverList.innerHTML = '<div class="server-empty">没有匹配的服务器，试试其他关键词</div>';
+      return;
+    }
+    // 按 folder 分组（未分类 = 空串，排最后）；搜索态组内过滤，无命中组不渲染。
+    // 组全选作用于该分类全部服务器（不受搜索过滤影响）：勾选态按 db.servers 全量计算。
+    const groups = new Map<string, Server[]>();
+    filtered.forEach((s) => {
+      const key = s.folder || '';
+      const arr = groups.get(key);
+      if (arr) arr.push(s);
+      else groups.set(key, [s]);
+    });
+    const keys = Array.from(groups.keys()).sort((a, b) => {
+      if (!a) return 1; // 未分类组排最后
+      if (!b) return -1;
+      return a.localeCompare(b, 'zh');
+    });
+    els.serverList.innerHTML = keys.map((folderKey) => {
+      const groupServers = groups.get(folderKey)!;
+      const expanded = expandedGroups.has(folderKey);
+      const cards = groupServers.map((s) => {
+        const selected = selectedServerIds.includes(s.id);
+        const authTag = s.authType === 'key'
+          ? '<span class="tag yellow">密钥</span>'
+          : '<span class="tag green">密码</span>';
+        return `
+          <div class="card clickable server-card${selected ? ' selected' : ''}" data-id="${esc(s.id)}">
+            <div class="sc-head">
+              <span class="sc-name ellipsis" title="${esc(s.name)}">${esc(s.name)}</span>
+              ${authTag}
+            </div>
+            <div class="sc-meta mono">${esc(s.host)}:${esc(s.port)}</div>
+          </div>`;
+      }).join('');
       return `
-        <div class="card clickable server-card${selected ? ' selected' : ''}" data-id="${esc(s.id)}">
-          <div class="sc-head">
-            <span class="sc-name ellipsis" title="${esc(s.name)}">${esc(s.name)}</span>
-            ${authTag}
-          </div>
-          <div class="sc-meta mono">${esc(s.host)}:${esc(s.port)}</div>
-        </div>`;
+        <div class="server-group-title" data-folder="${esc(folderKey)}">
+          <span class="sgt-folder">${icon(expanded ? 'folderOpen' : 'folder')}</span>
+          <span class="sgt-name" title="${esc(folderKey || '未分类')}">${esc(folderKey || '未分类')}</span>
+          <span class="tag">${groupServers.length}</span>
+          <input type="checkbox" class="sgt-check" data-folder="${esc(folderKey)}" title="全选 / 取消全选该分类">
+        </div>
+        <div class="server-group-body${expanded ? '' : ' hidden'}">${cards}</div>`;
     }).join('');
+    // 组全选勾选态：按该分类全部服务器（非搜索过滤结果）计算 checked / indeterminate
+    els.serverList.querySelectorAll<HTMLInputElement>('.sgt-check').forEach((check) => {
+      const folder = check.dataset.folder ?? '';
+      const groupAll = all.filter((s) => (s.folder || '') === folder);
+      const sel = groupAll.filter((s) => selectedServerIds.includes(s.id)).length;
+      check.checked = sel === groupAll.length;
+      check.indeterminate = sel > 0 && sel < groupAll.length;
+    });
+    syncToggleFoldersBtn();
   }
 
+  // 全部展开 / 全部折叠：单按钮按当前状态切换（图标 = 目标动作），作用于全部服务器的分类（含被搜索过滤掉的组）
+  const allFolderKeys = () => Array.from(new Set((db.servers || []).map((s) => s.folder || '')));
+  const syncToggleFoldersBtn = () => {
+    const keys = allFolderKeys();
+    const allExpanded = keys.length > 0 && keys.every((k) => expandedGroups.has(k));
+    els.serverToggleFolders.innerHTML = icon(allExpanded ? 'folder' : 'folderOpen');
+    els.serverToggleFolders.title = allExpanded ? '全部折叠' : '全部展开';
+  };
+  els.serverToggleFolders.onclick = () => {
+    const keys = allFolderKeys();
+    const allExpanded = keys.length > 0 && keys.every((k) => expandedGroups.has(k));
+    if (allExpanded) expandedGroups.clear();
+    else keys.forEach((k) => expandedGroups.add(k));
+    renderServerList();
+  };
+
+  // 列表点击委托：组标题 = 展开/收起；组全选复选框 = 整组勾选/取消；卡片 = 单选切换
   els.serverList.addEventListener('click', (e) => {
+    const check = (e.target as HTMLElement).closest<HTMLInputElement>('.sgt-check');
+    if (check) {
+      const folder = check.dataset.folder ?? '';
+      // 组全选作用于该分类全部服务器，不受搜索过滤影响
+      const groupAll = (db.servers || []).filter((s) => (s.folder || '') === folder);
+      const allSelected = groupAll.every((s) => selectedServerIds.includes(s.id));
+      if (allSelected) {
+        // 全部已选 → 全部移除
+        const remove = new Set(groupAll.map((s) => s.id));
+        selectedServerIds = selectedServerIds.filter((id) => !remove.has(id));
+      } else {
+        // 否则全部加入（去重）
+        groupAll.forEach((s) => {
+          if (!selectedServerIds.includes(s.id)) selectedServerIds.push(s.id);
+        });
+      }
+      renderServerList();
+      return;
+    }
+    const title = (e.target as HTMLElement).closest<HTMLElement>('.server-group-title');
+    if (title) {
+      const folder = title.dataset.folder ?? '';
+      if (expandedGroups.has(folder)) expandedGroups.delete(folder);
+      else expandedGroups.add(folder);
+      renderServerList();
+      return;
+    }
     const card = (e.target as HTMLElement).closest<HTMLElement>('.server-card');
     if (!card) return;
     const id = card.dataset.id;
@@ -383,6 +481,9 @@ export const renderWelcome: PageRender = (root) => {
     else selectedServerIds.push(id);
     renderServerList();
   });
+
+  // 搜索过滤：输入即重渲染（输入框为静态骨架，不随列表重建，焦点不丢）
+  els.serverSearch.addEventListener('input', renderServerList);
 
   /* ---------- 快捷新建服务器 ---------- */
   function expandMini() {
@@ -454,6 +555,7 @@ export const renderWelcome: PageRender = (root) => {
       authType: auth,
       username: els.miniUser.value.trim(),
       keyPath: auth === 'key' ? secret : '',
+      folder: '',
       locked: false,
     };
 
@@ -472,15 +574,6 @@ export const renderWelcome: PageRender = (root) => {
   }
   els.miniSave.onclick = () => void saveMiniServer();
 
-  /* ---------- 打开配置目录（原型「重置演示数据」的替代） ---------- */
-  els.btnReset.onclick = async () => {
-    try {
-      await openPath(await getConfigDir());
-    } catch {
-      toast('无法打开配置目录', 'error');
-    }
-  };
-
   /* ---------- 初始渲染 ---------- */
   void getState()
     .then((s) => {
@@ -489,7 +582,20 @@ export const renderWelcome: PageRender = (root) => {
     })
     .catch((err) => toast(String(err), 'error'));
 
+  // 命令面板（Ctrl+T）等全局操作清空/变更数据后广播，此处重新拉取渲染
+  const onDataChanged = () => {
+    void getState()
+      .then((s) => {
+        db = s;
+        renderProjects();
+        if (!els.modal.classList.contains('hidden')) renderServerList();
+      })
+      .catch((err) => toast(String(err), 'error'));
+  };
+  window.addEventListener('aishell:data-changed', onDataChanged);
+
   return () => {
     document.removeEventListener('keydown', onKeydown);
+    window.removeEventListener('aishell:data-changed', onDataChanged);
   };
 };

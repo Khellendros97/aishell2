@@ -795,7 +795,7 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
           <button class="btn small" type="button">粘贴到终端</button>
         </span></div>
         <code class="ai-suggest-main">${escapeHtml(p.body)}</code>
-        <button class="icon-btn ai-qc-fav" type="button" title="收藏为快捷指令">${icon('pin')}</button>
+        <button class="icon-btn ai-qc-fav" type="button" title="收藏为命令收藏">${icon('star')}</button>
       </div>`;
     case 'text':
       return `<div class="ai-suggest text" data-action="copy" data-text="${escapeHtml(p.body)}" title="点击卡片复制到剪贴板">

@@ -39,6 +39,25 @@
 .welcome-page .sc-name { flex: 1; min-width: 0; font-weight: 500; }
 .welcome-page .sc-meta { margin-top: 4px; font-size: 12px; color: var(--text-2); }
 .welcome-page .server-empty { font-size: 12px; color: var(--text-2); padding: 6px 2px; }
+/* 勾选列表搜索框行（静态骨架，不随列表重建）+ 全部展开/折叠按钮 */
+.welcome-page .server-search-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.welcome-page .server-search-row .input { flex: 1; min-width: 0; }
+.welcome-page .server-search-row .icon-btn { flex: none; width: 26px; height: 26px; font-size: 12px; }
+/* 按 folder 分组的折叠面板标题行（点击展开/收起；含组全选复选框） */
+.welcome-page .server-group-title {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; font-weight: 600; color: var(--text-1);
+  cursor: pointer; user-select: none; padding: 2px 4px; border-radius: 6px;
+}
+.welcome-page .server-group-title:hover { background: var(--bg-hover); }
+/* 折叠指示文件夹图标（收起 = 闭合 / 展开 = 打开） */
+.welcome-page .server-group-title .sgt-folder { display: inline-flex; flex: none; color: var(--text-2); }
+.welcome-page .server-group-title .sgt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.welcome-page .server-group-title .tag { font-weight: 400; }
+.welcome-page .server-group-title input[type="checkbox"] {
+  flex: none; width: 14px; height: 14px; margin: 0; cursor: pointer; accent-color: var(--accent);
+}
+.welcome-page .server-group-body { display: flex; flex-direction: column; gap: 8px; }
 
 /* ---------- 新建服务器快捷区 ---------- */
 .welcome-page .server-add {

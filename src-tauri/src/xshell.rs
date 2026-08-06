@@ -135,6 +135,17 @@ fn normalized_rel_name(rel: &Path) -> String {
     s
 }
 
+/// 相对 Sessions 的路径 → 所属目录：父目录组件以 '/' 连接（如 "生产环境/Web"）；
+/// 根目录下的文件返回空串（未分类）。
+fn rel_folder(rel: &Path) -> String {
+    let mut comps = rel.components();
+    comps.next_back(); // 去掉文件名
+    comps
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// 稳定 ID：名称统一分隔符、转小写后做 FNV-1a 64，格式 xshell-<16 位小写 hex>。
 fn session_id(name: &str) -> String {
     format!(
@@ -240,6 +251,8 @@ fn parse_session_file(path: &Path, rel: &Path, user_keys_dir: &Path) -> Option<(
         auth_type,
         username: fields.username.unwrap_or_default(),
         key_path,
+        // 所属目录：会话文件相对 Sessions 根目录的父目录（'/' 连接）；根目录下为空串（未分类）
+        folder: rel_folder(rel),
         // 新导入服务器默认未锁定（锁定是用户显式行为）
         locked: false,
     };

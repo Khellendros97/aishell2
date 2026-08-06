@@ -3,10 +3,12 @@
  * 差异：数据源为 Tauri 后端（get_state / upsert_server / delete_server / save_settings）；
  * 密码与 apiKey 表单留空提交 null（后端保持原值），显示位不打回明文；
  * 浏览按钮走 @tauri-apps/plugin-dialog；「重置演示数据」按钮本页无（见欢迎页「打开配置目录」）。
+ * 新增（非原型）：服务器列表支持按 名称/host/账号/目录 搜索，并按 folder 分组展示
+ * （folder 为 '/' 分隔相对路径，与 store.rs Server 字段 serde camelCase 对齐；旧配置无该字段按未分类）。
  */
 import type { AppState, LlmConfig, Server, Theme, XshellImportResult } from '../types';
-import { deleteServer, getState, importXshellFromDir, importXshellSessions, openDialog, saveSettings, setServerLocked, setTheme, upsertServer } from '../api';
-import { confirmDialog, toast, uid } from '../ui';
+import { createServerFolder, deleteServer, deleteServerFolder, getState, importXshellFromDir, importXshellSessions, openDialog, renameServerFolder, saveSettings, setServerLocked, setTheme, upsertServer } from '../api';
+import { attachCombo, confirmDialog, promptDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../theme';
@@ -14,6 +16,9 @@ import type { PageRender } from '../main';
 import './settings.css';
 
 const AUTH_LABEL: Record<string, string> = { password: '密码', key: '密钥' };
+
+/** 展开状态的服务器分组（键 = folder 值，含未分类空串）；默认全折叠，跨 renderServers 重渲染保留 */
+const expandedFolders = new Set<string>();
 
 export const renderSettings: PageRender = (root, params) => {
   root.classList.add('settings-page');
@@ -32,14 +37,23 @@ export const renderSettings: PageRender = (root, params) => {
             <div class="panel-title">服务器 <span id="server-count" class="tag">0</span></div>
             <div class="panel-actions">
               <button id="btn-import-xshell" class="btn">${icon('folder')} 从 Xshell 导入</button>
+              <button id="btn-new-folder" class="btn">${icon('folderPlus')} 新建分类目录</button>
               <button id="btn-new-server" class="btn primary">${icon('plus')} 新建服务器</button>
             </div>
           </div>
           <div id="import-note" class="import-note hidden" role="status"></div>
-          <div id="server-grid" class="server-grid"></div>
+          <div class="search-row">
+            <input id="server-search" class="input" placeholder="搜索服务器…">
+            <button id="btn-toggle-folders" class="icon-btn" title="全部展开">${icon('folderOpen')}</button>
+          </div>
+          <div id="server-grid"></div>
           <div id="server-empty" class="empty-state hidden">
             <div class="icon">${icon('monitor')}</div>
             <div>暂无服务器，点击右上角「新建服务器」开始配置</div>
+          </div>
+          <div id="server-search-empty" class="empty-state hidden">
+            <div class="icon">${icon('folder')}</div>
+            <div>没有匹配的服务器，试试其他关键词</div>
           </div>
         </section>
         <section id="panel-system" class="settings-panel hidden">
@@ -152,6 +166,11 @@ export const renderSettings: PageRender = (root, params) => {
               <button id="btn-browse-key" class="btn small">浏览…</button>
             </div>
           </div>
+          <div class="field">
+            <label>所属目录</label>
+            <input id="f-folder" class="input" placeholder="可输入新分类或从下拉选择，例如：生产环境/Web">
+            <div class="hint">以 / 分隔的目录路径，可输入新分类或从下拉选择；留空表示未分类</div>
+          </div>
         </div>
         <div class="modal-foot">
           <button id="server-modal-cancel" class="btn">取消</button>
@@ -170,6 +189,8 @@ export const renderSettings: PageRender = (root, params) => {
   };
   const grid = root.querySelector('#server-grid') as HTMLElement;
   const emptyState = root.querySelector('#server-empty') as HTMLElement;
+  const searchEmpty = root.querySelector('#server-search-empty') as HTMLElement;
+  const serverSearch = root.querySelector('#server-search') as HTMLInputElement;
   const countTag = root.querySelector('#server-count') as HTMLElement;
 
   const modal = root.querySelector('#server-modal') as HTMLElement;
@@ -181,6 +202,7 @@ export const renderSettings: PageRender = (root, params) => {
   const fUsername = root.querySelector('#f-username') as HTMLInputElement;
   const fPassword = root.querySelector('#f-password') as HTMLInputElement;
   const fKeyPath = root.querySelector('#f-keypath') as HTMLInputElement;
+  const fFolder = root.querySelector('#f-folder') as HTMLInputElement;
   let editingId: string | null = null;
 
   const fTheme = root.querySelector('#f-theme') as HTMLSelectElement;
@@ -195,8 +217,10 @@ export const renderSettings: PageRender = (root, params) => {
   /* ---------- 状态 ---------- */
   let db: AppState = {
     settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark' },
-    servers: [], projects: [], sessions: {},
+    servers: [], projects: [], sessions: {}, serverFolders: [],
   };
+  let searchQuery = ''; // 服务器列表搜索词（小写，空串 = 全部）
+  let renderedGroupKeys: string[] = []; // 最近一次渲染的分组键（「全部展开」用）
 
   // reason=missing-config：顶部黄色提示条（同 .proto/settings.js）
   if (params.get('reason') === 'missing-config') warnBanner.classList.add('show');
@@ -215,81 +239,320 @@ export const renderSettings: PageRender = (root, params) => {
   /* ============================================================
      服务器配置
      ============================================================ */
+  /** 搜索匹配：名称 / host / username / folder 大小写不敏感；空串显示全部 */
+  function matchServer(s: Server, q: string): boolean {
+    if (!q) return true;
+    return [s.name, s.host, s.username, s.folder].some((v) => v.toLowerCase().includes(q));
+  }
+
+  /** 单张服务器卡片（编辑 / 删除 / AI 锁按钮，事件委托挂在 #server-grid 上）；draggable 供拖拽改分类 */
+  function buildServerCard(s: Server): HTMLElement {
+    const card = document.createElement('div');
+    card.className = 'card server-card';
+    card.draggable = true;
+    card.dataset.id = s.id;
+
+    const head = document.createElement('div');
+    head.className = 'sc-head';
+    const name = document.createElement('span');
+    name.className = 'sc-name ellipsis';
+    name.textContent = s.name;
+    name.title = s.name;
+    const actions = document.createElement('div');
+    actions.className = 'sc-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'icon-btn';
+    editBtn.title = '编辑';
+    editBtn.innerHTML = icon('pencil');
+    editBtn.dataset.act = 'edit';
+    editBtn.dataset.id = s.id;
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'icon-btn danger';
+    delBtn.title = '删除';
+    delBtn.innerHTML = icon('trash');
+    delBtn.dataset.act = 'del';
+    delBtn.dataset.id = s.id;
+
+    // AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP
+    const lockBtn = document.createElement('button');
+    lockBtn.className = 'icon-btn' + (s.locked ? ' locked' : '');
+    lockBtn.title = s.locked
+      ? `「${s.name}」的 AI 远程操作已锁定，点击解锁`
+      : `锁定「${s.name}」的 AI 远程操作（手动 SSH/SFTP 不受影响）`;
+    lockBtn.innerHTML = icon(s.locked ? 'lock' : 'unlock');
+    lockBtn.dataset.act = 'lock';
+    lockBtn.dataset.id = s.id;
+
+    actions.append(editBtn, lockBtn, delBtn);
+    head.append(name, actions);
+
+    const host = document.createElement('div');
+    host.className = 'sc-host mono';
+    host.textContent = `${s.host}:${s.port}`;
+
+    const meta = document.createElement('div');
+    meta.className = 'sc-meta';
+    const tag = document.createElement('span');
+    tag.className = 'tag ' + (s.authType === 'key' ? 'purple' : 'blue');
+    tag.textContent = AUTH_LABEL[s.authType] || s.authType;
+    const user = document.createElement('span');
+    user.className = 'sc-user';
+    user.innerHTML = `${icon('user')} `;
+    user.appendChild(document.createTextNode(s.username || '-'));
+    meta.append(tag, user);
+
+    card.append(head, host, meta);
+    return card;
+  }
+
   function renderServers() {
     grid.innerHTML = '';
     countTag.textContent = String(db.servers.length);
-    emptyState.classList.toggle('hidden', db.servers.length > 0);
+    const q = searchQuery;
+    const filtered = db.servers.filter((s) => matchServer(s, q));
+    // 无服务器但存在空目录时也渲染目录列表（标题+计数 0），不显示「暂无服务器」空态
+    emptyState.classList.toggle('hidden', db.servers.length > 0 || (db.serverFolders?.length ?? 0) > 0);
+    // 有服务器但搜索无命中 → 专属空态（与「完全没有服务器」区分）
+    searchEmpty.classList.toggle('hidden', !(db.servers.length > 0 && filtered.length === 0));
 
-    db.servers.forEach((s) => {
-      const card = document.createElement('div');
-      card.className = 'card server-card';
+    // 组来源：server_folders ∪ 各服务器 folder 派生值（并集，去重），空目录（0 台）也渲染；
+    // 搜索中只展示命中服务器的分组（空目录无意义，保持原有搜索空态语义）。
+    const groups = new Map<string, Server[]>();
+    if (q) {
+      filtered.forEach((s) => {
+        const key = s.folder || '';
+        const list = groups.get(key);
+        if (list) list.push(s);
+        else groups.set(key, [s]);
+      });
+    } else {
+      const folderSet = new Set<string>(db.serverFolders ?? []);
+      filtered.forEach((s) => folderSet.add(s.folder || ''));
+      folderSet.forEach((key) => groups.set(key, []));
+      filtered.forEach((s) => groups.get(s.folder || '')!.push(s));
+    }
 
-      const head = document.createElement('div');
-      head.className = 'sc-head';
-      const name = document.createElement('span');
-      name.className = 'sc-name ellipsis';
-      name.textContent = s.name;
-      name.title = s.name;
-      const actions = document.createElement('div');
-      actions.className = 'sc-actions';
+    if (!groups.size) {
+      renderedGroupKeys = [];
+      syncToggleFoldersBtn();
+      return;
+    }
 
-      const editBtn = document.createElement('button');
-      editBtn.className = 'icon-btn';
-      editBtn.title = '编辑';
-      editBtn.innerHTML = icon('pencil');
-      editBtn.dataset.act = 'edit';
-      editBtn.dataset.id = s.id;
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'icon-btn danger';
-      delBtn.title = '删除';
-      delBtn.innerHTML = icon('trash');
-      delBtn.dataset.act = 'del';
-      delBtn.dataset.id = s.id;
-
-      // AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP
-      const lockBtn = document.createElement('button');
-      lockBtn.className = 'icon-btn' + (s.locked ? ' locked' : '');
-      lockBtn.title = s.locked
-        ? `「${s.name}」的 AI 远程操作已锁定，点击解锁`
-        : `锁定「${s.name}」的 AI 远程操作（手动 SSH/SFTP 不受影响）`;
-      lockBtn.innerHTML = icon(s.locked ? 'lock' : 'unlock');
-      lockBtn.dataset.act = 'lock';
-      lockBtn.dataset.id = s.id;
-
-      actions.append(editBtn, lockBtn, delBtn);
-      head.append(name, actions);
-
-      const host = document.createElement('div');
-      host.className = 'sc-host mono';
-      host.textContent = `${s.host}:${s.port}`;
-
-      const meta = document.createElement('div');
-      meta.className = 'sc-meta';
-      const tag = document.createElement('span');
-      tag.className = 'tag ' + (s.authType === 'key' ? 'purple' : 'blue');
-      tag.textContent = AUTH_LABEL[s.authType] || s.authType;
-      const user = document.createElement('span');
-      user.className = 'sc-user';
-      user.innerHTML = `${icon('user')} `;
-      user.appendChild(document.createTextNode(s.username || '-'));
-      meta.append(tag, user);
-
-      card.append(head, host, meta);
-      grid.appendChild(card);
+    // 未分类（空串）组排最后
+    const keys = Array.from(groups.keys()).sort((a, b) => {
+      if (!a) return 1;
+      if (!b) return -1;
+      return a.localeCompare(b, 'zh');
     });
+
+    keys.forEach((folderKey) => {
+      const expanded = expandedFolders.has(folderKey);
+      const section = document.createElement('div');
+      section.className = 'server-group';
+
+      const title = document.createElement('div');
+      title.className = 'server-group-title';
+      title.dataset.folder = folderKey;
+      // 折叠指示：收起 = 闭合文件夹 / 展开 = 打开的文件夹（标题行点击切换，见 #server-grid 事件委托）
+      const titleIcon = document.createElement('span');
+      titleIcon.className = 'sg-folder';
+      titleIcon.innerHTML = icon(expanded ? 'folderOpen' : 'folder');
+      const titleText = document.createElement('span');
+      titleText.textContent = folderKey || '未分类';
+      const count = document.createElement('span');
+      count.className = 'tag';
+      count.textContent = String(groups.get(folderKey)!.length);
+      title.append(titleIcon, titleText, count);
+
+      // 未分类不可重命名/删除；其余组标题行提供重命名入口（事件委托见 #server-grid）
+      if (folderKey) {
+        const renameBtn = document.createElement('button');
+        renameBtn.className = 'icon-btn';
+        renameBtn.title = `重命名「${folderKey}」`;
+        renameBtn.innerHTML = icon('pencil');
+        renameBtn.dataset.act = 'rename-folder';
+        renameBtn.dataset.folder = folderKey;
+        title.append(renameBtn);
+        // 仅空组（计数 0）可删除
+        if (groups.get(folderKey)!.length === 0) {
+          const delBtn = document.createElement('button');
+          delBtn.className = 'icon-btn danger';
+          delBtn.title = `删除「${folderKey}」`;
+          delBtn.innerHTML = icon('trash');
+          delBtn.dataset.act = 'del-folder';
+          delBtn.dataset.folder = folderKey;
+          title.append(delBtn);
+        }
+      }
+
+      const inner = document.createElement('div');
+      inner.className = 'server-grid';
+      inner.classList.toggle('hidden', !expanded);
+      groups.get(folderKey)!.forEach((s) => inner.appendChild(buildServerCard(s)));
+
+      section.append(title, inner);
+      grid.appendChild(section);
+    });
+    renderedGroupKeys = keys;
+    syncToggleFoldersBtn();
   }
 
-  // 事件委托：编辑 / 删除 / AI 锁切换
+  // 搜索过滤：输入即重渲染（输入框为静态骨架，不随列表重建，焦点不丢）
+  serverSearch.addEventListener('input', () => {
+    searchQuery = serverSearch.value.trim().toLowerCase();
+    renderServers();
+  });
+
+  // 事件委托：编辑 / 删除 / AI 锁切换 / 分类目录重命名、删除 / 组标题折叠切换
   grid.addEventListener('click', (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLElement>('.icon-btn');
-    if (!btn) return;
-    const server = db.servers.find((s) => s.id === btn.dataset.id);
-    if (!server) return;
-    if (btn.dataset.act === 'edit') openServerModal(server);
-    else if (btn.dataset.act === 'del') void deleteServerFlow(server);
-    else if (btn.dataset.act === 'lock') void toggleServerLock(server);
+    if (btn) {
+      if (btn.dataset.act === 'rename-folder') {
+        void renameFolderFlow(btn.dataset.folder ?? '');
+        return;
+      }
+      if (btn.dataset.act === 'del-folder') {
+        void deleteFolderFlow(btn.dataset.folder ?? '');
+        return;
+      }
+      const server = db.servers.find((s) => s.id === btn.dataset.id);
+      if (!server) return;
+      if (btn.dataset.act === 'edit') openServerModal(server);
+      else if (btn.dataset.act === 'del') void deleteServerFlow(server);
+      else if (btn.dataset.act === 'lock') void toggleServerLock(server);
+      return;
+    }
+    // 组标题行点击 = 展开/收起（标题行内按钮已在上方分支处理，不会误触发折叠）
+    const title = (e.target as HTMLElement).closest<HTMLElement>('.server-group-title');
+    if (title) toggleFolder(title.dataset.folder ?? '');
   });
+
+  // 拖拽改分类（页面内 HTML5 DnD）：dragstart 记录服务器 id，组标题行（含未分类）为放置目标
+  grid.addEventListener('dragstart', (e) => {
+    const card = (e.target as HTMLElement).closest<HTMLElement>('.server-card');
+    if (!e.dataTransfer || !card?.dataset.id) return;
+    e.dataTransfer.setData('application/x-aishell-server', card.dataset.id);
+    e.dataTransfer.setData('text/plain', card.dataset.id); // 兜底：外部场景读不到自定义类型
+    card.classList.add('dragging');
+  });
+
+  grid.addEventListener('dragend', (e) => {
+    (e.target as HTMLElement).closest<HTMLElement>('.server-card')?.classList.remove('dragging');
+    // 拖出窗口 / 中途取消时清理残留的放置高亮
+    grid.querySelectorAll('.server-group-title.drop-target').forEach((t) => t.classList.remove('drop-target'));
+  });
+
+  grid.addEventListener('dragover', (e) => {
+    const title = (e.target as HTMLElement).closest<HTMLElement>('.server-group-title');
+    if (!e.dataTransfer || !title) return;
+    if (!Array.from(e.dataTransfer.types).includes('application/x-aishell-server')) return;
+    e.preventDefault(); // 声明可放置，drop 才会触发
+    title.classList.add('drop-target');
+  });
+
+  grid.addEventListener('dragleave', (e) => {
+    const title = (e.target as HTMLElement).closest<HTMLElement>('.server-group-title');
+    if (!title) return;
+    if (e.relatedTarget instanceof Node && title.contains(e.relatedTarget)) return; // 标题内子元素间移动不取消
+    title.classList.remove('drop-target');
+  });
+
+  grid.addEventListener('drop', (e) => {
+    const title = (e.target as HTMLElement).closest<HTMLElement>('.server-group-title');
+    if (!e.dataTransfer || !title) return;
+    e.preventDefault();
+    title.classList.remove('drop-target');
+    const id = e.dataTransfer.getData('application/x-aishell-server') || e.dataTransfer.getData('text/plain');
+    const server = db.servers.find((s) => s.id === id);
+    if (!server) return;
+    const folderKey = title.dataset.folder ?? '';
+    if (server.folder === folderKey) return; // 已在目标组，跳过
+    void moveServerToFolder(server, folderKey);
+  });
+
+  /** 组标题行点击：切换折叠状态（键 = folder 值，含未分类空串）并重渲染 */
+  function toggleFolder(folder: string) {
+    if (expandedFolders.has(folder)) expandedFolders.delete(folder);
+    else expandedFolders.add(folder);
+    renderServers();
+  }
+
+  /** 拖拽移动服务器到目标目录：密码传 null 保持 keyring 原值 */
+  async function moveServerToFolder(server: Server, folder: string): Promise<void> {
+    try {
+      await upsertServer({ ...server, folder }, null);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    db = await getState();
+    renderServers();
+    toast(`已移动到「${folder || '未分类'}」`, 'success');
+  }
+
+  /* ---------- 分类目录：新建 / 重命名 ---------- */
+  async function createFolderFlow(): Promise<void> {
+    const name = await promptDialog({
+      title: '新建分类目录',
+      label: '目录路径（可含 / 层级）',
+      placeholder: '例如：生产环境/Web',
+      okText: '创建',
+      allowPath: true,
+    });
+    if (name === null) return;
+    try {
+      await createServerFolder(name);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    db = await getState();
+    renderServers();
+    toast(`分类目录「${name}」已创建`, 'success');
+  }
+
+  async function renameFolderFlow(folder: string): Promise<void> {
+    const name = await promptDialog({
+      title: '重命名分类目录',
+      label: '目录路径（可含 / 层级）',
+      defaultValue: folder,
+      okText: '重命名',
+      allowPath: true,
+    });
+    if (name === null) return;
+    try {
+      await renameServerFolder(folder, name);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    db = await getState();
+    renderServers();
+    toast(`分类目录已重命名为「${name}」`, 'success');
+  }
+
+  /** 删除空分类目录：确认后调后端（失败显示后端中文错误），仅空组标题行有删除按钮 */
+  async function deleteFolderFlow(folder: string): Promise<void> {
+    const ok = await confirmDialog({
+      title: '删除分类目录',
+      message: `确定删除分类目录「${folder}」吗？`,
+      danger: true,
+      okText: '删除',
+    });
+    if (!ok) return;
+    try {
+      await deleteServerFolder(folder);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    db = await getState();
+    expandedFolders.delete(folder); // 已删除目录不再保留折叠状态
+    renderServers();
+    toast(`分类目录「${folder}」已删除`, 'success');
+  }
 
   /** AI 锁切换：原子 API 成功后原地更新 db.servers，失败回退并 toast */
   async function toggleServerLock(server: Server): Promise<void> {
@@ -331,6 +594,15 @@ export const renderSettings: PageRender = (root, params) => {
   }
 
   /* ---------- 新建 / 编辑模态框 ---------- */
+  /** 所属目录组合框候选：db.serverFolders ∪ 各服务器 folder 派生值，去重排序；未分类不列。
+   *  attachCombo 每次展开时调用，手输新目录保存时由后端 upsert_server 自动注册。 */
+  const folderOptions = (): string[] => {
+    const names = new Set<string>(db.serverFolders ?? []);
+    db.servers.forEach((s) => { if (s.folder) names.add(s.folder); });
+    return Array.from(names).sort((a, b) => a.localeCompare(b, 'zh'));
+  };
+  attachCombo(fFolder, folderOptions);
+
   function openServerModal(server: Server | null) {
     editingId = server ? server.id : null;
     modalTitle.textContent = server ? '编辑服务器' : '新建服务器';
@@ -341,6 +613,7 @@ export const renderSettings: PageRender = (root, params) => {
     fUsername.value = server ? server.username : '';
     fPassword.value = ''; // 已保存的密码永不回传，留空 = 不修改
     fKeyPath.value = server ? server.keyPath : '';
+    fFolder.value = server ? server.folder : '';
     syncAuthFields();
     modal.classList.remove('hidden');
     requestAnimationFrame(() => modal.classList.add('open'));
@@ -377,6 +650,21 @@ export const renderSettings: PageRender = (root, params) => {
   });
 
   (root.querySelector('#btn-new-server') as HTMLElement).addEventListener('click', () => openServerModal(null));
+  (root.querySelector('#btn-new-folder') as HTMLElement).addEventListener('click', () => void createFolderFlow());
+
+  // 全部展开 / 全部折叠：单按钮按当前状态切换，图标 = 目标动作（folderOpen 展开 / folder 折叠）
+  const toggleFoldersBtn = root.querySelector('#btn-toggle-folders') as HTMLButtonElement;
+  const syncToggleFoldersBtn = () => {
+    const allExpanded = renderedGroupKeys.length > 0 && renderedGroupKeys.every((k) => expandedFolders.has(k));
+    toggleFoldersBtn.innerHTML = icon(allExpanded ? 'folder' : 'folderOpen');
+    toggleFoldersBtn.title = allExpanded ? '全部折叠' : '全部展开';
+  };
+  toggleFoldersBtn.addEventListener('click', () => {
+    const allExpanded = renderedGroupKeys.length > 0 && renderedGroupKeys.every((k) => expandedFolders.has(k));
+    if (allExpanded) expandedFolders.clear();
+    else renderedGroupKeys.forEach((k) => expandedFolders.add(k));
+    renderServers();
+  });
 
   /* ---------- 从 Xshell 一键导入 ---------- */
   const btnImportXshell = root.querySelector('#btn-import-xshell') as HTMLButtonElement;
@@ -434,6 +722,8 @@ export const renderSettings: PageRender = (root, params) => {
     const username = fUsername.value.trim();
     const password = fPassword.value;
     const keyPath = fKeyPath.value.trim();
+    // 所属目录：规范化 '/' 分隔路径（去首尾/重复分隔符），留空 = 未分类
+    const folder = fFolder.value.trim().split('/').filter(Boolean).join('/');
 
     if (!name) { toast('请填写服务器名称', 'error'); return; }
     if (!host) { toast('请填写 IP 地址', 'error'); return; }
@@ -452,6 +742,7 @@ export const renderSettings: PageRender = (root, params) => {
       name, host, port, authType,
       username,
       keyPath: authType === 'key' ? keyPath : '',
+      folder,
       // 编辑时保留原 AI 锁，新建默认未锁定
       locked: editingId ? (db.servers.find((s) => s.id === editingId)?.locked ?? false) : false,
     };
@@ -572,8 +863,17 @@ export const renderSettings: PageRender = (root, params) => {
     })
     .catch((err) => toast(String(err), 'error'));
 
+  // 命令面板（Ctrl+T）等全局操作清空/变更数据后广播，此处重新拉取渲染
+  const onDataChanged = () => {
+    void getState()
+      .then((s) => { db = s; renderServers(); })
+      .catch((err) => toast(String(err), 'error'));
+  };
+  window.addEventListener('aishell:data-changed', onDataChanged);
+
   return () => {
     document.removeEventListener('keydown', onKeydown);
+    window.removeEventListener('aishell:data-changed', onDataChanged);
     offTheme();
   };
 };

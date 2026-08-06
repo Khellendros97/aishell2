@@ -1,8 +1,9 @@
-//! SFTP 文件管理 —— sftp_home / sftp_list / sftp_read / sftp_write / sftp_upload / sftp_download /
-//! sftp_rename / sftp_copy / sftp_delete。
+//! SFTP 文件管理 —— sftp_home / sftp_list / sftp_stat / sftp_read / sftp_write / sftp_upload /
+//! sftp_download / sftp_rename / sftp_copy / sftp_delete。
 //! 连接一律经 ssh::SshManager::open_sftp 获取（连接复用由 SshManager 负责）；
 //! SftpSession 每次命令新建、用完即弃。目录递归在后端完成，重名自动 `name (1).ext`。
-//! FsEntry 复用 fsops::FsEntry（serde camelCase，与 src/types.ts 对齐）。
+//! FsEntry / FsStat 复用 fsops 同名结构（serde camelCase，与 src/types.ts 对齐）；
+//! 权限修改（chmod）不提供后端命令，由前端经迷你终端 autoRun 执行（见 mini-term.ts 契约）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use russh_sftp::client::SftpSession;
 use tauri::State;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::fsops::{unique_local_name, FsEntry};
+use crate::fsops::{unique_local_name, FsEntry, FsStat};
 use crate::ssh::SshManager;
 
 /// 流式拷贝缓冲大小（64KB）。
@@ -65,6 +66,45 @@ pub async fn sftp_list(
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(entries)
+}
+
+/// 读取远端单项属性（右键「属性」对话框用）：lstat 不跟随符号链接（链接显示为链接自身，
+/// link_target 另附指向）；mode 为 unix 权限位（含类型位，如 0o100644，与 fsops::fs_stat 一致）；
+/// readonly 恒为 false（远端无系统只读位，可写性由权限位表达）。
+#[tauri::command]
+pub async fn sftp_stat(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+    path: String,
+) -> Result<FsStat, String> {
+    if path.trim().is_empty() {
+        return Err("远端路径不能为空".to_string());
+    }
+    let sftp = ssh.inner().open_sftp(&server_id).await?;
+    let md = sftp
+        .symlink_metadata(&path)
+        .await
+        .map_err(|e| format!("读取远端 {path} 属性失败: {e}"))?;
+    let name = path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(path.as_str())
+        .to_string();
+    let link_target = if md.is_symlink() {
+        sftp.read_link(&path).await.ok()
+    } else {
+        None
+    };
+    Ok(FsStat {
+        path,
+        name,
+        is_dir: md.is_dir(),
+        size: md.size.unwrap_or(0),
+        mtime: md.mtime.unwrap_or(0) as i64,
+        mode: Some(md.permissions.unwrap_or(0)),
+        readonly: false,
+        link_target,
+    })
 }
 
 /// 上传本地文件/目录到远端目录：目录递归（本地 walk + 远端逐层建目录），文件流式拷贝；

@@ -1,5 +1,5 @@
 /**
- * 快捷指令面板 —— 移植自 .proto/workbench-sidebar.js 的「面板 3」。
+ * 命令收藏面板 —— 移植自 .proto/workbench-sidebar.js 的「面板 3」。
  * 差异：持久化走 upsert_project 命令（原型是 A.save(db)）；无可用终端时 toast
  * 「没有可用的终端标签页」；样式类改 wbs-commands- 前缀 + 共享 .wbs-content。
  * 契约：mountCommandsPanel(container) 由 workbench.ts 侧栏框架挂载（container = #sidebar-content，
@@ -15,7 +15,7 @@ import './commands.css';
 
 /** 侧栏框架渲染 #sidebar-head 用（标题 + actions 按钮） */
 export const commandsHead = {
-  title: '快捷指令',
+  title: '命令收藏',
   renderActions(el: HTMLElement): void {
     const addBtn = document.createElement('button');
     addBtn.className = 'btn small primary';
@@ -51,7 +51,7 @@ function openQuickCommandModal(qc: QuickCommand | null): void {
   mask.className = 'modal-mask';
   mask.innerHTML =
     '<div class="modal" style="width:440px">' +
-      `<div class="modal-head"><h3>${isNew ? '新增快捷指令' : '编辑快捷指令'}</h3></div>` +
+      `<div class="modal-head"><h3>${isNew ? '新增命令收藏' : '编辑命令收藏'}</h3></div>` +
       '<div class="modal-body">' +
         '<div class="field"><label>标题 <span class="req">*</span></label>' +
           '<input class="input wbs-commands-qc-title-input" placeholder="例如：查看 Git 状态"></div>' +
@@ -117,7 +117,7 @@ function render(): void {
   if (!qcs.length) {
     const es = document.createElement('div');
     es.className = 'empty-state';
-    es.innerHTML = `<div class="icon">${icon('zap')}</div><div>暂无快捷指令</div><div style="font-size:11.5px">点击「+ 新增」创建常用命令</div>`;
+    es.innerHTML = `<div class="icon">${icon('star')}</div><div>暂无命令收藏</div><div style="font-size:11.5px">点击「+ 新增」创建常用命令</div>`;
     wrap.appendChild(es);
     container.appendChild(wrap);
     return;
@@ -151,7 +151,7 @@ async function deleteQuickCommand(qc: QuickCommand): Promise<void> {
   const project = Workbench.state.project;
   if (!project) return;
   const ok = await confirmDialog({
-    title: '删除快捷指令',
+    title: '删除命令收藏',
     message: `确定删除「${qc.title}」吗？`,
     danger: true,
     okText: '删除',

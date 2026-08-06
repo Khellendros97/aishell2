@@ -34,3 +34,14 @@
 
 /* 右键菜单样式已上移 design.css（.ctx-menu 共享，编辑器通用） */
 
+/* ---------- 属性对话框 ---------- */
+.wbs-prop-modal { width: 460px; }
+.wbs-prop-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.wbs-prop-title .wbs-prop-icon { font-size: 18px; color: var(--accent); display: flex; flex: none; }
+.wbs-prop-title .wbs-prop-name { font-weight: 600; font-size: 14px; word-break: break-all; }
+.wbs-prop-rows { border-top: 1px solid var(--border); }
+.wbs-prop-row { display: flex; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.wbs-prop-row:last-child { border-bottom: none; }
+.wbs-prop-label { flex: none; width: 68px; color: var(--text-2); }
+.wbs-prop-value { min-width: 0; color: var(--text-0); word-break: break-all; }
+

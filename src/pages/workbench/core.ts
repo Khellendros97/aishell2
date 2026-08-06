@@ -2,9 +2,12 @@
  * 工作台核心：状态、事件总线、标签页管理器、模块注册表。
  * 逐行翻译自 .proto/workbench-core.js —— 本文件是所有工作台模块的协作契约，接口不得破坏。
  * 与原型唯一差异：DOM 容器由 init() 注入（workbench.ts 建好布局后调用），项目数据由 workbench.ts 异步装载。
+ * 原型之外的新交互：SSH 终端标签右键菜单（复制 SSH 渠道 / 关闭标签，openTab 内挂载，
+ * 复用 src/ui.ts showContextMenu，样式同全局 ctx-menu）。
  */
 import type { FileRef, Project, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
+import { showContextMenu, uid } from '../../ui';
 
 export type TabData = Record<string, unknown>;
 
@@ -106,6 +109,21 @@ export function openTab({
   tab.el.querySelector('.tab-title')!.textContent = title;
   tab.el.onclick = (e) => { if (!(e.target as HTMLElement).closest('.tab-close')) activateTab(id); };
   (tab.el.querySelector('.tab-close') as HTMLButtonElement).onclick = () => closeTab(id);
+  /* SSH 终端标签右键菜单（原生右键菜单已全局禁用，需 preventDefault）：
+     复制 SSH 渠道 = 以同 serverId 新开唯一 id 终端标签；关闭标签。
+     仅 type==='terminal' 且 data.kind==='ssh' 的标签挂载，本地终端 / 其他类型标签不显示。 */
+  if (type === 'terminal' && data.kind === 'ssh') {
+    tab.el.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const serverId = data.serverId as string;
+      showContextMenu(e.clientX, e.clientY, [
+        { label: '复制 SSH 渠道', iconName: 'copy', action: () => openTab({ id: `term:${serverId}:${uid('t')}`, type: 'terminal', title: tab.title, data: { kind: 'ssh', serverId } }) },
+        'sep',
+        { label: '关闭标签', iconName: 'x', action: () => closeTab(id) },
+      ]);
+    });
+  }
   tabBar.appendChild(tab.el);
 
   tab.pane = document.createElement('div');

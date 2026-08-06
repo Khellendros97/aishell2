@@ -8,11 +8,11 @@
 import { bus, getActiveTab, getTabs, openTab, Workbench } from '../core';
 import { confirmDialog, copyText, showContextMenu, toast, type CtxItem } from '../../../ui';
 import {
-  fsCopy, fsCreate, fsDelete, fsImport, fsList, fsMove, fsReveal,
+  fsCopy, fsCreate, fsDelete, fsImport, fsList, fsMove, fsReveal, fsStat,
   sftpDelete, sftpDownload, sftpUpload,
 } from '../../../api';
 import { clearClip, getClip, setClip } from '../clipboard';
-import type { FsEntry } from '../../../types';
+import type { FsEntry, FsStat } from '../../../types';
 import { icon as iconSvg } from '../../../icons';
 import './explorer.css';
 
@@ -194,7 +194,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
   const icon = document.createElement('span');
   icon.className = 'wbs-explorer-file-tag';
   if (node.isDir) {
-    icon.innerHTML = iconSvg('folder');
+    icon.innerHTML = iconSvg(expanded.has(node.path) ? 'folderOpen' : 'folder');
   } else {
     const ext = (node.name.split('.').pop() || '').toLowerCase();
     const st = FILE_STYLES[ext];
@@ -479,6 +479,108 @@ function relativePath(path: string): string {
   if (root && path.startsWith(`${root.path}/`)) return path.slice(root.path.length + 1);
   return path;
 }
+
+/* ---------- 属性对话框（一次性建 DOM 复用，模态框模式同 servers.ts） ---------- */
+let propModal: HTMLElement | null = null;
+
+/** 人类可读大小：B / KB / MB / GB / TB，≥100 取整，其余保留 1 位小数 */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = bytes / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  const s = v >= 100 ? String(Math.round(v)) : v.toFixed(1).replace(/\.0$/, '');
+  return `${s} ${units[i]}`;
+}
+
+function ensurePropModal(): HTMLElement {
+  if (propModal) return propModal;
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask hidden';
+  mask.innerHTML = `
+    <div class="modal wbs-prop-modal">
+      <div class="modal-head">
+        <h3>属性</h3>
+        <button class="icon-btn" title="关闭">${iconSvg('x')}</button>
+      </div>
+      <div class="modal-body">
+        <div class="wbs-prop-title">
+          <span class="wbs-prop-icon">${iconSvg('file')}</span>
+          <span class="wbs-prop-name"></span>
+        </div>
+        <div class="wbs-prop-rows"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" data-act="close">关闭</button>
+      </div>
+    </div>`;
+  const rows = mask.querySelector('.wbs-prop-rows')!;
+  const defs: Array<[string, string]> = [
+    ['type', '类型'],
+    ['size', '大小'],
+    ['mtime', '修改时间'],
+    ['readonly', '只读'],
+    ['link', '链接目标'],
+    ['path', '完整路径'],
+  ];
+  for (const [key, label] of defs) {
+    const row = document.createElement('div');
+    row.className = 'wbs-prop-row';
+    row.dataset.key = key;
+    const lab = document.createElement('span');
+    lab.className = 'wbs-prop-label';
+    lab.textContent = label;
+    const val = document.createElement('span');
+    val.className = 'wbs-prop-value mono';
+    row.append(lab, val);
+    rows.appendChild(row);
+  }
+  const close = (): void => {
+    mask.classList.remove('open');
+    setTimeout(() => mask.classList.add('hidden'), 160);
+  };
+  mask.querySelector('[data-act=close]')!.addEventListener('click', close);
+  mask.querySelector('.modal-head .icon-btn')!.addEventListener('click', close);
+  mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !mask.classList.contains('hidden')) close();
+  });
+  (container ?? document.body).appendChild(mask);
+  propModal = mask;
+  return mask;
+}
+
+async function showProperties(node: TreeNode): Promise<void> {
+  let stat: FsStat;
+  try {
+    stat = await fsStat(node.path);
+  } catch (err) {
+    toast(String(err), 'error');
+    return;
+  }
+  const mask = ensurePropModal();
+  const iconEl = mask.querySelector('.wbs-prop-icon') as HTMLElement;
+  iconEl.innerHTML = iconSvg(stat.linkTarget ? 'link' : stat.isDir ? 'folder' : 'file');
+  mask.querySelector('.wbs-prop-name')!.textContent = stat.name;
+  const values: Record<string, HTMLElement> = {};
+  mask.querySelectorAll<HTMLElement>('.wbs-prop-row').forEach((row) => {
+    values[row.dataset.key!] = row.querySelector('.wbs-prop-value')!;
+  });
+  values.type.textContent = stat.linkTarget ? '符号链接' : stat.isDir ? '文件夹' : '文件';
+  /* 目录大小由系统语义决定，不具可比性，展示 —（选简单方案） */
+  values.size.textContent = stat.isDir ? '—' : formatSize(stat.size);
+  values.mtime.textContent = new Date(stat.mtime * 1000).toLocaleString();
+  values.readonly.textContent = stat.readonly ? '是' : '否';
+  mask.querySelectorAll<HTMLElement>('.wbs-prop-row[data-key="link"]').forEach((row) => {
+    row.classList.toggle('hidden', !stat.linkTarget);
+  });
+  values.link.textContent = stat.linkTarget ?? '—';
+  values.path.textContent = stat.path;
+  mask.classList.remove('hidden');
+  requestAnimationFrame(() => mask.classList.add('open'));
+}
+
 function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): void {
   const pasteTarget = node.isDir ? node : node.parent;
   /* 编辑中的文件禁止移动类操作——旧标签写盘会在旧路径重建文件,抵消操作;防线前置为禁用态 */
@@ -522,6 +624,7 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(node.path).catch((err) => toast(String(err), 'error')) },
     { label: '复制文件路径', iconName: 'link', action: () => { void copyText(node.path.replace(/\//g, '\\')).then(() => toast('已复制文件路径', 'success')); } },
     { label: '复制相对路径', iconName: 'link', action: () => { void copyText(relativePath(node.path)).then(() => toast('已复制相对路径', 'success')); } },
+    { label: '属性', iconName: 'info', action: () => void showProperties(node) },
   ]);
 }
 
@@ -552,6 +655,7 @@ function showRootMenu(x: number, y: number, root: TreeNode): void {
     ...(uploadItems.length ? ['sep' as const, ...uploadItems] : []),
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(root.path).catch((err) => toast(String(err), 'error')) },
+    { label: '属性', iconName: 'info', action: () => void showProperties(root) },
   ]);
 }
 

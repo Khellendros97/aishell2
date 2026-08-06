@@ -1,8 +1,8 @@
 /**
- * 「收藏为快捷指令」共享模态 —— 从 terminal.ts 的 addToQuickCommands 平移而来,
- * 供终端信息栏 / 历史区块 / AI 命令建议卡片三处复用(模态 DOM 照 .proto/workbench-terminal.js)。
+ * 「收藏为命令收藏」共享模态 —— 从 terminal.ts 的 addToQuickCommands 平移而来,
+ * 供终端信息栏 / 历史命令 / AI 命令建议卡片三处复用(模态 DOM 照 .proto/workbench-terminal.js)。
  * 流程:命令去重 → 弹模态(标题必填,预填命令截断) → push 到当前项目 quickCommands
- * → upsertProject 持久化 → bus.emit('project-changed') 联动快捷指令面板刷新。
+ * → upsertProject 持久化 → bus.emit('project-changed') 联动命令收藏面板刷新。
  */
 import { toast, uid } from '../../ui';
 import { upsertProject } from '../../api';
@@ -13,14 +13,14 @@ export function addQuickCommandModal(cmdText: string): void {
   if (!project) { toast('当前没有打开的项目', 'error'); return; }
   const qcs = project.quickCommands ?? (project.quickCommands = []);
   if (qcs.some((q) => q.command === cmdText)) {
-    toast('该命令已在快捷指令中', 'error');
+    toast('该命令已在命令收藏中', 'error');
     return;
   }
   const mask = document.createElement('div');
   mask.className = 'modal-mask';
   mask.innerHTML = `
     <div class="modal" style="width:440px">
-      <div class="modal-head"><h3>添加快捷指令</h3></div>
+      <div class="modal-head"><h3>添加命令收藏</h3></div>
       <div class="modal-body">
         <div class="field"><label>指令标题<span class="req">*</span></label><input class="input term-qc-title" maxlength="40"></div>
         <div class="field"><label>命令</label><input class="input mono term-qc-cmd"></div>
@@ -49,7 +49,7 @@ export function addQuickCommandModal(cmdText: string): void {
     qcs.push({ id: uid('qc'), title, command });
     void upsertProject(project).catch((e) => toast(String(e), 'error'));
     bus.emit('project-changed');
-    toast('已添加快捷指令', 'success');
+    toast('已添加命令收藏', 'success');
     close();
   };
   (mask.querySelector('.term-qc-ok') as HTMLButtonElement).onclick = save;

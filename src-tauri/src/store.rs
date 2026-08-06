@@ -131,6 +131,10 @@ pub struct Server {
     pub auth_type: AuthType,
     pub username: String,
     pub key_path: String,
+    /// 所属目录：'/' 分隔的相对路径（如 "生产环境/Web"），空串 = 未分类。
+    /// 旧配置无此字段按未分类处理；Xshell 导入时按会话文件相对 Sessions 根目录的父目录填充。
+    #[serde(default)]
+    pub folder: String,
     /// AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP；旧配置无此字段按未锁定。
     #[serde(default)]
     pub locked: bool,
@@ -237,6 +241,10 @@ pub struct AppState {
     pub servers: Vec<Server>,
     pub projects: Vec<Project>,
     pub sessions: HashMap<String, Vec<ChatSession>>,
+    /// 服务器分类目录清单（'/' 分隔相对路径，与 Server.folder 同语义；空目录也在此）。
+    /// 旧配置无此字段按空列表（未分类）解析。
+    #[serde(default)]
+    pub server_folders: Vec<String>,
 }
 
 // ---------------------------------------------------------------- keyring
@@ -430,14 +438,19 @@ impl Store {
     }
 
     /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
+    /// folder 非空且不在 server_folders 时自动注册该目录（同一 with_state 内完成）。
     pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
         if let Some(pw) = password {
             self.secrets.set(&keyring_account_server(&server.id), pw)?;
         }
+        let folder = server.folder.clone();
         self.with_state(|s| {
             match s.servers.iter_mut().find(|sv| sv.id == server.id) {
                 Some(slot) => *slot = server,
                 None => s.servers.push(server),
+            }
+            if !folder.is_empty() && !s.server_folders.iter().any(|f| f == &folder) {
+                s.server_folders.push(folder);
             }
             Ok(())
         })
@@ -455,9 +468,101 @@ impl Store {
         })
     }
 
+    /// 清除全部服务器配置：先删各服务器 keyring 密钥（失败即中止、state 未动），
+    /// 再一次性清空 servers / server_folders 并让所有 projects 解绑，原子落盘。
+    pub fn clear_all_servers(&self) -> Result<(), String> {
+        let ids: Vec<String> = self.with_state(|s| Ok(s.servers.iter().map(|sv| sv.id.clone()).collect()))?;
+        for id in &ids {
+            self.secrets.delete(&keyring_account_server(id))?;
+        }
+        self.with_state(|s| {
+            s.servers.clear();
+            s.server_folders.clear();
+            for p in &mut s.projects {
+                p.server_ids.clear();
+            }
+            Ok(())
+        })
+    }
+
+    /// 分类目录名规范化：整体 trim、按 '/' 拆分、过滤空段后 join('/')（与前端表单同语义）。
+    fn normalize_folder(name: &str) -> String {
+        name.trim()
+            .split('/')
+            .filter(|seg| !seg.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// 新建服务器分类目录：规范化名称；空串报错、重名报错；一次 with_state 原子落盘。
+    pub fn create_server_folder(&self, name: &str) -> Result<(), String> {
+        let folder = Self::normalize_folder(name);
+        if folder.is_empty() {
+            return Err("分类目录名称不能为空".to_string());
+        }
+        self.with_state(|s| {
+            if s.server_folders.iter().any(|f| f == &folder) {
+                return Err("分类目录已存在".to_string());
+            }
+            s.server_folders.push(folder);
+            Ok(())
+        })
+    }
+
+    /// 重命名服务器分类目录：级联改写所有 folder==old 的服务器（含导入/表单产生的、不在
+    /// server_folders 列表里的旧值），并同步列表（old 移除、new 不存在才追加）。
+    /// 未分类（空串）不可重命名；new 规范化后与 old 相同视为 no-op。一次 with_state 原子落盘。
+    pub fn rename_server_folder(&self, old: &str, new: &str) -> Result<(), String> {
+        if old.is_empty() {
+            return Err("未分类目录不可重命名".to_string());
+        }
+        let folder = Self::normalize_folder(new);
+        if folder.is_empty() {
+            return Err("分类目录名称不能为空".to_string());
+        }
+        if folder == old {
+            return Ok(());
+        }
+        self.with_state(|s| {
+            if s.server_folders.iter().any(|f| f == &folder) {
+                return Err("分类目录已存在".to_string());
+            }
+            for sv in &mut s.servers {
+                if sv.folder == old {
+                    sv.folder = folder.clone();
+                }
+            }
+            s.server_folders.retain(|f| f != old);
+            if !s.server_folders.iter().any(|f| f == &folder) {
+                s.server_folders.push(folder);
+            }
+            Ok(())
+        })
+    }
+
+    /// 删除服务器分类目录：规范化名称；未分类空串报错；目录下仍有服务器报错；
+    /// 不存在视为幂等成功。一次 with_state 原子落盘。
+    pub fn delete_server_folder(&self, name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("未分类目录不可删除".to_string());
+        }
+        let folder = Self::normalize_folder(name);
+        if folder.is_empty() {
+            return Err("分类目录名称不能为空".to_string());
+        }
+        self.with_state(|s| {
+            if s.servers.iter().any(|sv| sv.folder == folder) {
+                return Err(format!("分类目录「{folder}」下仍有服务器，不能删除"));
+            }
+            s.server_folders.retain(|f| *f != folder);
+            Ok(())
+        })
+    }
+
     /// 批量合并 Xshell 导入的服务器：一次 with_state 原子持久化，不触碰 SecretStore。
     /// ID 已存在 → 连接配置以导入为准，但**保留现有 AI 锁**（重新导入绝不能解锁）；
     /// 配置完全一致（含锁位）→ unchanged；存在差异 → 覆盖并计 updated；不存在 → imported。
+    /// 导入产生的非空 folder 自动注册进 server_folders（同一 with_state 内完成）。
     pub(crate) fn merge_xshell_servers(&self, servers: &[Server]) -> Result<XshellImportResult, String> {
         let mut result = XshellImportResult::default();
         self.with_state(|s| {
@@ -477,6 +582,9 @@ impl Store {
                         s.servers.push(sv.clone());
                         result.imported += 1;
                     }
+                }
+                if !sv.folder.is_empty() && !s.server_folders.iter().any(|f| f == &sv.folder) {
+                    s.server_folders.push(sv.folder.clone());
                 }
             }
             Ok(result)
@@ -653,11 +761,6 @@ pub async fn get_state(store: State<'_, Arc<Store>>) -> Result<AppState, String>
 }
 
 #[tauri::command]
-pub fn get_config_dir(store: State<'_, Arc<Store>>) -> String {
-    store.config_dir.to_string_lossy().into_owned()
-}
-
-#[tauri::command]
 pub async fn save_settings(
     store: State<'_, Arc<Store>>,
     settings: Settings,
@@ -731,6 +834,36 @@ pub async fn set_server_locked(
     store.set_server_locked(&id, locked)
 }
 
+#[tauri::command]
+pub async fn create_server_folder(
+    store: State<'_, Arc<Store>>,
+    name: String,
+) -> Result<(), String> {
+    store.create_server_folder(&name)
+}
+
+#[tauri::command]
+pub async fn rename_server_folder(
+    store: State<'_, Arc<Store>>,
+    old: String,
+    new: String,
+) -> Result<(), String> {
+    store.rename_server_folder(&old, &new)
+}
+
+#[tauri::command]
+pub async fn delete_server_folder(
+    store: State<'_, Arc<Store>>,
+    name: String,
+) -> Result<(), String> {
+    store.delete_server_folder(&name)
+}
+
+#[tauri::command]
+pub async fn clear_all_servers(store: State<'_, Arc<Store>>) -> Result<(), String> {
+    store.clear_all_servers()
+}
+
 // ---------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -766,6 +899,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "deploy".to_string(),
                     key_path: String::new(),
+                    folder: String::new(),
                     locked: false,
                 },
                 Server {
@@ -776,6 +910,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "ubuntu".to_string(),
                     key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
+                    folder: "生产环境".to_string(),
                     locked: false,
                 },
             ],
@@ -828,6 +963,7 @@ mod tests {
                 );
                 m
             },
+            server_folders: vec!["生产环境".to_string()],
         }
     }
 
@@ -846,6 +982,7 @@ mod tests {
             "\"aiMode\"",
             "\"locked\"",
             "\"toolCallId\"",
+            "\"serverFolders\"",
         ] {
             assert!(json.contains(key), "序列化 JSON 缺少字段 {key}: {json}");
         }
@@ -1004,6 +1141,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    folder: String::new(),
                     locked: false,
                 },
                 Some("pw-1"),
@@ -1019,6 +1157,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
+                    folder: String::new(),
                     locked: false,
                 },
                 None,
@@ -1063,6 +1202,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            folder: String::new(),
             locked: false,
         };
         store.upsert_server(base.clone(), None).unwrap();
@@ -1073,6 +1213,365 @@ mod tests {
         let guard = store.state.lock().unwrap();
         assert_eq!(guard.servers.len(), 1, "同 id 应原地更新而非追加");
         assert_eq!(guard.servers[0].name, "新名");
+    }
+
+    #[test]
+    fn create_server_folder_normalizes_and_rejects_invalid() {
+        let dir = temp_config_dir("folder-create");
+        let store = test_store(dir.clone());
+        // 空串 / 纯分隔符 → 中文错误
+        assert_eq!(store.create_server_folder("  ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(store.create_server_folder("///").unwrap_err(), "分类目录名称不能为空");
+        // 规范化：trim + 去空段；支持层级
+        store.create_server_folder(" 生产环境/Web ").unwrap();
+        store.create_server_folder("a//b/").unwrap();
+        {
+            let guard = store.state.lock().unwrap();
+            assert_eq!(
+                guard.server_folders,
+                vec!["生产环境/Web".to_string(), "a/b".to_string()]
+            );
+        }
+        // 重名（规范化后相同）报错，且列表不变
+        assert_eq!(store.create_server_folder("生产环境/Web").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.state.lock().unwrap().server_folders,
+            vec!["生产环境/Web".to_string(), "a/b".to_string()]
+        );
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        assert_eq!(
+            reloaded.state.lock().unwrap().server_folders,
+            vec!["生产环境/Web".to_string(), "a/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn rename_server_folder_cascades_to_servers() {
+        let dir = temp_config_dir("rename-cascade");
+        let store = test_store(dir.clone());
+        store.create_server_folder("生产环境").unwrap();
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-r-1".to_string(),
+                    name: "A".to_string(),
+                    host: "h1".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    folder: "生产环境".to_string(),
+                    locked: false,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-r-2".to_string(),
+                    name: "B".to_string(),
+                    host: "h2".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    folder: String::new(),
+                    locked: false,
+                },
+                None,
+            )
+            .unwrap();
+
+        // 新旧名均按规范化处理：带空白与重复分隔符也应级联生效
+        store.rename_server_folder("生产环境", " 生产环境//Web ").unwrap();
+
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.server_folders, vec!["生产环境/Web".to_string()]);
+        assert_eq!(
+            guard.servers.iter().find(|s| s.id == "srv-r-1").unwrap().folder,
+            "生产环境/Web"
+        );
+        assert_eq!(guard.servers.iter().find(|s| s.id == "srv-r-2").unwrap().folder, "");
+        drop(guard);
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        let guard = reloaded.state.lock().unwrap();
+        assert_eq!(guard.server_folders, vec!["生产环境/Web".to_string()]);
+        assert_eq!(
+            guard.servers.iter().find(|s| s.id == "srv-r-1").unwrap().folder,
+            "生产环境/Web"
+        );
+    }
+
+    #[test]
+    fn rename_server_folder_rejects_conflict_and_uncategorized() {
+        let dir = temp_config_dir("rename-conflict");
+        let store = test_store(dir);
+        store.create_server_folder("甲").unwrap();
+        store.create_server_folder("乙").unwrap();
+
+        // 未分类（空串）不可重命名
+        assert_eq!(store.rename_server_folder("", "x").unwrap_err(), "未分类目录不可重命名");
+        // 目标已存在且 ≠ old → 报错
+        assert_eq!(store.rename_server_folder("甲", "乙").unwrap_err(), "分类目录已存在");
+        // new 规范化后为空 → 报错
+        assert_eq!(store.rename_server_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
+        // new 规范化后与 old 相同 → no-op，列表不变
+        store.rename_server_folder("甲", " 甲 ").unwrap();
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.server_folders, vec!["甲".to_string(), "乙".to_string()]);
+    }
+
+    #[test]
+    fn rename_server_folder_handles_folders_not_in_list() {
+        let dir = temp_config_dir("rename-derived");
+        let store = test_store(dir.clone());
+        // 旧配置里服务器的 folder 可能不在 server_folders 清单（upsert/导入现在会自动注册，
+        // 但历史 JSON 不会回溯补录）；重命名同样级联并补入清单
+        store
+            .with_state(|s| {
+                s.servers.push(Server {
+                    id: "srv-d-1".to_string(),
+                    name: "C".to_string(),
+                    host: "h3".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    folder: "旧目录".to_string(),
+                    locked: false,
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.state.lock().unwrap().server_folders.is_empty());
+
+        store.rename_server_folder("旧目录", "新目录").unwrap();
+
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.servers[0].folder, "新目录");
+        assert_eq!(guard.server_folders, vec!["新目录".to_string()]);
+    }
+
+    #[test]
+    fn delete_server_folder_removes_and_persists() {
+        let dir = temp_config_dir("folder-delete");
+        let store = test_store(dir.clone());
+        store.create_server_folder("生产环境").unwrap();
+        store.create_server_folder("开发环境/Web").unwrap();
+        // 未分类空串不可删除；规范化后为空同样报中文错误
+        assert_eq!(store.delete_server_folder("").unwrap_err(), "未分类目录不可删除");
+        assert_eq!(store.delete_server_folder(" / ").unwrap_err(), "分类目录名称不能为空");
+        // 不存在的目录视为幂等成功
+        store.delete_server_folder("不存在的目录").unwrap();
+        // 删除成功：入参规范化，仅移除匹配项
+        store.delete_server_folder(" 开发环境/Web ").unwrap();
+        {
+            let guard = store.state.lock().unwrap();
+            assert_eq!(guard.server_folders, vec!["生产环境".to_string()]);
+        }
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        assert_eq!(
+            reloaded.state.lock().unwrap().server_folders,
+            vec!["生产环境".to_string()]
+        );
+    }
+
+    #[test]
+    fn delete_server_folder_rejects_when_servers_exist() {
+        let dir = temp_config_dir("folder-delete-nonempty");
+        let store = test_store(dir.clone());
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-f-1".to_string(),
+                    name: "A".to_string(),
+                    host: "h1".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    folder: "生产环境".to_string(),
+                    locked: false,
+                },
+                None,
+            )
+            .unwrap();
+        // 目录下仍有服务器 → 中文错误
+        let err = store.delete_server_folder("生产环境").unwrap_err();
+        assert_eq!(err, "分类目录「生产环境」下仍有服务器，不能删除");
+        // 目录与服务器都未被改动
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.server_folders, vec!["生产环境".to_string()]);
+        assert_eq!(guard.servers.len(), 1);
+        drop(guard);
+        // 删除服务器后可删目录，且落盘一致
+        store.delete_server("srv-f-1").unwrap();
+        store.delete_server_folder("生产环境").unwrap();
+        assert!(store.state.lock().unwrap().server_folders.is_empty());
+        let reloaded = test_store(dir);
+        assert!(reloaded.state.lock().unwrap().server_folders.is_empty());
+    }
+
+    #[test]
+    fn clear_all_servers_wipes_servers_folders_and_keyring() {
+        let dir = temp_config_dir("clear-all");
+        let store = test_store(dir.clone());
+        // 两台服务器（一台带密码、一台带目录）+ 一个已绑定项目
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-cl-1".to_string(),
+                    name: "A".to_string(),
+                    host: "h1".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    folder: "生产环境".to_string(),
+                    locked: false,
+                },
+                Some("pw-1"),
+            )
+            .unwrap();
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-cl-2".to_string(),
+                    name: "B".to_string(),
+                    host: "h2".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Key,
+                    username: "u".to_string(),
+                    key_path: "C:\\key".to_string(),
+                    folder: String::new(),
+                    locked: false,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_project(Project {
+                id: "proj-cl-1".to_string(),
+                name: "P".to_string(),
+                path: None,
+                server_ids: vec!["srv-cl-1".to_string(), "srv-cl-2".to_string()],
+                quick_commands: vec![],
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+        assert_eq!(store.read_secret("server:srv-cl-1").unwrap(), "pw-1");
+
+        store.clear_all_servers().unwrap();
+
+        // state：servers / folders 清空，项目保留但解绑
+        let guard = store.state.lock().unwrap();
+        assert!(guard.servers.is_empty());
+        assert!(guard.server_folders.is_empty());
+        assert_eq!(guard.projects.len(), 1);
+        assert!(guard.projects[0].server_ids.is_empty());
+        drop(guard);
+        // keyring：全部删除
+        assert!(store.read_secret("server:srv-cl-1").is_err());
+        assert!(store.read_secret("server:srv-cl-2").is_err());
+        // 落盘可重载且一致
+        let reloaded = test_store(dir);
+        let guard = reloaded.state.lock().unwrap();
+        assert!(guard.servers.is_empty());
+        assert!(guard.server_folders.is_empty());
+        assert!(guard.projects[0].server_ids.is_empty());
+        // 幂等：空库再清不算错
+        drop(guard);
+        reloaded.clear_all_servers().unwrap();
+    }
+
+    #[test]
+    fn upsert_server_auto_registers_folder() {
+        let dir = temp_config_dir("upsert-folder-register");
+        let store = test_store(dir);
+        let srv = |id: &str, folder: &str| Server {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            folder: folder.to_string(),
+            locked: false,
+        };
+        // 非空 folder 自动注册
+        store.upsert_server(srv("srv-u-1", "生产环境"), None).unwrap();
+        assert_eq!(
+            store.state.lock().unwrap().server_folders,
+            vec!["生产环境".to_string()]
+        );
+        // 再次 upsert 同目录的服务器不重复注册
+        store.upsert_server(srv("srv-u-2", "生产环境"), None).unwrap();
+        assert_eq!(
+            store.state.lock().unwrap().server_folders,
+            vec!["生产环境".to_string()]
+        );
+        // 未分类（空串）不注册
+        store.upsert_server(srv("srv-u-3", ""), None).unwrap();
+        assert_eq!(
+            store.state.lock().unwrap().server_folders,
+            vec!["生产环境".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_xshell_servers_auto_registers_folders() {
+        let dir = temp_config_dir("xshell-merge-folder");
+        let store = test_store(dir.clone());
+        let srv = |id: &str, folder: &str| Server {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            folder: folder.to_string(),
+            locked: false,
+        };
+        store
+            .merge_xshell_servers(&[srv("x-1", "导入目录"), srv("x-2", "")])
+            .unwrap();
+        // 导入产生的非空 folder 自动注册；空串不注册
+        assert_eq!(
+            store.state.lock().unwrap().server_folders,
+            vec!["导入目录".to_string()]
+        );
+        // 重导（unchanged/updated 分支）不重复注册
+        store.merge_xshell_servers(&[srv("x-1", "导入目录")]).unwrap();
+        store
+            .merge_xshell_servers(&[srv("x-2", "导入目录")])
+            .unwrap();
+        assert_eq!(
+            store.state.lock().unwrap().server_folders,
+            vec!["导入目录".to_string()]
+        );
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        assert_eq!(
+            reloaded.state.lock().unwrap().server_folders,
+            vec!["导入目录".to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_json_without_server_folders_parses_as_empty() {
+        // 旧配置 JSON 无 serverFolders 字段 → serde default 空列表，不报错
+        let json = serde_json::to_string(&sample_state()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("serverFolders");
+        let back: AppState = serde_json::from_value(v).unwrap();
+        assert!(back.server_folders.is_empty());
+        assert_eq!(back.servers.len(), 2, "其余字段不受影响");
     }
 
     #[test]
@@ -1150,6 +1649,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    folder: String::new(),
                     locked: false,
                 },
                 Some("pw-a"),
@@ -1194,6 +1694,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "root".to_string(),
             key_path: String::new(),
+            folder: String::new(),
             locked: false,
         };
         // 首次：全部 imported
@@ -1241,6 +1742,7 @@ mod tests {
                 auth_type: AuthType::Password,
                 username: "u".to_string(),
                 key_path: String::new(),
+                folder: String::new(),
                 locked: false,
             }])
             .unwrap();
@@ -1406,6 +1908,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            folder: String::new(),
             locked: false,
         };
         store.upsert_server(srv("sv-a"), None).unwrap();
@@ -1443,6 +1946,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    folder: String::new(),
                     locked: true,
                 },
                 None,
@@ -1458,6 +1962,7 @@ mod tests {
                 auth_type: AuthType::Password,
                 username: "u".to_string(),
                 key_path: String::new(),
+                folder: String::new(),
                 locked: false,
             }])
             .unwrap();
@@ -1476,6 +1981,7 @@ mod tests {
                 auth_type: AuthType::Password,
                 username: "u".to_string(),
                 key_path: String::new(),
+                folder: String::new(),
                 locked: false,
             }])
             .unwrap();

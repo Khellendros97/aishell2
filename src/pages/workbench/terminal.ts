@@ -1,15 +1,22 @@
 /**
  * 终端标签页渲染器：真实 PTY（本地 Git Bash / SSH）的 xterm 封装。
  * import 即注册 registerRenderer('terminal', …)（模块级副作用，契约同 .proto/workbench-core.js）。
+ * 对照规格：.proto/workbench-terminal.js（交互语义），后端接口点见 src/api.ts：
+ * term_create / term_input / term_resize / term_close，事件 term:data:<id> / term:exit:<id>。
  *
  * 交互语义移植自 .proto/workbench-terminal.js，差异（计划 A4 决策）：
- * - 真实终端无法把按钮渲染进滚动区 DOM，故用「顶部信息栏 + 右侧 280px 历史区块抽屉」
- *   等价承载「每个区块都有 添加到chat / 📌 快捷指令 按钮」，信息栏固定作用于最后一个区块；
+ * - 真实终端无法把按钮渲染进滚动区 DOM，故用「顶部信息栏 + 右侧 280px 历史命令抽屉」
+ *   等价承载「每个区块都有 添加到chat / 命令收藏 按钮」，信息栏固定作用于最后一个区块；
  * - 区块命令名在回车瞬间从 xterm 屏幕缓冲读取（bash 已把真实命令画在屏幕上，
- *   ↑ 回调/编辑后的内容都准确）；输出经回显/提示符清洗后展示（计划 A4 的近似仅余提示符启发式）。
+ *   ↑ 回调/编辑后的内容都准确）；输出经回显/提示符清洗后展示（计划 A4 的近似仅余提示符启发式）；
+ * - 抽屉标题栏新增「清空历史命令」图标按钮（原型 clear 命令只删区块记录、不动 scrollback，
+ *   这里等价为清空 blocks 数据 + xterm.clear() 清屏，可视内容移入 scrollback 不抹除）。
  *
  * 生命周期：renderer 返回 api { paste, execute, takeSnapshot }；
  * tab.onClose 由本渲染器接管（term_close + 退订 + dispose）。
+ * 多实例：tab.id 由打开方生成且唯一（SSH 为 `term:<serverId>:<uid>`，本地为 `term-local:<uid>`，
+ * 启动时自动开的首个实例保持 'term-local'），
+ * 订阅/命令全部以 this.tab.id 为键，同一服务器并行终端互不串流。
  */
 import { Terminal } from '@xterm/xterm';
 import type { ITheme } from '@xterm/xterm';
@@ -55,7 +62,7 @@ const liveTerms = new Set<TermSession>();
 onThemeChange((t) => { liveTerms.forEach((s) => { s.term.options.theme = TERM_THEMES[t]; }); });
 import type { TermSnapshot } from '../../types';
 
-/** 历史区块：一条已结算命令及其输出（纯文本，剥除 ANSI）。 */
+/** 历史命令：一条已结算命令及其输出（纯文本，剥除 ANSI）。 */
 interface TermBlock {
   command: string;
   output: string[];
@@ -92,6 +99,7 @@ class TermSession {
   private readonly drawer: HTMLElement;
   private readonly drawerBody: HTMLElement;
   private readonly drawerToggle: HTMLButtonElement;
+  private readonly clearBtn: HTMLButtonElement;
 
   private unlisteners: UnlistenFn[] = [];
   private blocks: TermBlock[] = [];
@@ -121,14 +129,14 @@ class TermSession {
         <span>最后命令:</span>
         <span class="term-info-cmd"></span>
         <span class="term-info-spacer"></span>
-        <button class="btn small term-toggle-drawer" title="历史区块">${icon('history')} 历史区块</button>
-        <button class="btn small term-pin">${icon('pin')} 快捷指令</button>
+        <button class="btn small term-toggle-drawer" title="历史命令">${icon('history')} 历史命令</button>
+        <button class="btn small term-pin">${icon('star')} 命令收藏</button>
         <button class="btn small term-addchat">${icon('chatPlus')} 添加到chat</button>
       </div>
       <div class="term-main">
         <div class="term-xterm"></div>
         <div class="term-drawer">
-          <div class="term-drawer-head"><span>历史区块</span><button class="btn small ghost term-drawer-close">收起</button></div>
+          <div class="term-drawer-head"><span>历史命令</span><span class="term-drawer-actions"><button class="icon-btn term-drawer-clear" title="清空历史命令">${icon('trash')}</button><button class="btn small ghost term-drawer-close">收起</button></span></div>
           <div class="term-drawer-body"></div>
         </div>
       </div>`;
@@ -139,12 +147,15 @@ class TermSession {
     this.drawer = root.querySelector('.term-drawer')!;
     this.drawerBody = root.querySelector('.term-drawer-body')!;
     this.drawerToggle = root.querySelector('.term-toggle-drawer')!;
+    this.clearBtn = root.querySelector('.term-drawer-clear')!;
     this.addChatBtn = root.querySelector('.term-addchat')!;
     this.pinBtn = root.querySelector('.term-pin')!;
+    this.clearBtn.disabled = true; // 初始无区块
     this.drawerToggle.onclick = () => this.drawer.classList.toggle('term-drawer-hidden');
     (root.querySelector('.term-drawer-close') as HTMLButtonElement).onclick = () => {
       this.drawer.classList.add('term-drawer-hidden');
     };
+    this.clearBtn.onclick = () => this.clearHistoryBlocks();
     this.addChatBtn.onclick = () => this.sendToAI(this.takeSnapshot());
     this.pinBtn.onclick = () => {
       if (this.lastCommand) addQuickCommandModal(this.lastCommand);
@@ -422,6 +433,15 @@ class TermSession {
   }
 
   /* ---------- 信息栏 / 抽屉 ---------- */
+  /** 清空历史命令：清空前端区块/快照数据并清屏显示（语义同原型 clear 命令 ——
+      只清区块记录不动 scrollback：xterm.clear() 把可视内容移入 scrollback，不抹除历史输出） */
+  private clearHistoryBlocks(): void {
+    this.blocks = [];
+    this.term.clear();
+    this.renderDrawer();
+    toast('已清空历史命令', 'success');
+  }
+
   private updateInfo(): void {
     this.infoCmd.textContent = this.lastCommand || '—';
     this.infoCmd.style.color = this.lastCommand ? 'var(--text-0)' : 'var(--text-2)';
@@ -430,7 +450,8 @@ class TermSession {
   }
 
   private renderDrawer(): void {
-    this.drawerToggle.innerHTML = `${icon('history')} 历史区块 (${this.blocks.length})`;
+    this.drawerToggle.innerHTML = `${icon('history')} 历史命令 (${this.blocks.length})`;
+    this.clearBtn.disabled = this.blocks.length === 0;
     this.drawerBody.innerHTML = '';
     for (let bi = 0; bi < this.blocks.length; bi++) {
       const block = this.blocks[bi];
@@ -447,8 +468,8 @@ class TermSession {
       actions.className = 'term-block-item-actions';
       const pin = document.createElement('button');
       pin.className = 'btn small';
-      pin.innerHTML = `${icon('pin')} 快捷指令`;
-      pin.title = '将该命令添加为快捷指令';
+      pin.innerHTML = `${icon('star')} 命令收藏`;
+      pin.title = '将该命令添加为命令收藏';
       pin.onclick = () => addQuickCommandModal(block.command);
       const chat = document.createElement('button');
       chat.className = 'btn small';
@@ -532,7 +553,7 @@ class TermSession {
     }
   }
 
-  /* ---------- 外部 api（供快捷指令 / AI 建议组件） ---------- */
+  /* ---------- 外部 api（供命令收藏 / AI 建议组件） ---------- */
   paste(cmd: string): void {
     if (this.failed || this.exited) return;
     this.suppressSettle++;
@@ -567,7 +588,8 @@ class TermSession {
 }
 
 /**
- * 渲染器：id 由打开方在前端生成（如 'term-local' / `term:<serverId>` / `term-<rand>`），
+ * 渲染器：id 由打开方在前端生成且唯一（本地 `term-local:<uid>` 多实例，启动时自动开的
+ * 首个实例为 'term-local'；SSH `term:<serverId>:<uid>` 同一服务器可并行多实例），
  * 先订阅事件再 term_create 的时序在 TermSession.init 内保证。
  */
 function renderTerminal(container: HTMLElement, tab: Tab): { paste(cmd: string): void; execute(cmd: string): void; takeSnapshot(): TermSnapshot } {

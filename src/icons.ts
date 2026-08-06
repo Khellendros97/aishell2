@@ -2,7 +2,7 @@
  * 内联 SVG 图标库(替代 emoji)。
  * 风格:lucide 式 —— 24 viewBox、stroke=currentColor、圆角端点;尺寸 1em 随容器字号,
  * 颜色随上下文(含 hover / active / danger 态),无需额外 CSS。
- * 用法:DOM 构建 el.innerHTML = icon('folder');模板串 `${icon('pin')} 快捷指令`。
+ * 用法:DOM 构建 el.innerHTML = icon('folder');模板串 `${icon('star')} 命令收藏`。
  */
 
 const PATHS = {
@@ -34,7 +34,7 @@ const PATHS = {
   square: '<rect x="4" y="4" width="16" height="16" rx="2"/>',
   restore:
     '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
-  pin: '<path d="M9 4h6v6l3 3v2H6v-2l3-3V4z"/><path d="M12 15v6"/>',
+  star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
   wrench:
     '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M4.93 4.93l1.41 1.41"/><path d="M17.66 17.66l1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="M4.93 19.07l1.41-1.41"/><path d="M17.66 6.34l1.41-1.41"/>',
@@ -79,6 +79,7 @@ const PATHS = {
     '<rect x="3" y="5" width="18" height="13" rx="4"/><path d="M7 18l-4 4v-4"/><path d="M12 8.5v6"/><path d="M9 11.5h6"/>',
   alert:
     '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
   user: '<circle cx="12" cy="7" r="4"/><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/>',
   loader:
     '<path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.9 4.9l2.8 2.8"/><path d="M16.3 16.3l2.8 2.8"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.9 19.1l2.8-2.8"/><path d="M16.3 7.7l2.8-2.8"/>',

@@ -5,14 +5,16 @@
  * - 平铺/列表双视图；平铺视图支持拖拽框选（多选作用于复制/剪切/删除/压缩等菜单操作）
  * - 容器空白右键：粘贴 + 「打开终端」（迷你终端悬浮窗，自动 cd 到当前目录，可手动执行 tar 压缩/解压）
  * - 条目可拖拽（source:'remote' + serverId）；容器 drop 收 source:'local' → sftp_upload → toast → 刷新
+ * - 右键菜单含「属性」（sftp_stat 弹属性框）、「权限设置」「赋予可执行权限」（chmod 经迷你终端
+ *   autoRun 执行，完成后刷新 + toast，见 mini-term.ts 契约）；权限修改不新增后端命令
  * - OS 文件拖入（dataTransfer.files）在此面板刻意不接收：系统文件只进本地文件资源管理器
  * - 加载失败：toast 错误原文 + 面板内错误条与「重试」
  */
 import './sftp.css';
-import type { FsEntry } from '../../types';
+import type { FsEntry, FsStat } from '../../types';
 import {
   fsDelete, sftpCopy, sftpCreate, sftpDelete, sftpDownload, sftpHome, sftpList, sftpRename,
-  sftpUniqueName, sftpUpload,
+  sftpStat, sftpUniqueName, sftpUpload,
 } from '../../api';
 import { confirmDialog, promptDialog, showContextMenu, toast, type CtxItem } from '../../ui';
 import { bus, getActiveTab, openTab, registerRenderer, Workbench, type Tab } from './core';
@@ -453,6 +455,210 @@ async function extractRemote(st: SftpTabState, it: RemoteEntry): Promise<void> {
   runRemoteCommand(st, cmd, `已解压 ${it.name}`, joinRemote(parent, base));
 }
 
+/** 快速备份：目录压缩为 `名称_bakYYYYMMDD-HHMM.tgz`；文件复制为 `名称_bakYYYYMMDD-HHMM`（保留原扩展名）。
+ *  重名经 sftpUniqueName 自动改名；完成后刷新并聚焦备份文件。 */
+function backupRemote(st: SftpTabState, item: RemoteEntry): void {
+  const parent = parentOf(item.path);
+  const now = new Date();
+  const p = (v: number) => String(v).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}`;
+  void (async () => {
+    try {
+      const dest = await sftpUniqueName(st.serverId, parent, `${item.name}_bak${stamp}${item.isDir ? '.tgz' : ''}`);
+      const cmd = item.isDir
+        ? `tar czf ${shQuote(joinRemote(parent, dest))} -C ${shQuote(parent)} ${shQuote(item.name)}`
+        : `cp ${shQuote(item.path)} ${shQuote(joinRemote(parent, dest))}`;
+      runRemoteCommand(st, cmd, `备份完成：${dest}`, joinRemote(parent, dest));
+    } catch (err) {
+      toast(String(err), 'error');
+    }
+  })();
+}
+
+/* ---------- 属性 / 权限设置 / 赋予可执行权限（chmod 经迷你终端 autoRun 执行，完成后刷新） ---------- */
+
+/** 权限位 → 3 位八进制串（如 644）；mode 为 null 时显示 — */
+function modeOct(mode: number | null): string {
+  if (mode === null) return '—';
+  return (mode & 0o777).toString(8).padStart(3, '0');
+}
+
+/** 权限位 → 符号串（如 rwxr-xr-x）；mode 为 null 时显示 — */
+function modeSymbolic(mode: number | null): string {
+  if (mode === null) return '—';
+  const bits = mode & 0o777;
+  const chars = 'rwxrwxrwx';
+  let s = '';
+  for (let i = 8; i >= 0; i--) s += (bits >> i) & 1 ? chars[8 - i] : '-';
+  return s;
+}
+
+/** 「属性」对话框：sftp_stat 取远端属性，展示名称/类型/大小/修改时间/权限/链接目标/完整路径。 */
+function showSftpProperties(st: SftpTabState, it: RemoteEntry): void {
+  void (async () => {
+    let stat: FsStat;
+    try {
+      stat = await sftpStat(st.serverId, it.path);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML = `
+      <div class="modal sf-prop-modal">
+        <div class="modal-head">
+          <h3>属性</h3>
+          <button class="icon-btn" title="关闭">${iconSvg('x')}</button>
+        </div>
+        <div class="modal-body">
+          <div class="sf-prop-title">
+            <span class="sf-prop-icon">${iconSvg(stat.linkTarget ? 'link' : stat.isDir ? 'folder' : 'file')}</span>
+            <span class="sf-prop-name"></span>
+          </div>
+          <div class="sf-prop-rows"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn primary" data-act="close">关闭</button>
+        </div>
+      </div>`;
+    const rows = mask.querySelector('.sf-prop-rows')!;
+    const defs: Array<[string, string]> = [
+      ['type', '类型'],
+      ['size', '大小'],
+      ['mtime', '修改时间'],
+      ['mode', '权限'],
+      ['link', '链接目标'],
+      ['path', '完整路径'],
+    ];
+    for (const [key, label] of defs) {
+      const row = document.createElement('div');
+      row.className = 'sf-prop-row';
+      row.dataset.key = key;
+      const lab = document.createElement('span');
+      lab.className = 'sf-prop-label';
+      lab.textContent = label;
+      const val = document.createElement('span');
+      val.className = 'sf-prop-value mono';
+      row.append(lab, val);
+      rows.appendChild(row);
+    }
+    const close = (): void => {
+      mask.classList.remove('open');
+      setTimeout(() => mask.remove(), 160);
+    };
+    mask.querySelector('[data-act=close]')!.addEventListener('click', close);
+    mask.querySelector('.modal-head .icon-btn')!.addEventListener('click', close);
+    mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
+    const values: Record<string, HTMLElement> = {};
+    mask.querySelectorAll<HTMLElement>('.sf-prop-row').forEach((row) => {
+      values[row.dataset.key!] = row.querySelector('.sf-prop-value')!;
+    });
+    mask.querySelector('.sf-prop-name')!.textContent = stat.name;
+    values.type.textContent = stat.linkTarget ? '符号链接' : stat.isDir ? '目录' : '文件';
+    values.size.textContent = stat.isDir ? '—' : fmtSize(stat.size);
+    values.mtime.textContent = fmtTime(stat.mtime);
+    values.mode.textContent = stat.mode !== null ? `${modeSymbolic(stat.mode)} (${modeOct(stat.mode)})` : '—';
+    mask.querySelectorAll<HTMLElement>('.sf-prop-row[data-key="link"]').forEach((row) => {
+      row.classList.toggle('hidden', !stat.linkTarget);
+    });
+    values.link.textContent = stat.linkTarget ?? '—';
+    values.path.textContent = stat.path;
+    document.body.appendChild(mask);
+    requestAnimationFrame(() => mask.classList.add('open'));
+  })();
+}
+
+/** 「权限设置」对话框：输入 3 位八进制权限（预填当前值，可用预设快捷填充），确认后经迷你终端 chmod。 */
+function showChmodDialog(st: SftpTabState, it: RemoteEntry): void {
+  void (async () => {
+    let stat: FsStat;
+    try {
+      stat = await sftpStat(st.serverId, it.path);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    const current = stat.mode !== null ? modeOct(stat.mode) : '755';
+    const presets = [
+      ['755', '目录默认'], ['644', '文件默认'], ['700', '仅自己'],
+      ['600', '仅自己读写'], ['750', '同组读执行'], ['777', '全部读写执行'],
+    ];
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML = `
+      <div class="modal sf-chmod-modal">
+        <div class="modal-head"><h3>权限设置</h3></div>
+        <div class="modal-body">
+          <div class="sf-chmod-path mono"></div>
+          <label class="sf-chmod-label">八进制权限（3 位，0-7）：</label>
+          <input class="input sf-chmod-input" type="text" maxlength="3" spellcheck="false" inputmode="numeric">
+          <div class="sf-chmod-chips"></div>
+          <div class="sf-chmod-error"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" data-act="cancel">取消</button>
+          <button class="btn primary" data-act="ok">确定</button>
+        </div>
+      </div>`;
+    const input = mask.querySelector('.sf-chmod-input') as HTMLInputElement;
+    const errEl = mask.querySelector('.sf-chmod-error') as HTMLElement;
+    const chips = mask.querySelector('.sf-chmod-chips')!;
+    const setInput = (v: string): void => {
+      input.value = v;
+      errEl.textContent = '';
+      chips.querySelectorAll('.sf-chmod-chip').forEach((c) => {
+        c.classList.toggle('active', c.textContent === v);
+      });
+    };
+    for (const [mode, hint] of presets) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'sf-chmod-chip' + (mode === current ? ' active' : '');
+      chip.textContent = mode;
+      chip.title = hint;
+      chip.addEventListener('click', () => setInput(mode));
+      chips.appendChild(chip);
+    }
+    input.value = current;
+    input.title = '如 755 表示 rwxr-xr-x';
+    mask.querySelector('.sf-chmod-path')!.textContent = it.path;
+    const close = (): void => {
+      mask.classList.remove('open');
+      setTimeout(() => mask.remove(), 160);
+    };
+    const submit = (): void => {
+      const mode = input.value.trim();
+      if (!/^[0-7]{3}$/.test(mode)) {
+        errEl.textContent = '请输入 3 位八进制数（每位 0-7），例如 755';
+        return;
+      }
+      close();
+      // 绝对路径更稳（迷你终端 cwd 为当前 SFTP 目录，路径不受影响）
+      runRemoteCommand(st, `chmod ${mode} -- ${shQuote(it.path)}`, `已将 ${it.name} 权限设置为 ${mode}`, it.path);
+    };
+    mask.querySelector('[data-act=cancel]')!.addEventListener('click', close);
+    mask.querySelector('[data-act=ok]')!.addEventListener('click', submit);
+    mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') submit();
+      else if (e.key === 'Escape') close();
+    });
+    document.body.appendChild(mask);
+    requestAnimationFrame(() => {
+      mask.classList.add('open');
+      input.focus();
+      input.select();
+    });
+  })();
+}
+
+/** 赋予可执行权限（仅文件）：经迷你终端执行 chmod +x，完成后刷新并 toast。 */
+function makeExecutable(st: SftpTabState, it: RemoteEntry): void {
+  runRemoteCommand(st, `chmod +x -- ${shQuote(it.path)}`, `已赋予 ${it.name} 可执行权限`, it.path);
+}
+
 /** 在当前目录新建空文件/目录（空白右键菜单）：输入名称 → 创建 → 聚焦新条目 */
 async function createRemote(st: SftpTabState, isDir: boolean): Promise<void> {
   const name = await promptDialog({
@@ -581,10 +787,33 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
       label: '压缩为 tgz', iconName: 'package',
       action: () => void compressRemote(st, items),
     },
+    // 快速备份：目录压缩为 tgz、文件直接复制，完成后刷新并聚焦备份文件；多选时不可用
+    ...(!multi ? [
+      {
+        label: '快速备份', iconName: 'history',
+        action: () => backupRemote(st, first),
+      },
+    ] as CtxItem[] : []),
     ...(items.length === 1 && isArchive(items[0].name) ? [
       {
         label: '解压到当前目录', iconName: 'folderOpen',
         action: () => void extractRemote(st, items[0]),
+      },
+    ] as CtxItem[] : []),
+    'sep',
+    {
+      label: '属性', iconName: 'info', disabled: multi, disabledTip: '多选时不可用',
+      action: () => showSftpProperties(st, first),
+    },
+    {
+      label: '权限设置', iconName: 'lock', disabled: multi, disabledTip: '多选时不可用',
+      action: () => void showChmodDialog(st, first),
+    },
+    // 赋予可执行权限仅文件可用（与 Xshell / 常规 FTP 客户端一致：目录权限走「权限设置」）
+    ...(!multi && !first.isDir ? [
+      {
+        label: '赋予可执行权限', iconName: 'zap',
+        action: () => makeExecutable(st, first),
       },
     ] as CtxItem[] : []),
     'sep',

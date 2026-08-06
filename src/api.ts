@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, FsEntry, Project, Server, Settings, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, FsEntry, FsStat, Project, Server, Settings, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -27,6 +27,15 @@ export const setTheme = (theme: Theme) => call<void>('set_theme', { theme });
 export const upsertServer = (server: Server, password: string | null) =>
   call<void>('upsert_server', { server, password });
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
+/** 新建服务器分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
+export const createServerFolder = (name: string) => call<void>('create_server_folder', { name });
+/** 重命名服务器分类目录：级联改写所有服务器 folder；new 与 old 相同为 no-op；未分类不可重命名 */
+export const renameServerFolder = (oldName: string, newName: string) =>
+  call<void>('rename_server_folder', { old: oldName, new: newName });
+/** 删除服务器分类目录：目录下仍有服务器时返回后端中文错误；未分类不可删除 */
+export const deleteServerFolder = (name: string) => call<void>('delete_server_folder', { name });
+/** 清除全部服务器配置：清空服务器与分类目录、所有项目解绑、删除全部 keyring 密钥 */
+export const clearAllServers = () => call<void>('clear_all_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；
  *  密码永不迁移；无可用会话目录时 reject 中文错误串。 */
 export const importXshellSessions = () => call<XshellImportResult>('import_xshell_sessions');
@@ -83,6 +92,8 @@ export const fsMove = (from: string, to: string) => call<void>('fs_move', { from
 export const fsCopy = (from: string, toDir: string) => call<string>('fs_copy', { from, toDir });
 /** 在系统文件资源管理器中定位 */
 export const fsReveal = (path: string) => call<void>('fs_reveal', { path });
+/** 读取单项属性（属性对话框用）：mode 仅 Unix 有值（本地 Windows 为 null），linkTarget 仅符号链接有值 */
+export const fsStat = (path: string) => call<FsStat>('fs_stat', { path });
 
 /* ---------------- sftp ---------------- */
 /** 解析远端会话 home 目录（canonicalize(".")） */
@@ -90,6 +101,9 @@ export const sftpHome = (serverId: string) =>
   call<string>('sftp_home', { serverId });
 export const sftpList = (serverId: string, path: string) =>
   call<FsEntry[]>('sftp_list', { serverId, path });
+/** 读取远端单项属性（右键「属性」对话框用）：mode 为 unix 权限位，linkTarget 非符号链接为 null */
+export const sftpStat = (serverId: string, path: string) =>
+  call<FsStat>('sftp_stat', { serverId, path });
 /** 读取远端文本文件：>5MB 或二进制会 reject（与 fs_read 同一编辑约束） */
 export const sftpRead = (serverId: string, remotePath: string) =>
   call<string>('sftp_read', { serverId, remotePath });
@@ -150,6 +164,4 @@ export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<Unlis
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 
 /* ---------------- misc ---------------- */
-/** 返回 app_config_dir 绝对路径（配置页「打开配置目录」按钮用） */
-export const getConfigDir = () => call<string>('get_config_dir');
 export { open as openDialog } from '@tauri-apps/plugin-dialog';

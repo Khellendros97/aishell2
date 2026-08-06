@@ -192,6 +192,7 @@ async fn shell_echo_roundtrip() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: false,
+            folder: String::new(),
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -278,6 +279,7 @@ async fn remote_exec_roundtrip() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: false,
+            folder: String::new(),
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -343,6 +345,7 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: true,
+            folder: String::new(),
         };
         store
             .upsert_server(server.clone(), None)

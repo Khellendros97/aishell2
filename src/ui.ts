@@ -61,15 +61,17 @@ export function confirmDialog({
   return promise;
 }
 
-/** 输入对话框（如压缩包命名）：确定返回 trim 后的值（空/含路径分隔符时拒绝并提示），取消返回 null。 */
+/** 输入对话框（如压缩包命名）：确定返回 trim 后的值（空/含路径分隔符时拒绝并提示），取消返回 null。
+ *  allowPath=true 时跳过「名称不能包含路径分隔符」校验（分类目录等按路径输入的场景）。 */
 export function promptDialog({
-  title = '输入', label = '', defaultValue = '', placeholder = '', okText = '确定',
+  title = '输入', label = '', defaultValue = '', placeholder = '', okText = '确定', allowPath = false,
 }: {
   title?: string;
   label?: string;
   defaultValue?: string;
   placeholder?: string;
   okText?: string;
+  allowPath?: boolean;
 } = {}): Promise<string | null> {
   const { promise, resolve } = Promise.withResolvers<string | null>();
   const mask = document.createElement('div');
@@ -114,7 +116,7 @@ export function promptDialog({
       mask.querySelector('.prompt-error')!.textContent = '名称不能为空';
       return;
     }
-    if (/[\\/]/.test(value)) {
+    if (!allowPath && /[\\/]/.test(value)) {
       mask.querySelector('.prompt-error')!.textContent = '名称不能包含路径分隔符';
       return;
     }
@@ -206,4 +208,109 @@ export function showContextMenu(x: number, y: number, items: CtxMenuItems): void
   document.addEventListener('mousedown', onMenuOutside, true);
   document.addEventListener('keydown', onMenuKey, true);
   window.addEventListener('blur', closeMenu);
+}
+
+/* ---------- 组合框（样式 .combo 见 design.css，chevron 与 .select 对齐） ---------- */
+
+/**
+ * 自绘组合框：包住现有 input，展开时列出候选（按输入值大小写不敏感过滤），也可手输任意值。
+ * 替代原生 input[list]+datalist（WebView2 原生下拉样式不可控）。
+ * 下拉面板 portal 到 body + fixed 定位（模态框 overflow 会裁剪 absolute 子元素）；
+ * 下方空间不足时向上翻；滚动 / 缩放自动收起。
+ * getOptions 每次展开时取最新候选（调用方负责去重排序）。
+ * Esc 收起并 stopPropagation（避免冒泡触发模态框的 Esc 关闭）；↑/↓/Enter 键盘选择。
+ */
+export function attachCombo(input: HTMLInputElement, getOptions: () => string[]): void {
+  const wrap = document.createElement('div');
+  wrap.className = 'combo';
+  input.parentNode?.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const list = document.createElement('div');
+  list.className = 'combo-list hidden';
+
+  let activeIdx = -1;
+
+  /** 按 input 视口位置摆放面板；下方空间 < 120px 时向上翻 */
+  const place = () => {
+    const rect = input.getBoundingClientRect();
+    const below = window.innerHeight - rect.bottom - 12;
+    list.style.left = `${rect.left}px`;
+    list.style.width = `${rect.width}px`;
+    if (below >= 120) {
+      list.style.top = `${rect.bottom + 4}px`;
+      list.style.maxHeight = `${Math.min(180, below)}px`;
+    } else {
+      const above = rect.top - 12;
+      list.style.maxHeight = `${Math.min(180, Math.max(above, 80))}px`;
+      // 先按内容高度占位，渲染后再用实际高度上翻
+      list.style.top = `${Math.max(8, rect.top - 4 - Math.min(180, above, list.offsetHeight || 180))}px`;
+    }
+  };
+
+  const onDocScroll = (e: Event) => {
+    // 面板自身滚动不收起；其余任何容器滚动都收起（位置已失效）
+    if (e.target === list || (e.target instanceof Node && list.contains(e.target))) return;
+    close();
+  };
+
+  function close() {
+    list.classList.add('hidden');
+    activeIdx = -1;
+    if (list.parentNode) list.parentNode.removeChild(list);
+    document.removeEventListener('scroll', onDocScroll, true);
+    window.removeEventListener('resize', close);
+  }
+
+  const pick = (value: string) => {
+    input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    close();
+    input.focus();
+  };
+  const open = () => {
+    const q = input.value.trim().toLowerCase();
+    const opts = getOptions().filter((o) => !q || o.toLowerCase().includes(q));
+    list.innerHTML = '';
+    activeIdx = -1;
+    if (!opts.length) { close(); return; }
+    opts.forEach((o) => {
+      const item = document.createElement('div');
+      item.className = 'combo-option';
+      item.textContent = o;
+      item.title = o;
+      // mousedown 先于 blur：preventDefault 保持 input 焦点，直接选中
+      item.addEventListener('mousedown', (e) => { e.preventDefault(); pick(o); });
+      list.appendChild(item);
+    });
+    if (!list.parentNode) document.body.appendChild(list);
+    list.classList.remove('hidden');
+    place();
+    document.addEventListener('scroll', onDocScroll, true);
+    window.addEventListener('resize', close);
+  };
+
+  input.addEventListener('focus', open);
+  input.addEventListener('input', open);
+  input.addEventListener('blur', close);
+  input.addEventListener('keydown', (e) => {
+    if (list.classList.contains('hidden')) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); open(); }
+      return;
+    }
+    const items = Array.from(list.querySelectorAll<HTMLElement>('.combo-option'));
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      close();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIdx = e.key === 'ArrowDown'
+        ? Math.min(activeIdx + 1, items.length - 1)
+        : Math.max(activeIdx - 1, 0);
+      items.forEach((it, i) => it.classList.toggle('active', i === activeIdx));
+      items[activeIdx]?.scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter' && activeIdx >= 0) {
+      e.preventDefault();
+      pick(items[activeIdx].textContent ?? '');
+    }
+  });
 }

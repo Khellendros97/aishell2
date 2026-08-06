@@ -28,7 +28,7 @@ import './workbench.css';
 const PANELS: Record<string, string> = {
   explorer: '文件资源管理器',
   servers: '服务器列表',
-  commands: '快捷指令',
+  commands: '命令收藏',
 };
 
 export async function renderWorkbench(root: HTMLElement, params: URLSearchParams): Promise<(() => void) | void> {
@@ -41,7 +41,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
       <div id="activity-bar">
         <div class="activity-icon active" data-panel="explorer" title="文件资源管理器">${icon('folder')}</div>
         <div class="activity-icon" data-panel="servers" title="服务器列表">${icon('monitor')}</div>
-        <div class="activity-icon" data-panel="commands" title="快捷指令">${icon('zap')}</div>
+        <div class="activity-icon" data-panel="commands" title="命令收藏">${icon('star')}</div>
         <div class="activity-icon ai-toggle" data-panel="ai" title="AI 助手">${icon('bot')}</div>
       </div>
       <div id="sidebar">

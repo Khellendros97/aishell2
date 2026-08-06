@@ -1,6 +1,6 @@
 //! 本地文件操作。
-//! 契约（src/api.ts 的 fs 段）：fs_list/fs_read/fs_write/fs_create/fs_delete，
-//! FsEntry 与 src/types.ts 对齐（sftp.rs 复用本结构，序列化 camelCase）。
+//! 契约（src/api.ts 的 fs 段）：fs_list/fs_read/fs_write/fs_create/fs_delete/fs_stat，
+//! FsEntry 与 src/types.ts 对齐（sftp.rs 复用本结构，序列化 camelCase）；FsStat 亦与 src/types.ts 对齐。
 //! 全部为同步 std::fs 实现；所有路径拒绝空串，错误以中文可读串返回。
 
 use serde::Serialize;
@@ -15,6 +15,60 @@ pub struct FsEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: i64,
+}
+
+/// 单项属性快照（fs_stat 返回，属性对话框用）。
+/// mode 仅 Unix 有值（Windows 本地为 None）；link_target 仅符号链接有值；
+/// is_dir 为符号链接自身的类型（不跟随链接展开）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FsStat {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+    pub mode: Option<u32>,
+    pub readonly: bool,
+    pub link_target: Option<String>,
+}
+
+/// 读取单项属性：symlink_metadata 不跟随符号链接（链接显示为链接本身，另附 link_target）。
+#[tauri::command]
+pub fn fs_stat(path: String) -> Result<FsStat, String> {
+    let file = non_empty(&path)?;
+    let meta = fs::symlink_metadata(&file)
+        .map_err(|e| format!("无法访问「{}」：{e}", file.display()))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode())
+    };
+    #[cfg(not(unix))]
+    let mode = None;
+    Ok(FsStat {
+        path,
+        name: file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.display().to_string()),
+        is_dir: meta.is_dir(),
+        size: meta.len(),
+        mtime,
+        mode,
+        readonly: meta.permissions().readonly(),
+        link_target: if meta.file_type().is_symlink() {
+            fs::read_link(&file).ok().map(|t| t.to_string_lossy().into_owned())
+        } else {
+            None
+        },
+    })
 }
 
 fn non_empty(path: &str) -> Result<PathBuf, String> {
