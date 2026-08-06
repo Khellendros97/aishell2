@@ -11,7 +11,7 @@
  * 不依赖 Git Bash：下载走 Node fetch，解压走系统自带组件。
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, rmSync, cpSync, writeFileSync, chmodSync, writeSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, cpSync, renameSync, writeFileSync, chmodSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -104,14 +104,19 @@ try {
     if (r.status !== 0) fail('解压失败（tar）');
   }
 
-  // 包顶层若嵌套一层目录（如 pi-darwin-arm64/）则摊平，保证二进制直接位于 DEST 下
+  // 包顶层若嵌套一层目录（如 pi-win32-x64/、pi/）则摊平，保证二进制直接位于 DEST 下。
+  // 嵌套目录名可能与二进制同名（darwin 包结构是 pi/pi）：直接往 tmpDir 搬会让文件覆盖
+  // 同名目录（ENOTDIR），先整体改名挪出再搬回内容。
   const inner = readdirSync(tmpDir);
   if (inner.length === 1 && existsSync(path.join(tmpDir, inner[0], target.bin))) {
     const nested = path.join(tmpDir, inner[0]);
-    for (const f of readdirSync(nested)) {
-      cpSync(path.join(nested, f), path.join(tmpDir, f), { recursive: true, force: true });
+    const aside = `${tmpDir}-aside`;
+    rmSync(aside, { recursive: true, force: true });
+    renameSync(nested, aside); // 同卷 rename，零拷贝
+    for (const f of readdirSync(aside)) {
+      cpSync(path.join(aside, f), path.join(tmpDir, f), { recursive: true, force: true });
     }
-    rmSync(nested, { recursive: true, force: true });
+    rmSync(aside, { recursive: true, force: true });
   }
 
   if (!existsSync(path.join(tmpDir, target.bin))) {
