@@ -9,6 +9,10 @@ on:
   push:
     tags: ['v*']
 
+# contents: write 供 softprops/action-gh-release 创建 release 并上传 dmg
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -55,3 +59,10 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
           if-no-files-found: error
+
+      # tag 触发时把 dmg 挂到对应 GitHub Release（任何人免登录可下载；Artifacts 需登录且 90 天过期）
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          fail_on_unmatched_files: true
