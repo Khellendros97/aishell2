@@ -5,7 +5,7 @@ export function uid(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export function toast(msg: string, type?: 'error' | 'success' | 'info'): void {
+export function toast(msg: string, type?: 'error' | 'success' | 'info', durationMs?: number): void {
   let root = document.getElementById('toast-root');
   if (!root) {
     root = document.createElement('div');
@@ -20,7 +20,7 @@ export function toast(msg: string, type?: 'error' | 'success' | 'info'): void {
     el.style.opacity = '0';
     el.style.transition = 'opacity .2s';
     setTimeout(() => el.remove(), 220);
-  }, 2200);
+  }, durationMs ?? 2200);
 }
 
 export interface ConfirmOptions {

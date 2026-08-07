@@ -2,7 +2,8 @@
 //! 与 SSH shell 同构接入。
 //! 契约（与 src/api.ts 严格对齐）：
 //! - 命令 `term_create(id, kind, server_id, cwd)` / `term_input(id, data)` /
-//!   `term_resize(id, cols, rows)` / `term_close(id)`；
+//!   `term_resize(id, cols, rows)` / `term_close(id)` / `term_record_start(id, path, header)` /
+//!   `term_record_stop(id, footer)`；
 //! - 事件 `term:data:<id>` payload `{data}`（UTF-8 lossy）、`term:exit:<id>` payload `{code}`。
 //!
 //! SSH 分支复用 `ssh::SshManager::open_shell` 返回的 channel（连接复用由 SshManager 管理）。
@@ -198,11 +199,125 @@ impl TermHandle {
     }
 }
 
+/* ---------------- 终端录制（tee 到 项目/.aishell/record/服务器-日期时间.log） ---------------- */
+
+/// ANSI 转义剥除状态机（跨分片：CSI/OSC/ESC 序列可能断开在两个 chunk 边界，
+/// 状态留在 Recorder 内持续递进）。剥离 CSI(颜色/光标/模式如 ?2004h)、
+/// OSC(标题等,BEL 或 ST 收尾)、字符集选择(ESC ( X)与单字符转义,
+/// 只留可打印文本与 \r\n\t 控制符。
+#[derive(Debug, Default)]
+enum AnsiState {
+    #[default]
+    Normal,
+    /// 已见 ESC,等待判定序列类型
+    Esc,
+    /// CSI 体内,等终止字节 0x40..=0x7E
+    Csi,
+    /// OSC 体内,等 BEL 或 ST(ESC \)
+    Osc,
+    /// 字符集选择 ESC ( X / ESC ) X,再丢一个字节
+    Charset,
+}
+
+impl AnsiState {
+    /// 喂入一段输出,返回剥除转义后的明文字节。
+    fn strip(&mut self, data: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        for &b in data.as_bytes() {
+            match self {
+                AnsiState::Normal => {
+                    if b == 0x1b {
+                        *self = AnsiState::Esc;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                AnsiState::Esc => match b {
+                    b'[' => *self = AnsiState::Csi,
+                    b']' => *self = AnsiState::Osc,
+                    b'(' | b')' => *self = AnsiState::Charset,
+                    0x1b => { /* 连续 ESC:保持 Esc */ }
+                    _ => *self = AnsiState::Normal, // 单字符转义(含 ST 的 \):整体丢弃
+                },
+                AnsiState::Csi => {
+                    if (0x40..=0x7e).contains(&b) {
+                        *self = AnsiState::Normal;
+                    } else if b == 0x1b {
+                        *self = AnsiState::Esc;
+                    }
+                }
+                AnsiState::Osc => {
+                    if b == 0x07 {
+                        *self = AnsiState::Normal;
+                    } else if b == 0x1b {
+                        *self = AnsiState::Esc;
+                    }
+                }
+                AnsiState::Charset => *self = AnsiState::Normal,
+            }
+        }
+        out
+    }
+}
+
+/// 终端输出录制器：把 tee 到的输出流(剥除 ANSI 转义后的明文)落盘。
+/// 写失败一律静默（绝不影响终端主路径）；drop 时 BufWriter 兜底 flush。
+/// 前端负责全部呈现层格式（文件名/开始结束时间戳），本结构只建文件、写头尾、收尾。
+#[derive(Debug)]
+struct Recorder {
+    w: std::io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    strip: AnsiState,
+}
+
+impl Recorder {
+    /// 建父目录、建文件、写 header 并 flush。重复 create 同一路径报错（不覆盖已有录制）。
+    fn create(path: PathBuf, header: &str) -> Result<Recorder, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建录制目录失败: {e}"))?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    "录制文件已存在，请稍后重试".to_string()
+                } else {
+                    format!("创建录制文件失败: {e}")
+                }
+            })?;
+        let mut w = std::io::BufWriter::new(f);
+        writeln!(w, "{header}").map_err(|e| format!("写入录制文件失败: {e}"))?;
+        w.flush().map_err(|e| format!("写入录制文件失败: {e}"))?;
+        Ok(Recorder {
+            w,
+            path,
+            strip: AnsiState::default(),
+        })
+    }
+
+    /// tee 一段终端输出（剥除 ANSI 转义后落盘）；失败静默。
+    fn write(&mut self, data: &str) {
+        let plain = self.strip.strip(data);
+        let _ = self.w.write_all(&plain);
+    }
+
+    /// 收尾：写 \n+footer+\n 并 flush，返回文件路径（drop 兜底落盘）。
+    fn finish(mut self, footer: &str) -> PathBuf {
+        let _ = write!(self.w, "\n{footer}\n");
+        let _ = self.w.flush();
+        self.path
+    }
+}
+
 /* ---------------- 终端管理器 ---------------- */
 
 /// 统一终端管理器：id -> Arc<TermHandle>。本地与 SSH 对前端同构。
 pub struct TermManager {
     map: Mutex<HashMap<String, Arc<TermHandle>>>,
+    /// 录制器按 tab id 挂 manager：重连后新读任务继续 tee，不随 TermHandle 替换丢失。
+    records: Mutex<HashMap<String, Recorder>>,
     ssh: Arc<SshManager>,
 }
 
@@ -210,6 +325,7 @@ impl TermManager {
     pub fn new(ssh: Arc<SshManager>) -> Self {
         TermManager {
             map: Mutex::new(HashMap::new()),
+            records: Mutex::new(HashMap::new()),
             ssh,
         }
     }
@@ -284,9 +400,10 @@ impl TermManager {
             .map_err(|e| e.to_string())?
             .insert(id.clone(), Arc::clone(&handle));
 
-        // 读线程：PTY 输出 → term:data:<id>
+        // 读线程：PTY 输出 → term:data:<id> + 录制 tee
         if let Some(mut reader) = reader {
             let app = app.clone();
+            let mgr = Arc::clone(self);
             let id2 = id.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
@@ -295,6 +412,7 @@ impl TermManager {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let data = String::from_utf8_lossy(&buf[..n]).into_owned();
+                            mgr.tee_record(&id2, &data);
                             let _ = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
                         }
                     }
@@ -373,6 +491,7 @@ impl TermManager {
                     Some(ChannelMsg::Data { data }) => {
                         diag(&format!("recv id={id2} data len={}", data.len()));
                         let data = String::from_utf8_lossy(&data).into_owned();
+                        mgr.tee_record(&id2, &data);
                         let r = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
                         if let Err(e) = r {
                             diag(&format!("emit-err id={id2} err={e}"));
@@ -431,7 +550,42 @@ impl TermManager {
         if let Some(h) = handle {
             h.close().await;
         }
+        // 防御：前端忘停录制时在此移除 recorder（BufWriter Drop 兜底落盘，日志缺结束行）
+        if let Ok(mut records) = self.records.lock() {
+            records.remove(id);
+        }
         Ok(())
+    }
+
+    /// 录制 tee：把一段终端输出追加到该终端的录制文件；未在录制 / 写失败均静默。
+    fn tee_record(&self, id: &str, data: &str) {
+        if let Ok(mut records) = self.records.lock() {
+            if let Some(rec) = records.get_mut(id) {
+                rec.write(data);
+            }
+        }
+    }
+
+    /// 开始录制：终端必须存在且未在录制。
+    pub fn record_start(&self, id: &str, path: &str, header: &str) -> Result<(), String> {
+        let map = self.map.lock().map_err(|e| e.to_string())?;
+        if !map.contains_key(id) {
+            return Err("终端不存在或已关闭".to_string());
+        }
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        if records.contains_key(id) {
+            return Err("该终端正在录制中".to_string());
+        }
+        records.insert(id.to_string(), Recorder::create(PathBuf::from(path), header)?);
+        Ok(())
+    }
+
+    /// 停止录制：写 footer 收尾并返回文件路径；未在录制返回 None。
+    pub fn record_stop(&self, id: &str, footer: &str) -> Result<Option<String>, String> {
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        Ok(records
+            .remove(id)
+            .map(|rec| rec.finish(footer).to_string_lossy().into_owned()))
     }
 }
 
@@ -535,4 +689,100 @@ pub async fn term_close(
     id: String,
 ) -> Result<(), String> {
     manager.close(&id).await
+}
+
+/// 开始录制：终端不存在报「终端不存在或已关闭」，已在录制报「该终端正在录制中」。
+#[tauri::command]
+pub async fn term_record_start(
+    manager: State<'_, Arc<TermManager>>,
+    id: String,
+    path: String,
+    header: String,
+) -> Result<(), String> {
+    manager.record_start(&id, &path, &header)
+}
+
+/// 停止录制：写 footer 收尾，返回录制文件路径；未在录制返回 None。
+#[tauri::command]
+pub async fn term_record_stop(
+    manager: State<'_, Arc<TermManager>>,
+    id: String,
+    footer: String,
+) -> Result<Option<String>, String> {
+    manager.record_stop(&id, &footer)
+}
+
+/* ---------------- 单测：Recorder 内容与覆盖语义（temp_dir，不碰真实终端） ---------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::Recorder;
+    use std::io::Read;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("aishell-record-test-{tag}-{}", std::process::id()))
+    }
+
+    /// create → write → finish 的完整内容断言：header + 原始输出 + footer 齐全。
+    #[test]
+    fn recorder_roundtrip_content() {
+        let dir = tmp_dir("roundtrip");
+        let path = dir.join("测试服务器-20260807-120000.log");
+        let mut rec = Recorder::create(path.clone(), "===== 录制开始 2026-08-07 12:00:00 =====")
+            .expect("首次创建应成功");
+        rec.write("$ echo hi\r\nhi\r\n");
+        rec.write("$ ");
+        let got = rec.finish("===== 录制结束 2026-08-07 12:05:00 =====");
+        assert_eq!(got, path, "finish 应返回录制文件路径");
+
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .expect("录制文件应存在")
+            .read_to_string(&mut content)
+            .expect("读录制文件");
+        assert_eq!(
+            content,
+            "===== 录制开始 2026-08-07 12:00:00 =====\n$ echo hi\r\nhi\r\n$ \n===== 录制结束 2026-08-07 12:05:00 =====\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 重复 create 同一路径：报错而非覆盖（避免同名录制静默丢数据，语义明确）。
+    #[test]
+    fn recorder_create_duplicate_is_error() {
+        let dir = tmp_dir("duplicate");
+        let path = dir.join("dup.log");
+        assert!(Recorder::create(path.clone(), "h1").is_ok(), "首次创建应成功");
+        let err = Recorder::create(path.clone(), "h2").expect_err("重复 create 应报错");
+        assert!(!err.is_empty(), "错误文案不应为空");
+        // 原文件内容不受第二次 create 影响
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .expect("录制文件应存在")
+            .read_to_string(&mut content)
+            .expect("读录制文件");
+        assert_eq!(content, "h1\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ANSI 剥除:CSI(颜色/光标/括号粘贴 ?2004h)、OSC(BEL/ST 收尾)、字符集选择
+    /// 与单字符转义全部剥除,明文与 \r\n 保留;CSI 跨分片断开也能正确接续。
+    #[test]
+    fn ansi_strip_sequences() {
+        use super::AnsiState;
+        let mut s = AnsiState::default();
+        // CSI 被两个 chunk 边界断开:ESC 在上一片末尾、[32m 在下一片开头
+        let p1 = s.strip("$ ls \u{1b}");
+        let p2 = s.strip("[32mgreen\u{1b}[0m normal\r\n");
+        assert_eq!(String::from_utf8(p1).unwrap(), "$ ls ");
+        assert_eq!(String::from_utf8(p2).unwrap(), "green normal\r\n");
+        // 括号粘贴模式 + OSC 标题(BEL 与 ST 两种收尾) + 字符集选择 + 单字符转义
+        let p3 = s.strip("\u{1b}[?2004h\u{1b}]0;标题\u{7}\u{1b}]8;;https://x\u{1b}\\\u{1b}(0\u{1b}ctext");
+        assert_eq!(String::from_utf8(p3).unwrap(), "text");
+        // OSC 跨分片
+        let p4 = s.strip("\u{1b}]0;win");
+        let p5 = s.strip("dow\u{7}done");
+        assert_eq!(String::from_utf8(p4).unwrap(), "");
+        assert_eq!(String::from_utf8(p5).unwrap(), "done");
+    }
 }

@@ -32,7 +32,7 @@ import '@xterm/xterm/css/xterm.css';
 
 import {
   getState, onTermData, onTermExit, openDialog, SSH_AUTH_FAILED_PREFIX, termClose, termCreate, termInput,
-  termResize, upsertServer,
+  termRecordStart, termRecordStop, termResize, upsertServer,
 } from '../../api';
 import type { TermKind } from '../../api';
 import type { Server } from '../../types';
@@ -99,8 +99,18 @@ function stripAnsi(s: string): string {
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '')
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     .replace(/\u001b[()][0-9A-Za-z]/g, '')
-    .replace(/\u001b[@-Z\\-_]/g, '')
-    .replace(/\u001b./g, '');
+    .replace(/\\u001b[@-Z\\-_]/g, '')
+    .replace(/\\u001b./g, '');
+}
+
+/**
+ * 复制文本清洗:剥除选区里可能混入的 ANSI 转义(带 ESC 锚点)与 \t\n\r 之外的
+ * C0 控制符。不做无锚点 CSI 剥离——buffer 经 xterm 解析器渲染,转义不会以纯文本
+ * 残留;而用户手敲的 "\033[32m" 这类字面文本(printf 教程等)含 [32m 形态,
+ * 无锚点规则会误伤真实内容(实测踩过)。
+ */
+function cleanCopiedText(s: string): string {
+  return stripAnsi(s).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
 }
 
 /**
@@ -124,10 +134,14 @@ class TermSession {
   private readonly infoCmd: HTMLElement;
   private readonly addChatBtn: HTMLButtonElement;
   private readonly pinBtn: HTMLButtonElement;
+  private readonly recBtn: HTMLButtonElement;
   private readonly drawer: HTMLElement;
   private readonly drawerBody: HTMLElement;
   private readonly drawerToggle: HTMLButtonElement;
   private readonly clearBtn: HTMLButtonElement;
+
+  /** 录制状态标记（路径由 term_record_stop 返回,不额外持有）。 */
+  private recording = false;
 
   private unlisteners: UnlistenFn[] = [];
   private blocks: TermBlock[] = [];
@@ -170,6 +184,7 @@ class TermSession {
         <button class="btn small term-toggle-drawer" title="历史命令">${icon('history')} 历史命令</button>
         <button class="btn small term-pin">${icon('star')} 命令收藏</button>
         <button class="btn small term-addchat">${icon('chatPlus')} 添加到chat</button>
+        <button class="btn small term-rec" title="录制终端输出到日志文件">${icon('circle')} 录制</button>
       </div>
       <div class="term-main">
         <div class="term-xterm"></div>
@@ -188,6 +203,7 @@ class TermSession {
     this.clearBtn = root.querySelector('.term-drawer-clear')!;
     this.addChatBtn = root.querySelector('.term-addchat')!;
     this.pinBtn = root.querySelector('.term-pin')!;
+    this.recBtn = root.querySelector('.term-rec')!;
     this.clearBtn.disabled = true; // 初始无区块
     this.drawerToggle.onclick = () => this.drawer.classList.toggle('term-drawer-hidden');
     (root.querySelector('.term-drawer-close') as HTMLButtonElement).onclick = () => {
@@ -195,6 +211,7 @@ class TermSession {
     };
     this.clearBtn.onclick = () => this.clearHistoryBlocks();
     this.addChatBtn.onclick = () => this.sendToAI(this.takeSnapshot());
+    this.recBtn.onclick = () => void this.toggleRecording();
     this.pinBtn.onclick = () => {
       if (this.lastCommand) addQuickCommandModal(this.lastCommand);
     };
@@ -231,6 +248,9 @@ class TermSession {
         { label: '添加到对话', iconName: 'chatPlus', action: () => Workbench.ai?.addServerRef?.(ref) },
         { label: '复制', iconName: 'copy', disabled: !this.term.hasSelection(), action: () => this.copySelection() },
         { label: '粘贴', iconName: 'clipboard', action: () => void this.pasteClipboard() },
+        this.recording
+          ? { label: '停止录制', iconName: 'circle', action: () => void this.stopRecording(false) }
+          : { label: '开始录制', iconName: 'circle', action: () => void this.startRecording() },
         { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
       ]);
     });
@@ -338,10 +358,10 @@ class TermSession {
   }
 
   /* ---------- 输入：转发后端 + 区块追踪 ---------- */
-  /** 复制当前选区到系统剪贴板（无选区时静默） */
+  /** 复制当前选区到系统剪贴板(清洗 ANSI 转义/控制符;无选区时静默) */
   private copySelection(): void {
     const sel = this.term.getSelection();
-    if (sel) void copyText(sel);
+    if (sel) void copyText(cleanCopiedText(sel));
   }
 
   /** 读系统剪贴板并粘贴进终端（走 xterm paste 路径，保留 bracketed paste 语义与区块追踪） */
@@ -795,10 +815,71 @@ class TermSession {
     void termInput(this.tab.id, '\x03').catch(() => { /* 终端已关闭等后端错误忽略 */ });
   }
 
+  /* ---------- 录制（tee 到 项目/.aishell/record/服务器-日期时间.log） ---------- */
+  /** 顶部按钮点击：按当前状态切换开始/停止。 */
+  private async toggleRecording(): Promise<void> {
+    if (this.recording) await this.stopRecording(false);
+    else await this.startRecording();
+  }
+
+  /** 文件名时间戳：yyyymmdd-HHMMSS。 */
+  private fmtTs(d: Date): string {
+    const p = (v: number) => String(v).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  /** 日志头尾时间戳：yyyy-MM-dd HH:mm:ss。 */
+  private fmtStamp(d: Date): string {
+    const p = (v: number) => String(v).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  /** 开始录制：文件名 服务器-yyyymmdd-HHMMSS.log（SSH 用 tab.title 服务器名，本地固定「本地终端」）。 */
+  private async startRecording(): Promise<void> {
+    const projectPath = Workbench.state.project?.path;
+    if (!projectPath) {
+      toast('项目未绑定本地目录，无法保存录制文件', 'error');
+      return;
+    }
+    const data = this.tab.data as { kind?: string };
+    const name = (data.kind === 'ssh' ? this.tab.title : '本地终端').replace(/[\\/:*?"<>|]/g, '_');
+    const path = `${projectPath.replace(/[\\/]+$/, '')}/.aishell/record/${name}-${this.fmtTs(new Date())}.log`;
+    const header = `===== 录制开始 ${this.fmtStamp(new Date())} =====`;
+    try {
+      await termRecordStart(this.tab.id, path, header);
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    this.recording = true;
+    this.recBtn.classList.add('recording');
+    this.recBtn.innerHTML = `${icon('circle')} 停止录制`;
+    toast('已开始录制', 'success');
+  }
+
+  /** 停止录制：日志尾写结束时间，提示保存位置。auto=true 为关标签自动停止（同样提示）。 */
+  private async stopRecording(auto: boolean): Promise<void> {
+    const footer = `===== 录制结束 ${this.fmtStamp(new Date())} =====`;
+    let p: string | null = null;
+    try {
+      p = await termRecordStop(this.tab.id, footer);
+    } catch (err) {
+      console.warn('停止录制失败', err);
+      toast(String(err), 'error');
+      return;
+    }
+    dbg(`${this.sid} record-stop auto=${auto}`);
+    this.recording = false;
+    this.recBtn.classList.remove('recording');
+    this.recBtn.innerHTML = `${icon('circle')} 录制`;
+    if (p) toast(`录制已停止，日志保存至: ${p}`, 'success', 6000);
+  }
+
   /* ---------- 关闭清理（tab.onClose 由 renderer 接管） ---------- */
   destroy(): void {
     liveTerms.delete(this);
     this.resizer?.disconnect();
+    if (this.recording) void this.stopRecording(true);
     this.unlisteners.forEach((u) => { try { u(); } catch { /* 忽略退订异常 */ } });
     this.unlisteners = [];
     if (!this.exited) void termClose(this.tab.id).catch(() => {});

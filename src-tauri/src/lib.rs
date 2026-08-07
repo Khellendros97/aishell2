@@ -153,6 +153,8 @@ pub fn run() {
             term::term_input,
             term::term_resize,
             term::term_close,
+            term::term_record_start,
+            term::term_record_stop,
             term::debug_export,
             fsops::fs_list,
             fsops::fs_read,

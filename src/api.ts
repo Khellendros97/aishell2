@@ -84,6 +84,10 @@ export const termInput = (id: string, data: string) => call<void>('term_input', 
 export const termResize = (id: string, cols: number, rows: number) =>
   call<void>('term_resize', { id, cols, rows });
 export const termClose = (id: string) => call<void>('term_close', { id });
+export const termRecordStart = (id: string, path: string, header: string) =>
+  call<void>('term_record_start', { id, path, header });
+export const termRecordStop = (id: string, footer: string) =>
+  call<string | null>('term_record_stop', { id, footer });
 export const onTermData = (id: string, cb: (data: string) => void): Promise<UnlistenFn> =>
   listen<{ data: string }>(`term:data:${id}`, (e) => cb(e.payload.data));
 export const onTermExit = (id: string, cb: (code: number | null) => void): Promise<UnlistenFn> =>

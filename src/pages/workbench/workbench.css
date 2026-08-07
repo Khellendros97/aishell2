@@ -80,6 +80,13 @@ body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-selec
 .term-drawer-actions { display: flex; align-items: center; gap: 4px; }
 /* 清空历史命令按钮：破坏性操作，悬停红色提示（.icon-btn 基础样式见 styles/design.css） */
 .term-drawer-clear:hover:not(:disabled) { color: var(--red); }
+/* 录制按钮：录制中图标与文字变红，图标呼吸闪烁提示正在录制 */
+.term-rec.recording { color: var(--red); }
+.term-rec.recording .ic { animation: term-rec-pulse 1.2s ease-in-out infinite; }
+@keyframes term-rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
 .term-main { flex: 1; min-height: 0; display: flex; }
 .term-xterm { flex: 1; min-width: 0; background: var(--term-bg); padding: 6px 0 6px 8px; position: relative; }
 .term-xterm .xterm { height: 100%; }
