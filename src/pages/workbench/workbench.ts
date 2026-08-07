@@ -16,6 +16,7 @@ import { icon } from '../../icons';
 import type { Project } from '../../types';
 import { bus, closeTab, getActiveTab, getTabs, initWorkbench, openTab, Workbench } from './core';
 import type { Tab } from './core';
+import { wbLifecycle } from './lifecycle';
 import { mountExplorerPanel, explorerHead } from './sidebar/explorer';
 import { mountServersPanel, serversHead } from './sidebar/servers';
 import { mountCommandsPanel, commandsHead } from './sidebar/commands';
@@ -218,6 +219,8 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     };
   }
   Workbench.state.project = project;
+  /* 装载成功:登记保活 id,路由层复用本页(保留标签页)与顶栏返回箭头以此为凭 */
+  wbLifecycle.projectId = project.id;
 
   /* ---------- 默认面板 + AI 面板（原型 #ai-panel 常驻布局，默认开） ---------- */
   mountPanel('explorer');

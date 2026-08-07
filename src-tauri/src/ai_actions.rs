@@ -308,7 +308,6 @@ mod tests {
                     auth_type: crate::store::AuthType::Password,
                     username: "root".to_string(),
                     key_path: String::new(),
-                    folder: String::new(),
                     locked: false,
                 },
                 None,
@@ -324,7 +323,6 @@ mod tests {
                     auth_type: crate::store::AuthType::Key,
                     username: "ubuntu".to_string(),
                     key_path: "C:\\key".to_string(),
-                    folder: String::new(),
                     locked: true,
                 },
                 None,
@@ -341,7 +339,6 @@ mod tests {
                     auth_type: crate::store::AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
-                    folder: String::new(),
                     locked: false,
                 },
                 None,
@@ -354,6 +351,7 @@ mod tests {
                 path: Some("D:\\proj".to_string()),
                 server_ids: vec!["srv-a".to_string(), "srv-b".to_string()],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: crate::store::AiMode::Agent,
             })
             .unwrap();
@@ -385,6 +383,7 @@ mod tests {
                 path: None,
                 server_ids: vec![],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: crate::store::AiMode::Suggest,
             })
             .unwrap();

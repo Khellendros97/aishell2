@@ -15,7 +15,7 @@
 import { bus, getActiveTerminalApi, Workbench } from '../core';
 import { attachCombo, confirmDialog, promptDialog, toast, uid } from '../../../ui';
 import {
-  createCommandFolder, deleteCommandFolder, getState, renameCommandFolder, upsertProject,
+  createCommandFolder, deleteCommandFolder, getState, renameCommandFolder, setUiExpanded, upsertProject,
 } from '../../../api';
 import type { Project, QuickCommand } from '../../../types';
 import { icon } from '../../../icons';
@@ -46,6 +46,32 @@ let toggleBtn: HTMLButtonElement | null = null;
 let searchQuery = '';
 /** 展开的分类面板（键 = folder 值，空串 = 未分类）；模块级持久，重渲染保留展开态，默认全部折叠 */
 const expandedFolders = new Set<string>();
+/** 本次会话已从后端恢复过分类展开状态（每会话只播种一次，避免重复覆盖用户操作） */
+let foldersSeeded = false;
+/** 分类展开状态防抖落盘定时器（300ms 合并连续 toggle） */
+let foldersPersistTimer: number | null = null;
+
+/* ---------- 分类展开状态持久化（落盘 uiExpanded['commands:folders']，key 语义见 types.ts） ---------- */
+/** 300ms 防抖把分类展开集合写入后端；失败仅 console.warn 不打扰用户 */
+function persistFoldersExpanded(): void {
+  const snapshot = [...expandedFolders];
+  if (foldersPersistTimer !== null) window.clearTimeout(foldersPersistTimer);
+  foldersPersistTimer = window.setTimeout(() => {
+    foldersPersistTimer = null;
+    setUiExpanded('commands:folders', snapshot).catch((err) =>
+      console.warn('保存命令分类展开状态失败:', err));
+  }, 300);
+}
+/** 展开单个分类（用户显式 toggle / 搜索中不调用——搜索是过滤态不持久化） */
+function expandFolder(folder: string): void {
+  expandedFolders.add(folder);
+  persistFoldersExpanded();
+}
+/** 折叠单个分类（用户显式 toggle / 删除分类后的清理） */
+function collapseFolder(folder: string): void {
+  expandedFolders.delete(folder);
+  persistFoldersExpanded();
+}
 
 let latestFolders: string[] = [];    // 最近一次 render 拉取的 commandFolders 清单（空目录也在此）
 let latestCommands: QuickCommand[] = []; // 最近一次 render 的全部命令（含跨项目全局，供分类下拉候选）
@@ -122,7 +148,8 @@ async function deleteFolderFlow(folder: string): Promise<void> {
     toast(String(err), 'error');
     return;
   }
-  expandedFolders.delete(folder);
+  expandedFolders.delete(folder); // 已删除分类不再保留展开状态
+  persistFoldersExpanded();
   bus.emit('project-changed');
   toast(`分类目录「${folder}」已删除`, 'success');
 }
@@ -331,6 +358,7 @@ function buildSearchRow(wrap: HTMLElement): void {
     const allExpanded = renderedGroupKeys.length > 0 && renderedGroupKeys.every((k) => expandedFolders.has(k));
     if (allExpanded) expandedFolders.clear();
     else renderedGroupKeys.forEach((k) => expandedFolders.add(k));
+    persistFoldersExpanded();
     void render();
   };
   searchInput.addEventListener('input', () => {
@@ -351,6 +379,11 @@ async function collectCommands(): Promise<DisplayedCommand[]> {
   try {
     const state = await getState();
     latestFolders = state.commandFolders ?? [];
+    // 展开状态播种：首次取到 state 即恢复分类展开集合（此刻尚无列表 DOM 可点击，无竞态）
+    if (!foldersSeeded) {
+      foldersSeeded = true;
+      for (const f of state.uiExpanded?.['commands:folders'] ?? []) expandedFolders.add(f);
+    }
     for (const p of state.projects) {
       if (p.id === project?.id) continue;
       for (const qc of p.quickCommands ?? []) {
@@ -468,8 +501,8 @@ async function render(): Promise<void> {
     /* 点击标题行 = 展开/收起该组（搜索态自动展开，点击不切换） */
     if (!searching) {
       gTitle.addEventListener('click', () => {
-        if (expandedFolders.has(folderKey)) expandedFolders.delete(folderKey);
-        else expandedFolders.add(folderKey);
+        if (expandedFolders.has(folderKey)) collapseFolder(folderKey);
+        else expandFolder(folderKey);
         void render();
       });
     }

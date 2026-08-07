@@ -10,6 +10,7 @@ import { navigate } from '../router';
 import { setTheme } from '../api';
 import { applyTheme, currentTheme, onThemeChange } from '../theme';
 import { toast } from '../ui';
+import { wbLifecycle } from '../pages/workbench/lifecycle';
 
 export type TopbarPage = 'welcome' | 'settings' | null;
 
@@ -47,6 +48,17 @@ export function renderTopbar(root: HTMLElement, activePage: TopbarPage): HTMLEle
   if (activePage) {
     const btn = bar.querySelector(`[data-nav=${activePage}]`);
     if (btn) btn.classList.remove('ghost');
+  }
+
+  /* 「返回工作台」箭头:仅 welcome/settings 且工作台有保活项目时出现(见 lifecycle.ts);
+     点击经路由复用保活实例,标签页全部保留 */
+  if (activePage && wbLifecycle.projectId) {
+    const back = document.createElement('button');
+    back.className = 'icon-btn tb-back';
+    back.title = '返回工作台';
+    back.innerHTML = icon('arrowLeft');
+    back.onclick = () => navigate(`#/workbench?project=${wbLifecycle.projectId}`);
+    bar.prepend(back);
   }
 
   /* 主题快捷切换:立即生效(含终端/编辑器联动),后台持久化;失败回滚 */

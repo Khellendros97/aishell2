@@ -1,15 +1,16 @@
 /**
  * AI 助手面板 —— 照 .proto/workbench-ai.js 移植全部交互，mock 回复换成 pi 子进程流式事件
- * （ai:event:<key> 订阅，见 src/api.ts）。挂载时设置 Workbench.ai = { addSnapshot, addFileRef, addServerRef }，
+ * （ai:event:<key> 订阅，见 src/api.ts）。挂载时设置 Workbench.ai = { addSnapshot, addFileRef, addServerRef, addPathRef }，
  * 容器被移除时置 null 并 aiKillProject 清理该项目的 pi 进程。
- * 输入区 chip 三类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端引用
- * @remote:服务器名称 / @local（发送时展开为说明文本拼进 prompt）；Settings.autoSwitchAiWorkdir
+ * 输入区 chip 四类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端引用
+ * @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名（发送时展开为说明文本拼进 prompt）；
+ * Settings.autoSwitchAiWorkdir
  * 开启时输入区固定显示工作区域标签，随激活终端自动切换并作为当前目标上下文带入。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, LlmConfig, Project, Server, ServerRef, TermSnapshot } from '../../types';
+import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
 import {
   aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiSetThinking, getState, onAiEvent, saveSettings,
@@ -302,6 +303,7 @@ const expandedGroups = new Set<string>();
 const snapshots = new Map<string, TermSnapshot>(); // 快照 id -> 全文（输入区 chip + 历史消息 chip 共用）
 const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编辑器选区，@文件名_起_止 标签）
 const serverRefs = new Map<string, ServerRef>(); // 服务器/本地引用 key -> 引用（key = serverId ?? 'local'，@remote:名称 / @local 标签）
+const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -> 引用（@file:文件名 / @path:目录名 标签）
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
 /** 当前 AI 工作区域（默认本地；随激活终端自动切换） */
@@ -386,6 +388,7 @@ export function mountAiPanel(container: HTMLElement): void {
   snapshots.clear();
   fileRefs.clear();
   serverRefs.clear();
+  pathRefs.clear();
   autoSwitchAiWorkdir = false;
   workareaRef = null;
   workareaChipEl = null;
@@ -469,7 +472,7 @@ function cleanup(): void {
   if (project) void aiKillProject(project.id).catch(() => { /* 进程清理失败可忽略 */ });
 }
 
-/* ---------- Workbench.ai 句柄（终端模块添加快照 / 服务器引用） ---------- */
+/* ---------- Workbench.ai 句柄（终端模块添加快照 / 服务器引用 / 路径引用） ---------- */
 const aiHandle = {
   addSnapshot(snap: TermSnapshot): void {
     if (!snap || !snap.id) return;
@@ -495,6 +498,16 @@ const aiHandle = {
     }
     serverRefs.set(key, ref);
     addServerRefChip(ref);
+  },
+  /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容）；重复添加时提示 */
+  addPathRef(ref: PathRef): void {
+    if (!ref || typeof ref.path !== 'string' || !ref.path.trim()) return;
+    if (pathRefs.has(ref.path)) {
+      toast('该引用已在输入框中');
+      return;
+    }
+    pathRefs.set(ref.path, ref);
+    addPathRefChip(ref);
   },
 };
 
@@ -695,6 +708,7 @@ function finalize(sid: string): void {
     snapshots: [],
     fileRefs: [],
     serverRefs: [],
+    pathRefs: [],
     actions: collectActions(p),
     ts: Date.now(),
   });
@@ -714,6 +728,7 @@ function leaveSession(sid: string): void {
         snapshots: [],
         fileRefs: [],
         serverRefs: [],
+        pathRefs: [],
         actions: collectActions(p),
         ts: Date.now(),
       });
@@ -829,6 +844,11 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
         const key = serverRefKey(r);
         const label = r.serverId ? `@remote:${r.name}` : '@local';
         return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(key)}" data-kind="server" title="${r.serverId ? `引用服务器「${r.name}」` : '引用本地终端'}">${escapeHtml(label)}</span>`;
+      }),
+      ...(m.pathRefs ?? []).map((r) => {
+        const name = r.path.split('/').filter(Boolean).pop() || r.path;
+        const label = r.isDir ? `@path:${name}` : `@file:${name}`;
+        return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(r.path)}" data-kind="path" title="引用路径">${escapeHtml(label)}</span>`;
       }),
     ].join('');
     wrap.innerHTML =
@@ -1078,6 +1098,19 @@ function addServerRefChip(ref: ServerRef): void {
   chipRow.appendChild(c);
 }
 
+/** 文件/目录路径引用 chip：标签只用路径最后一段（@file:文件名 / @path:目录名），title 带完整路径 */
+function addPathRefChip(ref: PathRef): void {
+  const name = ref.path.split('/').filter(Boolean).pop() || ref.path;
+  const label = ref.isDir ? `@path:${name}` : `@file:${name}`;
+  const c = document.createElement('span');
+  c.className = 'tag blue ai-snap-chip';
+  c.dataset.id = ref.path;
+  c.dataset.kind = 'path';
+  c.title = `${ref.path}，✕ 移除`;
+  c.innerHTML = `${escapeHtml(label)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
+  chipRow.appendChild(c);
+}
+
 const clearChips = (): void => {
   chipRow.innerHTML = '';
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
@@ -1145,10 +1178,11 @@ function onChipRowClick(e: MouseEvent): void {
   if (chip.dataset.kind === 'workarea') return; // 固定工作区域标签不可移除
   if (target.closest('.ai-chip-x')) {
     if (chip.dataset.kind === 'server') serverRefs.delete(chip.dataset.id ?? '');
+    else if (chip.dataset.kind === 'path') pathRefs.delete(chip.dataset.id ?? '');
     chip.remove();
     return;
   }
-  if (chip.dataset.kind === 'server') return; // 服务器引用无详情弹窗
+  if (chip.dataset.kind === 'server' || chip.dataset.kind === 'path') return; // 服务器/路径引用无详情弹窗
   if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(chip.dataset.id ?? ''));
   else openSnapModal(snapshots.get(chip.dataset.id ?? ''));
 }
@@ -1237,6 +1271,7 @@ async function send(): Promise<void> {
   const snaps: TermSnapshot[] = [];
   const refs: FileRef[] = [];
   const srefs: ServerRef[] = [];
+  const prefs: PathRef[] = [];
   // 固定工作区域引用最先（开启自动切换时）；发送时作为当前目标上下文说明
   if (autoSwitchAiWorkdir && workareaRef) srefs.push(workareaRef);
   chipRow.querySelectorAll('.ai-snap-chip').forEach((c) => {
@@ -1252,14 +1287,17 @@ async function send(): Promise<void> {
     } else if (kind === 'server') {
       const r = serverRefs.get(id);
       if (r) srefs.push(r);
+    } else if (kind === 'path') {
+      const p = pathRefs.get(id);
+      if (p) prefs.push(p);
     }
   });
-  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0) return;
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0) return;
 
   // 首条用户消息决定会话标题
-  if (s.messages.length === 0) s.title = text.slice(0, 20) || (srefs.length ? '引用' : '文件引用');
+  if (s.messages.length === 0) s.title = text.slice(0, 20) || (srefs.length || prefs.length ? '引用' : '文件引用');
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, actions: [], ts: Date.now() });
   input.value = '';
   autoGrow();
   clearChips();
@@ -1269,8 +1307,8 @@ async function send(): Promise<void> {
   updateSendBtn();
   persistSession(s);
 
-  // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器引用说明（UI 气泡只显示 chip）
-  const prompt = await buildPrompt(text, snaps, refs, srefs);
+  // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器/路径引用说明（UI 气泡只显示 chip）
+  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs);
   aiChat(`${project.id}:${sid}`, prompt).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
     console.error('[AI] ai_chat 失败:', err);
@@ -1283,11 +1321,12 @@ async function send(): Promise<void> {
 }
 
 /**
- * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器引用说明。
+ * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器/路径引用说明。
  * 固定工作区域（开启自动切换时 srefs[0]）作为「当前工作区域」上下文说明，
- * 远程引用附 user@host:port 便于 AI 选择命令目标（后端 run_command 的 target 由 AI 工具参数决定）。
+ * 远程引用附 user@host:port 便于 AI 选择命令目标（后端 run_command 的 target 由 AI 工具参数决定）；
+ * 路径引用只带完整路径不带文件内容。
  */
-async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[]): Promise<string> {
+async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[]): Promise<string> {
   let servers: Server[] = [];
   try {
     servers = (await getState()).servers;
@@ -1323,6 +1362,7 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
   return text
     + snaps.map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`).join('')
     + refs.map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`).join('')
+    + prefs.map((p) => `\n\n[${p.isDir ? '引用目录' : '引用文件'}: ${p.path}]`).join('')
     + refText;
 }
 

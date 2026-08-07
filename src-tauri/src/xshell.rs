@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use crate::store::{AuthType, Server, Store, XshellImportResult};
+use crate::store::{AuthType, ScannedSession, Server, Store, XshellImportResult};
 
 // ---------------------------------------------------------------- 解码
 
@@ -207,8 +207,9 @@ fn safe_user_key_name(user_key: &str) -> Option<String> {
 
 /// 解析单个 .xsh（rel 为相对 Sessions 目录的路径，用于生成名称与稳定 ID）：
 /// 只导入 Protocol=SSH 且 Host 非空、Port 1..65535 的会话；其余返回 None（计 skipped）。
-/// 返回 (Server, 是否需要用户处理)。
-fn parse_session_file(path: &Path, rel: &Path, user_keys_dir: &Path) -> Option<(Server, bool)> {
+/// 返回 (ScannedSession, 是否需要用户处理)；所属目录随 ScannedSession.folder 携带，
+/// 服务器本身不再存目录（目录只用于导入时按目录自动建项目）。
+fn parse_session_file(path: &Path, rel: &Path, user_keys_dir: &Path) -> Option<(ScannedSession, bool)> {
     let bytes = fs::read(path).ok()?;
     let text = decode_xsh(&bytes)?;
     let fields = parse_xsh(&text);
@@ -251,13 +252,13 @@ fn parse_session_file(path: &Path, rel: &Path, user_keys_dir: &Path) -> Option<(
         auth_type,
         username: fields.username.unwrap_or_default(),
         key_path,
-        // 所属目录：会话文件相对 Sessions 根目录的父目录（'/' 连接）；根目录下为空串（未分类）
-        folder: rel_folder(rel),
         // 新导入服务器默认未锁定（锁定是用户显式行为）
         locked: false,
     };
     let needs = session_needs_attention(&server, user_key, user_keys_dir);
-    Some((server, needs))
+    // 所属目录：会话文件相对 Sessions 根目录的父目录（'/' 连接）；根目录下为空串（未分类）
+    let folder = rel_folder(rel);
+    Some((ScannedSession { server, folder }, needs))
 }
 
 /// 判定会话是否需要用户后续处理（每会话最多计一次）：
@@ -293,8 +294,8 @@ fn session_needs_attention(sv: &Server, user_key: &str, user_keys_dir: &Path) ->
 
 // ---------------------------------------------------------------- 目录扫描
 
-/// 扫描单个 Sessions 目录（递归含子分组），返回 (服务器列表, 需处理数, 跳过数)。
-fn scan_sessions_dir(sessions_dir: &Path) -> (Vec<Server>, usize, usize) {
+/// 扫描单个 Sessions 目录（递归含子分组），返回 (扫描产物列表, 需处理数, 跳过数)。
+fn scan_sessions_dir(sessions_dir: &Path) -> (Vec<ScannedSession>, usize, usize) {
     // 密钥目录：<版本>/SECSH/UserKeys（与 Sessions 所在版本目录同级）
     let user_keys_dir = sessions_dir
         .parent()
@@ -304,22 +305,22 @@ fn scan_sessions_dir(sessions_dir: &Path) -> (Vec<Server>, usize, usize) {
     let mut files = Vec::new();
     collect_xsh_files(sessions_dir, &mut files);
     files.sort();
-    let mut servers = Vec::with_capacity(files.len());
+    let mut sessions = Vec::with_capacity(files.len());
     let mut attention = 0usize;
     let mut skipped = 0usize;
     for f in &files {
         let rel = f.strip_prefix(sessions_dir).unwrap_or(f);
         match parse_session_file(f, rel, &user_keys_dir) {
-            Some((server, needs)) => {
+            Some((scan, needs)) => {
                 if needs {
                     attention += 1;
                 }
-                servers.push(server);
+                sessions.push(scan);
             }
             None => skipped += 1,
         }
     }
-    (servers, attention, skipped)
+    (sessions, attention, skipped)
 }
 
 /// 目录名中的版本号（第一个数字串）；没有数字按 0。
@@ -357,8 +358,8 @@ fn collect_version_candidates(root: &Path) -> Vec<(u64, String, PathBuf)> {
 
 /// 扫描给定根目录列表：跨所有根**全局**只选版本号最高的一个版本目录
 /// （避免 Documents 与 OneDrive 并存时重复导入；版本并列按目录名、路径排序确定），
-/// 返回 (服务器列表, 需处理数, 跳过数)。无任何可用会话目录时返回中文可执行错误。
-fn scan_roots(roots: &[PathBuf]) -> Result<(Vec<Server>, usize, usize), String> {
+/// 返回 (扫描产物列表, 需处理数, 跳过数)。无任何可用会话目录时返回中文可执行错误。
+fn scan_roots(roots: &[PathBuf]) -> Result<(Vec<ScannedSession>, usize, usize), String> {
     let mut candidates: Vec<(u64, String, PathBuf)> = Vec::new();
     for root in roots {
         candidates.extend(collect_version_candidates(root));
@@ -392,7 +393,7 @@ fn xshell_roots() -> Vec<PathBuf> {
 }
 
 /// 扫描本机所有候选根目录。
-fn scan_all() -> Result<(Vec<Server>, usize, usize), String> {
+fn scan_all() -> Result<(Vec<ScannedSession>, usize, usize), String> {
     scan_roots(&xshell_roots())
 }
 
@@ -405,7 +406,7 @@ fn scan_all() -> Result<(Vec<Server>, usize, usize), String> {
 ///   4. dir 是 NetSarang Computer 根（其直接子目录为版本目录），取版本号最高者。
 ///
 /// 全部未命中时返回中文可执行错误（说明应选择哪个目录）。
-fn scan_from_dir(dir: &Path) -> Result<(Vec<Server>, usize, usize), String> {
+fn scan_from_dir(dir: &Path) -> Result<(Vec<ScannedSession>, usize, usize), String> {
     let is_sessions_dir = |p: &Path| {
         p.file_name()
             .map(|n| n.to_string_lossy().eq_ignore_ascii_case("Sessions"))
@@ -441,8 +442,8 @@ fn scan_from_dir(dir: &Path) -> Result<(Vec<Server>, usize, usize), String> {
 pub async fn import_xshell_sessions(
     store: State<'_, Arc<Store>>,
 ) -> Result<XshellImportResult, String> {
-    let (servers, attention, skipped) = scan_all()?;
-    let mut result = store.merge_xshell_servers(&servers)?;
+    let (sessions, attention, skipped) = scan_all()?;
+    let mut result = store.merge_xshell_servers(&sessions)?;
     result.needs_attention = attention;
     result.skipped = skipped;
     Ok(result)
@@ -457,8 +458,8 @@ pub async fn import_xshell_from_dir(
     if dir.trim().is_empty() {
         return Err("未选择目录".to_string());
     }
-    let (servers, attention, skipped) = scan_from_dir(Path::new(dir.trim()))?;
-    let mut result = store.merge_xshell_servers(&servers)?;
+    let (sessions, attention, skipped) = scan_from_dir(Path::new(dir.trim()))?;
+    let mut result = store.merge_xshell_servers(&sessions)?;
     result.needs_attention = attention;
     result.skipped = skipped;
     Ok(result)
@@ -595,8 +596,8 @@ mod tests {
             "[CONNECTION]\nHost=4.4.4.4\nPort=22\nProtocol=SSH\n",
         )
         .unwrap();
-        let (servers, attention, skipped) = scan_sessions_dir(&sessions);
-        assert!(servers.is_empty());
+        let (scanned, attention, skipped) = scan_sessions_dir(&sessions);
+        assert!(scanned.is_empty());
         assert_eq!(attention, 0);
         assert_eq!(skipped, 5);
     }
@@ -628,22 +629,28 @@ mod tests {
         // 同一会话命中多种问题也只计一次（用户名空 + 密钥缺失）
         fs::write(sessions.join("multi.xsh"), "[CONNECTION]\nHost=6.6.6.6\nPort=22\nProtocol=SSH\n[CONNECTION:AUTHENTICATION]\nUserKey=nonexistent\n").unwrap();
 
-        let (servers, attention, skipped) = scan_sessions_dir(&sessions);
+        let (scanned, attention, skipped) = scan_sessions_dir(&sessions);
         assert_eq!(skipped, 0);
-        assert_eq!(servers.len(), 6);
+        assert_eq!(scanned.len(), 6);
         assert_eq!(
             attention, 5,
             "pw、nouser、missing-key、nsssh-key、multi 各计一次"
         );
         assert_eq!(
-            servers.iter().find(|s| s.name == "pw").unwrap().auth_type,
+            scanned
+                .iter()
+                .find(|s| s.server.name == "pw")
+                .unwrap()
+                .server
+                .auth_type,
             AuthType::Password
         );
         assert_eq!(
-            servers
+            scanned
                 .iter()
-                .find(|s| s.name == "good-key")
+                .find(|s| s.server.name == "good-key")
                 .unwrap()
+                .server
                 .auth_type,
             AuthType::Key
         );
@@ -666,15 +673,15 @@ mod tests {
         fs::write(sessions.join("dotdot.xsh"), "[CONNECTION]\nHost=1.1.1.1\nPort=22\nProtocol=SSH\n[CONNECTION:AUTHENTICATION]\nUserName=root\nUserKey=..\\evil\n").unwrap();
         fs::write(sessions.join("slash.xsh"), "[CONNECTION]\nHost=2.2.2.2\nPort=22\nProtocol=SSH\n[CONNECTION:AUTHENTICATION]\nUserName=root\nUserKey=sub\\key\n").unwrap();
         fs::write(sessions.join("dots.xsh"), "[CONNECTION]\nHost=3.3.3.3\nPort=22\nProtocol=SSH\n[CONNECTION:AUTHENTICATION]\nUserName=root\nUserKey=a..b\n").unwrap();
-        let (servers, attention, skipped) = scan_sessions_dir(&sessions);
+        let (scanned, attention, skipped) = scan_sessions_dir(&sessions);
         assert_eq!(skipped, 0);
-        assert_eq!(servers.len(), 3, "穿越 UserKey 的会话仍应导入");
-        for s in &servers {
-            assert_eq!(s.auth_type, AuthType::Key);
+        assert_eq!(scanned.len(), 3, "穿越 UserKey 的会话仍应导入");
+        for s in &scanned {
+            assert_eq!(s.server.auth_type, AuthType::Key);
             assert!(
-                s.key_path.is_empty(),
+                s.server.key_path.is_empty(),
                 "keyPath 必须留安全空值: {}",
-                s.key_path
+                s.server.key_path
             );
         }
         assert_eq!(attention, 3, "无法定位密钥需计 needsAttention");
@@ -709,10 +716,10 @@ mod tests {
         )
         .unwrap();
 
-        let (servers, _a, _s) = scan_roots(&[root1.clone(), root2.clone()]).unwrap();
-        assert_eq!(servers.len(), 1, "跨根只应扫一个最高版本目录");
-        assert_eq!(servers[0].name, "newest");
-        assert_eq!(servers[0].host, "9.9.9.9");
+        let (scanned, _a, _s) = scan_roots(&[root1.clone(), root2.clone()]).unwrap();
+        assert_eq!(scanned.len(), 1, "跨根只应扫一个最高版本目录");
+        assert_eq!(scanned[0].server.name, "newest");
+        assert_eq!(scanned[0].server.host, "9.9.9.9");
     }
 
     #[test]
@@ -771,36 +778,55 @@ mod tests {
         )
         .unwrap();
 
-        let (servers, attention, skipped) = scan_roots(&[root.join("NetSarang Computer")]).unwrap();
-        assert_eq!(servers.len(), 2);
+        let (scanned, attention, skipped) =
+            scan_roots(&[root.join("NetSarang Computer")]).unwrap();
+        assert_eq!(scanned.len(), 2);
         assert_eq!(attention, 1); // web-01 是密码认证
         assert_eq!(skipped, 3);
 
-        // 嵌套会话保留分组名称、ID 稳定且为 16 位小写 hex
-        let web01 = servers.iter().find(|s| s.name == "prod/web-01").unwrap();
-        assert_eq!(web01.host, "47.102.118.66");
-        assert_eq!(web01.port, 22);
-        assert_eq!(web01.auth_type, AuthType::Password);
-        assert!(web01.key_path.is_empty());
-        assert!(web01.id.starts_with("xshell-") && web01.id.len() == 23);
+        // 嵌套会话保留分组名称、ID 稳定且为 16 位小写 hex；目录随 ScannedSession.folder 携带
+        let web01 = scanned
+            .iter()
+            .find(|s| s.server.name == "prod/web-01")
+            .unwrap();
+        assert_eq!(web01.folder, "prod");
+        assert_eq!(web01.server.host, "47.102.118.66");
+        assert_eq!(web01.server.port, 22);
+        assert_eq!(web01.server.auth_type, AuthType::Password);
+        assert!(web01.server.key_path.is_empty());
+        assert!(
+            web01.server.id.starts_with("xshell-") && web01.server.id.len() == 23
+        );
 
-        let web02 = servers.iter().find(|s| s.name == "prod/web-02").unwrap();
-        assert_eq!(web02.auth_type, AuthType::Key);
+        let web02 = scanned
+            .iter()
+            .find(|s| s.server.name == "prod/web-02")
+            .unwrap();
+        assert_eq!(web02.folder, "prod");
+        assert_eq!(web02.server.auth_type, AuthType::Key);
         assert_eq!(
-            web02.key_path,
+            web02.server.key_path,
             user_keys.join("mykey.pri").to_string_lossy().into_owned()
         );
 
-        // 合并进测试 Store（内存密钥，绝不触碰真实 keyring）
+        // 合并进测试 Store（内存密钥，绝不触碰真实 keyring）：按目录自动建项目
         let store = test_store(temp_dir("e2e-store"));
-        let r = store.merge_xshell_servers(&servers).unwrap();
+        let r = store.merge_xshell_servers(&scanned).unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (2, 0, 0));
-        // 重复导入幂等：全部 unchanged
-        let r = store.merge_xshell_servers(&servers).unwrap();
+        assert_eq!(r.projects_created, 1, "目录 prod 应自动新建项目");
+        // 重复导入幂等：全部 unchanged，不重复建项目
+        let r = store.merge_xshell_servers(&scanned).unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
+        assert_eq!(r.projects_created, 0, "重复导入不重复建项目");
         // 内存状态可通过生产只读 API 查询，避免测试跨模块触碰 Store 私有字段
-        assert_eq!(store.server(&web01.id), Some(web01.clone()));
-        assert_eq!(store.server(&web02.id), Some(web02.clone()));
+        assert_eq!(
+            store.server(&web01.server.id),
+            Some(web01.server.clone())
+        );
+        assert_eq!(
+            store.server(&web02.server.id),
+            Some(web02.server.clone())
+        );
     }
 
     #[test]
@@ -824,14 +850,14 @@ mod tests {
         .unwrap();
 
         // 选到 Sessions 目录本身
-        let (servers, _, _) = scan_from_dir(&sessions).unwrap();
-        assert_eq!(servers.len(), 2);
+        let (scanned, _, _) = scan_from_dir(&sessions).unwrap();
+        assert_eq!(scanned.len(), 2);
         // 选到版本目录（...\Xshell 7）
-        let (servers, _, _) = scan_from_dir(sessions.parent().unwrap().parent().unwrap()).unwrap();
-        assert_eq!(servers.len(), 2);
+        let (scanned, _, _) = scan_from_dir(sessions.parent().unwrap().parent().unwrap()).unwrap();
+        assert_eq!(scanned.len(), 2);
         // 选到 NetSarang Computer 根（版本目录是其直接子目录）
-        let (servers, _, _) = scan_from_dir(&root.join("NetSarang Computer")).unwrap();
-        assert_eq!(servers.len(), 2);
+        let (scanned, _, _) = scan_from_dir(&root.join("NetSarang Computer")).unwrap();
+        assert_eq!(scanned.len(), 2);
         // 选到完全无关的目录 → 可执行错误
         let err = scan_from_dir(&root).unwrap_err();
         assert!(err.contains("未找到 Xshell 会话目录"), "{err}");
@@ -848,8 +874,8 @@ mod tests {
             "[CONNECTION]\nHost=3.3.3.3\nPort=22\nProtocol=SSH\n",
         )
         .unwrap();
-        let (servers, _, _) = scan_from_dir(&root).unwrap();
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].host, "3.3.3.3");
+        let (scanned, _, _) = scan_from_dir(&root).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].server.host, "3.3.3.3");
     }
 }

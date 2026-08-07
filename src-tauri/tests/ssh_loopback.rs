@@ -133,7 +133,8 @@ impl russh::server::Handler for EchoSession {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         // 模拟常见命令输出：`printf <text>` → stdout 为 <text>；其余命令原样回显命令串；
-        // stderr 恒空，退出码恒 0。SSH 惯例：data → exit-status → eof → close
+        // stderr 恒空，退出码恒 0。消息序照真实 OpenSSH 实测：data → eof → exit-status → close
+        // （与直觉相反：eof 先于退出码；客户端若在 eof 处中断读取将永远拿不到退出码）
         session.channel_success(channel)?;
         let cmd = String::from_utf8_lossy(data);
         let out: Vec<u8> = match cmd.strip_prefix("printf ") {
@@ -143,8 +144,8 @@ impl russh::server::Handler for EchoSession {
         if !out.is_empty() {
             session.data(channel, out)?;
         }
-        session.exit_status_request(channel, 0)?;
         session.eof(channel)?;
+        session.exit_status_request(channel, 0)?;
         session.close(channel)?;
         Ok(())
     }
@@ -192,7 +193,6 @@ async fn shell_echo_roundtrip() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: false,
-            folder: String::new(),
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -279,7 +279,6 @@ async fn remote_exec_roundtrip() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: false,
-            folder: String::new(),
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -345,7 +344,6 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: true,
-            folder: String::new(),
         };
         store
             .upsert_server(server.clone(), None)
@@ -370,6 +368,7 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
                 path: Some(project_dir.to_string_lossy().into_owned()),
                 server_ids: vec!["s-lock".to_string()],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: aishell_lib::store::AiMode::Yolo,
             })
             .expect("登记项目应成功");

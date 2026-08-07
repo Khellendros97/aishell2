@@ -1,15 +1,13 @@
 /**
  * 服务器表单（新建 / 编辑共用）—— 欢迎页「快捷新建服务器」与工作台侧栏「新建 / 编辑服务器」复用同一份字段、校验与构造逻辑。
  * 对照 .proto/welcome.js（mini 新建表单）与 .proto/workbench-sidebar.js（服务器列表新建模态框）；后端接口 upsert_server（见 src/api.ts）。
- * 字段与 src/types.ts Server 逐字段对齐（serde camelCase：authType / keyPath / folder / locked）。
+ * 字段与 src/types.ts Server 逐字段对齐（serde camelCase：authType / keyPath / locked）。
  * 安全约定：密码 / 密钥永不回传前端 —— 编辑时密码留空 = 提交 null（keyring 保持原值），也绝不写入 aishell.json。
  */
 import type { Server } from '../types';
-import { attachCombo, uid } from '../ui';
+import { uid } from '../ui';
 
 export interface ServerFormOptions {
-  /** 所属目录组合框候选（由调用方从其数据源提供，如 serverFolders ∪ 各服务器 folder 派生值）；缺省 = 无候选仅手输 */
-  folderOptions?: () => string[];
   /** 双列紧凑布局（欢迎页内联区）；缺省单列（侧栏模态框） */
   compact?: boolean;
 }
@@ -19,7 +17,7 @@ export interface ServerFormHandle {
   fill(server: Server | null): void;
   /** 校验：通过返回 null，否则返回中文错误文案并把问题字段标红（输入即清除） */
   validate(): string | null;
-  /** 由表单当前值构造 Server：id / locked 取自 editing（新建生成新 id、locked=false），folder 规范化 '/' 路径 */
+  /** 由表单当前值构造 Server：id / locked 取自 editing（新建生成新 id、locked=false） */
   buildServer(editing: Server | null): Server;
   /** 密码字段：认证方式为密码且已输入时返回原文，否则 null（新建不保存 / 编辑保持原值） */
   passwordValue(): string | null;
@@ -63,11 +61,6 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
         <label>密钥文件路径</label>
         <input id="${p}-keypath" class="input mono" placeholder="C:\\Users\\demo\\.ssh\\id_ed25519">
       </div>
-      <div class="field">
-        <label>所属目录</label>
-        <input id="${p}-folder" class="input" placeholder="可输入新分类或从下拉选择，例如：生产环境/Web">
-        <div class="hint">以 / 分隔的目录路径，用于侧栏分组展示；可下拉选择已有分类，也可直接输入新分类；留空表示未分类</div>
-      </div>
     </div>`;
 
   const q = <T extends HTMLElement>(id: string) => container.querySelector<T>(`#${p}-${id}`)!;
@@ -78,7 +71,6 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
   const fUsername = q<HTMLInputElement>('username');
   const fPassword = q<HTMLInputElement>('password');
   const fKeyPath = q<HTMLInputElement>('keypath');
-  const fFolder = q<HTMLInputElement>('folder');
 
   /** 认证方式切换：仅显示对应密码 / 密钥路径字段（同侧栏原模态框 data-auth 约定） */
   function syncAuthFields(): void {
@@ -93,11 +85,9 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
   const markInvalid = (el: HTMLInputElement, bad: boolean): void => {
     el.classList.toggle('invalid', bad);
   };
-  [fName, fHost, fPort, fUsername, fKeyPath, fFolder].forEach((el) => {
+  [fName, fHost, fPort, fUsername, fKeyPath].forEach((el) => {
     el.addEventListener('input', () => markInvalid(el, false));
   });
-
-  if (opts.folderOptions) attachCombo(fFolder, opts.folderOptions);
 
   return {
     fill(server: Server | null): void {
@@ -108,9 +98,8 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
       fUsername.value = server?.username ?? '';
       fPassword.value = ''; // 密码 / 密钥永不回显：编辑时留空 = 保持 keyring 原值
       fKeyPath.value = server?.keyPath ?? '';
-      fFolder.value = server?.folder ?? '';
       syncAuthFields();
-      [fName, fHost, fPort, fUsername, fKeyPath, fFolder].forEach((el) => markInvalid(el, false));
+      [fName, fHost, fPort, fUsername, fKeyPath].forEach((el) => markInvalid(el, false));
     },
     validate(): string | null {
       const name = fName.value.trim();
@@ -135,8 +124,6 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
         authType,
         username: fUsername.value.trim(),
         keyPath: authType === 'key' ? fKeyPath.value.trim() : '',
-        // 所属目录：规范化 '/' 分隔路径（去首尾/重复分隔符），留空 = 未分类
-        folder: fFolder.value.trim().split('/').filter(Boolean).join('/'),
         locked: editing?.locked ?? false,
       };
     },

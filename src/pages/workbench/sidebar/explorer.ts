@@ -9,7 +9,7 @@ import { bus, getActiveTab, getTabs, openTab, Workbench } from '../core';
 import { confirmDialog, copyText, showContextMenu, toast, type CtxItem } from '../../../ui';
 import {
   fsCopy, fsCreate, fsDelete, fsImport, fsList, fsMove, fsReveal, fsStat,
-  sftpDelete, sftpDownload, sftpUpload,
+  getState, setUiExpanded, sftpDelete, sftpDownload, sftpUpload,
 } from '../../../api';
 import { clearClip, getClip, setClip } from '../clipboard';
 import type { FsEntry, FsStat } from '../../../types';
@@ -67,10 +67,83 @@ let rootNode: TreeNode | null = null;
 /** 单击聚焦的当前行路径（快捷键操作目标；渲染时行加 .sel） */
 let selectedPath: string | null = null;
 const expanded = new Set<string>();
+/** 本次会话已从后端恢复过展开状态的项目 id（每项目只播种一次，避免重复覆盖用户操作） */
+const seededProjects = new Set<string>();
+/** 播种 await 期间用户手动改动过的路径（种子跳过，不覆盖用户在等待期间的点击） */
+let seedGuard: Set<string> | null = null;
+/** 展开状态防抖落盘定时器（300ms 合并连续 toggle） */
+let persistTimer: number | null = null;
 /** 全局加载序号：异步结果只接受最新一次（防止乱序渲染） */
 let loadSeq = 0;
 /** 拖拽中的本地节点（dragover 据此决定 move/copy 光标；守卫在 moveNode 内） */
 let draggingNode: TreeNode | null = null;
+
+/* ---------- 展开状态持久化（落盘 uiExpanded['explorer:<projectId>']，key 语义见 types.ts） ---------- */
+/**
+ * 300ms 防抖把当前展开集合写入后端；key 与快照都在触发时刻取，切项目不会串写。
+ * 尚未播种完的项目不落盘（getRoot 重建/首帧的临时状态会覆盖其历史展开状态）：
+ * 未播种过或播种 await 仍在途（seedGuard 非空）都跳过；失败仅 console.warn 不打扰用户。
+ */
+function persistExpanded(): void {
+  if (persistTimer !== null) window.clearTimeout(persistTimer);
+  persistTimer = window.setTimeout(() => {
+    persistTimer = null;
+    const pid = Workbench.state.project?.id;
+    if (!pid || !seededProjects.has(pid) || seedGuard !== null) return;
+    setUiExpanded(`explorer:${pid}`, [...expanded]).catch((err) =>
+      console.warn('保存目录展开状态失败:', err));
+  }, 300);
+}
+
+/** 展开目录（用户显式操作或操作后保证可见）；改动即防抖落盘 */
+function expand(path: string): void {
+  expanded.add(path);
+  seedGuard?.add(path);
+  persistExpanded();
+}
+
+/** 折叠目录（用户显式操作 / 加载失败清理）；改动即防抖落盘 */
+function collapse(path: string): void {
+  expanded.delete(path);
+  seedGuard?.add(path);
+  persistExpanded();
+}
+
+/** 清空展开集合（项目切换重建根时用）；未播种过的项目不落盘 */
+function clearExpanded(): void {
+  expanded.clear();
+  persistExpanded();
+}
+
+/**
+ * 恢复当前项目上次会话的展开状态；每项目每会话仅播种一次。
+ * 播种 await 期间用户改动过的路径不覆盖（seedGuard）；await 期间切了项目则整次作废。
+ */
+async function seedExpanded(): Promise<void> {
+  const pid = Workbench.state.project?.id;
+  if (!pid || seededProjects.has(pid)) return;
+  seededProjects.add(pid);
+  const key = `explorer:${pid}`;
+  const guard = new Set<string>();
+  seedGuard = guard;
+  let saved: string[] = [];
+  try {
+    saved = (await getState()).uiExpanded?.[key] ?? [];
+  } catch (err) {
+    console.warn('恢复目录展开状态失败:', err);
+  }
+  seedGuard = null;
+  if (Workbench.state.project?.id !== pid) return; // await 期间切了项目，本次作废
+  let changed = false;
+  for (const p of saved) {
+    if (guard.has(p) || expanded.has(p)) continue;
+    expanded.add(p);
+    changed = true;
+  }
+  // await 期间用户动过展开状态：播种完成后补一次合并落盘（期间被 persist 门禁拦下的改动）
+  if (guard.size > 0) persistExpanded();
+  if (changed) render();
+}
 
 const joinPath = (parent: string, name: string): string => `${parent}/${name}`;
 const normPath = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -81,8 +154,8 @@ function getRoot(): TreeNode | null {
   const path = normPath(raw);
   if (rootNode && rootNode.path === path) return rootNode;
   rootNode = { name: path, path, isDir: true, parent: null, children: null, loading: false };
-  expanded.clear();
-  expanded.add(path);
+  clearExpanded();
+  expand(path);
   return rootNode;
 }
 
@@ -108,7 +181,7 @@ async function loadDir(node: TreeNode): Promise<void> {
   } catch (err) {
     if (token !== loadSeq) return;
     toast(String(err), 'error');
-    expanded.delete(node.path);
+    collapse(node.path);
   } finally {
     node.loading = false;
     if (token === loadSeq) render();
@@ -327,7 +400,7 @@ async function deleteNode(node: TreeNode): Promise<void> {
       const idx = parent.children.indexOf(node);
       if (idx >= 0) parent.children.splice(idx, 1);
     }
-    expanded.delete(node.path);
+    collapse(node.path);
     render();
   } catch (err) {
     toast(String(err), 'error');
@@ -338,10 +411,10 @@ async function deleteNode(node: TreeNode): Promise<void> {
 function openNode(node: TreeNode): void {
   if (node.isDir) {
     if (expanded.has(node.path)) {
-      expanded.delete(node.path);
+      collapse(node.path);
       render();
     } else {
-      expanded.add(node.path);
+      expand(node.path);
       if (node.children) render();
       else void loadDir(node);
     }
@@ -380,7 +453,7 @@ async function moveNode(srcPath: string, name: string, isDir: boolean, targetDir
   if (blockedByEditor(srcPath)) return;
   try {
     await fsMove(srcPath, joinPath(targetDir.path, name));
-    expanded.add(targetDir.path);
+    expand(targetDir.path);
     await refreshAll();
   } catch (err) {
     toast(String(err), 'error');
@@ -403,7 +476,7 @@ async function pasteInto(targetDir: TreeNode): Promise<void> {
         for (const it of clip.items) await sftpDelete(clip.serverId, it.path);
         clearClip();
       }
-      expanded.add(targetDir.path);
+      expand(targetDir.path);
       await refreshDir(targetDir);
       toast('粘贴成功', 'success');
     } catch (err) {
@@ -427,7 +500,7 @@ async function pasteInto(targetDir: TreeNode): Promise<void> {
     } else {
       for (const it of clip.items) await fsCopy(it.path, targetDir.path);
     }
-    expanded.add(targetDir.path);
+    expand(targetDir.path);
     await refreshAll();
   } catch (err) {
     toast(String(err), 'error');
@@ -581,6 +654,15 @@ async function showProperties(node: TreeNode): Promise<void> {
   requestAnimationFrame(() => mask.classList.add('open'));
 }
 
+/** 把文件/目录路径引用加入 AI 输入框（@file:文件名 / @path:目录名 标签，见 core.ts AiHandle.addPathRef）；面板未挂载时提示 */
+function addPathToChat(path: string, isDir: boolean): void {
+  if (Workbench.ai?.addPathRef) {
+    Workbench.ai.addPathRef({ path, isDir });
+  } else {
+    toast('AI 面板尚未就绪');
+  }
+}
+
 function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): void {
   const pasteTarget = node.isDir ? node : node.parent;
   /* 编辑中的文件禁止移动类操作——旧标签写盘会在旧路径重建文件,抵消操作;防线前置为禁用态 */
@@ -622,6 +704,7 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
     { label: '删除', iconName: 'trash', danger: true, action: () => void deleteNode(node) },
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(node.path).catch((err) => toast(String(err), 'error')) },
+    { label: '添加到对话', iconName: 'chatPlus', action: () => addPathToChat(node.path, node.isDir) },
     { label: '复制文件路径', iconName: 'link', action: () => { void copyText(node.path.replace(/\//g, '\\')).then(() => toast('已复制文件路径', 'success')); } },
     { label: '复制相对路径', iconName: 'link', action: () => { void copyText(relativePath(node.path)).then(() => toast('已复制相对路径', 'success')); } },
     { label: '属性', iconName: 'info', action: () => void showProperties(node) },
@@ -655,6 +738,7 @@ function showRootMenu(x: number, y: number, root: TreeNode): void {
     ...(uploadItems.length ? ['sep' as const, ...uploadItems] : []),
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(root.path).catch((err) => toast(String(err), 'error')) },
+    { label: '添加到对话', iconName: 'chatPlus', action: () => addPathToChat(root.path, true) },
     { label: '属性', iconName: 'info', action: () => void showProperties(root) },
   ]);
 }
@@ -701,9 +785,9 @@ async function createIn(parent: TreeNode, name: string, isDir: boolean): Promise
   const target = joinPath(parent.path, name);
   try {
     await fsCreate(target, isDir);
-    if (isDir) expanded.add(target);
+    if (isDir) expand(target);
     // 父目录展开（含未展开过的情况）保证新项目立即可见
-    expanded.add(parent.path);
+    expand(parent.path);
     await refreshDir(parent);
   } catch (err) {
     toast(String(err), 'error');
@@ -718,7 +802,7 @@ async function downloadTo(
   try {
     await sftpDownload(data.serverId, data.path, targetDir.path);
     toast(`已下载 ${data.name} 到 ${targetDir.path}`, 'success');
-    expanded.add(targetDir.path);
+    expand(targetDir.path);
     await refreshDir(targetDir);
   } catch (err) {
     toast(String(err), 'error');
@@ -747,13 +831,13 @@ export async function revealLocalPath(path: string): Promise<void> {
   let node = root;
   // 逐级展开父目录（每层确保 children 已加载）
   for (let i = 0; i < segs.length - 1; i++) {
-    expanded.add(node.path);
+    expand(node.path);
     await ensureChildren(node);
     const child = (node.children ?? []).find((c) => c.name === segs[i]);
     if (!child) return;
     node = child;
   }
-  expanded.add(node.path);
+  expand(node.path);
   render();
   const row = Array.from(container.querySelectorAll('.wbs-explorer-row'))
     .find((el) => el.getAttribute('title') === path);
@@ -784,7 +868,7 @@ async function importOsFiles(dt: DataTransfer, targetDir: TreeNode): Promise<voi
     for (const entry of entries) count += await importEntry(entry, targetDir.path);
     if (count > 0) {
       toast(`已导入 ${count} 个项目到 ${targetDir.path}`, 'success');
-      expanded.add(targetDir.path);
+      expand(targetDir.path);
       await refreshDir(targetDir);
     }
   } catch (err) {
@@ -1001,12 +1085,16 @@ export function mountExplorerPanel(el: HTMLElement): void {
       const path = raw ? normPath(raw) : null;
       if (path !== (rootNode?.path ?? null)) {
         rootNode = null;
-        expanded.clear();
+        clearExpanded();
       }
       if (!getRoot()) { render(); return; }
+      // 切到新项目：播种其历史展开状态（每项目每会话一次；须在 getRoot 重建之后，
+      // 否则重建期的 persist 会先于种子落盘、覆盖该项目历史展开状态）
+      void seedExpanded();
       void refreshAll();
     });
   }
   render();
+  void seedExpanded();
   startPolling();
 }

@@ -70,6 +70,15 @@ pub enum Theme {
     Light,
 }
 
+/// 欢迎页项目视图；旧配置无此字段按卡片视图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectView {
+    #[default]
+    Card,
+    List,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchConfig {
@@ -92,6 +101,9 @@ pub struct Settings {
     /// 旧配置无此字段时按关闭处理
     #[serde(default)]
     pub auto_switch_ai_workdir: bool,
+    /// 欢迎页项目视图（card/list）；旧配置无此字段按卡片视图。
+    #[serde(default)]
+    pub project_view: ProjectView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,10 +147,6 @@ pub struct Server {
     pub auth_type: AuthType,
     pub username: String,
     pub key_path: String,
-    /// 所属目录：'/' 分隔的相对路径（如 "生产环境/Web"），空串 = 未分类。
-    /// 旧配置无此字段按未分类处理；Xshell 导入时按会话文件相对 Sessions 根目录的父目录填充。
-    #[serde(default)]
-    pub folder: String,
     /// AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP；旧配置无此字段按未锁定。
     #[serde(default)]
     pub locked: bool,
@@ -158,6 +166,8 @@ pub struct XshellImportResult {
     pub skipped: usize,
     /// 本次发现、需要用户后续处理的会话数（密码认证、用户名空、密钥缺失、NSSSH 私钥等）
     pub needs_attention: usize,
+    /// 本次导入新建的项目数（按会话目录自动建项目；同名项目复用不计）
+    pub projects_created: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +194,10 @@ pub struct Project {
     pub path: Option<String>,
     pub server_ids: Vec<String>,
     pub quick_commands: Vec<QuickCommand>,
+    /// 所属目录：'/' 分隔的相对路径（如 "生产环境/Web"），空串 = 未分类。
+    /// 旧配置无此字段按未分类处理；Xshell 导入时按会话目录自动建项目，新建项目 folder 为空。
+    #[serde(default)]
+    pub folder: String,
     /// AI 助手模式（suggest/agent/yolo）；旧配置无此字段按 suggest（不扩大权限）。
     #[serde(default)]
     pub ai_mode: AiMode,
@@ -231,6 +245,14 @@ pub struct ServerRef {
     pub name: String,
 }
 
+/// 文件/目录路径引用：UI 以 @file:文件名 / @path:目录名 标签呈现，发送时只带路径不带内容。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathRef {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMsg {
@@ -243,6 +265,9 @@ pub struct ChatMsg {
     /// 服务器/本地终端引用（@remote:名称 / @local 标签）；旧会话无此字段时按空处理
     #[serde(default)]
     pub server_refs: Vec<ServerRef>,
+    /// 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub path_refs: Vec<PathRef>,
     /// AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话按空。
     #[serde(default)]
     pub actions: Vec<AiActionRecord>,
@@ -265,14 +290,27 @@ pub struct AppState {
     pub servers: Vec<Server>,
     pub projects: Vec<Project>,
     pub sessions: HashMap<String, Vec<ChatSession>>,
-    /// 服务器分类目录清单（'/' 分隔相对路径，与 Server.folder 同语义；空目录也在此）。
+    /// 项目分类目录清单（'/' 分隔相对路径，与 Project.folder 同语义；空目录也在此）。
     /// 旧配置无此字段按空列表（未分类）解析。
     #[serde(default)]
-    pub server_folders: Vec<String>,
+    pub project_folders: Vec<String>,
     /// 命令收藏分类目录清单（'/' 分隔相对路径，与 QuickCommand.folder 同语义；空目录也在此）。
     /// 旧配置无此字段按空列表（未分类）解析。
     #[serde(default)]
     pub command_folders: Vec<String>,
+    /// 各目录树展开状态：key = explorer:<projectId> | welcome:projectGroups | commands:folders，
+    /// 值为展开节点的路径（或 folder 值）数组；key 语义与 src/types.ts AppState.uiExpanded 注释一致。
+    /// 旧配置无此字段按空 map 解析。
+    #[serde(default)]
+    pub ui_expanded: HashMap<String, Vec<String>>,
+}
+
+/// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
+/// 服务器本身不再携带 folder；目录仅用于导入时按目录自动建项目。
+#[derive(Debug, Clone)]
+pub struct ScannedSession {
+    pub server: Server,
+    pub folder: String,
 }
 
 // ---------------------------------------------------------------- keyring
@@ -466,19 +504,14 @@ impl Store {
     }
 
     /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
-    /// folder 非空且不在 server_folders 时自动注册该目录（同一 with_state 内完成）。
     pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
         if let Some(pw) = password {
             self.secrets.set(&keyring_account_server(&server.id), pw)?;
         }
-        let folder = server.folder.clone();
         self.with_state(|s| {
             match s.servers.iter_mut().find(|sv| sv.id == server.id) {
                 Some(slot) => *slot = server,
                 None => s.servers.push(server),
-            }
-            if !folder.is_empty() && !s.server_folders.iter().any(|f| f == &folder) {
-                s.server_folders.push(folder);
             }
             Ok(())
         })
@@ -497,7 +530,7 @@ impl Store {
     }
 
     /// 清除全部服务器配置：先删各服务器 keyring 密钥（失败即中止、state 未动），
-    /// 再一次性清空 servers / server_folders 并让所有 projects 解绑，原子落盘。
+    /// 再一次性清空 servers 并让所有 projects 解绑，原子落盘。
     pub fn clear_all_servers(&self) -> Result<(), String> {
         let ids: Vec<String> = self.with_state(|s| Ok(s.servers.iter().map(|sv| sv.id.clone()).collect()))?;
         for id in &ids {
@@ -505,7 +538,6 @@ impl Store {
         }
         self.with_state(|s| {
             s.servers.clear();
-            s.server_folders.clear();
             for p in &mut s.projects {
                 p.server_ids.clear();
             }
@@ -522,25 +554,25 @@ impl Store {
             .join("/")
     }
 
-    /// 新建服务器分类目录：规范化名称；空串报错、重名报错；一次 with_state 原子落盘。
-    pub fn create_server_folder(&self, name: &str) -> Result<(), String> {
+    /// 新建项目分类目录：规范化名称；空串报错、重名报错；一次 with_state 原子落盘。
+    pub fn create_project_folder(&self, name: &str) -> Result<(), String> {
         let folder = Self::normalize_folder(name);
         if folder.is_empty() {
             return Err("分类目录名称不能为空".to_string());
         }
         self.with_state(|s| {
-            if s.server_folders.iter().any(|f| f == &folder) {
+            if s.project_folders.iter().any(|f| f == &folder) {
                 return Err("分类目录已存在".to_string());
             }
-            s.server_folders.push(folder);
+            s.project_folders.push(folder);
             Ok(())
         })
     }
 
-    /// 重命名服务器分类目录：级联改写所有 folder==old 的服务器（含导入/表单产生的、不在
-    /// server_folders 列表里的旧值），并同步列表（old 移除、new 不存在才追加）。
+    /// 重命名项目分类目录：级联改写所有 folder==old 的项目（含历史 JSON 里产生的、不在
+    /// project_folders 列表里的旧值），并同步列表（old 移除、new 不存在才追加）。
     /// 未分类（空串）不可重命名；new 规范化后与 old 相同视为 no-op。一次 with_state 原子落盘。
-    pub fn rename_server_folder(&self, old: &str, new: &str) -> Result<(), String> {
+    pub fn rename_project_folder(&self, old: &str, new: &str) -> Result<(), String> {
         if old.is_empty() {
             return Err("未分类目录不可重命名".to_string());
         }
@@ -552,25 +584,25 @@ impl Store {
             return Ok(());
         }
         self.with_state(|s| {
-            if s.server_folders.iter().any(|f| f == &folder) {
+            if s.project_folders.iter().any(|f| f == &folder) {
                 return Err("分类目录已存在".to_string());
             }
-            for sv in &mut s.servers {
-                if sv.folder == old {
-                    sv.folder = folder.clone();
+            for p in &mut s.projects {
+                if p.folder == old {
+                    p.folder = folder.clone();
                 }
             }
-            s.server_folders.retain(|f| f != old);
-            if !s.server_folders.iter().any(|f| f == &folder) {
-                s.server_folders.push(folder);
+            s.project_folders.retain(|f| f != old);
+            if !s.project_folders.iter().any(|f| f == &folder) {
+                s.project_folders.push(folder);
             }
             Ok(())
         })
     }
 
-    /// 删除服务器分类目录：规范化名称；未分类空串报错；目录下仍有服务器报错；
+    /// 删除项目分类目录：规范化名称；未分类空串报错；目录下仍有项目报错；
     /// 不存在视为幂等成功。一次 with_state 原子落盘。
-    pub fn delete_server_folder(&self, name: &str) -> Result<(), String> {
+    pub fn delete_project_folder(&self, name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("未分类目录不可删除".to_string());
         }
@@ -579,16 +611,16 @@ impl Store {
             return Err("分类目录名称不能为空".to_string());
         }
         self.with_state(|s| {
-            if s.servers.iter().any(|sv| sv.folder == folder) {
-                return Err(format!("分类目录「{folder}」下仍有服务器，不能删除"));
+            if s.projects.iter().any(|p| p.folder == folder) {
+                return Err(format!("分类目录「{folder}」下仍有项目，不能删除"));
             }
-            s.server_folders.retain(|f| *f != folder);
+            s.project_folders.retain(|f| *f != folder);
             Ok(())
         })
     }
 
     /// 新建命令收藏分类目录：规范化名称；空串报错、重名报错；一次 with_state 原子落盘。
-    /// 空目录也保存在 command_folders（与 server_folders 同语义）。
+    /// 空目录也保存在 command_folders（与 project_folders 同语义）。
     pub fn create_command_folder(&self, name: &str) -> Result<(), String> {
         let folder = Self::normalize_folder(name);
         if folder.is_empty() {
@@ -659,14 +691,34 @@ impl Store {
         })
     }
 
-    /// 批量合并 Xshell 导入的服务器：一次 with_state 原子持久化，不触碰 SecretStore。
-    /// ID 已存在 → 连接配置以导入为准，但**保留现有 AI 锁**（重新导入绝不能解锁）；
+    /// 写入目录树展开状态（key = explorer:<projectId> | welcome:projectGroups | commands:folders，
+    /// values 为展开节点的路径或 folder 值数组，空数组即清空该 key）。
+    /// 前端防抖后调用，仅覆盖该 key 不影响其他展开状态。一次 with_state 原子落盘。
+    pub fn set_ui_expanded(&self, key: String, values: Vec<String>) -> Result<(), String> {
+        if key.is_empty() {
+            return Err("展开状态 key 不能为空".to_string());
+        }
+        self.with_state(|s| {
+            s.ui_expanded.insert(key, values);
+            Ok(())
+        })
+    }
+
+    /// 批量合并 Xshell 导入的服务器并按其目录自动建项目：一次 with_state 原子持久化，不触碰 SecretStore。
+    /// 服务器合并语义：ID 已存在 → 连接配置以导入为准，但**保留现有 AI 锁**（重新导入绝不能解锁）；
     /// 配置完全一致（含锁位）→ unchanged；存在差异 → 覆盖并计 updated；不存在 → imported。
-    /// 导入产生的非空 folder 自动注册进 server_folders（同一 with_state 内完成）。
-    pub(crate) fn merge_xshell_servers(&self, servers: &[Server]) -> Result<XshellImportResult, String> {
+    /// 项目：按 folder 分组，项目名 = folder 路径（如 "生产环境/Web"），空串统一归「未命名项目」；
+    /// 按名字匹配已有项目则复用（仅补绑 serverIds，去重），否则新建项目（id 唯一 proj- 前缀；
+    /// path=None；quick_commands 空；ai_mode 默认；folder=''）并计 projects_created。
+    /// 绑定对所有导入/更新/未变服务器都生效（幂等，不产生重复 serverIds）。
+    pub(crate) fn merge_xshell_servers(
+        &self,
+        sessions: &[ScannedSession],
+    ) -> Result<XshellImportResult, String> {
         let mut result = XshellImportResult::default();
         self.with_state(|s| {
-            for sv in servers {
+            for scan in sessions {
+                let sv = &scan.server;
                 match s.servers.iter_mut().find(|x| x.id == sv.id) {
                     Some(slot) => {
                         let mut merged = sv.clone();
@@ -683,8 +735,58 @@ impl Store {
                         result.imported += 1;
                     }
                 }
-                if !sv.folder.is_empty() && !s.server_folders.iter().any(|f| f == &sv.folder) {
-                    s.server_folders.push(sv.folder.clone());
+            }
+            // 按目录归组：项目名 = 目录路径；空目录统一归「未命名项目」。保持扫描顺序，
+            // 同一目录内按出现顺序累计 server id（去重）。
+            let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+            for scan in sessions {
+                let name = if scan.folder.is_empty() {
+                    "未命名项目".to_string()
+                } else {
+                    scan.folder.clone()
+                };
+                match groups.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, ids)) => {
+                        if !ids.contains(&scan.server.id) {
+                            ids.push(scan.server.id.clone());
+                        }
+                    }
+                    None => groups.push((name, vec![scan.server.id.clone()])),
+                }
+            }
+            for (name, ids) in groups {
+                match s.projects.iter_mut().find(|p| p.name == name) {
+                    // 同名项目复用：仅补绑 serverIds（去重）
+                    Some(p) => {
+                        for id in ids {
+                            if !p.server_ids.contains(&id) {
+                                p.server_ids.push(id);
+                            }
+                        }
+                    }
+                    None => {
+                        // 唯一 id：毫秒时间戳 hex + 冲突递增后缀，proj- 前缀
+                        let base = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let mut id = format!("proj-{base:x}");
+                        let mut n = 0u64;
+                        while s.projects.iter().any(|p| p.id == id) {
+                            n += 1;
+                            id = format!("proj-{base:x}-{n}");
+                        }
+                        s.projects.push(Project {
+                            id,
+                            name,
+                            path: None,
+                            server_ids: ids,
+                            quick_commands: Vec::new(),
+                            folder: String::new(),
+                            ai_mode: AiMode::default(),
+                        });
+                        result.projects_created += 1;
+                    }
                 }
             }
             Ok(result)
@@ -692,14 +794,15 @@ impl Store {
     }
 
     pub fn upsert_project(&self, project: Project) -> Result<(), String> {
-        // 命令收藏非空 folder 自动注册进 command_folders（与 upsert_server 的 folder 注册同语义；
-        // 前端手输新目录保存时无需先建目录）
+        // 命令收藏非空 folder 自动注册进 command_folders、项目自身非空 folder 自动注册进
+        // project_folders（前端手输新目录保存时无需先建目录）
         let folders: Vec<String> = project
             .quick_commands
             .iter()
             .filter(|qc| !qc.folder.is_empty())
             .map(|qc| qc.folder.clone())
             .collect();
+        let project_folder = project.folder.clone();
         self.with_state(|s| {
             match s.projects.iter_mut().find(|p| p.id == project.id) {
                 Some(slot) => *slot = project,
@@ -709,6 +812,9 @@ impl Store {
                 if !s.command_folders.iter().any(|x| x == &f) {
                     s.command_folders.push(f);
                 }
+            }
+            if !project_folder.is_empty() && !s.project_folders.iter().any(|x| x == &project_folder) {
+                s.project_folders.push(project_folder);
             }
             Ok(())
         })
@@ -948,28 +1054,28 @@ pub async fn set_server_locked(
 }
 
 #[tauri::command]
-pub async fn create_server_folder(
+pub async fn create_project_folder(
     store: State<'_, Arc<Store>>,
     name: String,
 ) -> Result<(), String> {
-    store.create_server_folder(&name)
+    store.create_project_folder(&name)
 }
 
 #[tauri::command]
-pub async fn rename_server_folder(
+pub async fn rename_project_folder(
     store: State<'_, Arc<Store>>,
     old: String,
     new: String,
 ) -> Result<(), String> {
-    store.rename_server_folder(&old, &new)
+    store.rename_project_folder(&old, &new)
 }
 
 #[tauri::command]
-pub async fn delete_server_folder(
+pub async fn delete_project_folder(
     store: State<'_, Arc<Store>>,
     name: String,
 ) -> Result<(), String> {
-    store.delete_server_folder(&name)
+    store.delete_project_folder(&name)
 }
 
 #[tauri::command]
@@ -995,6 +1101,15 @@ pub async fn delete_command_folder(
     name: String,
 ) -> Result<(), String> {
     store.delete_command_folder(&name)
+}
+
+#[tauri::command]
+pub async fn set_ui_expanded(
+    store: State<'_, Arc<Store>>,
+    key: String,
+    values: Vec<String>,
+) -> Result<(), String> {
+    store.set_ui_expanded(key, values)
 }
 
 #[tauri::command]
@@ -1028,6 +1143,7 @@ mod tests {
                 search: SearchConfig::default(),
                 theme: Theme::Dark,
                 auto_switch_ai_workdir: true,
+                project_view: ProjectView::Card,
             },
             servers: vec![
                 Server {
@@ -1038,7 +1154,6 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "deploy".to_string(),
                     key_path: String::new(),
-                    folder: String::new(),
                     locked: false,
                 },
                 Server {
@@ -1049,7 +1164,6 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "ubuntu".to_string(),
                     key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
-                    folder: "生产环境".to_string(),
                     locked: false,
                 },
             ],
@@ -1065,6 +1179,7 @@ mod tests {
                     folder: "常用".to_string(),
                     global: true,
                 }],
+                folder: "生产环境".to_string(),
                 ai_mode: AiMode::Suggest,
             }],
             sessions: {
@@ -1095,6 +1210,10 @@ mod tests {
                                 server_id: Some("srv-1".to_string()),
                                 name: "生产-Web-01".to_string(),
                             }],
+                            path_refs: vec![PathRef {
+                                path: "C:/demo/app.ts".to_string(),
+                                is_dir: false,
+                            }],
                             actions: vec![AiActionRecord {
                                 tool_call_id: "call-1".to_string(),
                                 tool: "run_command".to_string(),
@@ -1108,8 +1227,9 @@ mod tests {
                 );
                 m
             },
-            server_folders: vec!["生产环境".to_string()],
+            project_folders: vec!["生产环境".to_string()],
             command_folders: vec!["常用".to_string()],
+            ui_expanded: HashMap::new(),
         }
     }
 
@@ -1128,11 +1248,12 @@ mod tests {
             "\"aiMode\"",
             "\"locked\"",
             "\"toolCallId\"",
-            "\"serverFolders\"",
+            "\"projectFolders\"",
             "\"commandFolders\"",
             "\"global\"",
             "\"serverRefs\"",
             "\"autoSwitchAiWorkdir\"",
+            "\"projectView\"",
         ] {
             assert!(json.contains(key), "序列化 JSON 缺少字段 {key}: {json}");
         }
@@ -1291,7 +1412,6 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
-                    folder: String::new(),
                     locked: false,
                 },
                 Some("pw-1"),
@@ -1307,7 +1427,6 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
-                    folder: String::new(),
                     locked: false,
                 },
                 None,
@@ -1320,6 +1439,7 @@ mod tests {
                 path: None,
                 server_ids: vec!["srv-c-1".to_string(), "srv-c-2".to_string()],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
@@ -1352,7 +1472,6 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
-            folder: String::new(),
             locked: false,
         };
         store.upsert_server(base.clone(), None).unwrap();
@@ -1366,211 +1485,194 @@ mod tests {
     }
 
     #[test]
-    fn create_server_folder_normalizes_and_rejects_invalid() {
-        let dir = temp_config_dir("folder-create");
+    fn create_project_folder_normalizes_and_rejects_invalid() {
+        let dir = temp_config_dir("proj-folder-create");
         let store = test_store(dir.clone());
         // 空串 / 纯分隔符 → 中文错误
-        assert_eq!(store.create_server_folder("  ").unwrap_err(), "分类目录名称不能为空");
-        assert_eq!(store.create_server_folder("///").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(store.create_project_folder("  ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(store.create_project_folder("///").unwrap_err(), "分类目录名称不能为空");
         // 规范化：trim + 去空段；支持层级
-        store.create_server_folder(" 生产环境/Web ").unwrap();
-        store.create_server_folder("a//b/").unwrap();
+        store.create_project_folder(" 生产环境/Web ").unwrap();
+        store.create_project_folder("a//b/").unwrap();
         {
             let guard = store.state.lock().unwrap();
             assert_eq!(
-                guard.server_folders,
+                guard.project_folders,
                 vec!["生产环境/Web".to_string(), "a/b".to_string()]
             );
         }
         // 重名（规范化后相同）报错，且列表不变
-        assert_eq!(store.create_server_folder("生产环境/Web").unwrap_err(), "分类目录已存在");
+        assert_eq!(store.create_project_folder("生产环境/Web").unwrap_err(), "分类目录已存在");
         assert_eq!(
-            store.state.lock().unwrap().server_folders,
+            store.state.lock().unwrap().project_folders,
             vec!["生产环境/Web".to_string(), "a/b".to_string()]
         );
         // 落盘后重载一致
         let reloaded = test_store(dir);
         assert_eq!(
-            reloaded.state.lock().unwrap().server_folders,
+            reloaded.state.lock().unwrap().project_folders,
             vec!["生产环境/Web".to_string(), "a/b".to_string()]
         );
     }
 
     #[test]
-    fn rename_server_folder_cascades_to_servers() {
-        let dir = temp_config_dir("rename-cascade");
+    fn rename_project_folder_cascades_to_projects() {
+        let dir = temp_config_dir("proj-rename-cascade");
         let store = test_store(dir.clone());
-        store.create_server_folder("生产环境").unwrap();
+        store.create_project_folder("生产环境").unwrap();
         store
-            .upsert_server(
-                Server {
-                    id: "srv-r-1".to_string(),
-                    name: "A".to_string(),
-                    host: "h1".to_string(),
-                    port: 22,
-                    auth_type: AuthType::Password,
-                    username: "u".to_string(),
-                    key_path: String::new(),
-                    folder: "生产环境".to_string(),
-                    locked: false,
-                },
-                None,
-            )
+            .upsert_project(Project {
+                id: "proj-r-1".to_string(),
+                name: "A".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                folder: "生产环境".to_string(),
+                ai_mode: AiMode::Suggest,
+            })
             .unwrap();
         store
-            .upsert_server(
-                Server {
-                    id: "srv-r-2".to_string(),
-                    name: "B".to_string(),
-                    host: "h2".to_string(),
-                    port: 22,
-                    auth_type: AuthType::Password,
-                    username: "u".to_string(),
-                    key_path: String::new(),
-                    folder: String::new(),
-                    locked: false,
-                },
-                None,
-            )
+            .upsert_project(Project {
+                id: "proj-r-2".to_string(),
+                name: "B".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                folder: String::new(),
+                ai_mode: AiMode::Suggest,
+            })
             .unwrap();
 
         // 新旧名均按规范化处理：带空白与重复分隔符也应级联生效
-        store.rename_server_folder("生产环境", " 生产环境//Web ").unwrap();
+        store.rename_project_folder("生产环境", " 生产环境//Web ").unwrap();
 
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.server_folders, vec!["生产环境/Web".to_string()]);
+        assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
         assert_eq!(
-            guard.servers.iter().find(|s| s.id == "srv-r-1").unwrap().folder,
+            guard.projects.iter().find(|p| p.id == "proj-r-1").unwrap().folder,
             "生产环境/Web"
         );
-        assert_eq!(guard.servers.iter().find(|s| s.id == "srv-r-2").unwrap().folder, "");
+        assert_eq!(guard.projects.iter().find(|p| p.id == "proj-r-2").unwrap().folder, "");
         drop(guard);
         // 落盘后重载一致
         let reloaded = test_store(dir);
         let guard = reloaded.state.lock().unwrap();
-        assert_eq!(guard.server_folders, vec!["生产环境/Web".to_string()]);
+        assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
         assert_eq!(
-            guard.servers.iter().find(|s| s.id == "srv-r-1").unwrap().folder,
+            guard.projects.iter().find(|p| p.id == "proj-r-1").unwrap().folder,
             "生产环境/Web"
         );
     }
 
     #[test]
-    fn rename_server_folder_rejects_conflict_and_uncategorized() {
-        let dir = temp_config_dir("rename-conflict");
+    fn rename_project_folder_rejects_conflict_and_uncategorized() {
+        let dir = temp_config_dir("proj-rename-conflict");
         let store = test_store(dir);
-        store.create_server_folder("甲").unwrap();
-        store.create_server_folder("乙").unwrap();
+        store.create_project_folder("甲").unwrap();
+        store.create_project_folder("乙").unwrap();
 
         // 未分类（空串）不可重命名
-        assert_eq!(store.rename_server_folder("", "x").unwrap_err(), "未分类目录不可重命名");
+        assert_eq!(store.rename_project_folder("", "x").unwrap_err(), "未分类目录不可重命名");
         // 目标已存在且 ≠ old → 报错
-        assert_eq!(store.rename_server_folder("甲", "乙").unwrap_err(), "分类目录已存在");
+        assert_eq!(store.rename_project_folder("甲", "乙").unwrap_err(), "分类目录已存在");
         // new 规范化后为空 → 报错
-        assert_eq!(store.rename_server_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(store.rename_project_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
         // new 规范化后与 old 相同 → no-op，列表不变
-        store.rename_server_folder("甲", " 甲 ").unwrap();
+        store.rename_project_folder("甲", " 甲 ").unwrap();
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.server_folders, vec!["甲".to_string(), "乙".to_string()]);
+        assert_eq!(guard.project_folders, vec!["甲".to_string(), "乙".to_string()]);
     }
 
     #[test]
-    fn rename_server_folder_handles_folders_not_in_list() {
-        let dir = temp_config_dir("rename-derived");
+    fn rename_project_folder_handles_folders_not_in_list() {
+        let dir = temp_config_dir("proj-rename-derived");
         let store = test_store(dir.clone());
-        // 旧配置里服务器的 folder 可能不在 server_folders 清单（upsert/导入现在会自动注册，
-        // 但历史 JSON 不会回溯补录）；重命名同样级联并补入清单
+        // 历史 JSON 里项目的 folder 可能不在 project_folders 清单（upsert 现在会自动注册，
+        // 但旧配置不会回溯补录）；重命名同样级联并补入清单
         store
             .with_state(|s| {
-                s.servers.push(Server {
-                    id: "srv-d-1".to_string(),
+                s.projects.push(Project {
+                    id: "proj-d-1".to_string(),
                     name: "C".to_string(),
-                    host: "h3".to_string(),
-                    port: 22,
-                    auth_type: AuthType::Password,
-                    username: "u".to_string(),
-                    key_path: String::new(),
+                    path: None,
+                    server_ids: vec![],
+                    quick_commands: vec![],
                     folder: "旧目录".to_string(),
-                    locked: false,
+                    ai_mode: AiMode::Suggest,
                 });
                 Ok(())
             })
             .unwrap();
-        assert!(store.state.lock().unwrap().server_folders.is_empty());
+        assert!(store.state.lock().unwrap().project_folders.is_empty());
 
-        store.rename_server_folder("旧目录", "新目录").unwrap();
+        store.rename_project_folder("旧目录", "新目录").unwrap();
 
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.servers[0].folder, "新目录");
-        assert_eq!(guard.server_folders, vec!["新目录".to_string()]);
+        assert_eq!(guard.projects[0].folder, "新目录");
+        assert_eq!(guard.project_folders, vec!["新目录".to_string()]);
     }
 
     #[test]
-    fn delete_server_folder_removes_and_persists() {
-        let dir = temp_config_dir("folder-delete");
+    fn delete_project_folder_removes_and_persists() {
+        let dir = temp_config_dir("proj-folder-delete");
         let store = test_store(dir.clone());
-        store.create_server_folder("生产环境").unwrap();
-        store.create_server_folder("开发环境/Web").unwrap();
+        store.create_project_folder("生产环境").unwrap();
+        store.create_project_folder("开发环境/Web").unwrap();
         // 未分类空串不可删除；规范化后为空同样报中文错误
-        assert_eq!(store.delete_server_folder("").unwrap_err(), "未分类目录不可删除");
-        assert_eq!(store.delete_server_folder(" / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(store.delete_project_folder("").unwrap_err(), "未分类目录不可删除");
+        assert_eq!(store.delete_project_folder(" / ").unwrap_err(), "分类目录名称不能为空");
         // 不存在的目录视为幂等成功
-        store.delete_server_folder("不存在的目录").unwrap();
+        store.delete_project_folder("不存在的目录").unwrap();
         // 删除成功：入参规范化，仅移除匹配项
-        store.delete_server_folder(" 开发环境/Web ").unwrap();
+        store.delete_project_folder(" 开发环境/Web ").unwrap();
         {
             let guard = store.state.lock().unwrap();
-            assert_eq!(guard.server_folders, vec!["生产环境".to_string()]);
+            assert_eq!(guard.project_folders, vec!["生产环境".to_string()]);
         }
         // 落盘后重载一致
         let reloaded = test_store(dir);
         assert_eq!(
-            reloaded.state.lock().unwrap().server_folders,
+            reloaded.state.lock().unwrap().project_folders,
             vec!["生产环境".to_string()]
         );
     }
 
     #[test]
-    fn delete_server_folder_rejects_when_servers_exist() {
-        let dir = temp_config_dir("folder-delete-nonempty");
+    fn delete_project_folder_rejects_when_projects_exist() {
+        let dir = temp_config_dir("proj-folder-delete-nonempty");
         let store = test_store(dir.clone());
         store
-            .upsert_server(
-                Server {
-                    id: "srv-f-1".to_string(),
-                    name: "A".to_string(),
-                    host: "h1".to_string(),
-                    port: 22,
-                    auth_type: AuthType::Password,
-                    username: "u".to_string(),
-                    key_path: String::new(),
-                    folder: "生产环境".to_string(),
-                    locked: false,
-                },
-                None,
-            )
+            .upsert_project(Project {
+                id: "proj-f-1".to_string(),
+                name: "A".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                folder: "生产环境".to_string(),
+                ai_mode: AiMode::Suggest,
+            })
             .unwrap();
-        // 目录下仍有服务器 → 中文错误
-        let err = store.delete_server_folder("生产环境").unwrap_err();
-        assert_eq!(err, "分类目录「生产环境」下仍有服务器，不能删除");
-        // 目录与服务器都未被改动
+        // 目录下仍有项目 → 中文错误
+        let err = store.delete_project_folder("生产环境").unwrap_err();
+        assert_eq!(err, "分类目录「生产环境」下仍有项目，不能删除");
+        // 目录与项目都未被改动
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.server_folders, vec!["生产环境".to_string()]);
-        assert_eq!(guard.servers.len(), 1);
+        assert_eq!(guard.project_folders, vec!["生产环境".to_string()]);
+        assert_eq!(guard.projects.len(), 1);
         drop(guard);
-        // 删除服务器后可删目录，且落盘一致
-        store.delete_server("srv-f-1").unwrap();
-        store.delete_server_folder("生产环境").unwrap();
-        assert!(store.state.lock().unwrap().server_folders.is_empty());
+        // 删除项目后可删目录，且落盘一致
+        store.delete_project("proj-f-1").unwrap();
+        store.delete_project_folder("生产环境").unwrap();
+        assert!(store.state.lock().unwrap().project_folders.is_empty());
         let reloaded = test_store(dir);
-        assert!(reloaded.state.lock().unwrap().server_folders.is_empty());
+        assert!(reloaded.state.lock().unwrap().project_folders.is_empty());
     }
 
     #[test]
-    fn clear_all_servers_wipes_servers_folders_and_keyring() {
+    fn clear_all_servers_wipes_servers_and_keyring() {
         let dir = temp_config_dir("clear-all");
         let store = test_store(dir.clone());
-        // 两台服务器（一台带密码、一台带目录）+ 一个已绑定项目
+        // 两台服务器（一台带密码）+ 一个已绑定项目
         store
             .upsert_server(
                 Server {
@@ -1581,7 +1683,6 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
-                    folder: "生产环境".to_string(),
                     locked: false,
                 },
                 Some("pw-1"),
@@ -1597,7 +1698,6 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
-                    folder: String::new(),
                     locked: false,
                 },
                 None,
@@ -1610,6 +1710,7 @@ mod tests {
                 path: None,
                 server_ids: vec!["srv-cl-1".to_string(), "srv-cl-2".to_string()],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
@@ -1617,10 +1718,9 @@ mod tests {
 
         store.clear_all_servers().unwrap();
 
-        // state：servers / folders 清空，项目保留但解绑
+        // state：servers 清空，项目保留但解绑
         let guard = store.state.lock().unwrap();
         assert!(guard.servers.is_empty());
-        assert!(guard.server_folders.is_empty());
         assert_eq!(guard.projects.len(), 1);
         assert!(guard.projects[0].server_ids.is_empty());
         drop(guard);
@@ -1631,7 +1731,6 @@ mod tests {
         let reloaded = test_store(dir);
         let guard = reloaded.state.lock().unwrap();
         assert!(guard.servers.is_empty());
-        assert!(guard.server_folders.is_empty());
         assert!(guard.projects[0].server_ids.is_empty());
         // 幂等：空库再清不算错
         drop(guard);
@@ -1639,45 +1738,43 @@ mod tests {
     }
 
     #[test]
-    fn upsert_server_auto_registers_folder() {
-        let dir = temp_config_dir("upsert-folder-register");
+    fn upsert_project_auto_registers_folder() {
+        let dir = temp_config_dir("upsert-proj-folder-register");
         let store = test_store(dir);
-        let srv = |id: &str, folder: &str| Server {
-            id: id.to_string(),
-            name: id.to_string(),
-            host: "h".to_string(),
-            port: 22,
-            auth_type: AuthType::Password,
-            username: "u".to_string(),
-            key_path: String::new(),
+        let mk = |folder: &str| Project {
+            id: "proj-u-f".to_string(),
+            name: "U".to_string(),
+            path: None,
+            server_ids: vec![],
+            quick_commands: vec![],
             folder: folder.to_string(),
-            locked: false,
+            ai_mode: AiMode::Suggest,
         };
         // 非空 folder 自动注册
-        store.upsert_server(srv("srv-u-1", "生产环境"), None).unwrap();
+        store.upsert_project(mk("生产环境")).unwrap();
         assert_eq!(
-            store.state.lock().unwrap().server_folders,
+            store.state.lock().unwrap().project_folders,
             vec!["生产环境".to_string()]
         );
-        // 再次 upsert 同目录的服务器不重复注册
-        store.upsert_server(srv("srv-u-2", "生产环境"), None).unwrap();
+        // 再次 upsert 同目录的项目不重复注册
+        store.upsert_project(mk("生产环境")).unwrap();
         assert_eq!(
-            store.state.lock().unwrap().server_folders,
+            store.state.lock().unwrap().project_folders,
             vec!["生产环境".to_string()]
         );
         // 未分类（空串）不注册
-        store.upsert_server(srv("srv-u-3", ""), None).unwrap();
+        store.upsert_project(mk("")).unwrap();
         assert_eq!(
-            store.state.lock().unwrap().server_folders,
+            store.state.lock().unwrap().project_folders,
             vec!["生产环境".to_string()]
         );
     }
 
     #[test]
-    fn merge_xshell_servers_auto_registers_folders() {
-        let dir = temp_config_dir("xshell-merge-folder");
+    fn merge_xshell_servers_builds_projects_by_folder() {
+        let dir = temp_config_dir("xshell-merge-projects");
         let store = test_store(dir.clone());
-        let srv = |id: &str, folder: &str| Server {
+        let srv = |id: &str| Server {
             id: id.to_string(),
             name: id.to_string(),
             host: "h".to_string(),
@@ -1685,43 +1782,132 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
-            folder: folder.to_string(),
             locked: false,
         };
+        // 有目录 → 项目名 = 目录路径；空目录 → 归「未命名项目」
         store
-            .merge_xshell_servers(&[srv("x-1", "导入目录"), srv("x-2", "")])
+            .merge_xshell_servers(&[
+                ScannedSession {
+                    server: srv("x-1"),
+                    folder: "生产环境/Web".to_string(),
+                },
+                ScannedSession {
+                    server: srv("x-2"),
+                    folder: String::new(),
+                },
+                ScannedSession {
+                    server: srv("x-3"),
+                    folder: "生产环境/Web".to_string(),
+                },
+            ])
             .unwrap();
-        // 导入产生的非空 folder 自动注册；空串不注册
-        assert_eq!(
-            store.state.lock().unwrap().server_folders,
-            vec!["导入目录".to_string()]
-        );
-        // 重导（unchanged/updated 分支）不重复注册
-        store.merge_xshell_servers(&[srv("x-1", "导入目录")]).unwrap();
+        {
+            let guard = store.state.lock().unwrap();
+            assert_eq!(guard.servers.len(), 3);
+            assert_eq!(guard.projects.len(), 2, "两个目录各建一个项目");
+            let web = guard.projects.iter().find(|p| p.name == "生产环境/Web").unwrap();
+            // 新项目：id proj- 前缀、path=None、quick_commands 空、ai_mode 默认、folder 空
+            assert!(web.id.starts_with("proj-"), "id 应 proj- 前缀: {}", web.id);
+            assert_eq!(web.path, None);
+            assert!(web.quick_commands.is_empty());
+            assert_eq!(web.ai_mode, AiMode::Suggest);
+            assert_eq!(web.folder, "");
+            assert_eq!(
+                web.server_ids,
+                vec!["x-1".to_string(), "x-3".to_string()],
+                "同目录服务器应幂等去重绑定"
+            );
+            let unnamed = guard.projects.iter().find(|p| p.name == "未命名项目").unwrap();
+            assert_eq!(unnamed.server_ids, vec!["x-2".to_string()]);
+            // 空目录不注册进 project_folders
+            assert!(guard.project_folders.is_empty());
+        }
+        // 重复导入（全部 unchanged）：不重复建项目、不重复绑定
+        let r = store
+            .merge_xshell_servers(&[
+                ScannedSession {
+                    server: srv("x-1"),
+                    folder: "生产环境/Web".to_string(),
+                },
+                ScannedSession {
+                    server: srv("x-2"),
+                    folder: String::new(),
+                },
+            ])
+            .unwrap();
+        assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
+        assert_eq!(r.projects_created, 0, "重复导入不重复建项目");
+        {
+            let guard = store.state.lock().unwrap();
+            assert_eq!(guard.projects.len(), 2);
+            let web = guard.projects.iter().find(|p| p.name == "生产环境/Web").unwrap();
+            assert_eq!(
+                web.server_ids,
+                vec!["x-1".to_string(), "x-3".to_string()],
+                "绑定保持幂等（去重）"
+            );
+        }
+        // 已有同名项目复用：预置同名项目后导入该目录的服务器 → 复用仅补绑,不覆盖原字段
         store
-            .merge_xshell_servers(&[srv("x-2", "导入目录")])
+            .upsert_project(Project {
+                id: "proj-pre".to_string(),
+                name: "预置目录".to_string(),
+                path: Some("D:\\existing".to_string()),
+                server_ids: vec![],
+                quick_commands: vec![],
+                folder: String::new(),
+                ai_mode: AiMode::Agent,
+            })
             .unwrap();
+        let r = store
+            .merge_xshell_servers(&[ScannedSession {
+                server: srv("x-4"),
+                folder: "预置目录".to_string(),
+            }])
+            .unwrap();
+        assert_eq!(r.projects_created, 0, "同名项目复用不计新建");
+        let guard = store.state.lock().unwrap();
+        let pre = guard.projects.iter().find(|p| p.name == "预置目录").unwrap();
+        assert_eq!(pre.id, "proj-pre", "复用已有项目而非新建");
+        assert_eq!(pre.path, Some("D:\\existing".to_string()), "复用不覆盖原字段");
+        assert_eq!(pre.ai_mode, AiMode::Agent);
         assert_eq!(
-            store.state.lock().unwrap().server_folders,
-            vec!["导入目录".to_string()]
+            pre.server_ids,
+            vec!["x-4".to_string()],
+            "新服务器补绑进已有项目"
         );
-        // 落盘后重载一致
+        drop(guard);
+        // 落盘后重载一致(两个导入项目 + 一个预置项目)
         let reloaded = test_store(dir);
-        assert_eq!(
-            reloaded.state.lock().unwrap().server_folders,
-            vec!["导入目录".to_string()]
-        );
+        assert_eq!(reloaded.state.lock().unwrap().projects.len(), 3);
     }
 
     #[test]
-    fn legacy_json_without_server_folders_parses_as_empty() {
-        // 旧配置 JSON 无 serverFolders 字段 → serde default 空列表，不报错
+    fn legacy_json_without_project_folders_parses_as_empty() {
+        // 旧配置 JSON 无 projectFolders 字段 → serde default 空列表，不报错
         let json = serde_json::to_string(&sample_state()).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        v.as_object_mut().unwrap().remove("serverFolders");
+        v.as_object_mut().unwrap().remove("projectFolders");
         let back: AppState = serde_json::from_value(v).unwrap();
-        assert!(back.server_folders.is_empty());
+        assert!(back.project_folders.is_empty());
         assert_eq!(back.servers.len(), 2, "其余字段不受影响");
+    }
+
+    #[test]
+    fn legacy_json_server_folder_fields_are_ignored() {
+        // 旧配置 JSON 遗留的 serverFolders / Server.folder 字段 → 无 deny_unknown_fields，
+        // serde 直接忽略，不报错；Server 不再有 folder，项目 folder 缺省为空串
+        let old = r#"{
+            "settings": {"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark","autoSwitchAiWorkdir":false},
+            "servers":[{"id":"s1","name":"S","host":"h","port":22,"authType":"password","username":"u","keyPath":"","folder":"生产环境"}],
+            "projects":[{"id":"p1","name":"P","path":null,"serverIds":[],"quickCommands":[]}],
+            "sessions":{},
+            "serverFolders":["生产环境"]
+        }"#;
+        let state: AppState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.servers.len(), 1, "遗留 folder 字段不影响解析");
+        assert!(state.project_folders.is_empty(), "旧 serverFolders 不映射到 project_folders");
+        assert_eq!(state.projects[0].folder, "", "旧项目无 folder 字段按未分类");
     }
 
     #[test]
@@ -1751,6 +1937,67 @@ mod tests {
         assert_eq!(back.projects[0].quick_commands[0].folder, "");
         assert!(!back.projects[0].quick_commands[0].global);
         assert_eq!(back.servers.len(), 2, "其余字段不受影响");
+    }
+
+    #[test]
+    fn legacy_json_without_ui_expanded_parses_as_empty_map() {
+        // 旧配置 JSON 无 uiExpanded 字段 → serde default 空 map，不报错
+        let json = serde_json::to_string(&sample_state()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("uiExpanded");
+        let back: AppState = serde_json::from_value(v).unwrap();
+        assert!(back.ui_expanded.is_empty());
+        assert_eq!(back.servers.len(), 2, "其余字段不受影响");
+    }
+
+    #[test]
+    fn set_ui_expanded_persists_across_reload() {
+        // 写入后重载 store：展开状态仍在，且不影响其他 key
+        let dir = temp_config_dir("ui-expanded-persist");
+        let store = test_store(dir.clone());
+        store
+            .set_ui_expanded(
+                "explorer:proj-1".to_string(),
+                vec!["src".to_string(), "src/components".to_string()],
+            )
+            .unwrap();
+        // 空 key 拒绝
+        assert!(store
+            .set_ui_expanded(String::new(), vec!["x".to_string()])
+            .is_err());
+        // 覆盖写第二个 key
+        store
+            .set_ui_expanded("welcome:projectGroups".to_string(), vec!["生产环境".to_string()])
+            .unwrap();
+        let reloaded = test_store(dir.clone());
+        let guard = reloaded.state.lock().unwrap();
+        assert_eq!(
+            guard.ui_expanded.get("explorer:proj-1").unwrap(),
+            &vec!["src".to_string(), "src/components".to_string()],
+            "首次写入的 key 原样保留"
+        );
+        assert_eq!(
+            guard.ui_expanded.get("welcome:projectGroups").unwrap(),
+            &vec!["生产环境".to_string()],
+            "第二个 key 写入成功"
+        );
+        // 清空数组覆盖后 key 仍在（空值语义：空展开集合）
+        drop(guard);
+        store
+            .set_ui_expanded("welcome:projectGroups".to_string(), vec![])
+            .unwrap();
+        let reloaded2 = test_store(dir);
+        assert!(
+            reloaded2
+                .state
+                .lock()
+                .unwrap()
+                .ui_expanded
+                .get("welcome:projectGroups")
+                .unwrap()
+                .is_empty(),
+            "空数组覆盖后落盘为空列表"
+        );
     }
 
     #[test]
@@ -1801,6 +2048,7 @@ mod tests {
                 folder: folder.to_string(),
                 global: id == "b",
             }],
+            folder: String::new(),
             ai_mode: AiMode::Suggest,
         };
         // 两个项目各有一条命令挂在「常用」下，其中一个还带 global
@@ -1862,6 +2110,7 @@ mod tests {
                         folder: "旧目录".to_string(),
                         global: false,
                     }],
+                    folder: String::new(),
                     ai_mode: AiMode::Suggest,
                 });
                 Ok(())
@@ -1917,6 +2166,7 @@ mod tests {
                     folder: "常用".to_string(),
                     global: false,
                 }],
+                folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
@@ -1936,6 +2186,7 @@ mod tests {
                 path: None,
                 server_ids: vec![],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
@@ -1955,6 +2206,7 @@ mod tests {
             path: None,
             server_ids: vec![],
             quick_commands: qcs,
+            folder: String::new(),
             ai_mode: AiMode::Suggest,
         };
         // 非空 folder 自动注册
@@ -2025,6 +2277,7 @@ mod tests {
                 path: None,
                 server_ids: vec![],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
@@ -2045,6 +2298,7 @@ mod tests {
         assert_eq!(msg.snapshots.len(), 1);
         assert!(msg.file_refs.is_empty(), "旧数据应兼容为空引用列表");
         assert!(msg.server_refs.is_empty(), "旧数据应兼容为空服务器引用列表");
+        assert!(msg.path_refs.is_empty(), "旧数据应兼容为空路径引用列表");
     }
 
     #[test]
@@ -2063,6 +2317,7 @@ mod tests {
                     search: SearchConfig { enabled: false },
                     theme: Theme::Dark,
                     auto_switch_ai_workdir: false,
+                    project_view: ProjectView::Card,
                 },
                 Some("sk-test-key"),
                 None,
@@ -2078,7 +2333,6 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
-                    folder: String::new(),
                     locked: false,
                 },
                 Some("pw-a"),
@@ -2091,6 +2345,7 @@ mod tests {
                 path: Some("D:\\proj".to_string()),
                 server_ids: vec![],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: AiMode::Agent,
             })
             .unwrap();
@@ -2115,27 +2370,32 @@ mod tests {
     fn merge_xshell_servers_counts_imported_updated_unchanged() {
         let dir = temp_config_dir("xshell-merge-count");
         let store = test_store(dir.clone());
-        let srv = |id: &str, port: u16| Server {
-            id: id.to_string(),
-            name: id.to_string(),
-            host: format!("10.0.0.{}", port % 250 + 1),
-            port,
-            auth_type: AuthType::Password,
-            username: "root".to_string(),
-            key_path: String::new(),
+        let srv = |id: &str, port: u16| ScannedSession {
+            server: Server {
+                id: id.to_string(),
+                name: id.to_string(),
+                host: format!("10.0.0.{}", port % 250 + 1),
+                port,
+                auth_type: AuthType::Password,
+                username: "root".to_string(),
+                key_path: String::new(),
+                locked: false,
+            },
+            // 全部未分类 → 归「未命名项目」，不干扰计数断言
             folder: String::new(),
-            locked: false,
         };
-        // 首次：全部 imported
+        // 首次：全部 imported；根目录会话统一归「未命名项目」
         let r = store
             .merge_xshell_servers(&[srv("xshell-aaa", 22), srv("xshell-bbb", 2222)])
             .unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (2, 0, 0));
-        // 原样再导：全部 unchanged（幂等）
+        assert_eq!(r.projects_created, 1, "根目录会话建「未命名项目」");
+        // 原样再导：全部 unchanged（幂等），不重复建项目
         let r = store
             .merge_xshell_servers(&[srv("xshell-aaa", 22), srv("xshell-bbb", 2222)])
             .unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
+        assert_eq!(r.projects_created, 0);
         // 配置有变化：覆盖并计 updated（不新增重复项）
         let r = store.merge_xshell_servers(&[srv("xshell-bbb", 22)]).unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 1, 0));
@@ -2144,6 +2404,12 @@ mod tests {
             .merge_xshell_servers(&[srv("xshell-aaa", 22), srv("xshell-ccc", 2200)])
             .unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (1, 0, 1));
+        // 全部归入同一个「未命名项目」，绑定去重
+        {
+            let guard = store.state.lock().unwrap();
+            let unnamed = guard.projects.iter().find(|p| p.name == "未命名项目").unwrap();
+            assert_eq!(unnamed.server_ids.len(), 3, "三个会话都绑定且不重复");
+        }
         // 内存状态与落盘一致
         assert_eq!(store.state.lock().unwrap().servers.len(), 3);
         let saved: AppState =
@@ -2163,16 +2429,18 @@ mod tests {
         // 预置一条真实密钥，合并后必须原样保留（merge 绝不读写 SecretStore）
         store.secrets.set("server:xshell-keep", "pw").unwrap();
         store
-            .merge_xshell_servers(&[Server {
-                id: "xshell-keep".to_string(),
-                name: "K".to_string(),
-                host: "h".to_string(),
-                port: 22,
-                auth_type: AuthType::Password,
-                username: "u".to_string(),
-                key_path: String::new(),
+            .merge_xshell_servers(&[ScannedSession {
+                server: Server {
+                    id: "xshell-keep".to_string(),
+                    name: "K".to_string(),
+                    host: "h".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                },
                 folder: String::new(),
-                locked: false,
             }])
             .unwrap();
         assert_eq!(store.secrets.get("server:xshell-keep").unwrap(), "pw");
@@ -2186,6 +2454,7 @@ mod tests {
             unchanged: 3,
             skipped: 4,
             needs_attention: 5,
+            projects_created: 6,
         };
         let json = serde_json::to_string(&r).unwrap();
         for key in [
@@ -2194,6 +2463,7 @@ mod tests {
             "\"unchanged\":3",
             "\"skipped\":4",
             "\"needsAttention\":5",
+            "\"projectsCreated\":6",
         ] {
             assert!(json.contains(key), "序列化缺少字段 {key}: {json}");
         }
@@ -2214,6 +2484,7 @@ mod tests {
                     search: SearchConfig { enabled: true },
                     theme: Theme::Dark,
                     auto_switch_ai_workdir: false,
+                    project_view: ProjectView::List,
                 },
                 None,
                 Some("bsk-1"),
@@ -2297,6 +2568,7 @@ mod tests {
                 path: None,
                 server_ids: vec![],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
@@ -2307,6 +2579,7 @@ mod tests {
                 path: None,
                 server_ids: vec![],
                 quick_commands: vec![],
+                folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
@@ -2338,7 +2611,6 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
-            folder: String::new(),
             locked: false,
         };
         store.upsert_server(srv("sv-a"), None).unwrap();
@@ -2376,7 +2648,6 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
-                    folder: String::new(),
                     locked: true,
                 },
                 None,
@@ -2384,16 +2655,18 @@ mod tests {
             .unwrap();
         // Xshell 导入的同 ID 服务器 locked=false：连接配置合并，锁必须保留
         let r = store
-            .merge_xshell_servers(&[Server {
-                id: "xshell-lock".to_string(),
-                name: "K".to_string(),
-                host: "h".to_string(),
-                port: 22,
-                auth_type: AuthType::Password,
-                username: "u".to_string(),
-                key_path: String::new(),
+            .merge_xshell_servers(&[ScannedSession {
+                server: Server {
+                    id: "xshell-lock".to_string(),
+                    name: "K".to_string(),
+                    host: "h".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                },
                 folder: String::new(),
-                locked: false,
             }])
             .unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 1));
@@ -2403,16 +2676,18 @@ mod tests {
         );
         // 连接配置变化时同样保留锁
         let r = store
-            .merge_xshell_servers(&[Server {
-                id: "xshell-lock".to_string(),
-                name: "K2".to_string(),
-                host: "h".to_string(),
-                port: 2222,
-                auth_type: AuthType::Password,
-                username: "u".to_string(),
-                key_path: String::new(),
+            .merge_xshell_servers(&[ScannedSession {
+                server: Server {
+                    id: "xshell-lock".to_string(),
+                    name: "K2".to_string(),
+                    host: "h".to_string(),
+                    port: 2222,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                },
                 folder: String::new(),
-                locked: false,
             }])
             .unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 1, 0));

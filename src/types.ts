@@ -21,6 +21,8 @@ export interface Settings {
   theme: Theme;
   /** 自动切换 AI 工作区域：开启后 AI 输入框显示固定工作区域标签，随激活终端自动切换；旧配置无此字段按关闭 */
   autoSwitchAiWorkdir: boolean;
+  /** 欢迎页项目视图；旧配置无此字段按卡片视图 */
+  projectView: 'card' | 'list';
 }
 
 /** 与 store.rs Theme serde lowercase 对齐 */
@@ -36,8 +38,6 @@ export interface Server {
   authType: AuthType;
   username: string;
   keyPath: string;
-  /** 所属目录：'/' 分隔的相对路径（如 "生产环境/Web"），空串 = 未分类；Xshell 导入按会话分组填充 */
-  folder: string;
   /** AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP */
   locked: boolean;
 }
@@ -61,6 +61,8 @@ export interface Project {
   path: string | null;
   serverIds: string[];
   quickCommands: QuickCommand[];
+  /** 所属目录：'/' 分隔的相对路径（如 "生产环境/Web"），空串 = 未分类；旧数据无此字段按未分类 */
+  folder: string;
   /** AI 助手模式；旧数据无此字段按 suggest */
   aiMode: AiMode;
 }
@@ -99,6 +101,14 @@ export interface ServerRef {
   name: string;
 }
 
+/** 文件/目录路径引用：UI 以 @file:文件名 / @path:目录名 标签呈现，发送时只带路径不带内容 */
+export interface PathRef {
+  /** 绝对路径（正斜杠规范化） */
+  path: string;
+  /** true = 目录（@path: 标签）；false = 文件（@file: 标签） */
+  isDir: boolean;
+}
+
 export interface ChatMsg {
   role: 'user' | 'assistant';
   content: string;
@@ -106,6 +116,8 @@ export interface ChatMsg {
   fileRefs: FileRef[];
   /** 服务器/本地终端引用（@remote:名称 / @local 标签）；旧会话为空 */
   serverRefs: ServerRef[];
+  /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容）；旧会话为空 */
+  pathRefs: PathRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
   actions: AiActionRecord[];
   ts: number;
@@ -123,10 +135,15 @@ export interface AppState {
   servers: Server[];
   projects: Project[];
   sessions: Record<string, ChatSession[]>;
-  /** 服务器分类目录清单（'/' 分隔相对路径，与 Server.folder 同语义；空目录也在此）；旧配置无此字段为空列表 */
-  serverFolders: string[];
+  /** 项目分类目录清单（'/' 分隔相对路径，与 Project.folder 同语义；空目录也在此）；旧配置无此字段为空列表 */
+  projectFolders: string[];
   /** 命令收藏分类目录清单（'/' 分隔相对路径，与 QuickCommand.folder 同语义；空目录也在此）；旧配置无此字段为空列表 */
   commandFolders: string[];
+  /**
+   * 各目录树展开状态：key = explorer:<projectId>（文件绝对路径数组）| welcome:projectGroups
+   * （folder 值数组，空串 = 未分类）| commands:folders（同语义）；旧配置无此字段为空对象。
+   */
+  uiExpanded: Record<string, string[]>;
 }
 
 export interface FsEntry {
@@ -164,4 +181,6 @@ export interface XshellImportResult {
   unchanged: number;
   skipped: number;
   needsAttention: number;
+  /** 本次导入新建的项目数（按会话目录自动建项目；同名项目复用不计） */
+  projectsCreated: number;
 }

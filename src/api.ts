@@ -27,13 +27,13 @@ export const setTheme = (theme: Theme) => call<void>('set_theme', { theme });
 export const upsertServer = (server: Server, password: string | null) =>
   call<void>('upsert_server', { server, password });
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
-/** 新建服务器分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
-export const createServerFolder = (name: string) => call<void>('create_server_folder', { name });
-/** 重命名服务器分类目录：级联改写所有服务器 folder；new 与 old 相同为 no-op；未分类不可重命名 */
-export const renameServerFolder = (oldName: string, newName: string) =>
-  call<void>('rename_server_folder', { old: oldName, new: newName });
-/** 删除服务器分类目录：目录下仍有服务器时返回后端中文错误；未分类不可删除 */
-export const deleteServerFolder = (name: string) => call<void>('delete_server_folder', { name });
+/** 新建项目分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
+export const createProjectFolder = (name: string) => call<void>('create_project_folder', { name });
+/** 重命名项目分类目录：级联改写所有项目 folder；new 与 old 相同为 no-op；未分类不可重命名 */
+export const renameProjectFolder = (oldName: string, newName: string) =>
+  call<void>('rename_project_folder', { old: oldName, new: newName });
+/** 删除项目分类目录：目录下仍有项目时返回后端中文错误；未分类不可删除 */
+export const deleteProjectFolder = (name: string) => call<void>('delete_project_folder', { name });
 /** 新建命令收藏分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
 export const createCommandFolder = (name: string) => call<void>('create_command_folder', { name });
 /** 重命名命令收藏分类目录：级联改写所有项目命令的 folder；new 与 old 相同为 no-op；未分类不可重命名 */
@@ -41,6 +41,9 @@ export const renameCommandFolder = (oldName: string, newName: string) =>
   call<void>('rename_command_folder', { old: oldName, new: newName });
 /** 删除命令收藏分类目录：目录下仍有命令（任意项目）时返回后端中文错误；未分类不可删除 */
 export const deleteCommandFolder = (name: string) => call<void>('delete_command_folder', { name });
+/** 写入目录树展开状态（前端防抖后调用）；key = explorer:<projectId> | welcome:projectGroups | commands:folders */
+export const setUiExpanded = (key: string, values: string[]) =>
+  call<void>('set_ui_expanded', { key, values });
 /** 清除全部服务器配置：清空服务器与分类目录、所有项目解绑、删除全部 keyring 密钥 */
 export const clearAllServers = () => call<void>('clear_all_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；

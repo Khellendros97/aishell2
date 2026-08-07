@@ -4,23 +4,18 @@
  * 新增：标题行「新建」按钮 → 面板内联模态框创建服务器，创建成功后立即绑定到当前项目
  * （upsert_server + upsert_project，与设置页表单同字段语义：密码留空 = 不写入 keyring）。
  * 与原型差异：不做在线状态探活（计划明确去掉随机 mock 状态点），认证方式以 tag 呈现。
- * 新增（非原型）：远程服务器支持按 名称/host/账号/目录 搜索；空搜索词时按 folder 分组展示
- * （folder 与 store.rs Server 字段对齐）；新建模态框含「所属目录」组合框（下拉可选已有分类，也可手输新分类）。
- * 新增：分组面板默认折叠，点组标题展开/收起（全部展开/折叠切换按钮在搜索框旁）；拖服务器卡片到组标题可改分类。
+ * 新增（非原型）：远程服务器支持按 名称/host/账号 搜索；列表平铺展示（服务器不再有目录维度，分类能力已转移给项目）。
  * 侧栏框架契约：导出 head 描述符（title），mountServersPanel(container) 只渲染内容区。
  */
 import type { Server } from '../../../types';
 import { icon } from '../../../icons';
-import { getState, renameServerFolder, setServerLocked, upsertProject, upsertServer } from '../../../api';
+import { getState, setServerLocked, upsertProject, upsertServer } from '../../../api';
 import { bus, openTab, Workbench } from '../core';
-import { promptDialog, showContextMenu, toast, uid } from '../../../ui';
+import { showContextMenu, toast, uid } from '../../../ui';
 import { createServerForm } from '../../server-form';
 import './servers.css';
 
 export const serversHead = { title: '服务器列表' };
-
-/* 展开的分类面板（键 = folder 值，空串 = 未分类）；模块级持久，project-changed 重渲染保留展开态，默认全部折叠 */
-const expandedFolders = new Set<string>();
 
 /** 数据变更监听句柄：面板切换会重建 DOM 但 window 监听不自动消失，重挂载时先移除旧的 */
 let dataChangedHandler: (() => void) | null = null;
@@ -48,36 +43,20 @@ export function mountServersPanel(container: HTMLElement): void {
     </div>
   `);
 
-  /* 模态框逻辑（新建 / 编辑共用 server-form.ts）见下方 folderOptions 之后的实现 */
-
-  /* 搜索行（持久元素）：搜索框 + 全部展开/折叠切换按钮，不随列表重建，避免输入焦点丢失 */
+  /* 搜索行（持久元素）：不随列表重建，避免输入焦点丢失 */
   const searchWrap = document.createElement('div');
   searchWrap.className = 'wbs-search';
   const searchInput = document.createElement('input');
   searchInput.className = 'input';
   searchInput.placeholder = '搜索服务器…';
-  const toggleFoldersBtn = document.createElement('button');
-  toggleFoldersBtn.className = 'icon-btn';
-  toggleFoldersBtn.title = '全部展开';
-  toggleFoldersBtn.innerHTML = icon('folderOpen');
-  searchWrap.append(searchInput, toggleFoldersBtn);
+  searchWrap.append(searchInput);
   let searchQuery = ''; // 搜索词（小写，空串 = 显示全部）
 
-  let latestServers: Server[] = [];   // 最近一次 render 拉取的服务器（供新建模态框分类下拉候选）
-  let latestFolders: string[] = [];   // 最近一次 render 拉取的分类目录清单
-  let latestBoundFolders: string[] = []; // 最近一次 render 的分组键（「全部展开/折叠」切换用）
-
-  /** 所属目录组合框候选：已有目录 ∪ 各服务器 folder 派生值（去重排序）；手输新分类保存时后端自动注册 */
-  const folderOptions = (): string[] => {
-    const opts = new Set<string>(latestFolders);
-    latestServers.forEach((s) => { if (s.folder) opts.add(s.folder); });
-    return Array.from(opts).sort((a, b) => a.localeCompare(b, 'zh'));
-  };
   /* ---------- 新建 / 编辑服务器模态框（字段与校验复用 server-form.ts；编辑时密码留空 = 保持 keyring 原值） ---------- */
   const modal = container.querySelector('#srv-modal') as HTMLElement;
   const modalTitle = container.querySelector('#srv-modal-title') as HTMLElement;
   const saveBtn = container.querySelector('#srv-modal-save') as HTMLButtonElement;
-  const form = createServerForm(container.querySelector('#srv-modal-body') as HTMLElement, { folderOptions });
+  const form = createServerForm(container.querySelector('#srv-modal-body') as HTMLElement);
   let editingServer: Server | null = null; // null = 新建；否则为正在编辑的服务器（预填，密码不回显）
 
   function openModal(): void {
@@ -144,26 +123,6 @@ export function mountServersPanel(container: HTMLElement): void {
   };
   document.addEventListener('keydown', onKeydown);
 
-  /* 分组标题重命名：级联改所有服务器 folder 后整体重渲染（复用设置页 promptDialog 流程） */
-  async function renameFolderFlow(folder: string): Promise<void> {
-    const name = await promptDialog({
-      title: '重命名分类目录',
-      label: '目录路径（可含 / 层级）',
-      defaultValue: folder,
-      okText: '重命名',
-      allowPath: true,
-    });
-    if (name === null) return;
-    try {
-      await renameServerFolder(folder, name);
-    } catch (err) {
-      toast(`重命名分类目录失败: ${String(err)}`, 'error');
-      return;
-    }
-    bus.emit('project-changed');
-    toast(`分类目录已重命名为「${name}」`, 'success');
-  }
-
   /** 把服务器/本地终端引用加入 AI 输入框（@remote:服务器名称 / @local 标签，见 core.ts AiHandle.addServerRef） */
   function addRefToChat(ref: { serverId: string | null; name: string }): void {
     if (Workbench.ai?.addServerRef) {
@@ -175,24 +134,15 @@ export function mountServersPanel(container: HTMLElement): void {
 
   const render = async (): Promise<void> => {
     let servers: Server[] = [];
-    let folders: string[] = [];
     try {
       const state = await getState();
       servers = state.servers;
-      folders = state.serverFolders;
     } catch {
       /* 后端未就绪时按空列表渲染 */
-    }    latestServers = servers;
-    latestFolders = folders;
+    }
     const project = Workbench.state.project;
     const ids = project?.serverIds ?? [];
     const bound = servers.filter((s) => ids.includes(s.id));
-
-    // 全部展开/折叠切换按钮状态：图标 = 目标动作（folderOpen 展开 / folder 折叠）
-    latestBoundFolders = Array.from(new Set(bound.map((s) => s.folder || '')));
-    const allExpanded = latestBoundFolders.length > 0 && latestBoundFolders.every((k) => expandedFolders.has(k));
-    toggleFoldersBtn.innerHTML = icon(allExpanded ? 'folder' : 'folderOpen');
-    toggleFoldersBtn.title = allExpanded ? '全部折叠' : '全部展开';
 
     /* 复用内容容器：模态框是 container 直子节点，绝不能整清空（否则新建表单随列表刷新被移除）；
        只清理上次的动态内容（本地卡 / 标题 / 列表容器），持久搜索框保留 */
@@ -233,7 +183,7 @@ export function mountServersPanel(container: HTMLElement): void {
       ]);
     });
     /* 必须 prepend：持久搜索框（searchWrap）在重渲染时保留在 wrap 内，
-       appendChild 会把本地卡追加到搜索框/列表之后，目录展开时卡片沉底 */
+       appendChild 会把本地卡追加到搜索框/列表之后，卡片沉底 */
     wrap.prepend(localCard);
 
     // 「远程服务器」标题行 + 新建服务器快捷入口（空列表也可新建）
@@ -262,10 +212,10 @@ export function mountServersPanel(container: HTMLElement): void {
       wrap.append(head, searchWrap, list);
     }
 
-    // 搜索过滤：名称 / host / username / folder 大小写不敏感；空串显示全部
+    // 搜索过滤：名称 / host / username 大小写不敏感；空串显示全部
     const q = searchQuery;
     const filtered = bound.filter((s) =>
-      !q || [s.name, s.host, s.username, s.folder].some((v) => v.toLowerCase().includes(q))
+      !q || [s.name, s.host, s.username].some((v) => v.toLowerCase().includes(q))
     );
 
     if (!filtered.length) {
@@ -281,7 +231,6 @@ export function mountServersPanel(container: HTMLElement): void {
     const buildCard = (s: Server) => {
       const card = document.createElement('div');
       card.className = 'card wbs-server-card';
-      card.draggable = true; // 拖拽到分组标题行可改分类
       const lockTitle = s.locked
         ? 'AI 远程操作已锁定，点击解锁（手动 SSH/SFTP 不受影响）'
         : 'AI 远程操作未锁定，点击锁定（手动 SSH/SFTP 不受影响）';
@@ -347,113 +296,15 @@ export function mountServersPanel(container: HTMLElement): void {
           data: { serverId: s.id },
         });
       };
-      // 拖拽改分类：拖起时标记数据与半透明态，dragend 清理（搜索态平铺时无分组标题作为放置目标，属预期）
-      card.addEventListener('dragstart', (e) => {
-        const dt = e.dataTransfer;
-        if (!dt) return;
-        dt.setData('application/x-aishell-server', s.id);
-        dt.setData('text/plain', s.id);
-        card.classList.add('dragging');
-      });
-      card.addEventListener('dragend', () => card.classList.remove('dragging'));
       return card;
     };
 
-    // 搜索中平铺展示；空搜索词按 folder 分组（未分类 = 空串，放最后）
-    if (q) {
-      filtered.forEach((s) => list.appendChild(buildCard(s)));
-    } else {
-      const groups = new Map<string, Server[]>();
-      filtered.forEach((s) => {
-        const key = s.folder || '';
-        const arr = groups.get(key);
-        if (arr) arr.push(s);
-        else groups.set(key, [s]);
-      });
-      const keys = Array.from(groups.keys()).sort((a, b) => {
-        if (!a) return 1; // 未分类组排最后
-        if (!b) return -1;
-        return a.localeCompare(b, 'zh');
-      });
-      keys.forEach((folderKey) => {
-        const expanded = expandedFolders.has(folderKey);
-        const gTitle = document.createElement('div');
-        gTitle.className = 'wbs-server-group-title' + (expanded ? ' expanded' : '');
-        gTitle.dataset.folder = folderKey;
-        // 折叠指示：收起 = 闭合文件夹 / 展开 = 打开的文件夹
-        const ic = document.createElement('span');
-        ic.className = 'wbs-server-group-ic';
-        ic.innerHTML = icon(expanded ? 'folderOpen' : 'folder');
-        const tx = document.createElement('span');
-        tx.className = 'wbs-server-group-name';
-        tx.textContent = folderKey || '未分类';
-        const cnt = document.createElement('span');
-        cnt.className = 'tag';
-        cnt.textContent = String(groups.get(folderKey)!.length);
-        gTitle.append(ic, tx, cnt);
-        // 未分类不可重命名；其余组提供重命名入口（与设置页同流程）；stopPropagation 防触发折叠
-        if (folderKey) {
-          const renameBtn = document.createElement('button');
-          renameBtn.className = 'icon-btn';
-          renameBtn.title = `重命名「${folderKey}」`;
-          renameBtn.innerHTML = icon('pencil');
-          renameBtn.onclick = (e) => {
-            e.stopPropagation();
-            void renameFolderFlow(folderKey);
-          };
-          gTitle.append(renameBtn);
-        }
-        // 点击标题行 = 展开/收起该组（默认全部折叠）
-        gTitle.addEventListener('click', () => {
-          if (expandedFolders.has(folderKey)) expandedFolders.delete(folderKey);
-          else expandedFolders.add(folderKey);
-          void render();
-        });
-        list.appendChild(gTitle);
-        // 组内列表容器：收起时整体隐藏
-        const gList = document.createElement('div');
-        gList.className = 'wbs-server-group-list';
-        if (!expanded) gList.classList.add('hidden');
-        groups.get(folderKey)!.forEach((s) => gList.appendChild(buildCard(s)));
-        list.appendChild(gList);
-        // 放置目标：拖服务器卡片到组标题（含未分类）= 改分类
-        gTitle.addEventListener('dragover', (e) => {
-          const dt = e.dataTransfer;
-          if (dt && dt.types.includes('application/x-aishell-server')) {
-            e.preventDefault();
-            gTitle.classList.add('drop-target');
-          }
-        });
-        gTitle.addEventListener('dragleave', () => gTitle.classList.remove('drop-target'));
-        gTitle.addEventListener('drop', (e) => {
-          e.preventDefault();
-          gTitle.classList.remove('drop-target');
-          const id = e.dataTransfer?.getData('application/x-aishell-server') ?? '';
-          if (!id) return;
-          const server = servers.find((sv) => sv.id === id);
-          if (!server) return;
-          if (server.folder === folderKey) return; // 目标分类相同则跳过
-          void upsertServer({ ...server, folder: folderKey }, null)
-            .then(() => {
-              bus.emit('project-changed');
-              toast(`已移动到「${folderKey || '未分类'}」`, 'success');
-            })
-            .catch((err) => toast(`移动分类失败: ${String(err)}`, 'error'));
-        });
-      });
-    }
+    // 平铺列表展示（服务器不再按目录分组）
+    filtered.forEach((s) => list.appendChild(buildCard(s)));
   };
 
   searchInput.addEventListener('input', () => {
     searchQuery = searchInput.value.trim().toLowerCase();
-    void render();
-  });
-
-  // 全部展开 / 全部折叠：单按钮按当前状态切换（图标 = 目标动作）
-  toggleFoldersBtn.addEventListener('click', () => {
-    const allExpanded = latestBoundFolders.length > 0 && latestBoundFolders.every((k) => expandedFolders.has(k));
-    if (allExpanded) expandedFolders.clear();
-    else latestBoundFolders.forEach((k) => expandedFolders.add(k));
     void render();
   });
 

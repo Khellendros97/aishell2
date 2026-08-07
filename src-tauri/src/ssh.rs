@@ -232,7 +232,10 @@ impl SshManager {
                     ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
                     ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
                     ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
-                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    // EOF 仅表示服务端不再发数据,不能跳出:OpenSSH 的消息序是
+                    // Eof → ExitStatus → Close(已在真实 sshd 上实测),退出码在 EOF 之后才到。
+                    ChannelMsg::Eof => {}
+                    ChannelMsg::Close => break,
                     _ => {}
                 }
             }
@@ -457,7 +460,6 @@ mod tests {
             auth_type: store::AuthType::Key,
             username: "tester".to_string(),
             key_path: path.to_string(),
-            folder: String::new(),
             locked: false,
         }
     }
@@ -497,7 +499,6 @@ mod tests {
             auth_type: store::AuthType::Password,
             username: "root".to_string(),
             key_path: String::new(),
-            folder: String::new(),
             locked: false,
         };
         let msg = auth_failed_msg(&server, "Disconnected");

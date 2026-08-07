@@ -6,7 +6,7 @@
  * 复用 src/ui.ts showContextMenu，样式同全局 ctx-menu；SSH 与本地终端均挂载，
  * 「添加到对话」把该终端对应引用加入 AI 输入框）。
  */
-import type { FileRef, Project, ServerRef, TermSnapshot } from '../../types';
+import type { FileRef, PathRef, Project, ServerRef, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
 import { showContextMenu, uid, type CtxMenuItems } from '../../ui';
 
@@ -49,6 +49,8 @@ export interface AiHandle {
   addFileRef?(ref: FileRef): void;
   /** 服务器/本地终端引用（@remote:服务器名称 / @local 标签） */
   addServerRef?(ref: ServerRef): void;
+  /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容） */
+  addPathRef?(ref: PathRef): void;
 }
 
 /** fn(container, tab) 返回可选 tabApi 对象（供其他模块调用） */
