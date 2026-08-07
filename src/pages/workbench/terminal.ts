@@ -58,8 +58,14 @@ const TERM_THEMES: Record<'dark' | 'light', ITheme> = {
   },
 };
 
-/** 活跃终端实例:主题切换时批量换肤(destroy 时移除) */
+/** 活跃终端实例：主题切换时批量换肤（destroy 时移除） */
 const liveTerms = new Set<TermSession>();
+/* 调试取证:CDP/控制台经 window.__terms 内省 xterm 内部状态(写队列/buffer/modes),
+   用于 vi 卡死(xterm 渲染管线 stall)的活体诊断 */
+declare global {
+  interface Window { __terms?: Set<TermSession> }
+}
+window.__terms = liveTerms;
 onThemeChange((t) => { liveTerms.forEach((s) => { s.term.options.theme = TERM_THEMES[t]; }); });
 import type { TermSnapshot } from '../../types';
 
@@ -194,6 +200,12 @@ class TermSession {
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     this.term.loadAddon(new WebLinksAddon());
+    /* xterm 6.0.0 内建 DECRQM 处理器(requestMode 内 const enum 经 Vite 转译引用未声明变量)
+       被调用必抛 ReferenceError,同步打断写队列排空链 → 终端渲染永久停摆
+       (vim/less 等全屏程序启动必发 CSI ? Ps $ p 查询,触发即「卡死」)。
+       后注册的同 ident 处理器优先执行,返回 true 阻断冒泡到内建坏处理器。 */
+    this.term.parser.registerCsiHandler({ intermediates: '$', final: 'p' }, (params) => this.answerDecrqm(params, true));
+    this.term.parser.registerCsiHandler({ prefix: '?', intermediates: '$', final: 'p' }, (params) => this.answerDecrqm(params, false));
     this.term.open(this.host);
     this.term.onData((data) => this.onUserInput(data));
 
@@ -261,6 +273,52 @@ class TermSession {
       this.term.write(`\r\n\x1b[31m[启动失败] ${msg}\x1b[0m\r\n`);
       this.updateInfo();
     }
+  }
+
+  /* ---------- DECRQM 应答（覆盖 xterm 6.0.0 坏内建，见构造器注释） ---------- */
+  /** DECRPM 同步应答：状态值 0 未识别 / 1 set / 2 reset / 3 永久 set / 4 永久 reset。 */
+  private answerDecrqm(params: (number | number[])[] | { params: (number | number[])[] }, ansi: boolean): boolean {
+    // 公共类型标注为数组,运行时实际传 IParams 对象（内嵌 .params 数组）:两种形态兼容取值
+    const list = Array.isArray(params) ? params : params.params;
+    // DECRQM 首参恒为标量模式号（数组形仅多值参数场景）
+    const mode = typeof list[0] === 'number' ? list[0] : 0;
+    const m = this.term.modes;
+    const b = (v: boolean) => (v ? 1 : 2);
+    // xterm 无公开类型的字段（光标隐藏态 / 鼠标编码）：一次性受控转型取内部服务
+    const internals = this.term as unknown as {
+      _core: { _coreService: { isCursorHidden: boolean }; _coreMouseService: { activeEncoding: string } };
+    };
+    let v: number;
+    if (ansi) {
+      if (mode === 2) v = 4;
+      else if (mode === 4) v = b(m.insertMode);
+      else if (mode === 12) v = 3;
+      else if (mode === 20) v = b(this.term.options.convertEol ?? false);
+      else v = 0;
+    } else if (mode === 1) v = b(m.applicationCursorKeysMode);
+    else if (mode === 6) v = b(m.originMode);
+    else if (mode === 7) v = b(m.wraparoundMode);
+    else if (mode === 8) v = 3;
+    else if (mode === 9) v = b(m.mouseTrackingMode === 'x10');
+    else if (mode === 12) v = b(this.term.options.cursorBlink ?? false);
+    else if (mode === 25) v = b(!internals._core._coreService.isCursorHidden);
+    else if (mode === 45) v = b(m.reverseWraparoundMode);
+    else if (mode === 66) v = b(m.applicationKeypadMode);
+    else if (mode === 67) v = 4;
+    else if (mode === 1000) v = b(m.mouseTrackingMode === 'vt200');
+    else if (mode === 1002) v = b(m.mouseTrackingMode === 'drag');
+    else if (mode === 1003) v = b(m.mouseTrackingMode === 'any');
+    else if (mode === 1004) v = b(m.sendFocusMode);
+    else if (mode === 1005 || mode === 1015) v = 4;
+    else if (mode === 1006) v = b(internals._core._coreMouseService.activeEncoding === 'SGR');
+    else if (mode === 1016) v = b(internals._core._coreMouseService.activeEncoding === 'SGR_PIXELS');
+    else if (mode === 1048) v = 1; // 与 xterm 内建语义一致：1048 恒报 SET
+    else if (mode === 47 || mode === 1047 || mode === 1049) v = b(this.term.buffer.active.type === 'alternate');
+    else if (mode === 2004) v = b(m.bracketedPasteMode);
+    else v = 0;
+    // 走公开 input(wasUserInput=false):触发 onData → 终端输入管线 → 后端,与内建应答同路
+    this.term.input(`\x1b[${ansi ? '' : '?'}${mode};${v}$y`, false);
+    return true;
   }
 
   /* ---------- 输入：转发后端 + 区块追踪 ---------- */
@@ -387,9 +445,18 @@ class TermSession {
   /* ---------- 后端输出：写 xterm + 区块 output 捕获 ---------- */
   private onBackendData(data: string): void {
     dbg(`${this.sid} fe-recv len=${data.length} alt=${this.altMode ? 1 : 0}`);
-    this.term.write(data);
-    this.appendOutput(data);
-    this.syncAltMode();
+    // 渲染管线 stall 取证:write 抛异常时落日志(正常路径零开销)
+    try {
+      this.term.write(data);
+    } catch (e) {
+      dbg(`${this.sid} fe-write-err ${String(e).slice(0, 200)}`);
+    }
+    try {
+      this.appendOutput(data);
+      this.syncAltMode();
+    } catch (e) {
+      dbg(`${this.sid} fe-block-err ${String(e).slice(0, 200)}`);
+    }
   }
 
   private appendOutput(data: string): void {
