@@ -74,6 +74,8 @@ export interface AiActionRecord {
   intent: string;
   summary: string;
   status: 'approved' | 'rejected' | 'succeeded' | 'failed';
+  /** 动作开始时已生成文本长度(content 内的时序锚点,渲染时把动作卡穿插到该位置);旧记录无此字段回退整组折叠 */
+  textLen?: number;
 }
 
 export interface TermSnapshot {

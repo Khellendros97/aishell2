@@ -243,6 +243,8 @@ interface ActionCard {
   status: 'approving' | 'approved' | 'rejected' | 'running' | 'succeeded' | 'failed';
   /** actionEnd 的截断结果 */
   result?: string;
+  /** 动作开始时已生成文本长度(text 内时序锚点,渲染时把卡片穿插到该位置) */
+  textLen?: number;
 }
 
 /** 生成中/错误气泡的瞬时状态（不进 ChatSession.messages，不落盘）；tools 为工具活动行（同上） */
@@ -626,6 +628,7 @@ function handleEvent(key: string, ev: AiEvent): void {
       command: typeof ev.args.command === 'string' ? ev.args.command : existing?.command,
       requestId: existing?.requestId,
       status: project?.aiMode === 'agent' ? 'approving' : 'running',
+      textLen: existing?.textLen ?? p.text.length,
     });
     pendingBy.set(sid, p);
   } else if (ev.type === 'approval') {
@@ -646,6 +649,7 @@ function handleEvent(key: string, ev: AiEvent): void {
         command: existing?.command,
         requestId: ev.requestId,
         status: existing?.status === 'running' ? 'running' : 'approving',
+        textLen: existing?.textLen ?? p.text.length,
       });
       pendingBy.set(sid, p);
     }
@@ -692,6 +696,7 @@ function collectActions(p: Pending): AiActionRecord[] {
         : a.status === 'succeeded'
           ? 'succeeded'
           : 'approved',
+    textLen: a.textLen,
   }));
 }
 
@@ -856,11 +861,19 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
       `<div class="ai-text">${escapeHtml(m.content)}</div></div>`;
   } else {
     wrap.className = 'ai-msg ai';
-    // 历史只读审计：一串工具调用整组折叠（组头计数 + 展开状态保持）；旧会话无 actions 为空
-    const actionsHtml = m.actions?.length
-      ? renderActionGroup(m.actions, `${sid}:${m.ts}`)
-      : '';
-    wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${renderAI(m.content)}</div>${actionsHtml}</div>`;
+    /* 时序排版:有 textLen 锚点的动作卡穿插进 content 对应位置(文本段→卡→文本段);
+       旧记录(全部无锚点)回退为末尾整组折叠「工具调用 (N)」 */
+    const hasAnchors = (m.actions ?? []).some((a) => a.textLen != null);
+    const bodyHtml = hasAnchors
+      ? interleaveActions(
+          m.content,
+          (m.actions ?? []).map((a) => ({
+            html: renderActionCard({ toolCallId: a.toolCallId, tool: a.tool, intent: a.intent, summary: a.summary, status: a.status }),
+            textLen: a.textLen,
+          })),
+        )
+      : renderAI(m.content) + (m.actions?.length ? renderActionGroup(m.actions, `${sid}:${m.ts}`) : '');
+    wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${bodyHtml}</div></div>`;
   }
   return wrap;
 }
@@ -877,9 +890,31 @@ function renderPending(p: Pending): HTMLElement {
   } else if (p.phase === 'error') {
     wrap.innerHTML = `<div class="ai-bubble error"><div class="ai-text">${escapeHtml(p.error ?? '')}</div></div>`;
   } else {
-    wrap.innerHTML = `<div class="ai-bubble">${toolLines}${actionCards}<div class="ai-text">${renderAI(p.text)}</div></div>`;
+    /* 流式:动作卡按 textLen 锚点穿插进已生成文本(与历史时序排版同规则) */
+    const cards = [...p.actions.values()].map((a) => ({ html: renderActionCard(a), textLen: a.textLen }));
+    const body = cards.some((c) => c.textLen != null)
+      ? interleaveActions(p.text, cards)
+      : `${actionCards}${renderAI(p.text)}`;
+    wrap.innerHTML = `<div class="ai-bubble">${toolLines}<div class="ai-text">${body}</div></div>`;
   }
   return wrap;
+}
+
+/** 把动作卡按 textLen 锚点穿插进文本:时间顺序排版(文本段 → 动作卡 → 文本段);
+ *  无锚点的卡按序排在文本末尾(兼容旧记录)。锚点是 content 的字符偏移,
+ *  text 只增不减故偏移稳定;锚点恰好落在 ``` 围栏中间的概率极低(工具边界即文本分段点)。 */
+function interleaveActions(text: string, cards: Array<{ html: string; textLen?: number }>): string {
+  const sorted = [...cards].sort((a, b) => (a.textLen ?? Infinity) - (b.textLen ?? Infinity));
+  let out = '';
+  let last = 0;
+  for (const c of sorted) {
+    const at = Math.min(c.textLen ?? text.length, text.length);
+    if (at > last) out += renderAI(text.slice(last, at));
+    out += c.html;
+    last = at;
+  }
+  if (last < text.length) out += renderAI(text.slice(last));
+  return out || renderAI(text);
 }
 
 /* ---------- 极简 markdown：先转义 HTML，再解析 ---------- */
@@ -952,9 +987,46 @@ async function handleModeRequest(sid: string, ev: Extract<AiEvent, { type: 'appr
   }
   if (ok) {
     await switchMode('agent');
+    /* 跨边界切换后端重启 pi 进程,当前回合已被打断定稿(switchMode → leaveAllSessions);
+       会话历史在 --session 文件中,自动补发继续指令,AI 在工作模式下恢复历史接续执行 */
+    if (project && project.aiMode === 'agent') autoResumeAfterModeSwitch(sid);
   } else {
     toast('已拒绝 AI 的工作模式申请', 'info');
   }
+}
+
+/** 模式切换后的自动续跑:以一条用户消息把「已同意,请继续」送进会话并提交 aiChat;
+ *  pi 经 --session 恢复完整历史(含 AI 的申请与用户同意),据此接续被打断的操作。
+ *  有 pending(切换未生效/会话仍生成中)时不补发,避免与在途回合冲突。 */
+function autoResumeAfterModeSwitch(sid: string): void {
+  if (!project) return;
+  const s = sessions.get(sid);
+  if (!s || pendingBy.get(sid)) return;
+  const text = '已同意切换到工作模式，请继续执行刚才的操作。';
+  s.messages.push({
+    role: 'user',
+    content: text,
+    snapshots: [],
+    fileRefs: [],
+    serverRefs: [],
+    pathRefs: [],
+    actions: [],
+    ts: Date.now(),
+  });
+  pendingBy.set(sid, emptyPending());
+  if (sid === activeSessionId) {
+    renderHistory();
+    updateSendBtn();
+  }
+  persistSession(s);
+  aiChat(`${project.id}:${sid}`, text).catch((err: unknown) => {
+    console.error('[AI] 模式切换后续跑失败:', err);
+    pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
+    if (sid === activeSessionId) {
+      renderHistory();
+      updateSendBtn();
+    }
+  });
 }
 
 /** 回复 Agent 审批：批准 → 执行中；拒绝 → 已拒绝（后端只接受当前待处理 requestId） */

@@ -213,6 +213,9 @@ pub struct AiActionRecord {
     pub summary: String,
     /// approved | rejected | succeeded | failed（前端按此渲染状态）
     pub status: String,
+    /// 动作开始时已生成文本长度（content 内时序锚点，前端据此穿插动作卡）；旧记录无此字段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_len: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1270,6 +1273,7 @@ mod tests {
                                 intent: "查看版本".to_string(),
                                 summary: "执行命令：node -v".to_string(),
                                 status: "succeeded".to_string(),
+                                text_len: Some(160),
                             }],
                             ts: 1_752_000_000_001,
                         }],
