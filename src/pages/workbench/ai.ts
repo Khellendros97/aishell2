@@ -1113,6 +1113,12 @@ function addPathRefChip(ref: PathRef): void {
 
 const clearChips = (): void => {
   chipRow.innerHTML = '';
+  /* 状态 Map 必须与 chip DOM 同步清空:此前只清 DOM,serverRefs 等残留导致
+     发送后重新添加同一引用被误判「该引用已在输入框中」(与 chip ✕ 移除路径同语义) */
+  snapshots.clear();
+  fileRefs.clear();
+  serverRefs.clear();
+  pathRefs.clear();
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
 };
 
