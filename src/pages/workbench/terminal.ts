@@ -32,6 +32,7 @@ import { activateTab, bus, getActiveTab, registerRenderer, Workbench } from './c
 import { addQuickCommandModal } from './quickcommand';
 import type { Tab } from './core';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
+import { dbg } from '../../debug';
 import { currentTheme, onThemeChange } from '../../theme';
 
 /* ---------- 终端配色：暗 / 亮两套（background 与 workbench.css --term-bg 一致） ---------- */
@@ -136,6 +137,11 @@ class TermSession {
   /** 重连流程吞掉旧通道的 term:exit（setTimeout 兜底,防旧任务不醒来导致永久吞事件）。 */
   private ignoreExit = false;
 
+  /** 日志用短 id（term:srv-xxx:t-yyyy → t-yyyy） */
+  private get sid(): string {
+    return this.tab.id.split(':').pop() ?? this.tab.id;
+  }
+
   constructor(container: HTMLElement, tab: Tab) {
     this.tab = tab;
 
@@ -232,11 +238,13 @@ class TermSession {
   private async init(): Promise<void> {
     const data = this.tab.data as { kind?: string; serverId?: string; cwd?: string | null };
     const kind: TermKind = data.kind === 'ssh' ? 'ssh' : 'local';
+    dbg(`${this.sid} init kind=${kind}`);
     try {
       this.unlisteners.push(await onTermData(this.tab.id, (d) => this.onBackendData(d)));
       this.unlisteners.push(await onTermExit(this.tab.id, (code) => this.onExit(code)));
       await termCreate(this.tab.id, kind, data.serverId ?? null, data.cwd ?? null);
       this.ready = true;
+      dbg(`${this.sid} ready`);
       // 补发建立期间缓存的输入（如终端就绪前用户已敲下的命令、xterm 的自动应答）
       const pending = this.pendingInput.splice(0);
       this.pendingInputLen = 0;
@@ -248,6 +256,7 @@ class TermSession {
     } catch (err) {
       this.failed = true;
       const msg = String(err);
+      dbg(`${this.sid} failed ${msg}`);
       toast(msg, 'error');
       this.term.write(`\r\n\x1b[31m[启动失败] ${msg}\x1b[0m\r\n`);
       this.updateInfo();
@@ -276,9 +285,11 @@ class TermSession {
       if (this.pendingInputLen + data.length <= 8192) {
         this.pendingInput.push(data);
         this.pendingInputLen += data.length;
+        dbg(`${this.sid} fe-send-buffered len=${data.length}`);
       }
       return;
     }
+    dbg(`${this.sid} fe-send len=${data.length}`);
     void termInput(this.tab.id, data).catch(() => { /* 终端已关闭等后端错误忽略 */ });
     if (this.altMode || this.suppressSettle > 0) return;
     // 粘贴事件：正文计入 typedBuf，其中的 \r 只是插入换行，不结算
@@ -375,6 +386,7 @@ class TermSession {
 
   /* ---------- 后端输出：写 xterm + 区块 output 捕获 ---------- */
   private onBackendData(data: string): void {
+    dbg(`${this.sid} fe-recv len=${data.length} alt=${this.altMode ? 1 : 0}`);
     this.term.write(data);
     this.appendOutput(data);
     this.syncAltMode();
@@ -450,10 +462,12 @@ class TermSession {
     // 重连流程：旧通道的 term:exit 是预期内事件,吞掉一次（超时兜底在 reconnect 内）
     if (this.ignoreExit) {
       this.ignoreExit = false;
+      dbg(`${this.sid} fe-exit-swallowed code=${code}`);
       return;
     }
     if (this.exited) return;
     this.exited = true;
+    dbg(`${this.sid} fe-exit code=${code}`);
     this.resizer?.disconnect();
     this.tab.el.classList.add('wb-tab-exited');
     const hint = code === null ? '[进程已退出]' : `[进程已退出 code=${code}]`;
@@ -464,6 +478,7 @@ class TermSession {
   /* ---------- 重连:旧通道关闭(吞掉其 term:exit),同 id 重建后端会话 ---------- */
   private async reconnect(): Promise<void> {
     if (this.failed) return; // 启动失败态由 init 报错路径兜底,不在此重试
+    dbg(`${this.sid} fe-reconnect`);
     this.ignoreExit = true;
     setTimeout(() => { this.ignoreExit = false; }, 8000);
     try { await termClose(this.tab.id); } catch { /* 已关闭忽略 */ }

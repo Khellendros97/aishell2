@@ -83,6 +83,7 @@ pub fn run() {
             app.manage(ssh);
             app.manage(terms);
             app.manage(ai.clone());
+            term::set_debug_app(app.handle().clone());
             if let Some(win) = app.get_webview_window("main") {
                 // 禁用 WebView2 浏览器快捷键（Ctrl+Shift+C 开 DevTools、Ctrl+滚轮缩放、F5 刷新等）：
                 // 它们在页面 keydown 之前的 accelerator 阶段被宿主拦截，JS 无法阻止，
@@ -133,6 +134,7 @@ pub fn run() {
             term::term_input,
             term::term_resize,
             term::term_close,
+            term::debug_export,
             fsops::fs_list,
             fsops::fs_read,
             fsops::fs_write,

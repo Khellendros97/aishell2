@@ -2,6 +2,7 @@
 import './styles/design.css';
 import { getState, isConfigComplete, openDevtools } from './api';
 import { initCommandPanel } from './command-panel';
+import { initDebug } from './debug';
 import { navigate, onRoute, parseHash } from './router';
 import { applyTheme } from './theme';
 import { renderTopbar } from './components/topbar';
@@ -71,5 +72,7 @@ document.addEventListener('keydown', (e) => {
 
 void boot();
 
-/* 命令面板（Ctrl+T）：全局组件，挂载后不随页面重渲染销毁 */
+/* 命令面板（Ctrl+T / Ctrl+P）：全局组件，挂载后不随页面重渲染销毁 */
 initCommandPanel();
+/* Debug 日志总线：启动即订阅后端 debug:log（面板未开也留历史） */
+void initDebug();

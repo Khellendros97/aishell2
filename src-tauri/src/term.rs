@@ -35,6 +35,12 @@ struct TermExitPayload {
     code: Option<i32>,
 }
 
+/// Debug 面板事件 payload（前端 src/debug.ts 订阅 `debug:log`）。
+#[derive(Clone, Serialize)]
+struct DebugLogPayload {
+    line: String,
+}
+
 /* ---------------- 终端后端 ---------------- */
 
 /// 本地 PTY 或 SSH channel 的统一后端。
@@ -95,14 +101,33 @@ fn diag_tx() -> Option<&'static std::sync::mpsc::Sender<String>> {
     TX.as_ref()
 }
 
+/// Debug 面板事件出口：lib.rs setup 注入 AppHandle，diag 行同步广播 `debug:log`。
+static DEBUG_APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_debug_app(app: AppHandle) {
+    let _ = DEBUG_APP.set(app);
+}
+
 /// 追加一行带毫秒时间戳的诊断日志；失败静默（绝不影响终端主路径）。
+/// 同时落盘（diag_tx）与广播 `debug:log`（前端 Debug 面板实时流）。
 fn diag(msg: &str) {
-    let Some(tx) = diag_tx() else { return };
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let _ = tx.send(format!("{ms} {msg}"));
+    let line = format!("{ms} {msg}");
+    if let Some(tx) = diag_tx() {
+        let _ = tx.send(line.clone());
+    }
+    if let Some(app) = DEBUG_APP.get() {
+        let _ = app.emit("debug:log", DebugLogPayload { line });
+    }
+}
+
+/// 导出 Debug 面板日志到用户选定路径（前端 save 对话框拿路径后调此命令写盘）。
+#[tauri::command]
+pub fn debug_export(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| format!("导出日志失败: {e}"))
 }
 
 /// 单个终端句柄（id -> handle 存放于 TermManager）。

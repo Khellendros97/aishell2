@@ -7,6 +7,7 @@
 import { clearAllServers } from './api';
 import { confirmDialog, toast } from './ui';
 import { icon } from './icons';
+import { toggleDebugPanel } from './debug';
 
 interface PanelCommand {
   usage: string;                              // 命令用法（提示区展示）
@@ -16,6 +17,12 @@ interface PanelCommand {
 }
 
 const COMMANDS: PanelCommand[] = [
+  {
+    usage: 'debug',
+    desc: '打开/关闭 Debug 日志面板（终端事件流实时输出，支持暂停/清空/复制/导出）',
+    match: (t) => t.length === 1 && t[0] === 'debug',
+    run: () => toggleDebugPanel(),
+  },
   {
     usage: 'server config clear',
     desc: '清除所有服务器配置（服务器、分类目录、已保存的密码/密钥，所有项目解绑）',
@@ -74,9 +81,9 @@ export function initCommandPanel(): void {
   };
   const close = () => panelEl!.classList.add('hidden');
 
-  // Ctrl+T 全局唤起/收起：capture 阶段先行，避免被终端等输入处理吞掉
+  // Ctrl+T / Ctrl+P 全局唤起/收起：capture 阶段先行，避免被终端等输入处理吞掉
   document.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 't') {
+    if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 't' || e.key.toLowerCase() === 'p')) {
       e.preventDefault();
       e.stopPropagation();
       if (isOpen()) close();
