@@ -1,21 +1,24 @@
 /**
  * AI 助手面板 —— 照 .proto/workbench-ai.js 移植全部交互，mock 回复换成 pi 子进程流式事件
- * （ai:event:<key> 订阅，见 src/api.ts）。挂载时设置 Workbench.ai = { addSnapshot }，容器被移除时置 null
- * 并 aiKillProject 清理该项目的 pi 进程。
+ * （ai:event:<key> 订阅，见 src/api.ts）。挂载时设置 Workbench.ai = { addSnapshot, addFileRef, addServerRef }，
+ * 容器被移除时置 null 并 aiKillProject 清理该项目的 pi 进程。
+ * 输入区 chip 三类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端引用
+ * @remote:服务器名称 / @local（发送时展开为说明文本拼进 prompt）；Settings.autoSwitchAiWorkdir
+ * 开启时输入区固定显示工作区域标签，随激活终端自动切换并作为当前目标上下文带入。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, LlmConfig, Project, TermSnapshot } from '../../types';
+import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, LlmConfig, Project, Server, ServerRef, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
 import {
   aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiSetThinking, getState, onAiEvent, saveSettings,
   sessionUpsert, sessionsGet, setAiMode,
   type AiEvent,
 } from '../../api';
-import { Workbench, getActiveTerminalApi } from './core';
+import { Workbench, activateTab, bus, getActiveTab, getActiveTerminalApi, getTabs, type Tab, type TerminalApi } from './core';
 import { addQuickCommandModal } from './quickcommand';
-import { confirmDialog, toast, uid } from '../../ui';
+import { confirmDialog, copyText, toast, uid } from '../../ui';
 
 /* ---------- 面板样式（原型 workbench-ai.js 注入的样式 + 错误气泡红边） ---------- */
 const STYLE = `
@@ -179,6 +182,12 @@ const STYLE = `
 .ai-snap-chip { cursor: pointer; user-select: none; }
 .ai-snap-chip .ai-chip-x { margin-left: 5px; opacity: 0.7; cursor: pointer; }
 .ai-snap-chip .ai-chip-x:hover { opacity: 1; }
+/* 固定工作区域标签：随激活终端自动切换、不可移除，图标与文字对齐 */
+.ai-workarea-chip {
+  cursor: default; display: inline-flex; align-items: center; gap: 4px;
+  border-color: var(--accent); color: var(--accent-hover);
+}
+.ai-workarea-chip .ic { flex: none; }
 .ai-msg-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
 .ai-typing { display: inline-flex; align-items: center; gap: 4px; }
 .ai-typing .ai-typing-label { font-size: 11px; color: var(--text-2); margin-right: 2px; white-space: nowrap; }
@@ -292,10 +301,19 @@ const pendingBy = new Map<string, Pending | null>(); // 会话 id -> 瞬时气�
 const expandedGroups = new Set<string>();
 const snapshots = new Map<string, TermSnapshot>(); // 快照 id -> 全文（输入区 chip + 历史消息 chip 共用）
 const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编辑器选区，@文件名_起_止 标签）
+const serverRefs = new Map<string, ServerRef>(); // 服务器/本地引用 key -> 引用（key = serverId ?? 'local'，@remote:名称 / @local 标签）
+/** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
+let autoSwitchAiWorkdir = false;
+/** 当前 AI 工作区域（默认本地；随激活终端自动切换） */
+let workareaRef: ServerRef | null = null;
+/** 工作区域固定标签 DOM（不可移除；clearChips 清空后由 renderWorkareaChip 重建） */
+let workareaChipEl: HTMLElement | null = null;
 let activeSessionId = '';
 let unlisten: UnlistenFn | null = null;
 let observer: MutationObserver | null = null;
 let unmounted = false;
+/** AI 面板根容器（Ctrl+C 键盘策略监听用，卸载时移除） */
+let panelRoot: HTMLElement | null = null;
 
 let chat: HTMLElement;
 let sessionSelect: HTMLSelectElement;
@@ -310,7 +328,9 @@ let effortSaving = false;
 /** AI 模式切换防抖（YOLO 确认弹窗期间防重复触发） */
 let modeSaving = false;
 
-const MODE_LABEL: Record<AiMode, string> = { suggest: 'Suggest', agent: 'Agent', yolo: 'YOLO' };
+/* UI 显示文案：内部枚举值不变（AiMode / LlmConfig.effort），仅展示层用中文 */
+const MODE_LABEL: Record<AiMode, string> = { suggest: '仅建议', agent: '工作', yolo: '全自动' };
+const EFFORT_LABEL: Record<LlmConfig['effort'], string> = { low: '低', high: '高', max: '最高' };
 
 /**
  * 切换 AI 模式：YOLO 先弹危险确认（取消回退原模式）；确认后调 setAiMode 落盘
@@ -324,7 +344,7 @@ async function switchMode(mode: AiMode): Promise<void> {
   }
   if (mode === 'yolo') {
     const ok = await confirmDialog({
-      title: '开启 YOLO 模式',
+      title: '开启全自动模式',
       message: 'AI助手会获得所有权限并自动执行操作，请勿在生产环境中开启',
       danger: true,
       okText: '仍要开启',
@@ -337,7 +357,13 @@ async function switchMode(mode: AiMode): Promise<void> {
   modeSaving = true;
   try {
     await setAiMode(project.id, mode);
+    /* 跨「仅建议」边界（suggest ↔ agent/yolo）时，Rust 侧会重启该项目全部 pi 进程
+       （--tools 与系统提示不同，热推无法变更模型可见工具集）；生成中的回合被打断，
+       这里把所有会话的流式文本定稿并中止后端，UI 即时反映新模式。 */
+    const crossedSuggest = (project.aiMode === 'suggest') !== (mode === 'suggest');
     project.aiMode = mode;
+    modeSelect.value = mode;
+    if (crossedSuggest) leaveAllSessions();
     toast(`AI 模式已切换为 ${MODE_LABEL[mode]}`, 'success');
   } catch (err) {
     modeSelect.value = project.aiMode;
@@ -351,6 +377,19 @@ async function switchMode(mode: AiMode): Promise<void> {
 export function mountAiPanel(container: HTMLElement): void {
   project = Workbench.state.project;
   unmounted = false;
+
+  /* 会话与瞬时状态严格按项目隔离：工作台每次进入都会重新挂载本面板，
+     清空上一项目残留的会话/快照/引用/展开态，防止跨项目串数据（会话列表只含当前项目）。 */
+  sessions.clear();
+  pendingBy.clear();
+  expandedGroups.clear();
+  snapshots.clear();
+  fileRefs.clear();
+  serverRefs.clear();
+  autoSwitchAiWorkdir = false;
+  workareaRef = null;
+  workareaChipEl = null;
+  activeSessionId = '';
 
   const style = document.createElement('style');
   style.textContent = STYLE;
@@ -366,15 +405,15 @@ export function mountAiPanel(container: HTMLElement): void {
       <div id="ai-effort-bar">
         <span class="ai-mode-label">${icon('bot')} AI 模式</span>
         <select id="ai-mode-select" class="select" title="AI 执行模式（按项目持久化）">
-          <option value="suggest">Suggest</option>
-          <option value="agent">Agent</option>
-          <option value="yolo">YOLO</option>
+          <option value="suggest">仅建议</option>
+          <option value="agent">工作</option>
+          <option value="yolo">全自动</option>
         </select>
         <span class="ai-effort-label">${icon('zap')} 思考强度</span>
         <select id="ai-effort-select" class="select" title="思考强度（立即生效）">
-          <option value="low">low</option>
-          <option value="high">high</option>
-          <option value="max">max</option>
+          <option value="low">低</option>
+          <option value="high">高</option>
+          <option value="max">最高</option>
         </select>
       </div>
       <div id="ai-chip-row"></div>
@@ -403,10 +442,19 @@ export function mountAiPanel(container: HTMLElement): void {
 
   Workbench.ai = aiHandle;
 
+  /* 自动切换 AI 工作区域：激活终端标签（含新开终端）时跟随切换；
+     bus 无 off API：卸载后 unmounted 守卫 + container.isConnected 守卫使监听失效 */
+  bus.on('tab-activated', (t) => {
+    if (unmounted || !container.isConnected) return;
+    if (autoSwitchAiWorkdir) updateWorkareaFromTab(t);
+  });
+
   // pi 运行时诊断输出到控制台（F12 可查），便于排查安装版「pi 运行时不存在」
   void aiDebugInfo().then((info) => console.log('[AI] pi 运行时诊断:\n' + info));
 
   bindEvents();
+  panelRoot = container;
+  container.addEventListener('keydown', onPanelKeydown, true);
   void loadSessions();
   void loadEffort();
 }
@@ -414,13 +462,14 @@ export function mountAiPanel(container: HTMLElement): void {
 function cleanup(): void {
   if (unmounted) return;
   unmounted = true;
+  if (panelRoot) { panelRoot.removeEventListener('keydown', onPanelKeydown, true); panelRoot = null; }
   if (unlisten) { unlisten(); unlisten = null; }
   if (observer) { observer.disconnect(); observer = null; }
   if (Workbench.ai === aiHandle) Workbench.ai = null;
   if (project) void aiKillProject(project.id).catch(() => { /* 进程清理失败可忽略 */ });
 }
 
-/* ---------- Workbench.ai 句柄（终端模块添加快照） ---------- */
+/* ---------- Workbench.ai 句柄（终端模块添加快照 / 服务器引用） ---------- */
 const aiHandle = {
   addSnapshot(snap: TermSnapshot): void {
     if (!snap || !snap.id) return;
@@ -431,6 +480,21 @@ const aiHandle = {
     if (!ref || !ref.id) return;
     fileRefs.set(ref.id, ref);
     addFileChip(ref);
+  },
+  /** 服务器/本地终端引用（@remote:服务器名称 / @local 标签）；与固定工作区域重复时不再插入 */
+  addServerRef(ref: ServerRef): void {
+    if (!ref || typeof ref.name !== 'string' || !ref.name.trim()) return;
+    const key = serverRefKey(ref);
+    if (autoSwitchAiWorkdir && workareaRef && serverRefKey(workareaRef) === key) {
+      toast('该终端已是当前 AI 工作区域，无需重复添加');
+      return;
+    }
+    if (serverRefs.has(key)) {
+      toast('该引用已在输入框中');
+      return;
+    }
+    serverRefs.set(key, ref);
+    addServerRefChip(ref);
   },
 };
 
@@ -477,13 +541,20 @@ async function subscribe(key: string): Promise<void> {
   }
 }
 
-/** 读取当前思考强度回显到快捷入口（后端 settings 为事实源） */
+/** 读取思考强度/工作区域设置回显（后端 settings 为事实源） */
 async function loadEffort(): Promise<void> {
   try {
     const st = await getState();
     effortSelect.value = st.settings.llm.effort || 'low';
+    autoSwitchAiWorkdir = !!st.settings.autoSwitchAiWorkdir;
   } catch {
-    /* 读取失败保持默认 low */
+    /* 读取失败保持默认 low / 关闭 */
+  }
+  // 开启自动切换时：初始工作区域默认本地；已有激活终端则跟随其归属
+  if (autoSwitchAiWorkdir) {
+    const active = getActiveTab();
+    if (active && active.type === 'terminal') updateWorkareaFromTab(active);
+    renderWorkareaChip();
   }
 }
 
@@ -497,7 +568,7 @@ async function switchEffort(level: LlmConfig['effort']): Promise<void> {
     st.settings.llm.effort = level;
     await saveSettings(st.settings, null, null);
     await aiSetThinking(project.id, level);
-    toast(`思考强度已切换为 ${level}`, 'success');
+    toast(`思考强度已切换为 ${EFFORT_LABEL[level]}`, 'success');
   } catch (err) {
     effortSelect.value = st?.settings.llm.effort ?? 'low';
     toast(`切换思考强度失败: ${String(err)}`, 'error');
@@ -545,20 +616,26 @@ function handleEvent(key: string, ev: AiEvent): void {
     });
     pendingBy.set(sid, p);
   } else if (ev.type === 'approval') {
-    /* Agent 审批请求：卡片进入审批态（显示意图 + 批准/拒绝按钮） */
-    const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
-    const existing = p.actions.get(ev.toolCallId);
-    p.actions.set(ev.toolCallId, {
-      toolCallId: ev.toolCallId,
-      tool: existing?.tool ?? ev.action,
-      intent: ev.intent || existing?.intent || '',
-      summary: ev.summary || existing?.summary || '',
-      command: existing?.command,
-      requestId: ev.requestId,
-      status: existing?.status === 'running' ? 'running' : 'approving',
-    });
-    pendingBy.set(sid, p);
+    /* AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：弹确认框，
+       不进动作卡；其余仍为 Agent 逐调用审批卡 */
+    if (ev.action === 'request_agent_mode') {
+      void handleModeRequest(sid, ev);
+    } else {
+      /* Agent 审批请求：卡片进入审批态（显示意图 + 批准/拒绝按钮） */
+      const cur = pendingBy.get(sid) ?? null;
+      const p = cur ?? emptyPending();
+      const existing = p.actions.get(ev.toolCallId);
+      p.actions.set(ev.toolCallId, {
+        toolCallId: ev.toolCallId,
+        tool: existing?.tool ?? ev.action,
+        intent: ev.intent || existing?.intent || '',
+        summary: ev.summary || existing?.summary || '',
+        command: existing?.command,
+        requestId: ev.requestId,
+        status: existing?.status === 'running' ? 'running' : 'approving',
+      });
+      pendingBy.set(sid, p);
+    }
   } else if (ev.type === 'actionEnd') {
     /* 受控工具结束：更新终态（拒绝场景由前端本地标记，不走此事件） */
     const cur = pendingBy.get(sid) ?? null;
@@ -617,6 +694,7 @@ function finalize(sid: string): void {
     content: text,
     snapshots: [],
     fileRefs: [],
+    serverRefs: [],
     actions: collectActions(p),
     ts: Date.now(),
   });
@@ -635,6 +713,7 @@ function leaveSession(sid: string): void {
         content: p.text,
         snapshots: [],
         fileRefs: [],
+        serverRefs: [],
         actions: collectActions(p),
         ts: Date.now(),
       });
@@ -642,6 +721,12 @@ function leaveSession(sid: string): void {
     }
   }
   if (project) void aiAbort(`${project.id}:${sid}`).catch(() => { /* 后端无进程时静默 */ });
+}
+
+/** 模式切换跨「仅建议」边界时后端会重启本项目全部 pi 进程：把所有会话的生成中文本
+ *  定稿并中止后端（与 leaveSession 同语义，逐会话处理） */
+function leaveAllSessions(): void {
+  [...sessions.keys()].forEach((sid) => leaveSession(sid));
 }
 
 function persistSession(s: ChatSession): void {
@@ -740,6 +825,11 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
         const n = ref.path.split(/[\\/]/).pop() || ref.path;
         return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(ref.id)}" data-kind="file" title="点击查看文件引用">@${escapeHtml(n)}_${ref.startLine}_${ref.endLine}</span>`;
       }),
+      ...(m.serverRefs ?? []).map((r) => {
+        const key = serverRefKey(r);
+        const label = r.serverId ? `@remote:${r.name}` : '@local';
+        return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(key)}" data-kind="server" title="${r.serverId ? `引用服务器「${r.name}」` : '引用本地终端'}">${escapeHtml(label)}</span>`;
+      }),
     ].join('');
     wrap.innerHTML =
       `<div class="ai-bubble">${chips ? `<div class="ai-msg-chips">${chips}</div>` : ''}` +
@@ -823,6 +913,30 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
   }
 }
 
+/** AI 申请切换到工作模式（request_agent_mode 工具，仅建议模式可用）：
+ *  弹确认框展示申请理由；同意 → 先回复 pi（guard 拿到结果后本回合可继续），
+ *  再走 switchMode 实时切换路径切到工作模式（跨边界会重启进程、定稿当前生成）；
+ *  拒绝 → 仅回复 pi，保持仅建议模式。 */
+async function handleModeRequest(sid: string, ev: Extract<AiEvent, { type: 'approval' }>): Promise<void> {
+  if (!project) return;
+  const ok = await confirmDialog({
+    title: 'AI 申请切换到工作模式',
+    message: `AI 申请理由：${ev.summary || ev.intent || '未说明'}\n\n同意后当前会话立即切换为工作模式（Agent），AI 将获得执行命令、修改文件等权限。`,
+    okText: '同意切换',
+  });
+  try {
+    await aiRespondApproval(`${project.id}:${sid}`, ev.requestId, ok);
+  } catch (err) {
+    toast(`回复 AI 申请失败：${String(err)}`, 'error');
+    return;
+  }
+  if (ok) {
+    await switchMode('agent');
+  } else {
+    toast('已拒绝 AI 的工作模式申请', 'info');
+  }
+}
+
 /** 回复 Agent 审批：批准 → 执行中；拒绝 → 已拒绝（后端只接受当前待处理 requestId） */
 async function respondApproval(sid: string, toolCallId: string, confirmed: boolean): Promise<void> {
   if (!project) return;
@@ -899,6 +1013,11 @@ function onChatClick(e: MouseEvent): void {
       const api = getActiveTerminalApi();
       if (api) {
         api.paste(card.dataset.cmd ?? '');
+        // 目标终端标签未激活时先切换过去，再聚焦，保证「直接回车即可执行」
+        const termTab = getTabs().find((t) => t.type === 'terminal' && t.api === api);
+        const active = getActiveTab();
+        if (termTab && (!active || active.id !== termTab.id)) activateTab(termTab.id);
+        api.focus();
         toast('已粘贴到终端', 'success');
       } else {
         toast('没有可用的终端标签页', 'error');
@@ -914,12 +1033,13 @@ function onChatClick(e: MouseEvent): void {
   const chip = target.closest('[data-snap-id]') as HTMLElement | null;
   if (chip) {
     const id = chip.dataset.snapId ?? '';
+    if (chip.dataset.kind === 'server') return; // 服务器引用无详情弹窗
     if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(id));
     else openSnapModal(snapshots.get(id));
   }
 }
 
-/* ---------- 输入区 chip（终端快照 / 文件引用） ---------- */
+/* ---------- 输入区 chip（终端快照 / 文件引用 / 服务器引用 / 固定工作区域） ---------- */
 function addChip(snap: TermSnapshot): void {
   const c = document.createElement('span');
   c.className = 'tag blue ai-snap-chip';
@@ -941,18 +1061,94 @@ function addFileChip(ref: FileRef): void {
   chipRow.appendChild(c);
 }
 
+/** 服务器/本地引用 key：serverId 为空 = 本地终端 */
+function serverRefKey(r: ServerRef): string {
+  return r.serverId ?? 'local';
+}
+
+function addServerRefChip(ref: ServerRef): void {
+  const key = serverRefKey(ref);
+  const label = ref.serverId ? `@remote:${ref.name}` : '@local';
+  const c = document.createElement('span');
+  c.className = 'tag blue ai-snap-chip';
+  c.dataset.id = key;
+  c.dataset.kind = 'server';
+  c.title = ref.serverId ? `引用服务器「${ref.name}」，✕ 移除` : '引用本地终端，✕ 移除';
+  c.innerHTML = `${escapeHtml(label)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
+  chipRow.appendChild(c);
+}
+
 const clearChips = (): void => {
   chipRow.innerHTML = '';
+  renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
 };
+
+/** 固定工作区域标签（不可移除）：显示 @local / @remote:服务器名称，随激活终端自动切换 */
+function renderWorkareaChip(): void {
+  if (!autoSwitchAiWorkdir) {
+    if (workareaChipEl) { workareaChipEl.remove(); workareaChipEl = null; }
+    return;
+  }
+  if (!workareaRef) workareaRef = { serverId: null, name: '本地终端' };
+  const label = workareaRef.serverId ? `@remote:${workareaRef.name}` : '@local';
+  const title = workareaRef.serverId
+    ? `当前 AI 工作区域：服务器「${workareaRef.name}」（随激活终端自动切换）`
+    : '当前 AI 工作区域：本地（随激活终端自动切换）';
+  if (workareaChipEl && workareaChipEl.isConnected) {
+    workareaChipEl.innerHTML = `${icon('globe')} ${escapeHtml(label)}`;
+    workareaChipEl.title = title;
+    return;
+  }
+  const c = document.createElement('span');
+  c.className = 'tag blue ai-snap-chip ai-workarea-chip';
+  c.dataset.kind = 'workarea';
+  c.title = title;
+  c.innerHTML = `${icon('globe')} ${escapeHtml(label)}`;
+  chipRow.prepend(c);
+  workareaChipEl = c;
+}
+
+/** 工作区域切换：更新固定标签；同名手动引用被覆盖（固定引用不重复插入） */
+function setWorkarea(ref: ServerRef): void {
+  const key = serverRefKey(ref);
+  if (workareaRef && serverRefKey(workareaRef) === key) {
+    // 名称可能变化（如服务器改名），仍刷新标签
+    workareaRef = ref;
+    renderWorkareaChip();
+    return;
+  }
+  workareaRef = ref;
+  if (serverRefs.has(key)) {
+    serverRefs.delete(key);
+    chipRow.querySelectorAll('.ai-snap-chip[data-kind="server"]').forEach((el) => {
+      if ((el as HTMLElement).dataset.id === key) el.remove();
+    });
+  }
+  renderWorkareaChip();
+}
+
+/** 激活终端 → 工作区域：SSH 终端取服务器引用，本地终端取本地引用；非终端标签不切换 */
+function updateWorkareaFromTab(t: Tab | null): void {
+  if (!t || t.type !== 'terminal') return;
+  const data = t.data as { kind?: string; serverId?: string };
+  if (data.kind === 'ssh' && data.serverId) {
+    setWorkarea({ serverId: data.serverId, name: String(t.title || '服务器') });
+  } else {
+    setWorkarea({ serverId: null, name: '本地终端' });
+  }
+}
 
 function onChipRowClick(e: MouseEvent): void {
   const target = e.target as HTMLElement;
   const chip = target.closest('.ai-snap-chip') as HTMLElement | null;
   if (!chip) return;
+  if (chip.dataset.kind === 'workarea') return; // 固定工作区域标签不可移除
   if (target.closest('.ai-chip-x')) {
+    if (chip.dataset.kind === 'server') serverRefs.delete(chip.dataset.id ?? '');
     chip.remove();
     return;
   }
+  if (chip.dataset.kind === 'server') return; // 服务器引用无详情弹窗
   if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(chip.dataset.id ?? ''));
   else openSnapModal(snapshots.get(chip.dataset.id ?? ''));
 }
@@ -1024,7 +1220,7 @@ function isGenerating(sid: string): boolean {
 }
 
 /* ---------- 发送与流式接收 ---------- */
-function send(): void {
+async function send(): Promise<void> {
   if (!project) {
     toast('项目未加载', 'error');
     return;
@@ -1040,23 +1236,30 @@ function send(): void {
   const text = input.value.trim();
   const snaps: TermSnapshot[] = [];
   const refs: FileRef[] = [];
+  const srefs: ServerRef[] = [];
+  // 固定工作区域引用最先（开启自动切换时）；发送时作为当前目标上下文说明
+  if (autoSwitchAiWorkdir && workareaRef) srefs.push(workareaRef);
   chipRow.querySelectorAll('.ai-snap-chip').forEach((c) => {
     const el = c as HTMLElement;
     const id = el.dataset.id ?? '';
-    if (el.dataset.kind === 'file') {
+    const kind = el.dataset.kind ?? '';
+    if (kind === 'file') {
       const r = fileRefs.get(id);
       if (r) refs.push(r);
-    } else {
-      const s = snapshots.get(id);
-      if (s) snaps.push(s);
+    } else if (kind === 'term') {
+      const sn = snapshots.get(id);
+      if (sn) snaps.push(sn);
+    } else if (kind === 'server') {
+      const r = serverRefs.get(id);
+      if (r) srefs.push(r);
     }
   });
-  if (!text && snaps.length === 0 && refs.length === 0) return;
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0) return;
 
   // 首条用户消息决定会话标题
-  if (s.messages.length === 0) s.title = text.slice(0, 20) || '文件引用';
+  if (s.messages.length === 0) s.title = text.slice(0, 20) || (srefs.length ? '引用' : '文件引用');
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, actions: [], ts: Date.now() });
   input.value = '';
   autoGrow();
   clearChips();
@@ -1066,12 +1269,8 @@ function send(): void {
   updateSendBtn();
   persistSession(s);
 
-  // 提交给 ai_chat 的 prompt = 用户文本 + 每个快照/文件引用追加（UI 气泡只显示 chip）
-  const prompt = text + snaps
-    .map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`)
-    .join('') + refs
-    .map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`)
-    .join('');
+  // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器引用说明（UI 气泡只显示 chip）
+  const prompt = await buildPrompt(text, snaps, refs, srefs);
   aiChat(`${project.id}:${sid}`, prompt).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
     console.error('[AI] ai_chat 失败:', err);
@@ -1083,7 +1282,79 @@ function send(): void {
   });
 }
 
+/**
+ * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器引用说明。
+ * 固定工作区域（开启自动切换时 srefs[0]）作为「当前工作区域」上下文说明，
+ * 远程引用附 user@host:port 便于 AI 选择命令目标（后端 run_command 的 target 由 AI 工具参数决定）。
+ */
+async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[]): Promise<string> {
+  let servers: Server[] = [];
+  try {
+    servers = (await getState()).servers;
+  } catch {
+    /* 后端未就绪时仅用名称 */
+  }
+  /** 远程引用说明：名称 (user@host:port)；服务器已删除时回退为名称 */
+  const remoteText = (r: ServerRef): string => {
+    const sv = servers.find((s) => s.id === r.serverId);
+    if (!sv) return `[引用服务器: ${r.name}]`;
+    return `[引用服务器: ${sv.name} (${sv.username}@${sv.host}:${sv.port})]`;
+  };
+  const parts: string[] = [];
+  if (autoSwitchAiWorkdir && workareaRef && srefs[0] === workareaRef) {
+    // 固定工作区域：作为当前目标上下文说明
+    const wr: ServerRef = workareaRef; // 具名 const：IIFE 闭包内保持收窄
+    parts.push(
+      wr.serverId === null
+        ? '[当前工作区域: 本地]'
+        : (() => {
+            const sv = servers.find((s) => s.id === wr.serverId);
+            return sv
+              ? `[当前工作区域: 服务器 ${sv.name} (${sv.username}@${sv.host}:${sv.port})]`
+              : `[当前工作区域: ${wr.name}]`;
+          })(),
+    );
+  }
+  for (const r of srefs) {
+    if (r === workareaRef) continue; // 工作区域已作为上下文说明，避免重复
+    parts.push(r.serverId === null ? '[引用: 本地终端]' : remoteText(r));
+  }
+  const refText = parts.map((p) => `\n\n${p}`).join('');
+  return text
+    + snaps.map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`).join('')
+    + refs.map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`).join('')
+    + refText;
+}
+
 /* ---------- 事件绑定 ---------- */
+/** AI 面板 Ctrl+C 策略（capture 阶段）：
+ *  1) 输入框有选区 → 不拦截，交给浏览器默认复制；
+ *  2) 消息区有选中文本 → 显式复制（WebView 对非编辑区选中文本的默认复制不可靠，走 copyText 封装）；
+ *  3) 输入框为空且当前标签为终端 → 转发 ^C 给终端（中断正在运行的程序），避免误吞 Ctrl+C。 */
+function onPanelKeydown(e: KeyboardEvent): void {
+  if (e.key !== 'c' && e.key !== 'C') return;
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  // 输入框有选区：默认复制行为即可
+  if (input.selectionStart !== input.selectionEnd) return;
+  const sel = window.getSelection();
+  const selText = sel ? sel.toString() : '';
+  if (selText) {
+    e.preventDefault();
+    e.stopPropagation();
+    void copyText(selText);
+    return;
+  }
+  // 输入框为空且终端是当前 tab：转发 ^C 给终端
+  if (input.value === '') {
+    const active = getActiveTab();
+    if (active && active.type === 'terminal' && active.api) {
+      e.preventDefault();
+      e.stopPropagation();
+      (active.api as TerminalApi).ctrlC();
+    }
+  }
+}
+
 function bindEvents(): void {
   sessionSelect.onchange = () => {
     leaveSession(activeSessionId);

@@ -13,7 +13,8 @@ import type { Server } from '../../../types';
 import { icon } from '../../../icons';
 import { getState, renameServerFolder, setServerLocked, upsertProject, upsertServer } from '../../../api';
 import { bus, openTab, Workbench } from '../core';
-import { attachCombo, promptDialog, toast, uid } from '../../../ui';
+import { promptDialog, showContextMenu, toast, uid } from '../../../ui';
+import { createServerForm } from '../../server-form';
 import './servers.css';
 
 export const serversHead = { title: '服务器列表' };
@@ -30,52 +31,15 @@ const esc = (s: string | number): string =>
   )[c]);
 
 export function mountServersPanel(container: HTMLElement): void {
-  /* ---------- 新建服务器模态框（一次性建 DOM，复用全局 .modal-mask/.modal/.field 样式） ---------- */
+  /* ---------- 新建 / 编辑服务器模态框（字段与校验逻辑复用 server-form.ts；密码留空 = 保持原值，永不回显） ---------- */
   container.insertAdjacentHTML('beforeend', `
     <div class="modal-mask hidden" id="srv-modal">
       <div class="modal">
         <div class="modal-head">
-          <h3>新建服务器连接</h3>
+          <h3 id="srv-modal-title">新建服务器连接</h3>
           <button id="srv-modal-close" class="icon-btn" title="关闭">${icon('x')}</button>
         </div>
-        <div class="modal-body">
-          <div class="field">
-            <label>服务器名称<span class="req">*</span></label>
-            <input id="srv-f-name" class="input" placeholder="例如：生产-Web-01">
-          </div>
-          <div class="field">
-            <label>IP 地址<span class="req">*</span></label>
-            <input id="srv-f-host" class="input mono" placeholder="例如：47.102.118.66">
-          </div>
-          <div class="field">
-            <label>SSH 端口<span class="req">*</span></label>
-            <input id="srv-f-port" class="input mono" type="number" min="1" max="65535" value="22">
-          </div>
-          <div class="field">
-            <label>认证方式<span class="req">*</span></label>
-            <select id="srv-f-auth" class="select">
-              <option value="password">账号密码</option>
-              <option value="key">密钥</option>
-            </select>
-          </div>
-          <div class="field">
-            <label>账号<span class="req">*</span></label>
-            <input id="srv-f-username" class="input" placeholder="例如：deploy">
-          </div>
-          <div class="field" data-auth="password">
-            <label>密码</label>
-            <input id="srv-f-password" class="input" type="password" placeholder="留空则不保存">
-          </div>
-          <div class="field" data-auth="key">
-            <label>密钥文件路径</label>
-            <input id="srv-f-keypath" class="input mono" placeholder="C:\\Users\\demo\\.ssh\\id_ed25519">
-          </div>
-          <div class="field">
-            <label>所属目录</label>
-            <input id="srv-f-folder" class="input" placeholder="可输入新分类或从下拉选择，例如：生产环境/Web">
-            <div class="hint">以 / 分隔的目录路径，用于侧栏分组展示；可下拉选择已有分类，也可直接输入新分类；留空表示未分类</div>
-          </div>
-        </div>
+        <div class="modal-body" id="srv-modal-body"></div>
         <div class="modal-foot">
           <button id="srv-modal-cancel" class="btn">取消</button>
           <button id="srv-modal-save" class="btn primary">创建并绑定到当前项目</button>
@@ -84,91 +48,7 @@ export function mountServersPanel(container: HTMLElement): void {
     </div>
   `);
 
-  const modal = container.querySelector('#srv-modal') as HTMLElement;
-  const fName = container.querySelector('#srv-f-name') as HTMLInputElement;
-  const fHost = container.querySelector('#srv-f-host') as HTMLInputElement;
-  const fPort = container.querySelector('#srv-f-port') as HTMLInputElement;
-  const fAuth = container.querySelector('#srv-f-auth') as HTMLSelectElement;
-  const fUsername = container.querySelector('#srv-f-username') as HTMLInputElement;
-  const fPassword = container.querySelector('#srv-f-password') as HTMLInputElement;
-  const fKeyPath = container.querySelector('#srv-f-keypath') as HTMLInputElement;
-  const fFolder = container.querySelector('#srv-f-folder') as HTMLInputElement;
-
-  function syncAuthFields(): void {
-    const mode = fAuth.value;
-    modal.querySelectorAll('.field[data-auth]').forEach((field) => {
-      field.classList.toggle('hidden', field.getAttribute('data-auth') !== mode);
-    });
-  }
-
-  function openModal(): void {
-    // 每次打开重置表单（密码/密钥路径不留上次输入）
-    fName.value = '';
-    fHost.value = '';
-    fPort.value = '22';
-    fAuth.value = 'password';
-    fUsername.value = '';
-    fPassword.value = '';
-    fKeyPath.value = '';
-    fFolder.value = '';
-    syncAuthFields();
-    modal.classList.remove('hidden');
-    requestAnimationFrame(() => modal.classList.add('open'));
-    fName.focus();
-  }
-
-  function closeModal(): void {
-    modal.classList.remove('open');
-    setTimeout(() => modal.classList.add('hidden'), 160);
-  }
-
-  async function saveNewServer(): Promise<void> {
-    const name = fName.value.trim();
-    const host = fHost.value.trim();
-    if (!name || !host) {
-      toast('请填写服务器名称与 IP 地址', 'error');
-      return;
-    }
-    const server: Server = {
-      id: uid('srv'),
-      name,
-      host,
-      port: Number(fPort.value) || 22,
-      authType: fAuth.value as Server['authType'],
-      username: fUsername.value.trim(),
-      keyPath: fAuth.value === 'key' ? fKeyPath.value.trim() : '',
-      // 所属目录：规范化 '/' 分隔路径（去首尾/重复分隔符），留空 = 未分类
-      folder: fFolder.value.trim().split('/').filter(Boolean).join('/'),
-      locked: false,
-    };
-    const password = fAuth.value === 'password' ? fPassword.value : null;
-    try {
-      await upsertServer(server, password);
-      // 创建成功后立即绑定到当前项目（内存同步 + 落盘 + 通知各面板刷新）
-      const project = Workbench.state.project;
-      if (project) {
-        if (!project.serverIds.includes(server.id)) {
-          project.serverIds.push(server.id);
-          await upsertProject(project);
-        }
-        bus.emit('project-changed');
-      }
-      closeModal();
-      toast(`服务器「${name}」已创建并绑定到当前项目`, 'success');
-    } catch (err) {
-      toast(`创建服务器失败: ${String(err)}`, 'error');
-    }
-  }
-
-  modal.querySelector('#srv-modal-close')!.addEventListener('click', closeModal);
-  modal.querySelector('#srv-modal-cancel')!.addEventListener('click', closeModal);
-  modal.addEventListener('mousedown', (e) => { if (e.target === modal) closeModal(); });
-  fAuth.addEventListener('change', syncAuthFields);
-  modal.querySelector('#srv-modal-save')!.addEventListener('click', () => { void saveNewServer(); });
-  const onKeydown = (e: KeyboardEvent) => {
-    if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
-  };
-  document.addEventListener('keydown', onKeydown);
+  /* 模态框逻辑（新建 / 编辑共用 server-form.ts）见下方 folderOptions 之后的实现 */
 
   /* 搜索行（持久元素）：搜索框 + 全部展开/折叠切换按钮，不随列表重建，避免输入焦点丢失 */
   const searchWrap = document.createElement('div');
@@ -193,7 +73,76 @@ export function mountServersPanel(container: HTMLElement): void {
     latestServers.forEach((s) => { if (s.folder) opts.add(s.folder); });
     return Array.from(opts).sort((a, b) => a.localeCompare(b, 'zh'));
   };
-  attachCombo(fFolder, folderOptions);
+  /* ---------- 新建 / 编辑服务器模态框（字段与校验复用 server-form.ts；编辑时密码留空 = 保持 keyring 原值） ---------- */
+  const modal = container.querySelector('#srv-modal') as HTMLElement;
+  const modalTitle = container.querySelector('#srv-modal-title') as HTMLElement;
+  const saveBtn = container.querySelector('#srv-modal-save') as HTMLButtonElement;
+  const form = createServerForm(container.querySelector('#srv-modal-body') as HTMLElement, { folderOptions });
+  let editingServer: Server | null = null; // null = 新建；否则为正在编辑的服务器（预填，密码不回显）
+
+  function openModal(): void {
+    editingServer = null;
+    modalTitle.textContent = '新建服务器连接';
+    saveBtn.textContent = '创建并绑定到当前项目';
+    form.fill(null); // 每次打开重置表单（密码/密钥路径不留上次输入）
+    modal.classList.remove('hidden');
+    requestAnimationFrame(() => modal.classList.add('open'));
+    form.focusFirst();
+  }
+
+  /** 编辑入口：预填当前服务器配置（密码永不回显），保存走 upsert_server 且密码留空 = 保持原值 */
+  function openEditModal(server: Server): void {
+    editingServer = server;
+    modalTitle.textContent = '编辑服务器';
+    saveBtn.textContent = '保存';
+    form.fill(server);
+    modal.classList.remove('hidden');
+    requestAnimationFrame(() => modal.classList.add('open'));
+    form.focusFirst();
+  }
+
+  function closeModal(): void {
+    modal.classList.remove('open');
+    setTimeout(() => modal.classList.add('hidden'), 160);
+  }
+
+  async function saveServer(): Promise<void> {
+    const err = form.validate();
+    if (err) {
+      toast(err, 'error');
+      return;
+    }
+    const isNew = editingServer === null;
+    const server = form.buildServer(editingServer);
+    try {
+      await upsertServer(server, form.passwordValue());
+      if (isNew) {
+        // 创建成功后立即绑定到当前项目（内存同步 + 落盘 + 通知各面板刷新）
+        const project = Workbench.state.project;
+        if (project && !project.serverIds.includes(server.id)) {
+          project.serverIds.push(server.id);
+          await upsertProject(project);
+        }
+      }
+    } catch (err) {
+      toast(`${isNew ? '创建' : '保存'}服务器失败: ${String(err)}`, 'error');
+      return;
+    }
+    closeModal();
+    bus.emit('project-changed');
+    toast(isNew
+      ? `服务器「${server.name}」已创建并绑定到当前项目`
+      : `服务器「${server.name}」已更新`, 'success');
+  }
+
+  modal.querySelector('#srv-modal-close')!.addEventListener('click', closeModal);
+  modal.querySelector('#srv-modal-cancel')!.addEventListener('click', closeModal);
+  modal.addEventListener('mousedown', (e) => { if (e.target === modal) closeModal(); });
+  modal.querySelector('#srv-modal-save')!.addEventListener('click', () => { void saveServer(); });
+  const onKeydown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
+  };
+  document.addEventListener('keydown', onKeydown);
 
   /* 分组标题重命名：级联改所有服务器 folder 后整体重渲染（复用设置页 promptDialog 流程） */
   async function renameFolderFlow(folder: string): Promise<void> {
@@ -215,6 +164,15 @@ export function mountServersPanel(container: HTMLElement): void {
     toast(`分类目录已重命名为「${name}」`, 'success');
   }
 
+  /** 把服务器/本地终端引用加入 AI 输入框（@remote:服务器名称 / @local 标签，见 core.ts AiHandle.addServerRef） */
+  function addRefToChat(ref: { serverId: string | null; name: string }): void {
+    if (Workbench.ai?.addServerRef) {
+      Workbench.ai.addServerRef(ref);
+    } else {
+      toast('AI 面板未就绪');
+    }
+  }
+
   const render = async (): Promise<void> => {
     let servers: Server[] = [];
     let folders: string[] = [];
@@ -224,8 +182,7 @@ export function mountServersPanel(container: HTMLElement): void {
       folders = state.serverFolders;
     } catch {
       /* 后端未就绪时按空列表渲染 */
-    }
-    latestServers = servers;
+    }    latestServers = servers;
     latestFolders = folders;
     const project = Workbench.state.project;
     const ids = project?.serverIds ?? [];
@@ -267,6 +224,14 @@ export function mountServersPanel(container: HTMLElement): void {
         data: { kind: 'local', cwd: project?.path ?? null },
       });
     };
+    /* 本地终端卡右键菜单：添加到对话（@local 标签） */
+    localCard.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showContextMenu(e.clientX, e.clientY, [
+        { label: '添加到对话', iconName: 'chatPlus', action: () => addRefToChat({ serverId: null, name: '本地终端' }) },
+      ]);
+    });
     /* 必须 prepend：持久搜索框（searchWrap）在重渲染时保留在 wrap 内，
        appendChild 会把本地卡追加到搜索框/列表之后，目录展开时卡片沉底 */
     wrap.prepend(localCard);
@@ -327,6 +292,9 @@ export function mountServersPanel(container: HTMLElement): void {
             '<span class="wbs-server-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
             '<span class="wbs-server-addr mono">' + esc(s.host) + ':' + esc(s.port) + '</span>' +
           '</span>' +
+          '<button class="icon-btn wbs-edit" title="编辑服务器配置" aria-label="编辑服务器配置">' +
+            icon('pencil') +
+          '</button>' +
           '<button class="icon-btn wbs-lock' + (s.locked ? ' locked' : '') + '" title="' + lockTitle + '" aria-label="' + lockTitle + '" aria-pressed="' + String(s.locked) + '">' +
             icon(s.locked ? 'lock' : 'unlock') +
           '</button>' +
@@ -336,9 +304,26 @@ export function mountServersPanel(container: HTMLElement): void {
           '<span class="tag">' + (s.authType === 'key' ? icon('key') + ' 密钥' : '密码') + '</span>' +
         '</div>' +
         '<div class="wbs-server-actions">' +
+          '<button class="icon-btn wbs-chat" title="添加到对话" aria-label="添加到对话">' + icon('chatPlus') + '</button>' +
           '<button class="icon-btn wbs-ssh" title="SSH 连接" aria-label="SSH 连接">' + icon('terminal') + '</button>' +
           '<button class="icon-btn wbs-sftp" title="SFTP 文件管理" aria-label="SFTP 文件管理">' + icon('folder') + '</button>' +
         '</div>';
+      (card.querySelector('.wbs-chat') as HTMLButtonElement).onclick = (e) => {
+        e.stopPropagation();
+        addRefToChat({ serverId: s.id, name: s.name });
+      };
+      /* 服务器卡右键菜单：添加到对话（@remote:服务器名称 标签） */
+      card.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showContextMenu(e.clientX, e.clientY, [
+          { label: '添加到对话', iconName: 'chatPlus', action: () => addRefToChat({ serverId: s.id, name: s.name }) },
+        ]);
+      });
+      (card.querySelector('.wbs-edit') as HTMLButtonElement).onclick = (e) => {
+        e.stopPropagation();
+        openEditModal(s);
+      };
       (card.querySelector('.wbs-lock') as HTMLButtonElement).onclick = (e) => {
         e.stopPropagation();
         void setServerLocked(s.id, !s.locked)

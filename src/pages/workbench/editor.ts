@@ -4,6 +4,8 @@
  *   - 脏标记 ● / 800ms 防抖自动保存 / Ctrl+S 立即保存 / 关闭时静默落盘
  *   - 语法高亮改用 @codemirror/language-data 按文件名/扩展名匹配（不可识别为纯文本）
  *   - 数据源为真实 fs_read / fs_write（后端 fsops），载入失败 toast 错误原文并显示空文档
+ * 扩展（待优化 9，.proto 无此规格）：Ctrl+F / Ctrl+H 查找替换栏（复用 @codemirror/search），
+ *   替换走既有脏标记/自动保存；无只读态（二进制文件在打开前已被拦截）。
  * import 即完成注册（副作用），由 workbench.ts 引入。
  */
 import { EditorState, Prec, StateEffect, Compartment, type Extension } from '@codemirror/state';
@@ -13,8 +15,12 @@ import { HighlightStyle, LanguageDescription, indentUnit, syntaxHighlighting } f
 import { languages } from '@codemirror/language-data';
 import { tags } from '@lezer/highlight';
 import { oneDarkTheme } from '@codemirror/theme-one-dark';
+import { search, SearchQuery, getSearchQuery, openSearchPanel, closeSearchPanel, searchPanelOpen, setSearchQuery, findNext, findPrevious, replaceNext, replaceAll } from '@codemirror/search';
+import type { Panel, ViewUpdate } from '@codemirror/view';
 import { fsRead, fsWrite, onFsChanged, sftpRead, sftpWrite } from '../../api';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
+import { icon } from '../../icons';
+import type { IconName } from '../../icons';
 import type { FileRef } from '../../types';
 import { registerRenderer, bus, setTabTitle, Workbench, type Tab } from './core';
 import { currentTheme, onThemeChange } from '../../theme';
@@ -242,6 +248,255 @@ function addSelectionToAI(view: EditorView, path: string, from: number, to: numb
   }
 }
 
+/* ---------- 查找 / 替换（Ctrl+F / Ctrl+H，待优化 9） ----------
+   复用 @codemirror/search 的查询状态、匹配高亮与 findNext/findPrevious/replaceNext/replaceAll 命令，
+   面板换成中文 UI（顶部浮层）；替换产生 doc change，自动走既有脏标记/自动保存逻辑。 */
+
+/** 匹配计数上限：超过显示 1000+，避免超大文档全量扫描卡顿（与 @codemirror/search 内部限制一致） */
+const FIND_MATCH_CAP = 1000;
+/** 面板实例登记：openFind 需要把 Ctrl+H 的替换态同步到已打开的实例 */
+const findBars = new WeakMap<EditorView, FindBar>();
+
+/** Ctrl+F / Ctrl+H 打开（已打开则聚焦）查找栏；withReplace 控制替换行展开 */
+function openFind(view: EditorView, withReplace: boolean): void {
+  openSearchPanel(view);
+  findBars.get(view)?.setReplaceMode(withReplace);
+}
+
+class FindBar implements Panel {
+  readonly dom: HTMLElement;
+  readonly top = true;
+  pos = 0;
+
+  private readonly view: EditorView;
+  private query: SearchQuery;
+  private matches: { from: number; to: number }[] = [];
+  private truncated = false;
+  private current = -1;
+
+  private readonly searchInput: HTMLInputElement;
+  private readonly replaceInput: HTMLInputElement;
+  private readonly countEl: HTMLElement;
+  private readonly caseBtn: HTMLButtonElement;
+  private readonly wordBtn: HTMLButtonElement;
+  private readonly replaceRow: HTMLElement;
+  private readonly replaceToggleBtn: HTMLButtonElement;
+  private readonly replaceBtn: HTMLButtonElement;
+  private readonly replaceAllBtn: HTMLButtonElement;
+
+  constructor(view: EditorView) {
+    this.view = view;
+    this.query = new SearchQuery(getSearchQuery(view.state));
+    findBars.set(view, this);
+
+    this.searchInput = this.makeInput('查找');
+    this.searchInput.setAttribute('main-field', 'true'); // openSearchPanel 据此聚焦
+    this.replaceInput = this.makeInput('替换为');
+
+    this.countEl = document.createElement('span');
+    this.countEl.className = 'ed-find-count';
+
+    const iconBtn = (name: IconName, title: string, onClick: () => void): HTMLButtonElement => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'icon-btn';
+      b.title = title;
+      b.innerHTML = icon(name);
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    const textBtn = (label: string, extra: string, title: string, onClick: () => void): HTMLButtonElement => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `btn small${extra ? ' ' + extra : ''}`;
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener('click', onClick);
+      return b;
+    };
+
+    const prevBtn = iconBtn('arrowUp', '上一项（Shift+Enter）', () => findPrevious(view));
+    const nextBtn = iconBtn('arrowDown', '下一项（Enter）', () => findNext(view));
+    const closeBtn = iconBtn('x', '关闭（Esc）', () => closeSearchPanel(view));
+
+    this.caseBtn = textBtn('Aa', 'ed-find-toggle', '大小写敏感', () => {
+      this.caseBtn.classList.toggle('active');
+      this.commit();
+    });
+    this.wordBtn = textBtn('全词', 'ed-find-toggle', '全词匹配', () => {
+      this.wordBtn.classList.toggle('active');
+      this.commit();
+    });
+
+    // 替换行折叠/展开：查找输入框左侧的 chevron（>=折叠 / v=展开），与 Ctrl+H 等效
+    this.replaceToggleBtn = iconBtn('chevronRight', '展开替换（Ctrl+H）', () => {
+      this.setReplaceMode(this.replaceRow.classList.contains('hidden'));
+    });
+
+    this.replaceBtn = textBtn('替换', '', '替换当前匹配并跳到下一个（Enter）', () => this.doReplaceNext());
+    this.replaceAllBtn = textBtn('全部替换', '', '替换全部匹配', () => this.doReplaceAll());
+
+    this.replaceRow = document.createElement('div');
+    this.replaceRow.className = 'ed-find-replace hidden';
+    this.replaceRow.append(this.replaceInput, this.replaceBtn, this.replaceAllBtn);
+
+    this.dom = document.createElement('div');
+    this.dom.className = 'ed-findbar';
+    const mainRow = document.createElement('div');
+    mainRow.className = 'ed-find-row';
+    mainRow.append(this.replaceToggleBtn, this.searchInput, this.countEl, prevBtn, nextBtn, this.caseBtn, this.wordBtn, closeBtn);
+    this.dom.append(mainRow, this.replaceRow);
+
+    // 输入即提交查询（含大小写/全词开关与替换串）；Enter/Shift+Enter 跳转、Esc 关闭并交还焦点给编辑器
+    this.searchInput.addEventListener('input', () => this.commit());
+    this.replaceInput.addEventListener('input', () => this.commit());
+    [this.searchInput, this.replaceInput].forEach((input) => input.addEventListener('keydown', (e) => this.onKeydown(e)));
+
+    this.syncReplaceButtons();
+    this.recompute();
+  }
+
+  private makeInput(placeholder: string): HTMLInputElement {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'ed-find-input';
+    input.placeholder = placeholder;
+    input.spellcheck = false;
+    return input;
+  }
+
+  private commit(): void {
+    const query = new SearchQuery({
+      search: this.searchInput.value,
+      caseSensitive: this.caseBtn.classList.contains('active'),
+      wholeWord: this.wordBtn.classList.contains('active'),
+      replace: this.replaceInput.value,
+    });
+    if (!query.eq(this.query)) {
+      this.query = query;
+      this.view.dispatch({ effects: setSearchQuery.of(query) });
+    }
+  }
+
+  private onKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.target === this.replaceInput) this.doReplaceNext();
+      else if (e.shiftKey) findPrevious(this.view);
+      else findNext(this.view);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation(); // 避免再冒泡到编辑器 keymap 重复关闭
+      closeSearchPanel(this.view);
+    }
+  }
+
+  update(update: ViewUpdate): void {
+    let queryChanged = false;
+    for (const tr of update.transactions) {
+      for (const effect of tr.effects) {
+        if (effect.is(setSearchQuery) && !effect.value.eq(this.query)) {
+          this.query = effect.value;
+          this.syncFields();
+          queryChanged = true;
+        }
+      }
+    }
+    if (update.state.readOnly !== update.startState.readOnly) this.syncReplaceButtons();
+    if (queryChanged || update.docChanged) this.recompute();
+    else if (update.selectionSet) this.updateCurrent();
+  }
+
+  mount(): void {
+    this.searchInput.focus();
+    this.searchInput.select();
+  }
+
+  destroy(): void {
+    findBars.delete(this.view);
+  }
+
+  /** Ctrl+F 收起替换行 / Ctrl+H 或 chevron 按钮展开替换行，焦点跟随到对应输入框 */
+  setReplaceMode(on: boolean): void {
+    this.replaceRow.classList.toggle('hidden', !on);
+    this.replaceToggleBtn.innerHTML = icon(on ? 'chevronDown' : 'chevronRight');
+    this.replaceToggleBtn.title = on ? '收起替换' : '展开替换（Ctrl+H）';
+    (on ? this.replaceInput : this.searchInput).focus();
+  }
+
+  private syncFields(): void {
+    this.searchInput.value = this.query.search;
+    this.replaceInput.value = this.query.replace;
+    this.caseBtn.classList.toggle('active', this.query.caseSensitive);
+    this.wordBtn.classList.toggle('active', this.query.wholeWord);
+  }
+
+  /** 全量重算匹配（查询/文档变更时）：供计数、当前项定位使用 */
+  private recompute(): void {
+    this.matches = [];
+    this.truncated = false;
+    if (this.query.valid) {
+      const cursor = this.query.getCursor(this.view.state);
+      for (let it = cursor.next(); !it.done; it = cursor.next()) {
+        if (this.matches.length >= FIND_MATCH_CAP) { this.truncated = true; break; }
+        this.matches.push({ from: it.value.from, to: it.value.to });
+      }
+    }
+    this.updateCurrent();
+  }
+
+  /** 光标是否正落在某个匹配上（二分定位），并刷新 n/m 计数 */
+  private updateCurrent(): void {
+    const sel = this.view.state.selection.main;
+    const arr = this.matches;
+    let lo = 0, hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].from < sel.from) lo = mid + 1; else hi = mid;
+    }
+    this.current = lo < arr.length && arr[lo].from === sel.from && arr[lo].to === sel.to ? lo : -1;
+    this.renderCount();
+  }
+
+  private renderCount(): void {
+    if (!this.query.search) { this.countEl.textContent = ''; return; }
+    const total = this.matches.length;
+    const suffix = this.truncated ? '+' : '';
+    this.countEl.textContent = this.current >= 0
+      ? `${this.current + 1}/${total}${suffix}`
+      : `${total}${suffix} 处匹配`;
+  }
+
+  private doReplaceNext(): void {
+    if (this.view.state.readOnly) return;
+    if (!replaceNext(this.view)) toast('没有可替换的匹配项', 'info');
+  }
+
+  private doReplaceAll(): void {
+    const view = this.view;
+    if (view.state.readOnly) return;
+    if (!this.query.valid) { toast('请先输入查找内容', 'info'); return; }
+    // 先按与 replaceAll 相同的口径（仅精确匹配）统计数量，再执行
+    let count = 0;
+    const cursor = this.query.getCursor(view.state);
+    for (let it = cursor.next(); !it.done; it = cursor.next()) {
+      // @codemirror/search 的 d.ts 对 value 只声明 from/to，运行时恒带 precise 标志
+      const v = it.value as { from: number; to: number; precise: boolean };
+      if (v.precise) count++;
+    }
+    if (count === 0) { toast('没有可替换的匹配项', 'info'); return; }
+    replaceAll(view);
+    toast(`已替换 ${count} 处`, 'success');
+  }
+
+  /** 只读态（本编辑器暂不启用）时禁用替换按钮 */
+  private syncReplaceButtons(): void {
+    const ro = this.view.state.readOnly;
+    this.replaceBtn.disabled = ro;
+    this.replaceAllBtn.disabled = ro;
+  }
+}
+
 /* ---------- 渲染器 ---------- */
 registerRenderer('editor', (container, tab) => {
   const sftp = tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
@@ -270,7 +525,8 @@ registerRenderer('editor', (container, tab) => {
         history(),
         indentUnit.of('  '),
         EditorState.tabSize.of(2),
-        // Ctrl+S：立即保存（取消防抖计时器直接写）；Ctrl+L：框选内容添加到 AI 对话
+        // Ctrl+S：立即保存（取消防抖计时器直接写）；Ctrl+L：框选内容添加到 AI 对话；
+        // Ctrl+F/Ctrl+H：查找 / 替换（keymap 仅编辑器聚焦时生效，不干扰终端等全局快捷键）；Esc 关闭查找栏
         Prec.highest(keymap.of([
           {
             key: 'Mod-s',
@@ -282,9 +538,29 @@ registerRenderer('editor', (container, tab) => {
             preventDefault: true,
             run: () => addCurrentSelectionToAI(entry.view, path),
           },
+          {
+            key: 'Mod-f',
+            preventDefault: true,
+            run: () => { openFind(entry.view, false); return true; },
+          },
+          {
+            key: 'Mod-h',
+            preventDefault: true,
+            run: () => { openFind(entry.view, true); return true; },
+          },
+          {
+            key: 'Escape',
+            run: () => {
+              if (!searchPanelOpen(entry.view.state)) return false;
+              closeSearchPanel(entry.view);
+              return true;
+            },
+          },
         ])),
         keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
         cmTheme.of(cmThemeExt()),
+        // 查找/替换面板：top 浮层 + 中文面板（FindBar）；查询状态/高亮/跳转/替换复用 @codemirror/search
+        search({ top: true, createPanel: (view) => new FindBar(view) }),
         EditorView.updateListener.of((update) => { if (update.docChanged) markDirty(entry); }),
       ],
     }),

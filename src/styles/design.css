@@ -150,6 +150,11 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 }
 .input:focus, .select:focus, .textarea:focus { border-color: var(--accent); }
 .input::placeholder, .textarea::placeholder { color: var(--text-2); }
+/* 表单校验标红（欢迎页 / 侧栏 / 设置页共用，见 server-form.ts） */
+.input.invalid { border-color: var(--red); }
+/* 服务器表单双列紧凑布局（欢迎页内联区，见 server-form.ts）；侧栏模态框默认单列 */
+.server-form-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; }
+.server-form-grid .field { margin-bottom: 12px; }
 .select { appearance: none; cursor: pointer;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a8adbb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat; background-position: right 10px center; padding-right: 28px;
@@ -226,7 +231,7 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   width: 520px; max-width: calc(100vw - 48px); max-height: calc(100vh - 64px);
   background: var(--bg-1); border: 1px solid var(--border-strong); border-radius: var(--radius-l);
   box-shadow: var(--shadow-l); display: flex; flex-direction: column;
-  transform: translateY(8px) scale(0.98); transition: transform 0.15s;
+  transform: translateY(8px); transition: transform 0.15s;
 }
 .modal-mask.open .modal { transform: none; }
 .modal-head {
@@ -239,6 +244,23 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   display: flex; justify-content: flex-end; gap: 8px;
   padding: 12px 18px; border-top: 1px solid var(--border); flex: none;
 }
+
+/* ---------- SSH 认证失败重设凭据对话框（terminal.ts showAuthFixDialog） ---------- */
+.authfix-modal { width: 560px; }
+/* 报错信息区：顶部独立滚动区（表单不会遮挡），等宽、可换行、可选中复制 */
+.authfix-err {
+  position: relative; max-height: 150px; overflow: auto;
+  background: var(--bg-2); border: 1px solid var(--border-strong); border-radius: var(--radius-m);
+}
+.authfix-err pre {
+  margin: 0; padding: 10px 64px 10px 12px;
+  white-space: pre-wrap; word-break: break-all;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.55;
+  color: var(--red); user-select: text;
+}
+.authfix-err .authfix-copy { position: absolute; top: 6px; right: 6px; }
+.authfix-divider { height: 1px; background: var(--border); margin: 14px 0 16px; }
+.authfix-error { color: var(--red); font-size: 12px; min-height: 16px; margin-top: 4px; }
 
 /* ---------- 页头 ---------- */
 .page-topbar {

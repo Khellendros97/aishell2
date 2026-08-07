@@ -19,6 +19,8 @@ export interface Settings {
   /** 联网搜索配置；旧配置无此字段时按关闭处理 */
   search: SearchConfig;
   theme: Theme;
+  /** 自动切换 AI 工作区域：开启后 AI 输入框显示固定工作区域标签，随激活终端自动切换；旧配置无此字段按关闭 */
+  autoSwitchAiWorkdir: boolean;
 }
 
 /** 与 store.rs Theme serde lowercase 对齐 */
@@ -44,6 +46,10 @@ export interface QuickCommand {
   id: string;
   title: string;
   command: string;
+  /** 所属目录：'/' 分隔的相对路径（如 "常用/部署"），空串 = 未分类；旧数据无此字段按未分类 */
+  folder: string;
+  /** 全局可用：true 时所有项目的命令收藏面板与快捷指令面板可见可用；编辑/删除仍归属原项目 */
+  global: boolean;
 }
 
 /** 与 store.rs AiMode serde lowercase 对齐 */
@@ -85,11 +91,21 @@ export interface FileRef {
   ts: number;
 }
 
+/** 服务器/本地终端引用：UI 以 @remote:服务器名称 / @local 标签呈现，发送时展开为说明文本 */
+export interface ServerRef {
+  /** 服务器 id；null = 本地终端 */
+  serverId: string | null;
+  /** 服务器名称（本地终端为「本地终端」） */
+  name: string;
+}
+
 export interface ChatMsg {
   role: 'user' | 'assistant';
   content: string;
   snapshots: TermSnapshot[];
   fileRefs: FileRef[];
+  /** 服务器/本地终端引用（@remote:名称 / @local 标签）；旧会话为空 */
+  serverRefs: ServerRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
   actions: AiActionRecord[];
   ts: number;
@@ -109,6 +125,8 @@ export interface AppState {
   sessions: Record<string, ChatSession[]>;
   /** 服务器分类目录清单（'/' 分隔相对路径，与 Server.folder 同语义；空目录也在此）；旧配置无此字段为空列表 */
   serverFolders: string[];
+  /** 命令收藏分类目录清单（'/' 分隔相对路径，与 QuickCommand.folder 同语义；空目录也在此）；旧配置无此字段为空列表 */
+  commandFolders: string[];
 }
 
 export interface FsEntry {
@@ -129,6 +147,14 @@ export interface FsStat {
   mode: number | null;
   readonly: boolean;
   linkTarget: string | null;
+}
+
+/** ssh_exec 直执结果 —— 与 ssh.rs SshExecResult serde camelCase 对齐。
+ *  code 为 null 表示命令超时被中断或通道未返回退出码。 */
+export interface SshExecResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
 }
 
 /** Xshell 会话导入结果 —— 与 Rust import_xshell_sessions 返回值 serde camelCase 对齐 */

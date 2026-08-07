@@ -3,6 +3,13 @@
 //! Xshell 专用 NSSSH 私钥在加载前给出可执行的 OpenSSH 导出提示，带密码短语密钥亦明确报错；
 //! check_server_key MVP 直接信任（A5 已知限制）、连接与认证各自 10s 超时。
 //!
+//! 认证失败识别（待优化 4）：错误密码/密钥的常规表现是 `AuthResult::Failure`，
+//! 认证期间被服务器断开（如 MaxAuthTries 超限）表现为 `Error::Disconnect`；
+//! 两类均以 `AUTH_FAILED_PREFIX` 前缀返回中文错误，前端 terminal.ts 据此弹出重设凭据对话框。
+//!
+//! `ssh_exec`（待优化 5）：SFTP 直执命令入口，复用本管理器既有连接，新建 channel
+//! 执行并带整体超时（`SSH_EXEC_TIMEOUT`），不依赖前端迷你终端的登录时序。
+//!
 //! façade 签名即跨模块契约（term.rs / sftp.rs 依赖），实现时不得更改。
 //! 断线重连：连接放入 map 后 spawn 后台 watcher，`Handle::is_closed()` 变真时从 map 摘除，
 //! 下次 `get_or_connect` 自动重连。
@@ -15,11 +22,37 @@ use std::time::Duration;
 
 use russh::client;
 use russh::ChannelMsg;
+use serde::Serialize;
+use tauri::State;
 use tokio::sync::Mutex;
 
 use crate::store;
 
 const NSSSH_PRIVATE_KEY_HEADER: &[u8] = b"---- BEGIN NSSSH PRIVATE KEY ----";
+
+/// 认证失败错误的稳定前缀（机器可识别标记）：前端 terminal.ts 据此弹出
+/// 「重新设置登录凭据」对话框，展示时剥掉此前缀。与 src/api.ts SSH_AUTH_FAILED_PREFIX 保持一致。
+pub const AUTH_FAILED_PREFIX: &str = "[SSH认证失败]";
+
+/// 认证失败的中文错误（带原始错误摘要）：用户名、密码或密钥不正确，或认证方法不被服务器支持。
+fn auth_failed_msg(server: &store::Server, detail: &str) -> String {
+    format!(
+        "{AUTH_FAILED_PREFIX}服务器「{}」（{}:{}）认证失败：用户名、密码或密钥不正确，\
+         请重新设置后重试（原始错误：{detail}）",
+        server.name, server.host, server.port
+    )
+}
+
+/// 判定 russh 认证阶段的 Error 是否由凭据问题引起。错误密码/密钥的常规表现是
+/// `AuthResult::Failure`（success()==false，在 connect_handle 中单独处理），
+/// 此处兜底 Error 分支：认证期间被服务器断开（如连续失败触发 MaxAuthTries 上限）、
+/// 认证方法不被服务器支持（引导用户在对话框中切换认证方式）。
+fn is_auth_failure(e: &russh::Error) -> bool {
+    matches!(
+        e,
+        russh::Error::Disconnect | russh::Error::UnsupportedAuthMethod
+    )
+}
 
 fn has_nsssh_header(bytes: &[u8]) -> bool {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
@@ -151,10 +184,32 @@ impl SshManager {
 
     /// 执行单条远程命令并收集 stdout/stderr/退出码（复用底层连接；channel 用完即弃）。
     /// 空命令在建连前拒绝。AI 远程动作的锁检查在 ai_actions 入口，不在本方法内。
+    /// 无超时：命令挂起时长由调用方（ai_actions 的 AI 长命令）自行负责。
     pub async fn exec(
         self: &Arc<Self>,
         server_id: &str,
         command: &str,
+    ) -> Result<crate::ai_actions::CommandResult, String> {
+        self.exec_impl(server_id, command, None).await
+    }
+
+    /// 带整体超时的单命令执行（`ssh_exec` 命令使用）：超时后尝试中断远端命令，
+    /// 返回已收集的输出与 `None` 退出码（前端按失败提示，详见 debug 日志）。
+    pub async fn exec_with_timeout(
+        self: &Arc<Self>,
+        server_id: &str,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<crate::ai_actions::CommandResult, String> {
+        self.exec_impl(server_id, command, Some(timeout)).await
+    }
+
+    /// exec 公共实现；timeout=None 时不设限。
+    async fn exec_impl(
+        self: &Arc<Self>,
+        server_id: &str,
+        command: &str,
+        timeout: Option<Duration>,
     ) -> Result<crate::ai_actions::CommandResult, String> {
         if command.trim().is_empty() {
             return Err("命令不能为空".to_string());
@@ -171,14 +226,24 @@ impl SshManager {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut exit_code: Option<i32> = None;
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
-                ChannelMsg::Eof | ChannelMsg::Close => break,
-                _ => {}
+        let read = async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                    ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
+                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    _ => {}
+                }
             }
+        };
+        if let Some(d) = timeout {
+            if tokio::time::timeout(d, read).await.is_err() {
+                // 超时：尽力中断远端命令（失败无碍，channel drop 也会关闭），保留已收集输出
+                let _ = channel.eof().await;
+            }
+        } else {
+            read.await;
         }
         Ok(crate::ai_actions::CommandResult {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -254,7 +319,13 @@ impl SshManager {
                 )
                 .await
                 .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
-                .map_err(|e| format!("认证服务器「{}」失败：{e}", server.name))?;
+                .map_err(|e| {
+                    if is_auth_failure(&e) {
+                        auth_failed_msg(server, &e.to_string())
+                    } else {
+                        format!("认证服务器「{}」失败：{e}", server.name)
+                    }
+                })?;
                 res.success()
             }
             store::AuthType::Key => {
@@ -282,14 +353,20 @@ impl SshManager {
                 )
                 .await
                 .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
-                .map_err(|e| format!("认证服务器「{}」失败：{e}", server.name))?;
+                .map_err(|e| {
+                    if is_auth_failure(&e) {
+                        auth_failed_msg(server, &e.to_string())
+                    } else {
+                        format!("认证服务器「{}」失败：{e}", server.name)
+                    }
+                })?;
                 res.success()
             }
         };
         if !accepted {
-            return Err(format!(
-                "认证服务器「{}」被拒绝（{}:{}）",
-                server.name, server.host, server.port
+            return Err(auth_failed_msg(
+                server,
+                "服务器拒绝了当前凭据（USERAUTH_FAILURE）",
             ));
         }
         Ok(Arc::new(handle))
@@ -334,6 +411,39 @@ impl SshManager {
     }
 }
 
+/// `ssh_exec` 单条命令的通道级超时：压缩/解压大目录可能耗时，5 分钟兜底；
+/// 超时后中断远端命令并返回已收集的输出（退出码为 null，前端按失败提示）。
+const SSH_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `ssh_exec` 直执结果（serde camelCase，与 src/types.ts SshExecResult 对齐）；
+/// `code` 为 null 表示命令超时被中断或通道未返回退出码。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshExecResult {
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// SFTP 直执命令（待优化 5）：复用 SshManager 既有连接（每 serverId 一条），
+/// 新建 channel 执行单条命令并收集 stdout/stderr/退出码；不依赖前端迷你终端的
+/// 登录时序。命令与结果由前端写入 debug 日志（见 sftp.ts runRemoteCommand）。
+#[tauri::command]
+pub async fn ssh_exec(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+    command: String,
+) -> Result<SshExecResult, String> {
+    let res = ssh
+        .exec_with_timeout(&server_id, &command, SSH_EXEC_TIMEOUT)
+        .await?;
+    Ok(SshExecResult {
+        code: res.exit_code,
+        stdout: res.stdout,
+        stderr: res.stderr,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +474,65 @@ mod tests {
             b"-----BEGIN OPENSSH PRIVATE KEY-----\npayload"
         ));
         assert!(!has_nsssh_header(b"---- BEGIN NSSSH PRIVATE KEY ----x"));
+    }
+
+    #[test]
+    fn detects_auth_failure_error_variants() {
+        // 认证期间被服务器断开（如 MaxAuthTries 超限）/ 认证方法不受支持 → 判为认证失败
+        assert!(is_auth_failure(&russh::Error::Disconnect));
+        assert!(is_auth_failure(&russh::Error::UnsupportedAuthMethod));
+        // 网络/连接层错误不是凭据问题，不应触发重设凭据对话框
+        assert!(!is_auth_failure(&russh::Error::HUP));
+        assert!(!is_auth_failure(&russh::Error::ConnectionTimeout));
+        assert!(!is_auth_failure(&russh::Error::Kex));
+    }
+
+    #[test]
+    fn auth_failed_msg_carries_prefix_and_raw_detail() {
+        let server = store::Server {
+            id: "srv-x".to_string(),
+            name: "测试机".to_string(),
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            auth_type: store::AuthType::Password,
+            username: "root".to_string(),
+            key_path: String::new(),
+            folder: String::new(),
+            locked: false,
+        };
+        let msg = auth_failed_msg(&server, "Disconnected");
+        assert!(msg.starts_with(AUTH_FAILED_PREFIX));
+        assert!(msg.contains("测试机"));
+        assert!(msg.contains("10.0.0.1"));
+        assert!(msg.contains("Disconnected"));
+    }
+
+    /// ssh_exec 的错误路径（不连真实服务器、不碰真实 keyring，走 test_store/MemorySecrets）。
+    #[tokio::test]
+    async fn ssh_exec_rejects_empty_command_and_unknown_server_without_network() {
+        let store_dir = std::env::temp_dir()
+            .join(format!("aishell-sshexec-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let manager = Arc::new(SshManager::new(Arc::new(store::test_store(store_dir.clone()))));
+        let timeout = Duration::from_secs(5);
+
+        // 空命令在建连前拒绝
+        let err = manager
+            .exec_with_timeout("srv-missing", "   ", timeout)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("命令不能为空"), "unexpected: {err}");
+
+        // 未知服务器在建连前拒绝
+        let err = manager
+            .exec_with_timeout("srv-missing", "echo hi", timeout)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("服务器不存在"), "unexpected: {err}");
+
+        let _ = std::fs::remove_dir_all(store_dir);
     }
 
     #[tokio::test]

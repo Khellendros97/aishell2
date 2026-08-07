@@ -2,8 +2,11 @@
  * AIShell pi 门控扩展 —— 由 src-tauri/src/ai.rs 在每次 spawn 时重写进 agent_dir 并以 -e 加载。
  * 单一权限事实源（禁止另起第二套前端授权规则），三档模式：
  * - suggest：保持现状 —— 读限项目根，write/edit 仅 <项目>/.aishell/，不提供删除/命令/SFTP 工具；
+ *   另提供 request_agent_mode 工具（经 `AISHELL_MODE_REQUEST:` confirm 由前端确认后切到工作模式）；
  * - agent  /yolo：读写均限项目根，启用 delete_path/run_command/sftp_upload/sftp_download；
  *   模式变化经 RPC prompt `/aishell-mode <suggest|agent|yolo>` 热切换（非法值保持原模式并抛错）。
+ *   注意：RPC 模式下 setActiveTools 不影响模型请求的 tools（spawn 时 --tools 固定），
+ *   agent ↔ yolo 热推即可；suggest 边界切换由 Rust set_ai_mode 重启进程完成（会话经 --session 恢复）。
  * 审批：agent 对受控工具（write/edit/delete_path/run_command/sftp_upload/sftp_download）
  * 每次调用单独 ctx.ui.confirm（title 固定 `AISHELL_APPROVAL:<toolCallId>`，message 为
  * `{action,intent,summary}`）；yolo 跳过；suggest 即使异常收到变更工具调用也直接阻止。
@@ -198,6 +201,12 @@ export default function (pi: ExtensionAPI) {
 			case "list_servers":
 				// 只读查询：项目绑定的可操作服务器列表（无路径参数）
 				return undefined;
+			case "request_agent_mode":
+				// 仅建议模式专属工具（suggest 的 --tools 白名单才含它）：agent/yolo 下防御性阻止
+				if (mode !== "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式下才可申请切换工作模式。" };
+				}
+				return undefined;
 			default:
 				return { block: true, reason: `AIShell 权限边界:工具 ${tool} 不可用。` };
 		}
@@ -333,6 +342,39 @@ export default function (pi: ExtensionAPI) {
 				localPath: params.localPath,
 				remoteDir: params.remoteDir,
 			});
+		},
+	});
+
+	pi.registerTool({
+		name: "request_agent_mode",
+		label: "申请切换到工作模式",
+		description:
+			"仅建议模式下使用：向用户申请切换到工作（Agent）模式，需用户同意；用户拒绝则继续提供建议。不可申请切换到全自动（YOLO）模式。",
+		promptSnippet: "申请切换到工作模式",
+		promptGuidelines: [
+			"当你需要执行命令、修改项目源码等仅建议模式无法完成的操作时，先调用 request_agent_mode 用一句中文说明理由，用户同意后即可获得执行类工具。",
+		],
+		parameters: Type.Object({
+			reason: Type.String({ description: "申请理由（中文，展示给用户确认）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			if (mode !== "suggest") {
+				return okResult("当前已是工作/全自动模式，无需申请切换。");
+			}
+			let ok = false;
+			try {
+				ok = await ctx.ui.confirm(
+					"AISHELL_MODE_REQUEST:" + toolCallId,
+					JSON.stringify({ reason: String(params.reason || "") }),
+				);
+			} catch {
+				// 中止/窗口卸载/客户端取消（cancelled:true）统一按拒绝
+				ok = false;
+			}
+			if (!ok) {
+				return okResult("用户拒绝了切换到工作模式的申请，请继续以建议方式提供帮助。");
+			}
+			return okResult("用户已同意切换到工作模式。");
 		},
 	});
 

@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, FsEntry, FsStat, Project, Server, Settings, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, FsEntry, FsStat, Project, Server, Settings, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -34,6 +34,13 @@ export const renameServerFolder = (oldName: string, newName: string) =>
   call<void>('rename_server_folder', { old: oldName, new: newName });
 /** 删除服务器分类目录：目录下仍有服务器时返回后端中文错误；未分类不可删除 */
 export const deleteServerFolder = (name: string) => call<void>('delete_server_folder', { name });
+/** 新建命令收藏分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
+export const createCommandFolder = (name: string) => call<void>('create_command_folder', { name });
+/** 重命名命令收藏分类目录：级联改写所有项目命令的 folder；new 与 old 相同为 no-op；未分类不可重命名 */
+export const renameCommandFolder = (oldName: string, newName: string) =>
+  call<void>('rename_command_folder', { old: oldName, new: newName });
+/** 删除命令收藏分类目录：目录下仍有命令（任意项目）时返回后端中文错误；未分类不可删除 */
+export const deleteCommandFolder = (name: string) => call<void>('delete_command_folder', { name });
 /** 清除全部服务器配置：清空服务器与分类目录、所有项目解绑、删除全部 keyring 密钥 */
 export const clearAllServers = () => call<void>('clear_all_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；
@@ -131,6 +138,17 @@ export const sftpUniqueName = (serverId: string, dir: string, name: string) =>
 /** 创建远端空文件或目录（目标已存在会 reject） */
 export const sftpCreate = (serverId: string, path: string, isDir: boolean) =>
   call<void>('sftp_create', { serverId, path, isDir });
+
+/* ---------------- ssh 直执 ----------------
+   认证失败错误串的稳定前缀（与 ssh.rs AUTH_FAILED_PREFIX 保持一致）：terminal.ts 据此
+   识别 SSH 认证失败并弹出重设凭据对话框；对话框展示时剥掉此前缀。 */
+export const SSH_AUTH_FAILED_PREFIX = '[SSH认证失败]';
+
+/** ssh_exec：复用服务器既有 SSH 连接（每 serverId 一条）直执单条命令，不走迷你终端。
+ *  返回 { code, stdout, stderr }；code=null 表示命令超时被中断或未收到退出码。
+ *  命令与结果由调用方写入 debug 日志（见 sftp.ts runRemoteCommand）。 */
+export const sshExec = (serverId: string, command: string) =>
+  call<SshExecResult>('ssh_exec', { serverId, command });
 
 /* ---------------- ai ---------------- */
 /** 后端发出的 AI 回合事件（key = `<projectId>:<sessionId>`）：

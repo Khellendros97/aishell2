@@ -13,6 +13,7 @@
 .wbs-server-tags { display: flex; align-items: center; gap: 4px; min-width: 0; margin-left: 39px; }
 .wbs-server-tags .tag { display: inline-flex; align-items: center; gap: 3px; }
 .wbs-lock { margin-left: auto; width: 26px; height: 26px; font-size: 14px; }
+.wbs-edit { width: 26px; height: 26px; font-size: 14px; }
 .wbs-lock.locked { background: var(--red-dim); color: var(--red); }
 .wbs-lock.locked:hover { background: var(--red-dim); color: var(--red); }
 .wbs-server-actions { display: flex; justify-content: flex-end; gap: 6px; }

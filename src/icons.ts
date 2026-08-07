@@ -67,6 +67,8 @@ const PATHS = {
   arrowDown: '<path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/>',
   arrowLeft: '<path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>',
   arrowRight: '<path d="M5 12h14"/><path d="M12 5l7 7-7 7"/>',
+  chevronRight: '<path d="m9 18 6-6-6-6"/>',
+  chevronDown: '<path d="m6 9 6 6 6-6"/>',
   slash: '<path d="M17 5 7 19"/>',
   grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   list: '<path d="M9 6h12"/><path d="M9 12h12"/><path d="M9 18h12"/><path d="M4 6h1"/><path d="M4 12h1"/><path d="M4 18h1"/>',

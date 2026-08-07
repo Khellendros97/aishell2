@@ -14,6 +14,7 @@ import { confirmDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
 import { navigate } from '../router';
 import type { PageRender } from '../main';
+import { createServerForm } from './server-form';
 import './welcome.css';
 
 const welcomeLogoUrl = new URL('../assets/logo.svg', import.meta.url).href;
@@ -77,35 +78,8 @@ export const renderWelcome: PageRender = (root) => {
             <div class="server-list" id="server-list"></div>
             <div class="server-add" id="server-add-toggle">${icon('plus')} 新建服务器连接</div>
             <div class="server-mini hidden" id="server-mini">
-              <div class="mini-grid">
-                <div class="field">
-                  <label>名称<span class="req">*</span></label>
-                  <input class="input" id="mini-name" placeholder="例如：测试服务器">
-                </div>
-                <div class="field">
-                  <label>IP 地址<span class="req">*</span></label>
-                  <input class="input" id="mini-host" placeholder="例如：192.168.1.10">
-                </div>
-                <div class="field">
-                  <label>端口<span class="req">*</span></label>
-                  <input class="input mono" id="mini-port" type="number" min="1" max="65535" value="22">
-                </div>
-                <div class="field">
-                  <label>认证方式</label>
-                  <select class="select" id="mini-auth">
-                    <option value="password">密码</option>
-                    <option value="key">密钥</option>
-                  </select>
-                </div>
-                <div class="field">
-                  <label>账号</label>
-                  <input class="input" id="mini-user" placeholder="例如：root">
-                </div>
-                <div class="field">
-                  <label id="mini-secret-label">密码</label>
-                  <input class="input" id="mini-secret" placeholder="输入服务器密码">
-                </div>
-              </div>
+              <!-- 服务器表单字段（双列紧凑布局）由 server-form.ts 渲染，与侧栏编辑表单同源 -->
+              <div id="mini-form"></div>
               <div class="error hidden" id="mini-err"></div>
               <div class="mini-actions">
                 <button class="btn" id="mini-cancel">收起</button>
@@ -144,13 +118,7 @@ export const renderWelcome: PageRender = (root) => {
     serverToggleFolders: $('server-toggle-folders'),
     addToggle: $('server-add-toggle'),
     mini: $('server-mini'),
-    miniName: $<HTMLInputElement>('mini-name'),
-    miniHost: $<HTMLInputElement>('mini-host'),
-    miniPort: $<HTMLInputElement>('mini-port'),
-    miniAuth: $<HTMLSelectElement>('mini-auth'),
-    miniUser: $<HTMLInputElement>('mini-user'),
-    miniSecret: $<HTMLInputElement>('mini-secret'),
-    miniSecretLabel: $('mini-secret-label'),
+    miniForm: $('mini-form'),
     miniErr: $('mini-err'),
     miniSave: $('mini-save'),
     miniCancel: $('mini-cancel'),
@@ -158,8 +126,8 @@ export const renderWelcome: PageRender = (root) => {
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark' },
-    servers: [], projects: [], sessions: {}, serverFolders: [],
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: false },
+    servers: [], projects: [], sessions: {}, serverFolders: [], commandFolders: [],
   };
   let editingId: string | null = null;       // null = 新建；否则为正在编辑的项目 id
   let selectedServerIds: string[] = [];      // 模态框中多选的服务器 id
@@ -485,12 +453,21 @@ export const renderWelcome: PageRender = (root) => {
   // 搜索过滤：输入即重渲染（输入框为静态骨架，不随列表重建，焦点不丢）
   els.serverSearch.addEventListener('input', renderServerList);
 
-  /* ---------- 快捷新建服务器 ---------- */
+  /* ---------- 快捷新建服务器（字段与校验复用 server-form.ts，与侧栏编辑表单同源；密码留空 = 不保存） ---------- */
+  const miniForm = createServerForm(els.miniForm, {
+    compact: true,
+    folderOptions: () => {
+      const names = new Set<string>(db.serverFolders ?? []);
+      (db.servers ?? []).forEach((s) => { if (s.folder) names.add(s.folder); });
+      return Array.from(names).sort((a, b) => a.localeCompare(b, 'zh'));
+    },
+  });
+
   function expandMini() {
     els.addToggle.classList.add('hidden');
     els.mini.classList.remove('hidden');
     clearMiniError();
-    els.miniName.focus();
+    miniForm.focusFirst();
   }
   function collapseMini() {
     els.mini.classList.add('hidden');
@@ -498,69 +475,28 @@ export const renderWelcome: PageRender = (root) => {
   }
   function clearMiniError() {
     els.miniErr.classList.add('hidden');
-    [els.miniName, els.miniHost, els.miniPort].forEach((el) => el.classList.remove('invalid'));
   }
   function resetMini() {
-    els.miniName.value = '';
-    els.miniHost.value = '';
-    els.miniPort.value = '22';
-    els.miniAuth.value = 'password';
-    els.miniUser.value = '';
-    els.miniSecret.value = '';
-    updateSecretField();
+    miniForm.fill(null); // 清空为新建态（密码/密钥路径不留上次输入）
     clearMiniError();
   }
 
   els.addToggle.onclick = expandMini;
   els.miniCancel.onclick = () => { collapseMini(); resetMini(); };
 
-  /* 认证方式切换：密码 ⇄ 密钥路径 */
-  function updateSecretField() {
-    const isKey = els.miniAuth.value === 'key';
-    els.miniSecretLabel.textContent = isKey ? '密钥路径' : '密码';
-    els.miniSecret.placeholder = isKey
-      ? 'C:\\Users\\demo\\.ssh\\id_ed25519'
-      : '输入服务器密码';
-  }
-  els.miniAuth.onchange = updateSecretField;
-
   async function saveMiniServer() {
     clearMiniError();
 
-    const name = els.miniName.value.trim();
-    const host = els.miniHost.value.trim();
-    const portRaw = els.miniPort.value.trim();
-
-    let bad = false;
-    if (!name) { els.miniName.classList.add('invalid'); bad = true; }
-    if (!host) { els.miniHost.classList.add('invalid'); bad = true; }
-    const port = parseInt(portRaw, 10);
-    if (!portRaw || isNaN(port) || port < 1 || port > 65535) {
-      els.miniPort.classList.add('invalid');
-      bad = true;
-    }
-    if (bad) {
-      els.miniErr.textContent = '请填写必填项（名称、IP、端口），端口需为 1-65535 的整数';
+    const err = miniForm.validate();
+    if (err) {
+      els.miniErr.textContent = err;
       els.miniErr.classList.remove('hidden');
       return;
     }
 
-    const auth = els.miniAuth.value as Server['authType'];
-    const secret = els.miniSecret.value.trim();
-    const srv: Server = {
-      id: uid('srv'),
-      name,
-      host,
-      port,
-      authType: auth,
-      username: els.miniUser.value.trim(),
-      keyPath: auth === 'key' ? secret : '',
-      folder: '',
-      locked: false,
-    };
-
+    const srv = miniForm.buildServer(null);
     try {
-      await upsertServer(srv, auth === 'password' ? (secret || null) : null);
+      await upsertServer(srv, miniForm.passwordValue());
     } catch (err) {
       toast(String(err), 'error');
       return;

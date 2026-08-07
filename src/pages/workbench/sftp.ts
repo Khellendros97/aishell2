@@ -3,24 +3,26 @@
  * - 每个 tab 独立维护 cwd / history / forward 栈；打开时先解析远端 home（sftp_home）作为初始路径
  * - 顶栏：后退 / 前进 / 上级 / home（~ 主目录）/ 根（/）+ 可编辑路径输入框（回车或「跳转」直达）+ 平铺/列表视图切换
  * - 平铺/列表双视图；平铺视图支持拖拽框选（多选作用于复制/剪切/删除/压缩等菜单操作）
- * - 容器空白右键：粘贴 + 「打开终端」（迷你终端悬浮窗，自动 cd 到当前目录，可手动执行 tar 压缩/解压）
+ * - 容器空白右键：粘贴 + 「打开终端」（新开 SSH 终端标签，自动 cd 到当前目录，可手动执行 tar 压缩/解压）
  * - 条目可拖拽（source:'remote' + serverId）；容器 drop 收 source:'local' → sftp_upload → toast → 刷新
- * - 右键菜单含「属性」（sftp_stat 弹属性框）、「权限设置」「赋予可执行权限」（chmod 经迷你终端
- *   autoRun 执行，完成后刷新 + toast，见 mini-term.ts 契约）；权限修改不新增后端命令
+ * - 右键菜单含「属性」（sftp_stat 弹属性框）、「权限设置」「赋予可执行权限」（chmod 经后端
+ *   ssh_exec 直执执行，完成后刷新 + toast，见 api.ts sshExec 契约）；权限修改不新增后端命令
+ * - 远端命令直执（待优化 5）：压缩/解压/备份/chmod 一律走 ssh_exec 复用既有 SSH 连接，
+ *   不再起迷你终端（规避登录时序竞态）；命令与输出/退出码写入 debug 日志（src/debug.ts dbg）
  * - OS 文件拖入（dataTransfer.files）在此面板刻意不接收：系统文件只进本地文件资源管理器
  * - 加载失败：toast 错误原文 + 面板内错误条与「重试」
  */
 import './sftp.css';
-import type { FsEntry, FsStat } from '../../types';
+import type { FsEntry, FsStat, SshExecResult } from '../../types';
 import {
-  fsDelete, sftpCopy, sftpCreate, sftpDelete, sftpDownload, sftpHome, sftpList, sftpRename,
-  sftpStat, sftpUniqueName, sftpUpload,
+  fsDelete, getState, sftpCopy, sftpCreate, sftpDelete, sftpDownload, sftpHome, sftpList, sftpRename,
+  sftpStat, sftpUniqueName, sftpUpload, sshExec,
 } from '../../api';
-import { confirmDialog, promptDialog, showContextMenu, toast, type CtxItem } from '../../ui';
+import { confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../ui';
 import { bus, getActiveTab, openTab, registerRenderer, Workbench, type Tab } from './core';
 import { clearClip, getClip, setClip } from './clipboard';
 import { revealLocalPath } from './sidebar/explorer';
-import { openMiniTerm, type MiniTerm } from './mini-term';
+import { dbg } from '../../debug';
 import { icon, icon as iconSvg } from '../../icons';
 
 interface SftpEls {
@@ -50,12 +52,8 @@ interface SftpTabState {
   seq: number;
   /** 平铺视图框选/单击选中的条目路径集合（目录切换时清空） */
   sel: Set<string>;
-  /** 迷你终端悬浮窗实例（空白右键「打开终端」创建，关闭/标签关闭时销毁） */
-  mini: MiniTerm | null;
   /** 最近一次渲染的带完整远端路径条目（菜单多选操作的数据源） */
   renderEntries: RemoteEntry[];
-  /** 面板根元素（迷你终端悬浮窗挂载点） */
-  root: HTMLElement;
   /** 下次 loadDir 成功后要聚焦（选中+滚动）的条目路径；不存在则静默跳过 */
   pendingFocus: string | null;
 }
@@ -373,7 +371,7 @@ async function deleteRemote(st: SftpTabState, items: RemoteEntry[]): Promise<voi
   }
 }
 
-/* ---------- 压缩 / 解压（打开迷你终端自动执行 tar，完成后关闭并刷新） ---------- */
+/* ---------- 压缩 / 解压 / 备份 / chmod（ssh_exec 直执：命令与输出进 debug 日志） ---------- */
 
 /** POSIX shell 单引号引用（路径含空格/引号时防断词与注入） */
 function shQuote(s: string): string {
@@ -393,23 +391,40 @@ function entryIcon(it: RemoteEntry): string {
   return iconSvg('file', { stroke: '#64748b', fill: '#e2e8f0' });
 }
 
-/** 打开迷你终端自动执行远端命令；完成标记（含退出码）触发后关闭终端、刷新目录并 toast。 */
-function runRemoteCommand(st: SftpTabState, command: string, doneToast: string, focusPath: string | null): void {
-  st.mini?.destroy(); // 已有实例先关闭（onClose 会把 st.mini 置空）
-  st.mini = openMiniTerm(st.root, st.serverId, st.cwd, {
-    onClose: () => { st.mini = null; },
-    autoRun: {
-      command,
-      onDone: (success) => {
-        toast(success ? doneToast : `${doneToast}失败，请查看终端输出`, success ? 'success' : 'error');
-        // 失败时保留迷你终端（用户需查看 tar/unzip 的错误输出）；成功才自动关闭
-        if (success) st.mini?.destroy();
-        st.sel.clear();
-        if (success && focusPath) focusAfterRefresh(st, focusPath);
-        else void loadDir(st);
-      },
-    },
-  });
+/** 多行文本逐行写入 debug 日志（dbg 一行一条，避免长输出挤成单条）。 */
+function dbgLines(prefix: string, text: string): void {
+  if (!text) return;
+  for (const line of text.split('\n')) dbg(`${prefix} ${line}`);
+}
+
+/**
+ * 直执远端命令（待优化 5）：走后端 ssh_exec 复用 SSH 连接执行单条命令（不再起迷你终端，
+ * 规避登录时序竞态）；命令行 / stdout / stderr / 退出码写入 debug 日志，
+ * 完成后按退出码 toast 并刷新目录（成功且给了 focusPath 时聚焦落地条目）。
+ */
+async function runRemoteCommand(st: SftpTabState, command: string, doneToast: string, focusPath: string | null): Promise<void> {
+  dbg(`sftp ssh_exec ${st.serverId} $ ${command}`);
+  let res: SshExecResult;
+  try {
+    res = await sshExec(st.serverId, command);
+  } catch (err) {
+    dbg(`sftp ssh_exec ${st.serverId} 失败: ${String(err)}`);
+    toast(String(err), 'error');
+    st.sel.clear();
+    void loadDir(st);
+    return;
+  }
+  dbgLines(`sftp ssh_exec ${st.serverId} stdout`, res.stdout);
+  dbgLines(`sftp ssh_exec ${st.serverId} stderr`, res.stderr);
+  dbg(`sftp ssh_exec ${st.serverId} exit=${res.code ?? 'null(超时中断或无退出码)'}`);
+  const success = res.code === 0;
+  toast(
+    success ? doneToast : `${doneToast}失败，详见 debug 日志`,
+    success ? 'success' : 'error',
+  );
+  st.sel.clear();
+  if (success && focusPath) focusAfterRefresh(st, focusPath);
+  else void loadDir(st);
 }
 
 /** 压缩选中条目为 tgz：单选目录/文件 → `名称.tgz`；多选 → 弹输入框指定包名（重名自动改名）。 */
@@ -438,7 +453,7 @@ async function compressRemote(st: SftpTabState, items: RemoteEntry[]): Promise<v
     const dest = await sftpUniqueName(st.serverId, parent, want);
     const names = items.map((i) => shQuote(i.name)).join(' ');
     const cmd = `tar czf ${shQuote(joinRemote(parent, dest))} -C ${shQuote(parent)} ${names}`;
-    runRemoteCommand(st, cmd, `已压缩为 ${dest}`, joinRemote(parent, dest));
+    await runRemoteCommand(st, cmd, `已压缩为 ${dest}`, joinRemote(parent, dest));
   } catch (err) {
     toast(String(err), 'error');
   }
@@ -452,7 +467,7 @@ async function extractRemote(st: SftpTabState, it: RemoteEntry): Promise<void> {
     : `tar xzf ${shQuote(it.path)} -C ${shQuote(parent)}`;
   // 聚焦解压产物：通常与压缩包同名（去扩展名）；产物名不同时 applyFocus 静默跳过
   const base = it.name.replace(/\.(tar\.gz|tgz|zip)$/i, '');
-  runRemoteCommand(st, cmd, `已解压 ${it.name}`, joinRemote(parent, base));
+  await runRemoteCommand(st, cmd, `已解压 ${it.name}`, joinRemote(parent, base));
 }
 
 /** 快速备份：目录压缩为 `名称_bakYYYYMMDD-HHMM.tgz`；文件复制为 `名称_bakYYYYMMDD-HHMM`（保留原扩展名）。
@@ -468,14 +483,14 @@ function backupRemote(st: SftpTabState, item: RemoteEntry): void {
       const cmd = item.isDir
         ? `tar czf ${shQuote(joinRemote(parent, dest))} -C ${shQuote(parent)} ${shQuote(item.name)}`
         : `cp ${shQuote(item.path)} ${shQuote(joinRemote(parent, dest))}`;
-      runRemoteCommand(st, cmd, `备份完成：${dest}`, joinRemote(parent, dest));
+      await runRemoteCommand(st, cmd, `备份完成：${dest}`, joinRemote(parent, dest));
     } catch (err) {
       toast(String(err), 'error');
     }
   })();
 }
 
-/* ---------- 属性 / 权限设置 / 赋予可执行权限（chmod 经迷你终端 autoRun 执行，完成后刷新） ---------- */
+/* ---------- 属性 / 权限设置 / 赋予可执行权限（chmod 经 ssh_exec 直执，完成后刷新） ---------- */
 
 /** 权限位 → 3 位八进制串（如 644）；mode 为 null 时显示 — */
 function modeOct(mode: number | null): string {
@@ -569,7 +584,7 @@ function showSftpProperties(st: SftpTabState, it: RemoteEntry): void {
   })();
 }
 
-/** 「权限设置」对话框：输入 3 位八进制权限（预填当前值，可用预设快捷填充），确认后经迷你终端 chmod。 */
+/** 「权限设置」对话框：输入 3 位八进制权限（预填当前值，可用预设快捷填充），确认后经 ssh_exec 直执 chmod。 */
 function showChmodDialog(st: SftpTabState, it: RemoteEntry): void {
   void (async () => {
     let stat: FsStat;
@@ -634,8 +649,8 @@ function showChmodDialog(st: SftpTabState, it: RemoteEntry): void {
         return;
       }
       close();
-      // 绝对路径更稳（迷你终端 cwd 为当前 SFTP 目录，路径不受影响）
-      runRemoteCommand(st, `chmod ${mode} -- ${shQuote(it.path)}`, `已将 ${it.name} 权限设置为 ${mode}`, it.path);
+      // 绝对路径更稳（ssh_exec 不依赖会话 cwd，路径不受影响）
+      void runRemoteCommand(st, `chmod ${mode} -- ${shQuote(it.path)}`, `已将 ${it.name} 权限设置为 ${mode}`, it.path);
     };
     mask.querySelector('[data-act=cancel]')!.addEventListener('click', close);
     mask.querySelector('[data-act=ok]')!.addEventListener('click', submit);
@@ -654,9 +669,9 @@ function showChmodDialog(st: SftpTabState, it: RemoteEntry): void {
   })();
 }
 
-/** 赋予可执行权限（仅文件）：经迷你终端执行 chmod +x，完成后刷新并 toast。 */
+/** 赋予可执行权限（仅文件）：经 ssh_exec 直执 chmod +x，完成后刷新并 toast。 */
 function makeExecutable(st: SftpTabState, it: RemoteEntry): void {
-  runRemoteCommand(st, `chmod +x -- ${shQuote(it.path)}`, `已赋予 ${it.name} 可执行权限`, it.path);
+  void runRemoteCommand(st, `chmod +x -- ${shQuote(it.path)}`, `已赋予 ${it.name} 可执行权限`, it.path);
 }
 
 /** 在当前目录新建空文件/目录（空白右键菜单）：输入名称 → 创建 → 聚焦新条目 */
@@ -830,7 +845,7 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
   ]);
 }
 
-/** 容器空白区右键：打开终端（迷你悬浮窗）+ 粘贴到当前目录 */
+/** 容器空白区右键：打开终端（新开 SSH 终端标签，自动 cd 到当前目录）+ 粘贴到当前目录 */
 function bindRootContextMenu(root: HTMLElement, st: SftpTabState): void {
   root.addEventListener('contextmenu', (e) => {
     if ((e.target as HTMLElement).closest('.sf-item, .sf-table tr')) return; // 条目行已自行处理
@@ -852,14 +867,18 @@ function bindRootContextMenu(root: HTMLElement, st: SftpTabState): void {
       {
         label: '打开终端', iconName: 'terminal',
         action: () => {
-          // 已存在迷你终端则聚焦复用（悬浮窗常驻，避免重复创建连接）
-          if (st.mini) {
-            (root.querySelector('.mini-term input, .mini-term .xterm-helper-textarea') as HTMLElement | null)?.focus();
-            return;
-          }
-          st.mini = openMiniTerm(root, st.serverId, st.cwd, {
-            onClose: () => { st.mini = null; },
-          });
+          // 直执改造后不再起迷你终端（时序问题）：新开 SSH 终端标签并自动 cd 到当前目录
+          // （term_create 的 cwd 契约，见 term.rs create_ssh）
+          void (async () => {
+            const name = (await getState().catch(() => null))
+              ?.servers.find((s) => s.id === st.serverId)?.name ?? 'SSH';
+            openTab({
+              id: `term:${st.serverId}:${uid('t')}`,
+              type: 'terminal',
+              title: name,
+              data: { kind: 'ssh', serverId: st.serverId, cwd: st.cwd },
+            });
+          })();
         },
       },
       'sep',
@@ -1195,9 +1214,7 @@ registerRenderer('sftp', (container, tab) => {
     error: '',
     seq: 0,
     sel: new Set<string>(),
-    mini: null,
     renderEntries: [],
-    root: container,
     pendingFocus: null,
   };
   sftpTabs.set(tab.id, st);
@@ -1227,15 +1244,11 @@ registerRenderer('sftp', (container, tab) => {
 
 bus.on('tab-closed', (tab: Tab | null) => {
   if (!tab) return;
-  const st = sftpTabs.get(tab.id);
-  if (st) {
-    st.mini?.destroy();
-    sftpTabs.delete(tab.id);
-  }
+  sftpTabs.delete(tab.id);
 });
 
 /* ---------- 快捷键：Ctrl+C 复制 / Ctrl+X 剪切 / Ctrl+V 粘贴 / F2 重命名 / Delete 删除 ----------
-   仅当激活标签为 SFTP 时生效；路径输入框 / 编辑器 / 迷你终端等编辑控件聚焦时不劫持。 */
+   仅当激活标签为 SFTP 时生效；路径输入框 / 编辑器等编辑控件聚焦时不劫持。 */
 window.addEventListener('keydown', (e) => {
   const tab = getActiveTab();
   if (!tab || tab.type !== 'sftp') return;

@@ -95,9 +95,9 @@ export const renderSettings: PageRender = (root, params) => {
             <div class="field">
               <label>思考强度</label>
               <select id="f-effort" class="select">
-                <option value="low">low</option>
-                <option value="high">high</option>
-                <option value="max">max</option>
+                <option value="low">低</option>
+                <option value="high">高</option>
+                <option value="max">最高</option>
               </select>
             </div>
           </fieldset>
@@ -115,6 +115,14 @@ export const renderSettings: PageRender = (root, params) => {
                 <button id="btn-toggle-brave" class="icon-btn" title="显示 / 隐藏">${icon('eye')}</button>
               </div>
               <div class="hint">免费额度 2000 次/月，<a href="https://api-dashboard.search.brave.com/app/keys" data-open-url="https://api-dashboard.search.brave.com/app/keys">获取 Brave Search API Key</a></div>
+            </div>
+          </fieldset>
+          <fieldset class="llm-group">
+            <legend>AI 工作区域</legend>
+            <div class="field">
+              <label>自动切换 AI 工作区域</label>
+              <input id="f-ai-workdir" type="checkbox">
+              <div class="hint">开启后 AI 输入框显示固定工作区域标签（默认本地）：打开或切换到 SSH/本地终端时自动跟随；发送消息时把当前工作区域作为上下文提供给 AI 助手</div>
             </div>
           </fieldset>
           <div class="form-actions">
@@ -213,11 +221,12 @@ export const renderSettings: PageRender = (root, params) => {
   const fEffort = root.querySelector('#f-effort') as HTMLSelectElement;
   const fSearchEnabled = root.querySelector('#f-search-enabled') as HTMLInputElement;
   const fBraveKey = root.querySelector('#f-brave-key') as HTMLInputElement;
+  const fAiWorkdir = root.querySelector('#f-ai-workdir') as HTMLInputElement;
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark' },
-    servers: [], projects: [], sessions: {}, serverFolders: [],
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: false },
+    servers: [], projects: [], sessions: {}, serverFolders: [], commandFolders: [],
   };
   let searchQuery = ''; // 服务器列表搜索词（小写，空串 = 全部）
   let renderedGroupKeys: string[] = []; // 最近一次渲染的分组键（「全部展开」用）
@@ -780,6 +789,7 @@ export const renderSettings: PageRender = (root, params) => {
     fEffort.value = s.llm.effort || 'low';
     fSearchEnabled.checked = s.search?.enabled ?? false;
     fBraveKey.value = ''; // 同上：Brave key 永不回传
+    fAiWorkdir.checked = s.autoSwitchAiWorkdir ?? false;
   }
 
   // Workspace 浏览…：真实目录选择
@@ -842,7 +852,7 @@ export const renderSettings: PageRender = (root, params) => {
     const apiKey = fApiKey.value.trim();
     const braveKey = fBraveKey.value.trim();
     /* theme 带内存当前值:避免本页打开期间顶栏切换的主题被表单旧值覆盖 */
-    const settings = { workspaceDir, llm, search: { enabled: fSearchEnabled.checked }, theme: currentTheme() };
+    const settings = { workspaceDir, llm, search: { enabled: fSearchEnabled.checked }, theme: currentTheme(), autoSwitchAiWorkdir: fAiWorkdir.checked };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
       db.settings = settings;

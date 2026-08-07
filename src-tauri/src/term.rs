@@ -110,7 +110,8 @@ pub fn set_debug_app(app: AppHandle) {
 
 /// 追加一行带毫秒时间戳的诊断日志；失败静默（绝不影响终端主路径）。
 /// 同时落盘（diag_tx）与广播 `debug:log`（前端 Debug 面板实时流）。
-fn diag(msg: &str) {
+/// pub(crate)：gitinstall（Git Bash 首启安装引导）复用同一事件流。
+pub(crate) fn diag(msg: &str) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())

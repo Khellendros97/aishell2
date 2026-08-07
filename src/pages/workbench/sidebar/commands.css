@@ -6,6 +6,7 @@
 /* 标题行：标题占满左侧，编辑/删除图标按钮靠右（卡片少一行更紧凑） */
 .wbs-commands-qc-head { display: flex; align-items: center; gap: 6px; }
 .wbs-commands-qc-head .wbs-commands-qc-title { flex: 1; min-width: 0; }
+.wbs-commands-qc-head .wbs-commands-global-tag { flex: none; }
 .wbs-commands-qc-icons { flex: none; display: flex; gap: 2px; align-items: center; }
 .wbs-commands-qc-icons .icon-btn { width: 24px; height: 24px; font-size: 13px; }
 .wbs-commands-qc-cmd {
@@ -13,3 +14,31 @@
   white-space: pre-wrap; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 .wbs-commands-qc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* 命令列表容器：分组标题与组内列表的直接父级 */
+.wbs-commands-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+/* 命令搜索行：搜索框 + 新建分类目录 + 全部展开/折叠（持久元素，不随列表重建，避免输入焦点丢失） */
+.wbs-commands-search { display: flex; align-items: center; gap: 6px; }
+.wbs-commands-search .input { flex: 1; min-width: 0; }
+.wbs-commands-search .icon-btn { flex: none; }
+
+/* 按所属目录分组的标题行（点击展开/收起；与服务器分类交互一致） */
+.wbs-commands-group-title {
+  display: flex; align-items: center; gap: 6px;
+  margin: 4px 2px 6px; font-size: 11px; font-weight: 600; color: var(--text-2);
+  cursor: pointer; user-select: none; border-radius: 6px; padding: 1px 4px;
+}
+.wbs-commands-group-title:hover { background: var(--bg-hover); }
+.wbs-commands-group-title .wbs-commands-group-ic { display: inline-flex; flex: none; color: var(--text-2); }
+.wbs-commands-group-title .wbs-commands-group-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wbs-commands-group-title .tag { margin-left: auto; font-weight: 400; }
+/* 分组标题重命名/删除按钮：压缩尺寸，不挤占标题行 */
+.wbs-commands-group-title .icon-btn {
+  flex: none; width: 18px; height: 18px; font-size: 11px; margin-left: 2px;
+}
+/* 组内命令列表容器：收起时整体隐藏 */
+.wbs-commands-group-list { display: flex; flex-direction: column; gap: 8px; }
+.wbs-commands-group-list.hidden { display: none; }

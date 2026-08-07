@@ -15,9 +15,16 @@
 //!
 //! 三档模式（按项目持久化，见 store.rs AiMode）：suggest / agent / yolo。权限事实源在
 //! pi_ext/aishell-guard.ts（每次 spawn 重写进 agent_dir 并显式 --extension 加载）：
-//!   - suggest：read/grep/find/ls/write/edit(+web_search)，写仅限 .aishell/；
-//!   - agent/yolo：读写限项目根 + delete_path/run_command/sftp_upload/sftp_download；
-//!   - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；yolo 跳过；suggest 直接阻止。
+//!
+//! - suggest：read/grep/find/ls/write/edit(+web_search)+request_agent_mode（申请切换工作模式），写仅限 .aishell/；
+//! - agent/yolo：读写限项目根 + delete_path/run_command/sftp_upload/sftp_download；
+//! - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；yolo 跳过；suggest 直接阻止。
+//!
+//! 模式切换（set_ai_mode）：agent ↔ yolo 热推 `/aishell-mode`（guard 模式变量即时生效）；
+//! suggest ↔ agent/yolo 因工具集/系统提示在 spawn 时固定而静默重启该项目全部 pi 进程，
+//! 会话历史经 `--session <agent_dir>/sessions/<projectId>__<sessionId>.jsonl` 恢复。
+//! AI 主动申请切到工作模式：suggest 下工具 request_agent_mode 发 `AISHELL_MODE_REQUEST:`
+//! confirm，经 approval 事件转发前端确认框，同意后前端走 set_ai_mode 实时切换路径。
 //!
 //! 动作执行经内部协议 `AISHELL_ACTION:` input 交给 ai_actions.rs（唯一后端入口：项目根校验 +
 //! 服务器 AI 锁检查，锁只拦 AI，不影响用户手动 SSH/SFTP）。
@@ -44,6 +51,7 @@ const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用�
 - read/grep/find/ls：只能读当前项目目录内的文件，项目外一律不可读。
 - write/edit：只能写项目下 .aishell/ 目录内的文件（可用于保存笔记、记忆、计划；父目录不存在会自动创建）。
 - 没有 bash 工具，不能执行任何命令。
+- request_agent_mode：当你需要执行命令或修改项目源码等 .aishell/ 之外的文件时，调用该工具向用户申请切换到工作(Agent)模式；需用户同意，不同意则继续给出建议。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
 - 用户要求修改项目源码等 .aishell/ 之外的文件时：不要调用 write/edit（会被拒），改为给出命令或补丁文本让用户自行处理。
 输出协议（必须严格遵守）：
@@ -208,14 +216,23 @@ impl AiManager {
 
         // 初始工具集按模式下发（agent/yolo 直接启用变更工具，避免依赖扩展加载期 setActiveTools）；
         // 热切换仍由 /aishell-mode 命令 + 扩展 applyToolset 增量同步。
+        // 注意：RPC 模式下工具集在 spawn 时经 --tools 固定（setActiveTools 不影响模型请求），
+        // 跨 suggest 边界切换模式需重启进程（见 set_ai_mode）。
         let mut tools = if mode == AiMode::Suggest {
-            BASE_TOOLS.to_string()
+            format!("{BASE_TOOLS},request_agent_mode")
         } else {
             format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers")
         };
         if search_enabled {
             tools.push_str(",web_search");
         }
+
+        // 会话持久化（每 key 固定路径）：pi 自动把对话条目落盘到此 jsonl；
+        // 模式跨 suggest 边界切换时重启进程，凭同一路径恢复完整对话历史（探针验证）。
+        let session_dir = self.agent_dir.join("sessions");
+        std::fs::create_dir_all(&session_dir).map_err(|e| format!("创建 pi 会话目录失败: {e}"))?;
+        let session_id = key.split_once(':').map(|(_, s)| s).unwrap_or("default");
+        let session_path = session_dir.join(format!("{project_id}__{session_id}.jsonl"));
 
         let mut cmd = Command::new(&pi_bin);
         cmd.args([
@@ -234,9 +251,9 @@ impl AiManager {
         .arg(&guard_path)
         .args(["--extension"])
         .arg(&search_path)
+        .args(["--no-approve", "--session"])
+        .arg(&session_path)
         .args([
-            "--no-approve",
-            "--no-session",
             "--no-context-files",
             "--append-system-prompt",
             system_prompt,
@@ -610,6 +627,31 @@ fn handle_extension_ui_request(
         });
         let result = runtime.block_on(run_internal_action(actions, project_id, &payload));
         write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}));
+    } else if method == "confirm" && title.starts_with("AISHELL_MODE_REQUEST:") {
+        // AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：
+        // 与审批同通道转发前端（action=request_agent_mode），前端确认后经
+        // ai_respond_approval 回复 extension_ui_response(confirmed:true/false)。
+        let tool_call_id = title["AISHELL_MODE_REQUEST:".len()..].to_string();
+        if let Ok(mut map) = approvals2.lock() {
+            map.insert(id.clone(), tool_call_id.clone());
+        }
+        let reason = ev
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("reason").and_then(serde_json::Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        let _ = app2.emit(
+            event,
+            json!({
+                "type": "approval",
+                "requestId": id,
+                "toolCallId": tool_call_id,
+                "action": "request_agent_mode",
+                "intent": "AI 申请切换到工作模式",
+                "summary": reason,
+            }),
+        );
     } else if method == "confirm" && title.starts_with("AISHELL_APPROVAL:") {
         // 审批：登记待处理项并转发前端
         let tool_call_id = title["AISHELL_APPROVAL:".len()..].to_string();
@@ -851,8 +893,13 @@ pub async fn ai_set_thinking(
     Ok(())
 }
 
-/// 原子切换项目 AI 模式：先落盘（store.set_ai_mode），再向该项目全部存活 pi 进程热推
-/// `/aishell-mode <mode>`（扩展命令，流式期间也能立即执行）；无存活进程时静默，下次 spawn 生效。
+/// 原子切换项目 AI 模式：先落盘（store.set_ai_mode），再处理存活 pi 进程。
+/// - agent ↔ yolo（同侧）：工具集与系统提示相同，热推 `/aishell-mode <mode>`（扩展命令，
+///   流式期间也能立即执行），guard 模式变量即时生效（审批/跳过审批）。
+/// - suggest ↔ agent/yolo（跨边界）：pi RPC 模式下模型可见工具集由 spawn 时 --tools 固定
+///   （setActiveTools 不影响模型请求），系统提示也不同，无法热切换 → 静默重启该项目全部
+///   pi 进程：会话历史经 --session 文件恢复（每 key 固定路径），下次 ai_chat 按新模式惰性
+///   重生；生成中的回合被打断，前端在 setAiMode 成功后自行定稿/清理。
 #[tauri::command]
 pub async fn set_ai_mode(
     mgr: State<'_, Arc<AiManager>>,
@@ -861,7 +908,13 @@ pub async fn set_ai_mode(
 ) -> Result<(), String> {
     let parsed: AiMode = serde_json::from_str(&format!("\"{mode}\""))
         .map_err(|_| format!("未知 AI 模式: {mode}，可选 suggest|agent|yolo"))?;
+    let old = mgr.store.ai_mode(&project_id).unwrap_or_default();
     mgr.store.set_ai_mode(&project_id, parsed)?;
+    let on_suggest_side = |m: AiMode| m == AiMode::Suggest;
+    if on_suggest_side(old) != on_suggest_side(parsed) {
+        mgr.kill_project(&project_id);
+        return Ok(());
+    }
     let msg = serde_json::to_vec(&json!({
         "type": "prompt",
         "message": format!("/aishell-mode {}", parsed.as_str()),

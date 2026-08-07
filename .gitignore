@@ -25,5 +25,7 @@ dist-ssr
 
 # pi runtime（scripts/fetch-pi.sh 拉取）
 src-tauri/resources/pi/
+# Git 安装程序（scripts/fetch-git.sh 拉取，首启静默安装用）
+src-tauri/resources/git/
 src-tauri/target
 tmp/

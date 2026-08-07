@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run fetch-pi && npm run build",
+    "beforeBuildCommand": "npm run fetch-pi && npm run fetch-git && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -29,7 +29,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": ["resources/pi"],
+    "resources": ["resources/pi", "resources/git"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

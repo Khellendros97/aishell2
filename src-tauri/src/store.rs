@@ -88,6 +88,10 @@ pub struct Settings {
     /// 界面主题；旧配置无此字段时按深色处理
     #[serde(default)]
     pub theme: Theme,
+    /// 自动切换 AI 工作区域：开启后前端 AI 输入框显示固定工作区域标签，随激活终端自动切换；
+    /// 旧配置无此字段时按关闭处理
+    #[serde(default)]
+    pub auto_switch_ai_workdir: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +166,14 @@ pub struct QuickCommand {
     pub id: String,
     pub title: String,
     pub command: String,
+    /// 所属目录：'/' 分隔的相对路径（如 "常用/部署"），空串 = 未分类。
+    /// 旧配置无此字段按未分类处理。
+    #[serde(default)]
+    pub folder: String,
+    /// 全局可用：true 时该命令在所有项目的命令收藏面板与快捷指令面板可见可用；
+    /// 编辑/删除仍归属原项目；旧配置无此字段按仅本项目可见。
+    #[serde(default)]
+    pub global: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -210,6 +222,15 @@ pub struct FileRef {
     pub ts: i64,
 }
 
+/// 服务器/本地终端引用：UI 以 @remote:服务器名称 / @local 标签呈现，发送时展开为说明文本。
+/// server_id = None 表示本地终端。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerRef {
+    pub server_id: Option<String>,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMsg {
@@ -219,6 +240,9 @@ pub struct ChatMsg {
     /// 旧会话无此字段时按空处理
     #[serde(default)]
     pub file_refs: Vec<FileRef>,
+    /// 服务器/本地终端引用（@remote:名称 / @local 标签）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub server_refs: Vec<ServerRef>,
     /// AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话按空。
     #[serde(default)]
     pub actions: Vec<AiActionRecord>,
@@ -245,6 +269,10 @@ pub struct AppState {
     /// 旧配置无此字段按空列表（未分类）解析。
     #[serde(default)]
     pub server_folders: Vec<String>,
+    /// 命令收藏分类目录清单（'/' 分隔相对路径，与 QuickCommand.folder 同语义；空目录也在此）。
+    /// 旧配置无此字段按空列表（未分类）解析。
+    #[serde(default)]
+    pub command_folders: Vec<String>,
 }
 
 // ---------------------------------------------------------------- keyring
@@ -559,6 +587,78 @@ impl Store {
         })
     }
 
+    /// 新建命令收藏分类目录：规范化名称；空串报错、重名报错；一次 with_state 原子落盘。
+    /// 空目录也保存在 command_folders（与 server_folders 同语义）。
+    pub fn create_command_folder(&self, name: &str) -> Result<(), String> {
+        let folder = Self::normalize_folder(name);
+        if folder.is_empty() {
+            return Err("分类目录名称不能为空".to_string());
+        }
+        self.with_state(|s| {
+            if s.command_folders.iter().any(|f| f == &folder) {
+                return Err("分类目录已存在".to_string());
+            }
+            s.command_folders.push(folder);
+            Ok(())
+        })
+    }
+
+    /// 重命名命令收藏分类目录：级联改写所有项目 quick_commands 中 folder==old 的命令
+    /// （含不在 command_folders 列表里的旧值），并同步列表（old 移除、new 不存在才追加）。
+    /// 未分类（空串）不可重命名；new 规范化后与 old 相同视为 no-op。一次 with_state 原子落盘。
+    pub fn rename_command_folder(&self, old: &str, new: &str) -> Result<(), String> {
+        if old.is_empty() {
+            return Err("未分类目录不可重命名".to_string());
+        }
+        let folder = Self::normalize_folder(new);
+        if folder.is_empty() {
+            return Err("分类目录名称不能为空".to_string());
+        }
+        if folder == old {
+            return Ok(());
+        }
+        self.with_state(|s| {
+            if s.command_folders.iter().any(|f| f == &folder) {
+                return Err("分类目录已存在".to_string());
+            }
+            for p in &mut s.projects {
+                for qc in &mut p.quick_commands {
+                    if qc.folder == old {
+                        qc.folder = folder.clone();
+                    }
+                }
+            }
+            s.command_folders.retain(|f| f != old);
+            if !s.command_folders.iter().any(|f| f == &folder) {
+                s.command_folders.push(folder);
+            }
+            Ok(())
+        })
+    }
+
+    /// 删除命令收藏分类目录：规范化名称；未分类空串报错；任意项目仍有命令使用该目录时报错；
+    /// 不存在视为幂等成功。一次 with_state 原子落盘。
+    pub fn delete_command_folder(&self, name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("未分类目录不可删除".to_string());
+        }
+        let folder = Self::normalize_folder(name);
+        if folder.is_empty() {
+            return Err("分类目录名称不能为空".to_string());
+        }
+        self.with_state(|s| {
+            if s
+                .projects
+                .iter()
+                .any(|p| p.quick_commands.iter().any(|qc| qc.folder == folder))
+            {
+                return Err(format!("分类目录「{folder}」下仍有命令，不能删除"));
+            }
+            s.command_folders.retain(|f| *f != folder);
+            Ok(())
+        })
+    }
+
     /// 批量合并 Xshell 导入的服务器：一次 with_state 原子持久化，不触碰 SecretStore。
     /// ID 已存在 → 连接配置以导入为准，但**保留现有 AI 锁**（重新导入绝不能解锁）；
     /// 配置完全一致（含锁位）→ unchanged；存在差异 → 覆盖并计 updated；不存在 → imported。
@@ -592,10 +692,23 @@ impl Store {
     }
 
     pub fn upsert_project(&self, project: Project) -> Result<(), String> {
+        // 命令收藏非空 folder 自动注册进 command_folders（与 upsert_server 的 folder 注册同语义；
+        // 前端手输新目录保存时无需先建目录）
+        let folders: Vec<String> = project
+            .quick_commands
+            .iter()
+            .filter(|qc| !qc.folder.is_empty())
+            .map(|qc| qc.folder.clone())
+            .collect();
         self.with_state(|s| {
             match s.projects.iter_mut().find(|p| p.id == project.id) {
                 Some(slot) => *slot = project,
                 None => s.projects.push(project),
+            }
+            for f in folders {
+                if !s.command_folders.iter().any(|x| x == &f) {
+                    s.command_folders.push(f);
+                }
             }
             Ok(())
         })
@@ -860,6 +973,31 @@ pub async fn delete_server_folder(
 }
 
 #[tauri::command]
+pub async fn create_command_folder(
+    store: State<'_, Arc<Store>>,
+    name: String,
+) -> Result<(), String> {
+    store.create_command_folder(&name)
+}
+
+#[tauri::command]
+pub async fn rename_command_folder(
+    store: State<'_, Arc<Store>>,
+    old: String,
+    new: String,
+) -> Result<(), String> {
+    store.rename_command_folder(&old, &new)
+}
+
+#[tauri::command]
+pub async fn delete_command_folder(
+    store: State<'_, Arc<Store>>,
+    name: String,
+) -> Result<(), String> {
+    store.delete_command_folder(&name)
+}
+
+#[tauri::command]
 pub async fn clear_all_servers(store: State<'_, Arc<Store>>) -> Result<(), String> {
     store.clear_all_servers()
 }
@@ -889,6 +1027,7 @@ mod tests {
                 llm: LlmConfig::default(),
                 search: SearchConfig::default(),
                 theme: Theme::Dark,
+                auto_switch_ai_workdir: true,
             },
             servers: vec![
                 Server {
@@ -923,6 +1062,8 @@ mod tests {
                     id: "qc-1".to_string(),
                     title: "查看 Git 状态".to_string(),
                     command: "git status && git log --oneline -5".to_string(),
+                    folder: "常用".to_string(),
+                    global: true,
                 }],
                 ai_mode: AiMode::Suggest,
             }],
@@ -950,6 +1091,10 @@ mod tests {
                                 content: "const a = 1;".to_string(),
                                 ts: 1_752_000_000_001,
                             }],
+                            server_refs: vec![ServerRef {
+                                server_id: Some("srv-1".to_string()),
+                                name: "生产-Web-01".to_string(),
+                            }],
                             actions: vec![AiActionRecord {
                                 tool_call_id: "call-1".to_string(),
                                 tool: "run_command".to_string(),
@@ -964,6 +1109,7 @@ mod tests {
                 m
             },
             server_folders: vec!["生产环境".to_string()],
+            command_folders: vec!["常用".to_string()],
         }
     }
 
@@ -983,6 +1129,10 @@ mod tests {
             "\"locked\"",
             "\"toolCallId\"",
             "\"serverFolders\"",
+            "\"commandFolders\"",
+            "\"global\"",
+            "\"serverRefs\"",
+            "\"autoSwitchAiWorkdir\"",
         ] {
             assert!(json.contains(key), "序列化 JSON 缺少字段 {key}: {json}");
         }
@@ -1575,6 +1725,283 @@ mod tests {
     }
 
     #[test]
+    fn legacy_json_without_command_folder_fields_parses_with_defaults() {
+        // 旧配置 JSON 无 commandFolders 字段、QuickCommand 无 folder/global 字段 →
+        // serde default：空列表 / 未分类 / 非全局，不报错
+        let json = serde_json::to_string(&sample_state()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("commandFolders");
+        let proj = obj.get_mut("projects").unwrap().as_array_mut().unwrap();
+        for p in proj.iter_mut() {
+            for qc in p
+                .get_mut("quickCommands")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+            {
+                let q = qc.as_object_mut().unwrap();
+                q.remove("folder");
+                q.remove("global");
+            }
+        }
+        let back: AppState = serde_json::from_value(v).unwrap();
+        assert!(back.command_folders.is_empty());
+        assert_eq!(back.projects[0].quick_commands[0].folder, "");
+        assert!(!back.projects[0].quick_commands[0].global);
+        assert_eq!(back.servers.len(), 2, "其余字段不受影响");
+    }
+
+    #[test]
+    fn create_command_folder_normalizes_and_rejects_invalid() {
+        let dir = temp_config_dir("qc-folder-create");
+        let store = test_store(dir.clone());
+        // 空串 / 纯分隔符 → 中文错误
+        assert_eq!(store.create_command_folder("  ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(store.create_command_folder("///").unwrap_err(), "分类目录名称不能为空");
+        // 规范化：trim + 去空段；支持层级
+        store.create_command_folder(" 常用/部署 ").unwrap();
+        store.create_command_folder("a//b/").unwrap();
+        {
+            let guard = store.state.lock().unwrap();
+            assert_eq!(
+                guard.command_folders,
+                vec!["常用/部署".to_string(), "a/b".to_string()]
+            );
+        }
+        // 重名（规范化后相同）报错，且列表不变
+        assert_eq!(store.create_command_folder("常用/部署").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.state.lock().unwrap().command_folders,
+            vec!["常用/部署".to_string(), "a/b".to_string()]
+        );
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        assert_eq!(
+            reloaded.state.lock().unwrap().command_folders,
+            vec!["常用/部署".to_string(), "a/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn rename_command_folder_cascades_across_projects() {
+        let dir = temp_config_dir("qc-rename-cascade");
+        let store = test_store(dir.clone());
+        store.create_command_folder("常用").unwrap();
+        let mk = |id: &str, folder: &str| Project {
+            id: format!("proj-{id}"),
+            name: format!("P{id}"),
+            path: None,
+            server_ids: vec![],
+            quick_commands: vec![QuickCommand {
+                id: format!("qc-{id}"),
+                title: format!("T{id}"),
+                command: format!("echo {id}"),
+                folder: folder.to_string(),
+                global: id == "b",
+            }],
+            ai_mode: AiMode::Suggest,
+        };
+        // 两个项目各有一条命令挂在「常用」下，其中一个还带 global
+        store.upsert_project(mk("a", "常用")).unwrap();
+        store.upsert_project(mk("b", "常用")).unwrap();
+        // 新旧名均按规范化处理：带空白与重复分隔符也应级联生效
+        store.rename_command_folder("常用", " 常用//部署 ").unwrap();
+        {
+            let guard = store.state.lock().unwrap();
+            assert_eq!(guard.command_folders, vec!["常用/部署".to_string()]);
+            for p in &guard.projects {
+                assert_eq!(p.quick_commands[0].folder, "常用/部署");
+                // global 字段级联后保持不变
+                assert_eq!(p.quick_commands[0].global, p.id == "proj-b");
+            }
+        }
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        let guard = reloaded.state.lock().unwrap();
+        assert_eq!(guard.command_folders, vec!["常用/部署".to_string()]);
+        assert_eq!(guard.projects[0].quick_commands[0].folder, "常用/部署");
+        assert_eq!(guard.projects[1].quick_commands[0].folder, "常用/部署");
+    }
+
+    #[test]
+    fn rename_command_folder_rejects_conflict_and_uncategorized() {
+        let dir = temp_config_dir("qc-rename-conflict");
+        let store = test_store(dir);
+        store.create_command_folder("甲").unwrap();
+        store.create_command_folder("乙").unwrap();
+        // 未分类（空串）不可重命名
+        assert_eq!(store.rename_command_folder("", "x").unwrap_err(), "未分类目录不可重命名");
+        // 目标已存在且 ≠ old → 报错
+        assert_eq!(store.rename_command_folder("甲", "乙").unwrap_err(), "分类目录已存在");
+        // new 规范化后为空 → 报错
+        assert_eq!(store.rename_command_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
+        // new 规范化后与 old 相同 → no-op，列表不变
+        store.rename_command_folder("甲", " 甲 ").unwrap();
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.command_folders, vec!["甲".to_string(), "乙".to_string()]);
+    }
+
+    #[test]
+    fn rename_command_folder_handles_folders_not_in_list() {
+        let dir = temp_config_dir("qc-rename-derived");
+        let store = test_store(dir.clone());
+        // 历史 JSON 里命令的 folder 可能不在 command_folders 清单；重命名同样级联并补入清单
+        store
+            .with_state(|s| {
+                s.projects.push(Project {
+                    id: "proj-d".to_string(),
+                    name: "D".to_string(),
+                    path: None,
+                    server_ids: vec![],
+                    quick_commands: vec![QuickCommand {
+                        id: "qc-d".to_string(),
+                        title: "T".to_string(),
+                        command: "echo d".to_string(),
+                        folder: "旧目录".to_string(),
+                        global: false,
+                    }],
+                    ai_mode: AiMode::Suggest,
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.state.lock().unwrap().command_folders.is_empty());
+        store.rename_command_folder("旧目录", "新目录").unwrap();
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.projects[0].quick_commands[0].folder, "新目录");
+        assert_eq!(guard.command_folders, vec!["新目录".to_string()]);
+    }
+
+    #[test]
+    fn delete_command_folder_removes_and_persists() {
+        let dir = temp_config_dir("qc-folder-delete");
+        let store = test_store(dir.clone());
+        store.create_command_folder("常用").unwrap();
+        store.create_command_folder("开发环境/Web").unwrap();
+        // 未分类空串不可删除；规范化后为空同样报中文错误
+        assert_eq!(store.delete_command_folder("").unwrap_err(), "未分类目录不可删除");
+        assert_eq!(store.delete_command_folder(" / ").unwrap_err(), "分类目录名称不能为空");
+        // 不存在的目录视为幂等成功
+        store.delete_command_folder("不存在的目录").unwrap();
+        // 删除成功：入参规范化，仅移除匹配项
+        store.delete_command_folder(" 开发环境/Web ").unwrap();
+        {
+            let guard = store.state.lock().unwrap();
+            assert_eq!(guard.command_folders, vec!["常用".to_string()]);
+        }
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        assert_eq!(
+            reloaded.state.lock().unwrap().command_folders,
+            vec!["常用".to_string()]
+        );
+    }
+
+    #[test]
+    fn delete_command_folder_rejects_when_commands_exist() {
+        let dir = temp_config_dir("qc-folder-delete-nonempty");
+        let store = test_store(dir.clone());
+        store.create_command_folder("常用").unwrap();
+        store
+            .upsert_project(Project {
+                id: "proj-f".to_string(),
+                name: "F".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![QuickCommand {
+                    id: "qc-f".to_string(),
+                    title: "T".to_string(),
+                    command: "echo f".to_string(),
+                    folder: "常用".to_string(),
+                    global: false,
+                }],
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+        // 目录下仍有命令（任意项目）→ 中文错误
+        let err = store.delete_command_folder("常用").unwrap_err();
+        assert_eq!(err, "分类目录「常用」下仍有命令，不能删除");
+        // 目录与命令都未被改动
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.command_folders, vec!["常用".to_string()]);
+        assert_eq!(guard.projects[0].quick_commands.len(), 1);
+        drop(guard);
+        // 删除命令后可删目录，且落盘一致
+        store
+            .upsert_project(Project {
+                id: "proj-f".to_string(),
+                name: "F".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+        store.delete_command_folder("常用").unwrap();
+        assert!(store.state.lock().unwrap().command_folders.is_empty());
+        let reloaded = test_store(dir);
+        assert!(reloaded.state.lock().unwrap().command_folders.is_empty());
+    }
+
+    #[test]
+    fn upsert_project_auto_registers_command_folders() {
+        let dir = temp_config_dir("upsert-qc-folder-register");
+        let store = test_store(dir);
+        let mk = |qcs: Vec<QuickCommand>| Project {
+            id: "proj-u".to_string(),
+            name: "U".to_string(),
+            path: None,
+            server_ids: vec![],
+            quick_commands: qcs,
+            ai_mode: AiMode::Suggest,
+        };
+        // 非空 folder 自动注册
+        store
+            .upsert_project(mk(vec![QuickCommand {
+                id: "qc-u-1".to_string(),
+                title: "T".to_string(),
+                command: "echo u".to_string(),
+                folder: "常用".to_string(),
+                global: true,
+            }]))
+            .unwrap();
+        assert_eq!(
+            store.state.lock().unwrap().command_folders,
+            vec!["常用".to_string()]
+        );
+        // 再次 upsert 同目录命令不重复注册
+        store
+            .upsert_project(mk(vec![QuickCommand {
+                id: "qc-u-2".to_string(),
+                title: "T".to_string(),
+                command: "echo v".to_string(),
+                folder: "常用".to_string(),
+                global: false,
+            }]))
+            .unwrap();
+        assert_eq!(
+            store.state.lock().unwrap().command_folders,
+            vec!["常用".to_string()]
+        );
+        // 未分类（空串）不注册
+        store
+            .upsert_project(mk(vec![QuickCommand {
+                id: "qc-u-3".to_string(),
+                title: "T".to_string(),
+                command: "echo w".to_string(),
+                folder: String::new(),
+                global: false,
+            }]))
+            .unwrap();
+        assert_eq!(
+            store.state.lock().unwrap().command_folders,
+            vec!["常用".to_string()]
+        );
+    }
+
+    #[test]
     fn sessions_upsert_and_delete_project_cleanup() {
         let dir = temp_config_dir("sessions");
         let store = test_store(dir);
@@ -1617,6 +2044,7 @@ mod tests {
         assert_eq!(msg.role, "user");
         assert_eq!(msg.snapshots.len(), 1);
         assert!(msg.file_refs.is_empty(), "旧数据应兼容为空引用列表");
+        assert!(msg.server_refs.is_empty(), "旧数据应兼容为空服务器引用列表");
     }
 
     #[test]
@@ -1634,6 +2062,7 @@ mod tests {
                     },
                     search: SearchConfig { enabled: false },
                     theme: Theme::Dark,
+                    auto_switch_ai_workdir: false,
                 },
                 Some("sk-test-key"),
                 None,
@@ -1784,6 +2213,7 @@ mod tests {
                     llm: LlmConfig::default(),
                     search: SearchConfig { enabled: true },
                     theme: Theme::Dark,
+                    auto_switch_ai_workdir: false,
                 },
                 None,
                 Some("bsk-1"),

@@ -4,6 +4,11 @@
  * 对照规格：.proto/workbench-terminal.js（交互语义），后端接口点见 src/api.ts：
  * term_create / term_input / term_resize / term_close，事件 term:data:<id> / term:exit:<id>。
  *
+ * SSH 认证失败（待优化 4）：后端以 SSH_AUTH_FAILED_PREFIX（ssh.rs AUTH_FAILED_PREFIX）
+ * 前缀标记密码/密钥类认证错误，本渲染器捕获后弹出「重设登录凭据」对话框
+ * （showAuthFixDialog：报错全文可见可复制 + 用户名/认证方式/密码/密钥表单），
+ * 保存后凭据进 keyring（upsert_server）、自动重连（connectAfterAuthFix）。
+ *
  * 交互语义移植自 .proto/workbench-terminal.js，差异（计划 A4 决策）：
  * - 真实终端无法把按钮渲染进滚动区 DOM，故用「顶部信息栏 + 右侧 280px 历史命令抽屉」
  *   等价承载「每个区块都有 添加到chat / 命令收藏 按钮」，信息栏固定作用于最后一个区块；
@@ -12,7 +17,7 @@
  * - 抽屉标题栏新增「清空历史命令」图标按钮（原型 clear 命令只删区块记录、不动 scrollback，
  *   这里等价为清空 blocks 数据 + xterm.clear() 清屏，可视内容移入 scrollback 不抹除）。
  *
- * 生命周期：renderer 返回 api { paste, execute, takeSnapshot }；
+ * 生命周期：renderer 返回 TerminalApi { paste, execute, takeSnapshot, focus, ctrlC }；
  * tab.onClose 由本渲染器接管（term_close + 退订 + dispose）。
  * 多实例：tab.id 由打开方生成且唯一（SSH 为 `term:<serverId>:<uid>`，本地为 `term-local:<uid>`，
  * 启动时自动开的首个实例保持 'term-local'），
@@ -25,12 +30,16 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
 
-import { onTermData, onTermExit, termClose, termCreate, termInput, termResize } from '../../api';
+import {
+  getState, onTermData, onTermExit, openDialog, SSH_AUTH_FAILED_PREFIX, termClose, termCreate, termInput,
+  termResize, upsertServer,
+} from '../../api';
 import type { TermKind } from '../../api';
+import type { Server } from '../../types';
 import { icon } from '../../icons';
 import { activateTab, bus, getActiveTab, registerRenderer, Workbench } from './core';
 import { addQuickCommandModal } from './quickcommand';
-import type { Tab } from './core';
+import type { Tab, TerminalApi } from './core';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
 import { dbg } from '../../debug';
 import { currentTheme, onThemeChange } from '../../theme';
@@ -67,7 +76,7 @@ declare global {
 }
 window.__terms = liveTerms;
 onThemeChange((t) => { liveTerms.forEach((s) => { s.term.options.theme = TERM_THEMES[t]; }); });
-import type { TermSnapshot } from '../../types';
+import type { TermSnapshot, ServerRef } from '../../types';
 
 /** 历史命令：一条已结算命令及其输出（纯文本，剥除 ANSI）。 */
 interface TermBlock {
@@ -209,11 +218,17 @@ class TermSession {
     this.term.open(this.host);
     this.term.onData((data) => this.onUserInput(data));
 
-    /* 自定义右键菜单（原生菜单已全局禁用）：复制 / 粘贴 / 重连 */
+    /* 自定义右键菜单（原生菜单已全局禁用）：添加到对话 / 复制 / 粘贴 / 重连。
+       添加到对话 = 把该终端对应引用加入 AI 输入框（SSH → @remote:服务器名称，本地 → @local） */
     this.host.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      const data = this.tab.data as { kind?: string; serverId?: string };
+      const ref: ServerRef = data.kind === 'ssh' && data.serverId
+        ? { serverId: data.serverId, name: this.tab.title }
+        : { serverId: null, name: '本地终端' };
       showContextMenu(e.clientX, e.clientY, [
+        { label: '添加到对话', iconName: 'chatPlus', action: () => Workbench.ai?.addServerRef?.(ref) },
         { label: '复制', iconName: 'copy', disabled: !this.term.hasSelection(), action: () => this.copySelection() },
         { label: '粘贴', iconName: 'clipboard', action: () => void this.pasteClipboard() },
         { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
@@ -271,6 +286,7 @@ class TermSession {
       dbg(`${this.sid} failed ${msg}`);
       toast(msg, 'error');
       this.term.write(`\r\n\x1b[31m[启动失败] ${msg}\x1b[0m\r\n`);
+      this.handleConnectError(msg);
       this.updateInfo();
     }
   }
@@ -549,8 +565,20 @@ class TermSession {
     this.ignoreExit = true;
     setTimeout(() => { this.ignoreExit = false; }, 8000);
     try { await termClose(this.tab.id); } catch { /* 已关闭忽略 */ }
+    await this.establish();
+  }
+
+  /** 认证失败重设凭据成功后重试（init 失败态专用：后端无旧会话可关，直接重建）。 */
+  private async connectAfterAuthFix(): Promise<void> {
+    dbg(`${this.sid} fe-auth-retry`);
+    await this.establish();
+  }
+
+  /** 与后端重建会话：重置状态 → term_create；失败统一走 handleConnectError 分流。 */
+  private async establish(): Promise<void> {
     this.ready = false;
     this.exited = false;
+    this.failed = false;
     this.tab.el.classList.remove('wb-tab-exited');
     this.pendingInput = [];
     this.pendingInputLen = 0;
@@ -576,9 +604,24 @@ class TermSession {
       const msg = String(err);
       toast(msg, 'error');
       this.term.write(`\r\n\x1b[31m[重连失败] ${msg}\x1b[0m\r\n`);
+      this.handleConnectError(msg);
     }
     this.updateInfo();
     this.renderDrawer();
+  }
+
+  /**
+   * 建连错误分流（待优化 4）：后端以 SSH_AUTH_FAILED_PREFIX 前缀标记认证失败
+   * （密码/密钥错误等，见 ssh.rs auth_failed_msg）→ 弹「重设登录凭据」对话框，
+   * 用户修正后自动重试连接。
+   */
+  private handleConnectError(msg: string): void {
+    if (!msg.startsWith(SSH_AUTH_FAILED_PREFIX)) return;
+    // tab.data 由打开方构造（见 openTab 调用处），serverId 为 SSH 终端固定字段
+    const data = this.tab.data as { serverId?: string };
+    if (!data.serverId) return;
+    dbg(`${this.sid} fe-auth-failed, opening fix dialog`);
+    void showAuthFixDialog(data.serverId, msg, () => void this.connectAfterAuthFix());
   }
 
   /* ---------- 尺寸 ---------- */
@@ -738,6 +781,20 @@ class TermSession {
     if (!this.altMode) this.pushBlock(String(cmd));
   }
 
+  /** 聚焦 xterm（外部入口粘贴命令后调用，保证「直接回车即可执行」） */
+  focus(): void {
+    if (this.failed || this.exited) return;
+    this.term.focus();
+  }
+
+  /** 发送 Ctrl+C（^C 中断）：与 xterm 键盘路径等价（onData 直发 termInput('\x03')），
+   *  供 AI 面板等外部焦点场景转发中断信号；同步清 typedBuf（同真实 Ctrl+C 语义）。 */
+  ctrlC(): void {
+    if (this.failed || this.exited) return;
+    this.typedBuf = '';
+    void termInput(this.tab.id, '\x03').catch(() => { /* 终端已关闭等后端错误忽略 */ });
+  }
+
   /* ---------- 关闭清理（tab.onClose 由 renderer 接管） ---------- */
   destroy(): void {
     liveTerms.delete(this);
@@ -749,12 +806,150 @@ class TermSession {
   }
 }
 
+/* ---------- SSH 认证失败重设凭据对话框（待优化 4） ---------- */
+
+/**
+ * 密码/密钥认证失败时弹出（由 TermSession.handleConnectError 触发）：
+ * 顶部完整展示后端报错——等宽、可滚动、可复制，不被下方表单遮挡；
+ * 表单可修改用户名 / 认证方式（密码|密钥）/ 密码 / 密钥路径。
+ * 保存后：密码走 keyring（upsert_server 的 password 参数，留空=保持原值），
+ * 其余字段经 upsert_server 落库；成功后回调 onSaved 自动重连。
+ */
+async function showAuthFixDialog(serverId: string, errorMsg: string, onSaved: () => void): Promise<void> {
+  const state = await getState().catch(() => null);
+  const server = state?.servers.find((s) => s.id === serverId);
+  if (!server) return; // 服务器已被删除：无从重设，不弹框
+  const srv: Server = server; // 具名 const：闭包内保持收窄后的类型
+
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  // 展示时剥掉后端机器识别前缀（[SSH认证失败]，见 ssh.rs AUTH_FAILED_PREFIX）
+  const displayErr = errorMsg.startsWith(SSH_AUTH_FAILED_PREFIX)
+    ? errorMsg.slice(SSH_AUTH_FAILED_PREFIX.length)
+    : errorMsg;
+  mask.innerHTML = `
+    <div class="modal authfix-modal">
+      <div class="modal-head">
+        <h3>SSH 连接失败 · 重新设置登录凭据</h3>
+        <button class="icon-btn authfix-close" title="关闭">${icon('x')}</button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label>报错信息</label>
+          <div class="authfix-err">
+            <pre></pre>
+            <button class="btn small ghost authfix-copy">${icon('copy')} 复制</button>
+          </div>
+        </div>
+        <div class="authfix-divider"></div>
+        <div class="field">
+          <label>账号<span class="req">*</span></label>
+          <input class="input authfix-username" type="text" spellcheck="false">
+        </div>
+        <div class="field">
+          <label>认证方式<span class="req">*</span></label>
+          <select class="select authfix-auth">
+            <option value="password">账号密码</option>
+            <option value="key">密钥文件</option>
+          </select>
+        </div>
+        <div class="field authfix-f-password">
+          <label>密码</label>
+          <input class="input authfix-password" type="password" placeholder="留空表示保持原密码不变">
+          <div class="hint">密码只保存到系统钥匙串（account server:${serverId}），不会写入任何配置文件</div>
+        </div>
+        <div class="field authfix-f-key">
+          <label>密钥文件路径</label>
+          <div class="input-row">
+            <input class="input mono authfix-keypath" spellcheck="false" placeholder="C:\\Users\\demo\\.ssh\\id_ed25519">
+            <button class="btn authfix-browse">浏览…</button>
+          </div>
+        </div>
+        <div class="authfix-error"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn authfix-cancel">取消</button>
+        <button class="btn primary authfix-save">保存并重连</button>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  requestAnimationFrame(() => mask.classList.add('open'));
+
+  const errEl = mask.querySelector('.authfix-error') as HTMLElement;
+  const usernameEl = mask.querySelector('.authfix-username') as HTMLInputElement;
+  const authEl = mask.querySelector('.authfix-auth') as HTMLSelectElement;
+  const passwordEl = mask.querySelector('.authfix-password') as HTMLInputElement;
+  const keypathEl = mask.querySelector('.authfix-keypath') as HTMLInputElement;
+  const saveBtn = mask.querySelector('.authfix-save') as HTMLButtonElement;
+  const pre = mask.querySelector('.authfix-err pre')!;
+
+  pre.textContent = displayErr;
+  usernameEl.value = server.username;
+  authEl.value = server.authType;
+  keypathEl.value = server.keyPath;
+  const syncAuth = (): void => {
+    const key = authEl.value === 'key';
+    mask.querySelector('.authfix-f-password')!.classList.toggle('hidden', key);
+    mask.querySelector('.authfix-f-key')!.classList.toggle('hidden', !key);
+  };
+  authEl.addEventListener('change', syncAuth);
+  syncAuth();
+
+  const close = (): void => {
+    mask.classList.remove('open');
+    setTimeout(() => mask.remove(), 160);
+  };
+  mask.querySelector('.authfix-close')!.addEventListener('click', close);
+  mask.querySelector('.authfix-cancel')!.addEventListener('click', close);
+  mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && mask.isConnected) close();
+  }, { once: true });
+
+  mask.querySelector('.authfix-copy')!.addEventListener('click', () => {
+    void copyText(displayErr).then(() => toast('报错信息已复制', 'success'));
+  });
+  mask.querySelector('.authfix-browse')!.addEventListener('click', async () => {
+    const path = await openDialog();
+    if (path) keypathEl.value = path;
+  });
+
+  saveBtn.addEventListener('click', () => void save());
+  usernameEl.focus();
+
+  async function save(): Promise<void> {
+    const username = usernameEl.value.trim();
+    const authType = authEl.value === 'key' ? 'key' : 'password';
+    const password = passwordEl.value;
+    const keyPath = keypathEl.value.trim();
+    if (!username) { errEl.textContent = '请填写账号'; return; }
+    if (authType === 'key' && !keyPath) { errEl.textContent = '请填写密钥文件路径'; return; }
+    errEl.textContent = '';
+    const next: Server = { ...srv, username, authType, keyPath: authType === 'key' ? keyPath : '' };
+    // 密码留空 = 保持原值（后端 password=null 不触碰 keyring）
+    const passwordOrNull = authType === 'password' ? (password || null) : null;
+    saveBtn.disabled = true;
+    saveBtn.textContent = '保存中…';
+    try {
+      await upsertServer(next, passwordOrNull);
+    } catch (err) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = '保存并重连';
+      errEl.textContent = String(err);
+      toast(String(err), 'error');
+      return;
+    }
+    close();
+    onSaved();
+  }
+}
+
 /**
  * 渲染器：id 由打开方在前端生成且唯一（本地 `term-local:<uid>` 多实例，启动时自动开的
  * 首个实例为 'term-local'；SSH `term:<serverId>:<uid>` 同一服务器可并行多实例），
  * 先订阅事件再 term_create 的时序在 TermSession.init 内保证。
  */
-function renderTerminal(container: HTMLElement, tab: Tab): { paste(cmd: string): void; execute(cmd: string): void; takeSnapshot(): TermSnapshot } {
+function renderTerminal(container: HTMLElement, tab: Tab): TerminalApi {
   const session = new TermSession(container, tab);
   liveTerms.add(session);
   tab.onClose = () => session.destroy();
@@ -762,6 +957,8 @@ function renderTerminal(container: HTMLElement, tab: Tab): { paste(cmd: string):
     paste: (cmd) => session.paste(cmd),
     execute: (cmd) => session.execute(cmd),
     takeSnapshot: () => session.takeSnapshot(),
+    focus: () => session.focus(),
+    ctrlC: () => session.ctrlC(),
   };
 }
 
