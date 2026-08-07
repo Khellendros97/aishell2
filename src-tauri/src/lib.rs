@@ -144,6 +144,8 @@ pub fn run() {
             store::rename_command_folder,
             store::delete_command_folder,
             store::set_ui_expanded,
+            store::set_sftp_history,
+            store::set_sftp_favorites,
             store::clear_all_servers,
             xshell::import_xshell_sessions,
             xshell::import_xshell_from_dir,

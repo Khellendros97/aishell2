@@ -115,7 +115,7 @@ export const renderSettings: PageRender = (root, params) => {
   /* ---------- 状态 ---------- */
   let db: AppState = {
     settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: false, projectView: 'card' },
-    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
+    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {},
   };
 
   // reason=missing-config：顶部黄色提示条（同 .proto/settings.js）

@@ -44,6 +44,12 @@ export const deleteCommandFolder = (name: string) => call<void>('delete_command_
 /** 写入目录树展开状态（前端防抖后调用）；key = explorer:<projectId> | welcome:projectGroups | commands:folders */
 export const setUiExpanded = (key: string, values: string[]) =>
   call<void>('set_ui_expanded', { key, values });
+/** 写入某服务器的 SFTP 路径历史（MRU：最新在前，前端防抖后调用） */
+export const setSftpHistory = (serverId: string, paths: string[]) =>
+  call<void>('set_sftp_history', { serverId, paths });
+/** 写入某服务器的 SFTP 收藏夹路径（按添加顺序，前端防抖后调用） */
+export const setSftpFavorites = (serverId: string, paths: string[]) =>
+  call<void>('set_sftp_favorites', { serverId, paths });
 /** 清除全部服务器配置：清空服务器与分类目录、所有项目解绑、删除全部 keyring 密钥 */
 export const clearAllServers = () => call<void>('clear_all_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；

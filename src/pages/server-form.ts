@@ -5,6 +5,7 @@
  * 安全约定：密码 / 密钥永不回传前端 —— 编辑时密码留空 = 提交 null（keyring 保持原值），也绝不写入 aishell.json。
  */
 import type { Server } from '../types';
+import { openDialog } from '../api';
 import { uid } from '../ui';
 
 export interface ServerFormOptions {
@@ -59,7 +60,10 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
       </div>
       <div class="field" data-auth="key">
         <label>密钥文件路径</label>
-        <input id="${p}-keypath" class="input mono" placeholder="C:\\Users\\demo\\.ssh\\id_ed25519">
+        <div class="path-row">
+          <input id="${p}-keypath" class="input mono" placeholder="C:\\Users\\demo\\.ssh\\id_ed25519">
+          <button type="button" id="${p}-keybrowse" class="btn" title="选择密钥文件">浏览…</button>
+        </div>
       </div>
     </div>`;
 
@@ -71,6 +75,16 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
   const fUsername = q<HTMLInputElement>('username');
   const fPassword = q<HTMLInputElement>('password');
   const fKeyPath = q<HTMLInputElement>('keypath');
+  const fKeyBrowse = q<HTMLButtonElement>('keybrowse');
+
+  /* 浏览…：文件选择器选密钥（私钥无固定扩展名，不加过滤器） */
+  fKeyBrowse.onclick = async () => {
+    const path = await openDialog({ directory: false });
+    if (typeof path === 'string' && path) {
+      fKeyPath.value = path;
+      markInvalid(fKeyPath, false);
+    }
+  };
 
   /** 认证方式切换：仅显示对应密码 / 密钥路径字段（同侧栏原模态框 data-auth 约定） */
   function syncAuthFields(): void {
@@ -80,6 +94,8 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
     });
   }
   fAuth.addEventListener('change', syncAuthFields);
+  /* 创建即同步一次：否则首次展开（尚未 fill）两个 data-auth 字段会同时可见 */
+  syncAuthFields();
 
   /* 校验标红：输入即清除（同欢迎页 mini 表单行为） */
   const markInvalid = (el: HTMLInputElement, bad: boolean): void => {

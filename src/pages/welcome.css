@@ -90,9 +90,7 @@
 /* ---------- 表单校验 ---------- */
 .welcome-page .field .error { margin-top: 4px; font-size: 11px; color: var(--red); }
 
-/* ---------- 路径输入行 ---------- */
-.welcome-page .path-row { display: flex; gap: 8px; }
-.welcome-page .path-row .input { flex: 1; min-width: 0; }
+/* ---------- 路径输入行(通用规则已移至 design.css .path-row) ---------- */
 
 /* ---------- 服务器多选列表（平铺，仅搜索过滤） ---------- */
 .welcome-page .server-list { display: flex; flex-direction: column; gap: 8px; max-height: 200px; overflow-y: auto; padding-right: 2px; }

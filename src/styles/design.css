@@ -155,6 +155,9 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 /* 服务器表单双列紧凑布局（欢迎页内联区，见 server-form.ts）；侧栏模态框默认单列 */
 .server-form-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; }
 .server-form-grid .field { margin-bottom: 12px; }
+/* 输入框 + 按钮同行（密钥路径浏览、项目目录浏览等，server-form.ts / welcome 共用） */
+.path-row { display: flex; gap: 8px; }
+.path-row .input { flex: 1; min-width: 0; }
 .select { appearance: none; cursor: pointer;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a8adbb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat; background-position: right 10px center; padding-right: 28px;

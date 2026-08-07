@@ -303,6 +303,14 @@ pub struct AppState {
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
     pub ui_expanded: HashMap<String, Vec<String>>,
+    /// SFTP 路径历史：serverId → MRU 路径列表（最新在前，最多 10 条，由前端截断）。
+    /// 旧配置无此字段按空 map 解析。
+    #[serde(default)]
+    pub sftp_history: HashMap<String, Vec<String>>,
+    /// SFTP 收藏夹：serverId → 收藏路径列表（按添加顺序，由前端维护）。
+    /// 旧配置无此字段按空 map 解析。
+    #[serde(default)]
+    pub sftp_favorites: HashMap<String, Vec<String>>,
 }
 
 /// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
@@ -700,6 +708,30 @@ impl Store {
         }
         self.with_state(|s| {
             s.ui_expanded.insert(key, values);
+            Ok(())
+        })
+    }
+
+    /// 写入某服务器的 SFTP 路径历史（MRU：最新在前，最多 10 条由前端维护）。
+    /// 前端防抖后调用，仅覆盖该 serverId 不影响其他服务器。一次 with_state 原子落盘。
+    pub fn set_sftp_history(&self, server_id: String, paths: Vec<String>) -> Result<(), String> {
+        if server_id.is_empty() {
+            return Err("服务器 ID 不能为空".to_string());
+        }
+        self.with_state(|s| {
+            s.sftp_history.insert(server_id, paths);
+            Ok(())
+        })
+    }
+
+    /// 写入某服务器的 SFTP 收藏夹路径（按添加顺序）。
+    /// 前端防抖后调用，仅覆盖该 serverId 不影响其他服务器。一次 with_state 原子落盘。
+    pub fn set_sftp_favorites(&self, server_id: String, paths: Vec<String>) -> Result<(), String> {
+        if server_id.is_empty() {
+            return Err("服务器 ID 不能为空".to_string());
+        }
+        self.with_state(|s| {
+            s.sftp_favorites.insert(server_id, paths);
             Ok(())
         })
     }
@@ -1113,6 +1145,24 @@ pub async fn set_ui_expanded(
 }
 
 #[tauri::command]
+pub async fn set_sftp_history(
+    store: State<'_, Arc<Store>>,
+    server_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    store.set_sftp_history(server_id, paths)
+}
+
+#[tauri::command]
+pub async fn set_sftp_favorites(
+    store: State<'_, Arc<Store>>,
+    server_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    store.set_sftp_favorites(server_id, paths)
+}
+
+#[tauri::command]
 pub async fn clear_all_servers(store: State<'_, Arc<Store>>) -> Result<(), String> {
     store.clear_all_servers()
 }
@@ -1230,6 +1280,8 @@ mod tests {
             project_folders: vec!["生产环境".to_string()],
             command_folders: vec!["常用".to_string()],
             ui_expanded: HashMap::new(),
+            sftp_history: HashMap::new(),
+            sftp_favorites: HashMap::new(),
         }
     }
 
@@ -1250,6 +1302,9 @@ mod tests {
             "\"toolCallId\"",
             "\"projectFolders\"",
             "\"commandFolders\"",
+            "\"uiExpanded\"",
+            "\"sftpHistory\"",
+            "\"sftpFavorites\"",
             "\"global\"",
             "\"serverRefs\"",
             "\"autoSwitchAiWorkdir\"",
@@ -1997,6 +2052,107 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "空数组覆盖后落盘为空列表"
+        );
+    }
+
+    #[test]
+    fn legacy_json_without_sftp_history_and_favorites_parses_as_empty_maps() {
+        // 旧配置 JSON 无 sftpHistory / sftpFavorites 字段 → serde default 空 map，不报错
+        let json = serde_json::to_string(&sample_state()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("sftpHistory");
+        v.as_object_mut().unwrap().remove("sftpFavorites");
+        let back: AppState = serde_json::from_value(v).unwrap();
+        assert!(back.sftp_history.is_empty(), "旧 JSON 无 sftpHistory 按空 map");
+        assert!(back.sftp_favorites.is_empty(), "旧 JSON 无 sftpFavorites 按空 map");
+        assert_eq!(back.servers.len(), 2, "其余字段不受影响");
+    }
+
+    #[test]
+    fn set_sftp_history_persists_across_reload() {
+        // 写入后重载 store：路径历史仍在，且不影响其他服务器
+        let dir = temp_config_dir("sftp-history-persist");
+        let store = test_store(dir.clone());
+        store
+            .set_sftp_history(
+                "srv-1".to_string(),
+                vec!["/var/log".to_string(), "/etc".to_string(), "/".to_string()],
+            )
+            .unwrap();
+        // 空 serverId 拒绝
+        assert!(store
+            .set_sftp_history(String::new(), vec!["/".to_string()])
+            .is_err());
+        // 第二个服务器独立
+        store
+            .set_sftp_history("srv-2".to_string(), vec!["/tmp".to_string()])
+            .unwrap();
+        let reloaded = test_store(dir.clone());
+        let guard = reloaded.state.lock().unwrap();
+        assert_eq!(
+            guard.sftp_history.get("srv-1").unwrap(),
+            &vec!["/var/log".to_string(), "/etc".to_string(), "/".to_string()],
+            "首次写入的服务器原样保留"
+        );
+        assert_eq!(
+            guard.sftp_history.get("srv-2").unwrap(),
+            &vec!["/tmp".to_string()],
+            "第二个服务器写入成功"
+        );
+        // 空数组覆盖后 key 仍在（清空语义）
+        drop(guard);
+        store
+            .set_sftp_history("srv-1".to_string(), vec![])
+            .unwrap();
+        let reloaded2 = test_store(dir);
+        assert!(
+            reloaded2
+                .state
+                .lock()
+                .unwrap()
+                .sftp_history
+                .get("srv-1")
+                .unwrap()
+                .is_empty(),
+            "空数组覆盖后落盘为空列表"
+        );
+    }
+
+    #[test]
+    fn set_sftp_favorites_persists_across_reload() {
+        // 写入后重载 store：收藏夹仍在，且不影响其他服务器
+        let dir = temp_config_dir("sftp-favorites-persist");
+        let store = test_store(dir.clone());
+        store
+            .set_sftp_favorites("srv-1".to_string(), vec!["/data".to_string(), "/backup".to_string()])
+            .unwrap();
+        // 空 serverId 拒绝
+        assert!(store
+            .set_sftp_favorites(String::new(), vec!["/data".to_string()])
+            .is_err());
+        let reloaded = test_store(dir.clone());
+        let guard = reloaded.state.lock().unwrap();
+        assert_eq!(
+            guard.sftp_favorites.get("srv-1").unwrap(),
+            &vec!["/data".to_string(), "/backup".to_string()],
+            "收藏路径按添加顺序保留"
+        );
+        // 覆盖写（取消收藏后列表变短）同样落盘
+        drop(guard);
+        store
+            .set_sftp_favorites("srv-1".to_string(), vec!["/data".to_string()])
+            .unwrap();
+        let reloaded2 = test_store(dir);
+        assert_eq!(
+            reloaded2
+                .state
+                .lock()
+                .unwrap()
+                .sftp_favorites
+                .get("srv-1")
+                .unwrap(),
+            &vec!["/data".to_string()],
+            "覆盖写后落盘为新列表"
         );
     }
 

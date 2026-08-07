@@ -70,6 +70,7 @@ const PATHS = {
   chevronRight: '<path d="m9 18 6-6-6-6"/>',
   chevronDown: '<path d="m6 9 6 6 6-6"/>',
   slash: '<path d="M17 5 7 19"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>',
   grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   list: '<path d="M9 6h12"/><path d="M9 12h12"/><path d="M9 18h12"/><path d="M4 6h1"/><path d="M4 12h1"/><path d="M4 18h1"/>',
   key: '<circle cx="7.5" cy="16.5" r="4.5"/><path d="M10.7 13.3 21 3"/><path d="M16 8l3 3"/>',

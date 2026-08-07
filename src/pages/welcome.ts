@@ -214,7 +214,7 @@ export const renderWelcome: PageRender = (root) => {
       autoSwitchAiWorkdir: false,
       projectView: 'card',
     },
-    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
+    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {},
   };
   let editingId: string | null = null;       // null = 新建；否则为正在编辑的项目 id
   let selectedServerIds: string[] = [];      // 模态框中多选的服务器 id

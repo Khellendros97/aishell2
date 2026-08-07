@@ -144,6 +144,10 @@ export interface AppState {
    * （folder 值数组，空串 = 未分类）| commands:folders（同语义）；旧配置无此字段为空对象。
    */
   uiExpanded: Record<string, string[]>;
+  /** SFTP 路径历史：serverId → MRU 路径列表（最新在前，最多 10 条）；旧配置无此字段为空对象 */
+  sftpHistory: Record<string, string[]>;
+  /** SFTP 收藏夹：serverId → 收藏路径列表（按添加顺序）；旧配置无此字段为空对象 */
+  sftpFavorites: Record<string, string[]>;
 }
 
 export interface FsEntry {

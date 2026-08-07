@@ -1,7 +1,10 @@
 /**
  * SFTP 标签渲染器 —— 移植自 .proto/workbench-sftp.js，数据源换成真实后端命令。
  * - 每个 tab 独立维护 cwd / history / forward 栈；打开时先解析远端 home（sftp_home）作为初始路径
- * - 顶栏：后退 / 前进 / 上级 / home（~ 主目录）/ 根（/）+ 可编辑路径输入框（回车或「跳转」直达）+ 平铺/列表视图切换
+ * - 顶栏：后退 / 前进 / 上级 / home（~ 主目录）/ 根（/）+ 可编辑路径输入框（回车或「跳转」直达，
+ *   聚焦展开最近访问历史下拉（MRU 最多 10 条，mousedown 跳转）+ 收藏星按钮 + 平铺/列表视图切换
+ * - 列表视图支持按「名称 / 修改时间」表头排序（目录恒在前）；工具栏搜索框按名称即时过滤当前目录
+ * - 工具栏右端收藏夹按钮开关右侧收藏夹侧边栏（项点击跳转、✕ 移除；路径历史与收藏持久化到 aishell.json）
  * - 平铺/列表双视图；平铺视图支持拖拽框选（多选作用于复制/剪切/删除/压缩等菜单操作）
  * - 容器空白右键：粘贴 + 「打开终端」（新开 SSH 终端标签，自动 cd 到当前目录，可手动执行 tar 压缩/解压）
  * - 条目可拖拽（source:'remote' + serverId）；容器 drop 收 source:'local' → sftp_upload → toast → 刷新
@@ -15,8 +18,8 @@
 import './sftp.css';
 import type { FsEntry, FsStat, SshExecResult } from '../../types';
 import {
-  fsDelete, getState, sftpCopy, sftpCreate, sftpDelete, sftpDownload, sftpHome, sftpList, sftpRename,
-  sftpStat, sftpUniqueName, sftpUpload, sshExec,
+  fsDelete, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
+  sftpHome, sftpList, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec,
 } from '../../api';
 import { confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../ui';
 import { bus, getActiveTab, openTab, registerRenderer, Workbench, type Tab } from './core';
@@ -27,6 +30,8 @@ import { icon, icon as iconSvg } from '../../icons';
 
 interface SftpEls {
   body: HTMLElement;
+  /** 地址栏包裹层（历史下拉浮层挂载点，绝对定位随它） */
+  pathWrap: HTMLElement;
   backBtn: HTMLButtonElement;
   fwdBtn: HTMLButtonElement;
   upBtn: HTMLButtonElement;
@@ -34,6 +39,16 @@ interface SftpEls {
   rootBtn: HTMLButtonElement;
   pathInput: HTMLInputElement;
   goBtn: HTMLButtonElement;
+  /** 地址栏星按钮（收藏当前路径） */
+  starBtn: HTMLButtonElement;
+  /** 工具栏搜索按钮 / 搜索输入框 */
+  searchBtn: HTMLButtonElement;
+  searchInput: HTMLInputElement;
+  /** 工具栏收藏夹按钮 / 收藏夹侧边栏 */
+  favBtn: HTMLButtonElement;
+  favPanel: HTMLElement;
+  /** 路径历史下拉浮层（仅展开期间存在） */
+  historyBox: HTMLElement | null;
   gridBtn: HTMLButtonElement;
   listBtn: HTMLButtonElement;
 }
@@ -56,6 +71,14 @@ interface SftpTabState {
   renderEntries: RemoteEntry[];
   /** 下次 loadDir 成功后要聚焦（选中+滚动）的条目路径；不存在则静默跳过 */
   pendingFocus: string | null;
+  /** 搜索关键字（即时过滤当前目录，切目录时清空） */
+  query: string;
+  /** 工具栏搜索输入框是否展开 */
+  searchOpen: boolean;
+  /** 收藏夹侧边栏是否展开 */
+  favOpen: boolean;
+  /** 历史下拉展开期间挂的 document mousedown 监听（收起时移除，防泄漏） */
+  historyDocHandler: ((e: MouseEvent) => void) | null;
 }
 
 /** 带完整远端路径的展示条目 */
@@ -71,7 +94,108 @@ type DndPayload = { source?: string; path?: string; name?: string; isDir?: boole
 
 /* ---------- 视图状态（模块级，跨标签共享） ---------- */
 let viewMode: 'grid' | 'list' = 'grid';
+/** 列表视图排序：当前排序列与方向（会话级，不持久化；目录恒在前不受方向影响） */
+let sortKey: 'name' | 'mtime' = 'name';
+let sortAsc = true;
 const sftpTabs = new Map<string, SftpTabState>();
+
+/* ---------- SFTP 持久化数据层（路径历史 / 收藏夹，事实源在 Rust aishell.json） ---------- */
+const HISTORY_MAX = 10;
+/** serverId → MRU 路径（最新在前）；首次需要时从 getState 播种，每 serverId 一次 */
+const historyByServer = new Map<string, string[]>();
+/** serverId → 收藏路径（按添加顺序） */
+const favoritesByServer = new Map<string, string[]>();
+const seededHistory = new Set<string>();
+const seededFavorites = new Set<string>();
+/** 防抖落盘定时器 + 待写集合（多个服务器并发变更也不丢） */
+let historySaveTimer: number | null = null;
+let favoritesSaveTimer: number | null = null;
+const dirtyHistory = new Set<string>();
+const dirtyFavorites = new Set<string>();
+
+/** 播种某服务器的路径历史：与本地合并——本地条目（本次会话新访问）在前，磁盘补旧，去重截断 10。
+ *  不能用「本地已有则丢弃磁盘」:loadDir 落地即 recordHistory,播种到达时本地几乎必已有数据。 */
+function seedHistory(serverId: string): void {
+  if (seededHistory.has(serverId)) return;
+  seededHistory.add(serverId);
+  void getState()
+    .then((s) => {
+      const disk = s.sftpHistory?.[serverId];
+      if (!disk || disk.length === 0) return;
+      const local = historyByServer.get(serverId) ?? [];
+      const merged = local.slice();
+      for (const p of disk) if (!merged.includes(p)) merged.push(p);
+      historyByServer.set(serverId, merged.slice(0, HISTORY_MAX));
+    })
+    .catch(() => { /* 播种失败静默：本次会话历史从空开始，不影响其他功能 */ });
+}
+
+/** 播种某服务器的收藏夹：与本地合并（磁盘补进本地未有条目，保持本地顺序在前），语义同 seedHistory */
+function seedFavorites(serverId: string): void {
+  if (seededFavorites.has(serverId)) return;
+  seededFavorites.add(serverId);
+  void getState()
+    .then((s) => {
+      const disk = s.sftpFavorites?.[serverId];
+      if (!disk || disk.length === 0) return;
+      const local = favoritesByServer.get(serverId) ?? [];
+      const merged = local.slice();
+      for (const p of disk) if (!merged.includes(p)) merged.push(p);
+      favoritesByServer.set(serverId, merged);
+      sftpTabs.forEach((st) => { if (st.serverId === serverId) renderView(st); });
+    })
+    .catch(() => {});
+}
+
+function getHistory(serverId: string): string[] {
+  seedHistory(serverId);
+  return historyByServer.get(serverId) ?? [];
+}
+
+function getFavorites(serverId: string): string[] {
+  seedFavorites(serverId);
+  return favoritesByServer.get(serverId) ?? [];
+}
+
+/** 记录一次成功落地的目录访问：MRU 去重（已存在先删再 unshift）+ 截断 10 条，防抖落盘 */
+function recordHistory(serverId: string, path: string): void {
+  seedHistory(serverId); // 首次访问即触发播种：磁盘旧历史经合并保留，否则本地从空起步会整体覆盖
+  const list = (historyByServer.get(serverId) ?? []).filter((p) => p !== path);
+  list.unshift(path);
+  historyByServer.set(serverId, list.slice(0, HISTORY_MAX));
+  dirtyHistory.add(serverId);
+  if (historySaveTimer === null) {
+    historySaveTimer = window.setTimeout(() => {
+      historySaveTimer = null;
+      dirtyHistory.forEach((id) => {
+        const paths = historyByServer.get(id);
+        if (paths) {
+          setSftpHistory(id, paths).catch((err: unknown) =>
+            console.warn('保存 SFTP 路径历史失败:', err));
+        }
+      });
+      dirtyHistory.clear();
+    }, 300);
+  }
+}
+
+/** 收藏集变更后防抖落盘（fire-and-forget，失败仅 console.warn 不 toast） */
+function scheduleFavoritesSave(serverId: string): void {
+  dirtyFavorites.add(serverId);
+  if (favoritesSaveTimer === null) {
+    favoritesSaveTimer = window.setTimeout(() => {
+      favoritesSaveTimer = null;
+      dirtyFavorites.forEach((id) => {
+        const paths = favoritesByServer.get(id);
+        if (paths) {
+          setSftpFavorites(id, paths).catch((err: unknown) =>
+            console.warn('保存 SFTP 收藏夹失败:', err));
+        }
+      });
+      dirtyFavorites.clear();
+    }, 300);
+  }
+}
 
 function fmtSize(n: number): string {
   if (n < 1024) return n + ' B';
@@ -128,6 +252,8 @@ async function loadDir(st: SftpTabState): Promise<void> {
     if (seq !== st.seq) return;
     st.entries = entries;
     st.loading = false;
+    // 目录落地成功即记录访问（后退/前进/直接跳转/初始 home 一视同仁；刷新同路径去重后置顶）
+    recordHistory(st.serverId, st.cwd);
   } catch (err) {
     if (seq !== st.seq) return;
     st.loading = false;
@@ -177,6 +303,9 @@ function goTo(st: SftpTabState, path: string, push: boolean): void {
     void loadDir(st);
     return;
   }
+  // 切换目录：清空搜索并收起搜索框 / 历史下拉（goBack/goForward 复用本函数语义）
+  clearSearch(st);
+  closeHistory(st);
   if (push) {
     st.back.push(st.cwd);
     st.fwd.length = 0;
@@ -899,6 +1028,158 @@ function markClipped(el: HTMLElement, st: SftpTabState, it: RemoteEntry): void {
   }
 }
 
+/* ---------- 路径历史下拉（地址栏聚焦展开，mousedown 跳转先于 blur） ---------- */
+
+function showHistory(st: SftpTabState): void {
+  closeHistory(st);
+  const list = getHistory(st.serverId);
+  if (!list.length) return;
+  const box = document.createElement('div');
+  box.className = 'sf-history';
+  list.forEach((path) => {
+    const item = document.createElement('div');
+    item.className = 'sf-history-item' + (path === st.cwd ? ' current' : '');
+    item.textContent = path;
+    item.title = path;
+    // mousedown 先于 blur 触发：preventDefault 保住输入框焦点，避免 blur 关闭下拉后收不到点击
+    item.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      closeHistory(st);
+      st.els.pathInput.blur();
+      goTo(st, path, true);
+    });
+    box.appendChild(item);
+  });
+  st.els.historyBox = box;
+  st.els.pathWrap.appendChild(box);
+  const onDoc = (e: MouseEvent): void => {
+    // 点击浮层与输入框之外 → 收起（输入框自身点击不关：focus 已展开）
+    const t = e.target as Node;
+    if (!box.contains(t) && !st.els.pathInput.contains(t)) closeHistory(st);
+  };
+  st.historyDocHandler = onDoc;
+  document.addEventListener('mousedown', onDoc);
+}
+
+/** 收起历史下拉并移除 document 级监听（幂等；tab 关闭时也调用防泄漏） */
+function closeHistory(st: SftpTabState): void {
+  if (st.historyDocHandler) {
+    document.removeEventListener('mousedown', st.historyDocHandler);
+    st.historyDocHandler = null;
+  }
+  st.els.historyBox?.remove();
+  st.els.historyBox = null;
+}
+
+/* ---------- 搜索（工具栏展开输入框，即时过滤当前目录） ---------- */
+
+/** 收起搜索框并清空关键字（DOM 与状态同步；renderView 亦会按状态补同步） */
+function clearSearch(st: SftpTabState): void {
+  st.query = '';
+  st.searchOpen = false;
+  st.els.searchInput.value = '';
+  st.els.searchInput.classList.remove('sf-search-open');
+  st.els.searchBtn.classList.remove('active');
+}
+
+/** 搜索匹配：query 含 `*` / `?` 时按 glob 整名匹配（`*` → 任意串、`?` → 单字符，
+ *  其余正则元字符转义，不区分大小写）；不含通配符时维持子串包含匹配。 */
+function matchEntry(name: string, query: string): boolean {
+  if (query.includes('*') || query.includes('?')) {
+    // 先转义正则元字符（* ? 除外），再展开通配符；整体锚定整名
+    const re = new RegExp('^' + query.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+    return re.test(name);
+  }
+  return name.toLowerCase().includes(query.toLowerCase());
+}
+
+function setSearchOpen(st: SftpTabState, open: boolean): void {
+  if (open) {
+    st.searchOpen = true;
+    st.els.searchBtn.classList.add('active');
+    st.els.searchInput.classList.add('sf-search-open');
+    st.els.searchInput.focus();
+  } else {
+    clearSearch(st);
+  }
+}
+
+/* ---------- 收藏夹（星按钮 + 右侧边栏） ---------- */
+
+function basenameOf(path: string): string {
+  return path === '/' ? '/' : path.slice(path.lastIndexOf('/') + 1);
+}
+
+/** 星按钮：收藏 / 取消收藏当前路径，按钮态即时更新，防抖落盘 */
+function toggleFavorite(st: SftpTabState): void {
+  const list = getFavorites(st.serverId);
+  const idx = list.indexOf(st.cwd);
+  const next = idx >= 0 ? list.filter((p) => p !== st.cwd) : [...list, st.cwd];
+  favoritesByServer.set(st.serverId, next);
+  scheduleFavoritesSave(st.serverId);
+  renderView(st); // 星按钮态 + 侧边栏列表（开着时）一并刷新
+}
+
+/** 侧边栏 ✕：从收藏夹移除指定路径 */
+function removeFavorite(st: SftpTabState, path: string): void {
+  favoritesByServer.set(st.serverId, getFavorites(st.serverId).filter((p) => p !== path));
+  scheduleFavoritesSave(st.serverId);
+  renderView(st);
+}
+
+function setFavOpen(st: SftpTabState, open: boolean): void {
+  st.favOpen = open;
+  st.els.favPanel.hidden = !open;
+  st.els.favBtn.classList.toggle('active', open);
+  if (open) renderFavList(st);
+}
+
+/** 重渲收藏夹侧边栏列表（打开时调用；收藏集变化时若侧栏开着也重渲） */
+function renderFavList(st: SftpTabState): void {
+  const panel = st.els.favPanel;
+  panel.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'sf-fav-head';
+  const title = document.createElement('span');
+  title.textContent = '收藏夹';
+  const close = document.createElement('button');
+  close.className = 'icon-btn sf-fav-close';
+  close.innerHTML = icon('x');
+  close.title = '关闭收藏夹';
+  close.addEventListener('click', () => setFavOpen(st, false));
+  head.appendChild(title);
+  head.appendChild(close);
+  panel.appendChild(head);
+  const list = getFavorites(st.serverId);
+  if (!list.length) {
+    panel.appendChild(emptyState('star', '暂无收藏'));
+    return;
+  }
+  const ul = document.createElement('div');
+  ul.className = 'sf-fav-list';
+  list.forEach((path) => {
+    const item = document.createElement('div');
+    item.className = 'sf-fav-item' + (path === st.cwd ? ' current' : '');
+    item.title = path; // 悬浮提示完整路径
+    const name = document.createElement('span');
+    name.className = 'nm';
+    name.textContent = basenameOf(path);
+    item.appendChild(name);
+    const rm = document.createElement('button');
+    rm.className = 'icon-btn sf-fav-rm';
+    rm.innerHTML = icon('x');
+    rm.title = '取消收藏';
+    rm.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeFavorite(st, path);
+    });
+    item.appendChild(rm);
+    item.addEventListener('click', () => goTo(st, path, true));
+    ul.appendChild(item);
+  });
+  panel.appendChild(ul);
+}
+
 /* ---------- 视图渲染 ---------- */
 function buildToolbar(st: SftpTabState): HTMLElement {
   const bar = document.createElement('div');
@@ -929,12 +1210,18 @@ function buildToolbar(st: SftpTabState): HTMLElement {
   st.els.upBtn = mk('', icon('arrowUp'), '上一级', () => goTo(st, parentOf(st.cwd), true));
   st.els.homeBtn = mk('', icon('home'), '回到主目录 ~', () => goTo(st, st.home, true));
   st.els.rootBtn = mk('', icon('slash'), '根目录 /', () => goTo(st, '/', true));
+  // 地址栏包一层相对定位容器：路径历史下拉浮层（.sf-history）定位随它
+  const pathWrap = document.createElement('div');
+  pathWrap.className = 'sf-path-wrap';
+  st.els.pathWrap = pathWrap;
   const input = document.createElement('input');
   input.className = 'input sf-path';
   input.type = 'text';
   input.spellcheck = false;
   input.placeholder = '输入远程路径，回车跳转';
-  input.title = '远程路径（自动归一化 . / ..），回车或点击「跳转」进入';
+  input.title = '远程路径（自动归一化 . / ..），回车或点击「跳转」进入；聚焦显示最近访问历史';
+  input.addEventListener('focus', () => showHistory(st));
+  input.addEventListener('blur', () => closeHistory(st));
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') jump();
     else if (e.key === 'Escape') {
@@ -942,6 +1229,15 @@ function buildToolbar(st: SftpTabState): HTMLElement {
       input.blur();
     }
   });
+  pathWrap.appendChild(input);
+  // 收藏当前路径星按钮：absolute 定位在地址栏输入框内部右端（浏览器 URL 栏式），active 态 = 已收藏
+  const starBtn = document.createElement('button');
+  starBtn.className = 'icon-btn sf-star';
+  starBtn.innerHTML = icon('star');
+  starBtn.title = '收藏当前路径';
+  starBtn.addEventListener('click', () => toggleFavorite(st));
+  st.els.starBtn = starBtn;
+  pathWrap.appendChild(starBtn);
   const goBtn = document.createElement('button');
   goBtn.className = 'btn sf-go';
   goBtn.textContent = '跳转';
@@ -951,15 +1247,37 @@ function buildToolbar(st: SftpTabState): HTMLElement {
   st.els.goBtn = goBtn;
   st.els.gridBtn = mk('sf-view', icon('grid'), '平铺视图', () => setViewMode('grid'));
   st.els.listBtn = mk('sf-view', icon('list'), '列表视图', () => setViewMode('list'));
+  // 收藏夹侧边栏开关（工具栏右端，视图按钮旁；active 态 = 侧边栏展开）
+  st.els.favBtn = mk('sf-fav-toggle', icon('star'), '收藏夹', () => setFavOpen(st, !st.favOpen));
+  // 搜索按钮 + 搜索输入框（工具栏最右；展开时 focus，收起时隐藏）
+  st.els.searchBtn = mk('sf-search-toggle', icon('search'), '搜索当前目录', () => setSearchOpen(st, !st.searchOpen));
+  const searchInput = document.createElement('input');
+  searchInput.className = 'input sf-search';
+  searchInput.type = 'text';
+  searchInput.spellcheck = false;
+  searchInput.placeholder = '搜索当前目录，支持 *.log 通配';
+  searchInput.title = '按名称过滤当前目录（大小写不敏感）；含 * 或 ? 时按通配整名匹配，如 *.log；Esc 关闭';
+  searchInput.addEventListener('input', () => {
+    st.query = searchInput.value;
+    renderView(st);
+  });
+  searchInput.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Escape') clearSearch(st);
+  });
+  st.els.searchInput = searchInput;
   bar.appendChild(st.els.backBtn);
   bar.appendChild(st.els.fwdBtn);
   bar.appendChild(st.els.upBtn);
   bar.appendChild(st.els.homeBtn);
   bar.appendChild(st.els.rootBtn);
-  bar.appendChild(input);
+  bar.appendChild(pathWrap);
   bar.appendChild(goBtn);
   bar.appendChild(st.els.gridBtn);
   bar.appendChild(st.els.listBtn);
+  bar.appendChild(st.els.favBtn);
+  bar.appendChild(st.els.searchBtn);
+  bar.appendChild(searchInput);
   return bar;
 }
 
@@ -1081,20 +1399,52 @@ function bindGridMarquee(grid: HTMLElement, st: SftpTabState): void {
     dragging = false;
   };
 }
+/** 列表视图排序：目录恒在前（不受方向影响），组内按排序列比较 */
+function sortedEntries(entries: RemoteEntry[]): RemoteEntry[] {
+  const arr = entries.slice();
+  arr.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    const d = sortKey === 'name'
+      ? a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+      : a.mtime - b.mtime;
+    return sortAsc ? d : -d;
+  });
+  return arr;
+}
+
 function buildTable(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[]): void {
   const table = document.createElement('table');
   table.className = 'sf-table';
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
-  [['名称'], ['大小', 'right'], ['修改时间']].forEach(([label, align]) => {
+  // 可排序表头：名称 / 修改时间（大小列不参与）；同列点击取反方向，换列重置升序
+  const mkTh = (label: string, key: 'name' | 'mtime' | null, align?: string): HTMLTableCellElement => {
     const th = document.createElement('th');
     th.textContent = label;
     if (align === 'right') th.style.textAlign = 'right';
-    headRow.appendChild(th);
-  });
+    if (key) {
+      th.className = 'sf-sortable';
+      if (sortKey === key) {
+        th.classList.add('sf-sort-active');
+        const ind = document.createElement('span');
+        ind.className = 'sf-sort-ind';
+        ind.innerHTML = icon(sortAsc ? 'arrowUp' : 'arrowDown');
+        th.appendChild(ind);
+      }
+      th.addEventListener('click', () => {
+        if (sortKey === key) sortAsc = !sortAsc;
+        else { sortKey = key; sortAsc = true; }
+        renderView(st);
+      });
+    }
+    return th;
+  };
+  headRow.appendChild(mkTh('名称', 'name'));
+  headRow.appendChild(mkTh('大小', null, 'right'));
+  headRow.appendChild(mkTh('修改时间', 'mtime'));
   thead.appendChild(headRow);
   const tbody = document.createElement('tbody');
-  entries.forEach((it) => {
+  sortedEntries(entries).forEach((it) => {
     const tr = document.createElement('tr');
     const tdName = document.createElement('td');
     const span = document.createElement('span');
@@ -1160,6 +1510,15 @@ function renderView(st: SftpTabState): void {
   st.els.homeBtn.title = '回到主目录 ' + st.home;
   st.els.gridBtn.classList.toggle('active', viewMode === 'grid');
   st.els.listBtn.classList.toggle('active', viewMode === 'list');
+  // 搜索框 / 收藏夹按钮与侧边栏状态同步（导航清空或按钮点击后保持一致）
+  st.els.searchBtn.classList.toggle('active', st.searchOpen);
+  st.els.searchInput.classList.toggle('sf-search-open', st.searchOpen);
+  st.els.favBtn.classList.toggle('active', st.favOpen);
+  st.els.favPanel.hidden = !st.favOpen;
+  const isFav = getFavorites(st.serverId).includes(st.cwd);
+  st.els.starBtn.classList.toggle('active', isFav);
+  st.els.starBtn.title = isFav ? '取消收藏' : '收藏当前路径';
+  if (st.favOpen) renderFavList(st);
   // 输入框聚焦编辑中不覆盖用户输入；其余时刻与当前路径保持同步
   if (document.activeElement !== st.els.pathInput) st.els.pathInput.value = st.cwd;
 
@@ -1184,10 +1543,6 @@ function renderView(st: SftpTabState): void {
     body.appendChild(box);
     return;
   }
-  if (!st.entries.length) {
-    body.appendChild(emptyState('folder', '目录为空'));
-    return;
-  }
   const entries: RemoteEntry[] = st.entries.map((e) => ({
     name: e.name,
     path: (st.cwd === '/' ? '' : st.cwd) + '/' + e.name,
@@ -1196,8 +1551,15 @@ function renderView(st: SftpTabState): void {
     mtime: e.mtime,
   }));
   st.renderEntries = entries;
-  if (viewMode === 'grid') buildGrid(body, st, entries);
-  else buildTable(body, st, entries);
+  // 搜索过滤：名称按 matchEntry（子串或 glob 通配，大小写不敏感），仅影响展示；renderEntries 保持全量（菜单数据源）
+  const q = st.query.trim();
+  const filtered = q ? entries.filter((e) => matchEntry(e.name, q)) : entries;
+  if (!filtered.length) {
+    body.appendChild(emptyState(q ? 'search' : 'folder', q ? '无匹配条目' : '目录为空'));
+    return;
+  }
+  if (viewMode === 'grid') buildGrid(body, st, filtered);
+  else buildTable(body, st, filtered);
 }
 
 /* ---------- 渲染器注册 ---------- */
@@ -1216,6 +1578,10 @@ registerRenderer('sftp', (container, tab) => {
     sel: new Set<string>(),
     renderEntries: [],
     pendingFocus: null,
+    query: '',
+    searchOpen: false,
+    favOpen: false,
+    historyDocHandler: null,
   };
   sftpTabs.set(tab.id, st);
 
@@ -1223,10 +1589,24 @@ registerRenderer('sftp', (container, tab) => {
   root.className = 'sf-root';
   root.appendChild(buildToolbar(st));
 
+  // 主行 = 目录区 + 收藏夹侧边栏（默认隐藏）
+  const main = document.createElement('div');
+  main.className = 'sf-main';
   const body = document.createElement('div');
   body.className = 'sf-body';
   st.els.body = body;
-  root.appendChild(body);
+  const fav = document.createElement('aside');
+  fav.className = 'sf-fav';
+  fav.hidden = true; // 默认收起；setFavOpen / renderView 切换
+  st.els.favPanel = fav;
+  // 侧边栏右键不冒泡到容器菜单（新建/粘贴等动作只对目录区有意义）
+  fav.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  main.appendChild(body);
+  main.appendChild(fav);
+  root.appendChild(main);
 
   container.appendChild(root);
   bindDrop(root, st);
@@ -1244,6 +1624,8 @@ registerRenderer('sftp', (container, tab) => {
 
 bus.on('tab-closed', (tab: Tab | null) => {
   if (!tab) return;
+  const st = sftpTabs.get(tab.id);
+  if (st) closeHistory(st); // 移除历史下拉的 document 级监听，防泄漏
   sftpTabs.delete(tab.id);
 });
 
