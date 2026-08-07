@@ -5,6 +5,7 @@
  * 右侧内嵌最小化 / 最大化-还原 / 关闭按钮，交互元素不会误拖。
  */
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getVersion } from '@tauri-apps/api/app';
 import { icon } from '../icons';
 import { navigate } from '../router';
 import { setTheme } from '../api';
@@ -33,7 +34,7 @@ export function renderTopbar(root: HTMLElement, activePage: TopbarPage): HTMLEle
   bar.className = 'page-topbar';
   bar.setAttribute('data-tauri-drag-region', '');
   bar.innerHTML = `
-    <div class="brand"><img class="logo" src="${appLogoUrl}" alt="AIShell"><span>AIShell</span></div>
+    <div class="brand"><img class="logo" src="${appLogoUrl}" alt="AIShell"><span>AIShell</span><span class="tb-version"></span></div>
     <div class="spacer"></div>
     <button class="btn ghost small" data-nav="welcome">项目</button>
     <button class="btn ghost small" data-nav="settings">设置</button>
@@ -45,6 +46,11 @@ export function renderTopbar(root: HTMLElement, activePage: TopbarPage): HTMLEle
     </div>`;
   (bar.querySelector('[data-nav=welcome]') as HTMLButtonElement).onclick = () => navigate('#/welcome');
   (bar.querySelector('[data-nav=settings]') as HTMLButtonElement).onclick = () => navigate('#/settings');
+
+  /* 版本号(tauri.conf.json version,异步填充;失败静默留空) */
+  getVersion()
+    .then((v) => { (bar.querySelector('.tb-version') as HTMLSpanElement).textContent = `v${v}`; })
+    .catch(() => { /* 版本号获取失败不影响顶栏 */ });
   if (activePage) {
     const btn = bar.querySelector(`[data-nav=${activePage}]`);
     if (btn) btn.classList.remove('ghost');

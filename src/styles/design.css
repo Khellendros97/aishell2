@@ -271,6 +271,7 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   padding: 0 16px; background: var(--bg-1); border-bottom: 1px solid var(--border);
 }
 .page-topbar .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+.page-topbar .brand .tb-version { font-weight: 400; font-size: 11px; color: var(--text-3); margin-top: 2px; }
 .page-topbar .brand .logo {
   width: 22px; height: 22px; border-radius: 6px;
   display: block; object-fit: contain; flex: none;

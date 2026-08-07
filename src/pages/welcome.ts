@@ -771,6 +771,8 @@ export const renderWelcome: PageRender = (root) => {
 
   // 搜索过滤：输入即重渲染（输入框为静态骨架，不随列表重建，焦点不丢）
   els.serverSearch.addEventListener('input', renderServerList);
+  /* 项目搜索:输入即按 名称/路径/所属目录 过滤重渲染(matchProject 见上) */
+  els.search.addEventListener('input', renderProjects);
 
   /* ---------- 快捷新建服务器（字段与校验复用 server-form.ts，与侧栏编辑表单同源；密码留空 = 不保存） ---------- */
   const miniForm = createServerForm(els.miniForm, { compact: true });
