@@ -383,7 +383,7 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
         );
         // AI SFTP 上传 / 下载同样在连接前被拒
         let err = actions
-            .sftp_upload("p-lock", "s-lock".to_string(), "a.txt".to_string(), "/tmp".to_string())
+            .sftp_upload("p-lock", "s-lock".to_string(), "a.txt".to_string(), "/tmp".to_string(), false)
             .await
             .expect_err("锁定服务器应拒绝 AI 上传");
         assert!(err.contains("已锁定，AI 无权执行远程操作"), "错误串不符: {err}");

@@ -100,8 +100,8 @@ export default function (pi: ExtensionAPI) {
 			case "sftp_upload":
 				return {
 					action: "sftp_upload",
-					intent: `上传 ${String(input.localPath || "")} 到 ${String(input.remoteDir || "")}`,
-					summary: `SFTP 上传到服务器 ${String(input.serverId || "")}`,
+					intent: `上传 ${String(input.localPath || "")} 到 ${String(input.remoteDir || "")}${input.overwrite ? "（覆盖同名）" : ""}`,
+					summary: `SFTP 上传到服务器 ${String(input.serverId || "")}${input.overwrite ? "（覆盖远端同名文件）" : "（重名自动创建副本）"}`,
 				};
 			case "sftp_download":
 				return {
@@ -325,15 +325,20 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "sftp_upload",
 		label: "SFTP Upload",
-		description: "上传项目目录内的本地文件或目录到远程服务器的指定目录（重名自动改名）。",
+		description:
+			"上传项目目录内的本地文件或目录到远程服务器的指定目录（默认重名自动创建副本并返回副本文件名；overwrite=true 时覆盖远端同名文件）。",
 		promptSnippet: "上传文件到服务器",
 		promptGuidelines: [
 			"sftp_upload 的 localPath 必须是当前项目目录内的文件或目录；服务器受 AI 操作锁约束。",
+			"更新远端已有文件时传 overwrite=true 直接覆盖，否则会生成副本文件；结果会返回远端实际文件名，回复用户时如实引用。",
 		],
 		parameters: Type.Object({
 			serverId: Type.String({ description: "目标服务器 ID" }),
 			localPath: Type.String({ description: "本地源路径（项目目录内）" }),
 			remoteDir: Type.String({ description: "远端目标目录" }),
+			overwrite: Type.Optional(
+				Type.Boolean({ description: "是否覆盖远端同名文件：true 覆盖；默认 false（重名自动创建副本）" }),
+			),
 		}),
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			return await rustAction(ctx, toolCallId, {
@@ -341,6 +346,7 @@ export default function (pi: ExtensionAPI) {
 				serverId: params.serverId,
 				localPath: params.localPath,
 				remoteDir: params.remoteDir,
+				overwrite: params.overwrite === true,
 			});
 		},
 	});

@@ -240,7 +240,9 @@ interface ActionCard {
   command?: string;
   /** 审批事件携带的 requestId（批准/拒绝回执用） */
   requestId?: string;
-  status: 'approving' | 'approved' | 'rejected' | 'running' | 'succeeded' | 'failed';
+  /** 智能审批自动放行：status='smart' 时展示判定理由 */
+  smartReason?: string;
+  status: 'approving' | 'approved' | 'rejected' | 'running' | 'succeeded' | 'failed' | 'smart';
   /** actionEnd 的截断结果 */
   result?: string;
   /** 动作开始时已生成文本长度(text 内时序锚点,渲染时把卡片穿插到该位置) */
@@ -269,6 +271,7 @@ const ACTION_NAMES: Record<string, string> = {
 const ACTION_STATUS: Record<ActionCard['status'], string> = {
   approving: '等待批准',
   approved: '已批准',
+  smart: '已智能放行',
   running: '执行中…',
   succeeded: '成功',
   failed: '失败',
@@ -287,7 +290,7 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
     case 'run_command':
       return String(args.intent ?? '');
     case 'sftp_upload':
-      return `上传 ${String(args.localPath ?? '')} 到 ${String(args.remoteDir ?? '')}`;
+      return `上传 ${String(args.localPath ?? '')} 到 ${String(args.remoteDir ?? '')}${args.overwrite ? '（覆盖同名）' : ''}`;
     case 'sftp_download':
       return `下载 ${String(args.remotePath ?? '')} 到 ${String(args.localDir ?? '')}`;
     default:
@@ -563,7 +566,7 @@ async function loadEffort(): Promise<void> {
     effortSelect.value = st.settings.llm.effort || 'low';
     autoSwitchAiWorkdir = !!st.settings.autoSwitchAiWorkdir;
   } catch {
-    /* 读取失败保持默认 low / 关闭 */
+    /* 读取失败保持默认 low / 开启（与 Settings 默认一致） */
   }
   // 开启自动切换时：初始工作区域默认本地；已有激活终端则跟随其归属
   if (autoSwitchAiWorkdir) {
@@ -636,6 +639,22 @@ function handleEvent(key: string, ev: AiEvent): void {
        不进动作卡；其余仍为 Agent 逐调用审批卡 */
     if (ev.action === 'request_agent_mode') {
       void handleModeRequest(sid, ev);
+    } else if (ev.smart) {
+      /* 智能审批自动放行：后端已判定非危险并直接回 confirmed，卡片进入「已智能放行」态 */
+      const cur = pendingBy.get(sid) ?? null;
+      const p = cur ?? emptyPending();
+      const existing = p.actions.get(ev.toolCallId);
+      p.actions.set(ev.toolCallId, {
+        toolCallId: ev.toolCallId,
+        tool: existing?.tool ?? ev.action,
+        intent: ev.intent || existing?.intent || '',
+        summary: ev.summary || existing?.summary || '',
+        command: existing?.command,
+        status: 'smart',
+        smartReason: ev.smartReason,
+        textLen: existing?.textLen ?? p.text.length,
+      });
+      pendingBy.set(sid, p);
     } else {
       /* Agent 审批请求：卡片进入审批态（显示意图 + 批准/拒绝按钮） */
       const cur = pendingBy.get(sid) ?? null;
@@ -794,6 +813,9 @@ function renderActionCard(a: ActionCard): string {
   const resultHtml = a.result && (a.status === 'succeeded' || a.status === 'failed')
     ? `<div class="ai-action-result">${escapeHtml(a.result)}</div>`
     : '';
+  const smartHtml = a.status === 'smart' && a.smartReason
+    ? `<div class="ai-action-intent ai-action-smart">智能判定：${escapeHtml(a.smartReason)}</div>`
+    : '';
   return `<div class="ai-action-card ${cls}">
     <div class="ai-action-head">
       <span class="ai-action-name">${icon('wrench')} ${ACTION_NAMES[a.tool] ?? a.tool}</span>
@@ -804,6 +826,7 @@ function renderActionCard(a: ActionCard): string {
       ${isCmd && a.command
         ? `<code class="ai-action-cmd">${escapeHtml(a.command)}</code>`
         : a.summary ? `<div class="ai-action-intent ai-action-summary">${escapeHtml(a.summary)}</div>` : ''}
+      ${smartHtml}
       ${buttons}
       ${resultHtml}
     </div>

@@ -92,6 +92,17 @@ export const renderSettings: PageRender = (root, params) => {
               <div class="hint">开启后 AI 输入框显示固定工作区域标签（默认本地）：打开或切换到 SSH/本地终端时自动跟随；发送消息时把当前工作区域作为上下文提供给 AI 助手</div>
             </div>
           </fieldset>
+          <fieldset class="llm-group">
+            <legend>AI 审批</legend>
+            <div class="field">
+              <label>审批模式</label>
+              <select id="f-approval-mode" class="select">
+                <option value="smart">智能审批</option>
+                <option value="all">全部审批</option>
+              </select>
+              <div class="hint">智能审批：AI 操作先由大模型判定，非危险操作（常规读写、查询、构建等）自动放行并展示「已智能放行」；删除、服务启停、格式化等危险操作仍需人工确认。全部审批：每次操作都需人工确认</div>
+            </div>
+          </fieldset>
           <div class="form-actions">
             <button id="btn-save-system" class="btn primary">保存</button>
           </div>
@@ -111,10 +122,11 @@ export const renderSettings: PageRender = (root, params) => {
   const fSearchEnabled = root.querySelector('#f-search-enabled') as HTMLInputElement;
   const fBraveKey = root.querySelector('#f-brave-key') as HTMLInputElement;
   const fAiWorkdir = root.querySelector('#f-ai-workdir') as HTMLInputElement;
+  const fApprovalMode = root.querySelector('#f-approval-mode') as HTMLSelectElement;
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: false, projectView: 'card' },
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: true, projectView: 'card', approvalMode: 'smart' },
     servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {},
   };
 
@@ -135,7 +147,8 @@ export const renderSettings: PageRender = (root, params) => {
     fEffort.value = s.llm.effort || 'low';
     fSearchEnabled.checked = s.search?.enabled ?? false;
     fBraveKey.value = ''; // 同上：Brave key 永不回传
-    fAiWorkdir.checked = s.autoSwitchAiWorkdir ?? false;
+    fAiWorkdir.checked = s.autoSwitchAiWorkdir ?? true;
+    fApprovalMode.value = s.approvalMode ?? 'smart';
   }
 
   // Workspace 浏览…：真实目录选择
@@ -202,6 +215,7 @@ export const renderSettings: PageRender = (root, params) => {
     const settings: Settings = {
       workspaceDir, llm, search: { enabled: fSearchEnabled.checked }, theme: currentTheme(),
       autoSwitchAiWorkdir: fAiWorkdir.checked, projectView: db.settings.projectView ?? 'card',
+      approvalMode: fApprovalMode.value as Settings['approvalMode'],
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);

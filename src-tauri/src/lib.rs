@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod ai_actions;
+pub mod smart_approval;
 #[cfg(windows)]
 pub mod gitinstall;
 pub mod fsops;

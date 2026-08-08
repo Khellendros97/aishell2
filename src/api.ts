@@ -174,7 +174,9 @@ export type AiEvent =
   | { type: 'segment' }
   | { type: 'done' }
   | { type: 'error'; message: string }
-  | { type: 'approval'; requestId: string; toolCallId: string; action: string; intent: string; summary: string }
+  | { type: 'approval'; requestId: string; toolCallId: string; action: string; intent: string; summary: string;
+      /** 智能审批自动放行：true 时卡片直接展示「已智能放行」（后端已回 confirmed，无需再回复） */
+      smart?: boolean; smartReason?: string }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */

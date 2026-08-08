@@ -77,13 +77,16 @@ impl AiActions {
     }
 
     /// SFTP 上传：本地源必须在项目根内且已存在（文件或目录），远端目录必填。
+    /// overwrite=true 时远端同名直接覆盖；false 时重名自动创建副本。
+    /// 返回给模型的落地说明：明确远端文件名，创建副本时显式提示。
     pub async fn sftp_upload(
         &self,
         project_id: &str,
         server_id: String,
         local_path: String,
         remote_dir: String,
-    ) -> Result<(), String> {
+        overwrite: bool,
+    ) -> Result<String, String> {
         if local_path.trim().is_empty() {
             return Err("本地路径不能为空".to_string());
         }
@@ -99,9 +102,25 @@ impl AiActions {
             return Err(format!("上传源既不是文件也不是目录：{}", local.display()));
         }
         let sftp = self.ssh.open_sftp(&server_id).await?;
-        crate::sftp::upload_one(&sftp, &local, &remote_dir)
-            .await
-            .map(|_| ())
+        let landed = crate::sftp::upload_one(&sftp, &local, &remote_dir, overwrite).await?;
+        let full = format!(
+            "{}/{}",
+            remote_dir.trim_end_matches('/'),
+            landed
+        );
+        // 顶层落地名与本地文件名不同 = 远端已有同名 → 自动创建了副本（upload_one 返回的落地名）
+        let base_name = local
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if !overwrite && landed != base_name {
+            Ok(format!("远端已存在同名文件，已创建副本：{full}（服务器 {server_id}）"))
+        } else if overwrite {
+            Ok(format!("上传完成（已覆盖远端同名文件）：{full}（服务器 {server_id}）"))
+        } else {
+            Ok(format!("上传完成：{full}（服务器 {server_id}）"))
+        }
     }
 
     /// SFTP 下载：本地目标目录必须在项目根内且**已存在**（AI 不自动创建目录）。

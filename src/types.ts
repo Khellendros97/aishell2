@@ -19,10 +19,12 @@ export interface Settings {
   /** 联网搜索配置；旧配置无此字段时按关闭处理 */
   search: SearchConfig;
   theme: Theme;
-  /** 自动切换 AI 工作区域：开启后 AI 输入框显示固定工作区域标签，随激活终端自动切换；旧配置无此字段按关闭 */
+  /** 自动切换 AI 工作区域：开启后 AI 输入框显示固定工作区域标签，随激活终端自动切换；旧配置无此字段按开启 */
   autoSwitchAiWorkdir: boolean;
   /** 欢迎页项目视图；旧配置无此字段按卡片视图 */
   projectView: 'card' | 'list';
+  /** 审批模式（智能审批/全部审批）；旧配置无此字段按智能审批 */
+  approvalMode: 'smart' | 'all';
 }
 
 /** 与 store.rs Theme serde lowercase 对齐 */

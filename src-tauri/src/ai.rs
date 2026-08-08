@@ -43,7 +43,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::ai_actions::AiActions;
-use crate::store::{AiMode, Store};
+use crate::store::{AiMode, ApprovalMode, Store};
 
 /// suggest 模式的系统提示（保持现状：无 bash，写仅 .aishell/）。
 const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
@@ -75,6 +75,18 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 2. 给用户直接复用的文本（说明、模板等）：放在 ```text 围栏代码块中。
 3. 普通代码示例使用对应语言的围栏代码块。
 4. 用中文回复，简洁直接。";
+
+/// 本地终端环境说明（注入系统提示词开头）：明确 shell 类型，避免模型按错误 shell 语法
+/// 执行本地 run_command（Windows 是 Git Bash，macOS/Linux 是 zsh）。
+#[cfg(windows)]
+fn local_env_note() -> &'static str {
+    "本地终端环境：Windows + Git Bash（Bash 语法）。本地 run_command 在项目根目录的 Git Bash 中执行，命令必须使用 Bash 语法，不是 cmd/PowerShell 语法；远程命令按目标服务器的默认 shell 执行。"
+}
+
+#[cfg(not(windows))]
+fn local_env_note() -> &'static str {
+    "本地终端环境：macOS/Linux + zsh（POSIX Shell 语法）。本地 run_command 在项目根目录的默认 shell 中执行；远程命令按目标服务器的默认 shell 执行。"
+}
 
 /// 门控扩展源码（spawn 时重写进 agent_dir，与 models.json 同模式）。
 const GUARD_EXT: &str = include_str!("pi_ext/aishell-guard.ts");
@@ -195,10 +207,15 @@ impl AiManager {
             .trim_matches('"')
             .to_string();
         let mode = self.store.ai_mode(project_id).unwrap_or_default();
-        let system_prompt = match mode {
-            AiMode::Suggest => SYSTEM_PROMPT_SUGGEST,
-            AiMode::Agent | AiMode::Yolo => SYSTEM_PROMPT_AGENT,
-        };
+        // 本地终端环境说明注入提示词：让模型用对 shell 语法（Windows 是 Git Bash，不是 cmd/PowerShell）
+        let system_prompt = format!(
+            "{}\n{}",
+            local_env_note(),
+            match mode {
+                AiMode::Suggest => SYSTEM_PROMPT_SUGGEST,
+                AiMode::Agent | AiMode::Yolo => SYSTEM_PROMPT_AGENT,
+            }
+        );
         let cwd = self
             .store
             .project_path(project_id)
@@ -256,7 +273,7 @@ impl AiManager {
         .args([
             "--no-context-files",
             "--append-system-prompt",
-            system_prompt,
+            &system_prompt,
         ])
         .env("PI_CODING_AGENT_DIR", &self.agent_dir)
         .env("DEEPSEEK_API_KEY", &api_key)
@@ -294,6 +311,7 @@ impl AiManager {
         let approvals2 = Arc::clone(&approvals);
         let actions = Arc::clone(&self.actions);
         let project_id2 = project_id.to_string();
+        let store2 = Arc::clone(&self.store);
         thread::spawn(move || {
             // 已开始执行的 write/edit 工具 → 规范化绝对路径（end 成功时据此发 fs:changed）
             let mut pending_paths: HashMap<String, String> = HashMap::new();
@@ -517,6 +535,7 @@ impl AiManager {
                             &stdin2,
                             &approvals2,
                             &actions,
+                            &store2,
                             &project_id2,
                             &mut rt,
                         );
@@ -602,6 +621,7 @@ fn handle_extension_ui_request(
     stdin2: &Arc<Mutex<ChildStdin>>,
     approvals2: &Arc<Mutex<HashMap<String, String>>>,
     actions: &Arc<AiActions>,
+    store2: &Arc<Store>,
     project_id: &str,
     rt: &mut Option<tokio::runtime::Runtime>,
 ) {
@@ -653,11 +673,10 @@ fn handle_extension_ui_request(
             }),
         );
     } else if method == "confirm" && title.starts_with("AISHELL_APPROVAL:") {
-        // 审批：登记待处理项并转发前端
+        // 审批：默认登记待处理项并转发前端；智能审批模式下先由 LLM 判定，
+        // 非危险直接放行（extension_ui_response confirmed:true，不登记），
+        // 危险或判定失败（网络/超时/解析）回退人工审批。
         let tool_call_id = title["AISHELL_APPROVAL:".len()..].to_string();
-        if let Ok(mut map) = approvals2.lock() {
-            map.insert(id.clone(), tool_call_id.clone());
-        }
         let info: serde_json::Value = ev
             .get("message")
             .and_then(serde_json::Value::as_str)
@@ -666,6 +685,46 @@ fn handle_extension_ui_request(
         let action = info.get("action").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let intent = info.get("intent").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let summary = info.get("summary").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+
+        if store2.approval_mode() == ApprovalMode::Smart {
+            let runtime = rt.get_or_insert_with(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("创建智能审批 runtime 失败")
+            });
+            match runtime.block_on(crate::smart_approval::judge(store2, &action, &intent, &summary)) {
+                // 非危险：直接放行，并向前端发带 smart 标记的 approval 事件（渲染「已智能放行」卡）
+                Ok((false, reason)) => {
+                    write_stdin_json(
+                        stdin2,
+                        &json!({"type": "extension_ui_response", "id": id, "confirmed": true}),
+                    );
+                    let _ = app2.emit(
+                        event,
+                        json!({
+                            "type": "approval",
+                            "requestId": id,
+                            "toolCallId": tool_call_id,
+                            "action": action,
+                            "intent": intent,
+                            "summary": summary,
+                            "smart": true,
+                            "smartReason": reason,
+                        }),
+                    );
+                    return;
+                }
+                // 危险：照常人工审批
+                Ok((true, _)) => {}
+                // 判定失败：回退人工审批（危险方向保守）
+                Err(_) => {}
+            }
+        }
+
+        if let Ok(mut map) = approvals2.lock() {
+            map.insert(id.clone(), tool_call_id.clone());
+        }
         let _ = app2.emit(
             event,
             json!({
@@ -740,12 +799,20 @@ async fn run_internal_action(
             let server_id = str_field("serverId");
             let local_path = str_field("localPath");
             let remote_dir = str_field("remoteDir");
+            let overwrite = payload
+                .get("overwrite")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             actions
-                .sftp_upload(project_id, server_id.clone(), local_path.clone(), remote_dir.clone())
+                .sftp_upload(
+                    project_id,
+                    server_id.clone(),
+                    local_path.clone(),
+                    remote_dir.clone(),
+                    overwrite,
+                )
                 .await
-                .map(|_| {
-                    json!({"ok": true, "text": format!("上传完成：{local_path} → {remote_dir}（服务器 {server_id}）")})
-                })
+                .map(|text| json!({"ok": true, "text": text}))
         }
         "sftp_download" => {
             let server_id = str_field("serverId");

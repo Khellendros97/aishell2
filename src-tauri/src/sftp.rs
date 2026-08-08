@@ -126,13 +126,24 @@ pub async fn sftp_upload(
         remote_dir
     };
     let sftp = ssh.inner().open_sftp(&server_id).await?;
-    upload_one(&sftp, Path::new(&local_path), &target).await
+    upload_one(&sftp, Path::new(&local_path), &target, false).await
 }
 
 /// 递归上传一个本地文件或目录（async 递归需装箱，见 inner），返回落地名称。
+/// overwrite=true 时远端同名直接覆盖（SFTP create 截断语义）；false 时重名自动 `name (1).ext`。
 /// pub(crate)：ai_actions 的 AI 上传复用（不改变手动 sftp_upload 语义）。
-pub(crate) async fn upload_one(sftp: &SftpSession, local: &Path, remote_dir: &str) -> Result<String, String> {
-    async fn inner(sftp: &SftpSession, local: &Path, remote_dir: &str) -> Result<String, String> {
+pub(crate) async fn upload_one(
+    sftp: &SftpSession,
+    local: &Path,
+    remote_dir: &str,
+    overwrite: bool,
+) -> Result<String, String> {
+    async fn inner(
+        sftp: &SftpSession,
+        local: &Path,
+        remote_dir: &str,
+        overwrite: bool,
+    ) -> Result<String, String> {
         let md = std::fs::metadata(local)
             .map_err(|e| format!("读取本地 {} 失败: {e}", local.display()))?;
         let name = local
@@ -142,18 +153,26 @@ pub(crate) async fn upload_one(sftp: &SftpSession, local: &Path, remote_dir: &st
             .unwrap_or("upload")
             .to_string();
         if md.is_dir() {
-            let dir_name = unique_remote_name(sftp, remote_dir, &name).await?;
+            let dir_name = if overwrite {
+                name
+            } else {
+                unique_remote_name(sftp, remote_dir, &name).await?
+            };
             let dir_path = join_remote(remote_dir, &dir_name);
             mkdir_ignore_exists(sftp, &dir_path).await?;
             let rd = std::fs::read_dir(local)
                 .map_err(|e| format!("读取本地目录 {} 失败: {e}", local.display()))?;
             for ent in rd {
                 let ent = ent.map_err(|e| format!("读取本地目录 {} 失败: {e}", local.display()))?;
-                Box::pin(inner(sftp, &ent.path(), &dir_path)).await?;
+                Box::pin(inner(sftp, &ent.path(), &dir_path, overwrite)).await?;
             }
             Ok(dir_name)
         } else {
-            let file_name = unique_remote_name(sftp, remote_dir, &name).await?;
+            let file_name = if overwrite {
+                name
+            } else {
+                unique_remote_name(sftp, remote_dir, &name).await?
+            };
             let file_path = join_remote(remote_dir, &file_name);
             let mut src = tokio::fs::File::open(local)
                 .await
@@ -173,7 +192,7 @@ pub(crate) async fn upload_one(sftp: &SftpSession, local: &Path, remote_dir: &st
             Ok(file_name)
         }
     }
-    Box::pin(inner(sftp, local, remote_dir)).await
+    Box::pin(inner(sftp, local, remote_dir, overwrite)).await
 }
 
 /// 下载远端文件/目录到本地目录：对称递归，本地重名同样自动 `name (1).ext`。

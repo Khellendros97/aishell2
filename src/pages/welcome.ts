@@ -211,8 +211,9 @@ export const renderWelcome: PageRender = (root) => {
       llm: { modelId: '', baseUrl: '', effort: 'low' },
       search: { enabled: false },
       theme: 'dark',
-      autoSwitchAiWorkdir: false,
+      autoSwitchAiWorkdir: true,
       projectView: 'card',
+      approvalMode: 'smart',
     },
     servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {},
   };

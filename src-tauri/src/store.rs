@@ -98,12 +98,15 @@ pub struct Settings {
     #[serde(default)]
     pub theme: Theme,
     /// 自动切换 AI 工作区域：开启后前端 AI 输入框显示固定工作区域标签，随激活终端自动切换；
-    /// 旧配置无此字段时按关闭处理
-    #[serde(default)]
+    /// 旧配置无此字段时按开启处理（默认开启）
+    #[serde(default = "default_true")]
     pub auto_switch_ai_workdir: bool,
     /// 欢迎页项目视图（card/list）；旧配置无此字段按卡片视图。
     #[serde(default)]
     pub project_view: ProjectView,
+    /// 审批模式（智能审批/全部审批）；旧配置无此字段按智能审批
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +127,32 @@ pub enum AiMode {
     Suggest,
     Agent,
     Yolo,
+}
+
+/// 审批模式（全局设置）：
+/// - Smart：智能审批——受控工具调用先由 LLM 判定是否危险，非危险直接放行，
+///   危险或判定失败（网络/解析错误）回退人工审批（危险方向保守）；
+/// - All：全部审批——每次受控工具调用都弹人工确认（原行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    #[default]
+    Smart,
+    All,
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalMode::Smart => "smart",
+            ApprovalMode::All => "all",
+        }
+    }
+}
+
+/// serde 默认值：旧配置无 autoSwitchAiWorkdir 字段时按开启处理（默认开启）。
+fn default_true() -> bool {
+    true
 }
 
 impl AiMode {
@@ -931,6 +960,11 @@ impl Store {
         guard.settings.llm.clone()
     }
 
+    /// 当前审批模式（默认智能审批）。
+    pub fn approval_mode(&self) -> ApprovalMode {
+        self.settings().approval_mode
+    }
+
     /// 当前全局设置（clone）。
     pub fn settings(&self) -> Settings {
         let guard = self
@@ -1197,6 +1231,7 @@ mod tests {
                 theme: Theme::Dark,
                 auto_switch_ai_workdir: true,
                 project_view: ProjectView::Card,
+                approval_mode: ApprovalMode::Smart,
             },
             servers: vec![
                 Server {
@@ -2478,6 +2513,7 @@ mod tests {
                     theme: Theme::Dark,
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::Card,
+                    approval_mode: ApprovalMode::Smart,
                 },
                 Some("sk-test-key"),
                 None,
@@ -2645,6 +2681,7 @@ mod tests {
                     theme: Theme::Dark,
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::List,
+                    approval_mode: ApprovalMode::Smart,
                 },
                 None,
                 Some("bsk-1"),
@@ -2680,6 +2717,11 @@ mod tests {
         let old = r#"{"workspaceDir":"C:\\ws","llm":{"modelId":"deepseek-chat","baseUrl":"https://api.deepseek.com/v1","effort":"medium"},"theme":"dark"}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
         assert!(!s.search.enabled);
+        // 旧配置无 autoSwitchAiWorkdir 字段 → 默认开启（无感升级）
+        assert!(s.auto_switch_ai_workdir);
+        // 旧配置无 approvalMode 字段 → 默认智能审批（无感升级，且默认不扩大打扰）
+        assert_eq!(s.approval_mode, ApprovalMode::Smart);
+        assert_eq!(s.approval_mode.as_str(), "smart");
     }
 
     #[test]
