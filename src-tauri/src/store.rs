@@ -354,6 +354,9 @@ pub struct AiActionRecord {
     pub summary: String,
     /// approved | rejected | succeeded | failed（前端按此渲染状态）
     pub status: String,
+    /// run_command 使用的整体超时秒数；旧记录无此字段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
     /// 动作开始时已生成文本长度（content 内时序锚点，前端据此穿插动作卡）；旧记录无此字段
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_len: Option<u32>,
@@ -1613,6 +1616,7 @@ mod tests {
                                 intent: "查看版本".to_string(),
                                 summary: "执行命令：node -v".to_string(),
                                 status: "succeeded".to_string(),
+                                timeout_seconds: Some(10),
                                 text_len: Some(160),
                             }],
                             ts: 1_752_000_000_001,
@@ -2873,6 +2877,7 @@ mod tests {
                         intent: "查询在线记录".to_string(),
                         summary: "执行命令（远程）：mysql -uicc -p'hunter2' -e 'select 1'".to_string(),
                         status: "succeeded".to_string(),
+                        timeout_seconds: None,
                         text_len: None,
                     }],
                     ts: 2,

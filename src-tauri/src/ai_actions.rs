@@ -9,18 +9,22 @@
 //!   锁检查只放在本模块入口，不下沉到 SshManager——锁定不会关闭已有用户终端，
 //!   也不影响用户手动 SSH/SFTP；动作开始后再切锁不强杀已在运行的单次动作。
 //!
-//! 本地命令复用 term::find_shell（本地 shell，`--login -c`，项目根 cwd），完整捕获
-//! stdout/stderr/退出码；远程命令复用 `SshManager::exec`（russh channel，连接复用）。
+//! stdout/stderr/退出码；远程命令复用 `SshManager::exec_with_timeout`（russh channel，连接复用）。
+//! run_command 默认 10 秒超时，模型可用 timeoutSeconds 覆盖（1–3600 秒）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::ssh::SshManager;
 use crate::store::{DbKind, Store};
 
-/// 命令执行结果（serde camelCase：stdout / stderr / exitCode）。
+const DEFAULT_RUN_COMMAND_TIMEOUT_SECS: u64 = 10;
+const MAX_RUN_COMMAND_TIMEOUT_SECS: u64 = 3600;
+
+/// 命令执行结果（serde camelCase：stdout / stderr / exitCode / timedOut）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandResult {
@@ -28,6 +32,8 @@ pub struct CommandResult {
     pub stderr: String,
     /// 未收到 ExitStatus（通道异常关闭等）时为 null
     pub exit_code: Option<i32>,
+    /// 整体执行是否触发调用方设置的超时。
+    pub timed_out: bool,
 }
 
 /// AI 动作执行器（由 AiManager 持有并复用 Store + SshManager）。
@@ -41,8 +47,8 @@ impl AiActions {
         AiActions { store, ssh }
     }
 
-    /// 执行命令：target=local 走本地 shell（项目根 cwd），target=remote 走 SshManager::exec。
-    /// 空命令 / 空 intent 在建进程或网络前拒绝。
+    /// 执行命令：target=local 走本地 shell（项目根 cwd），target=remote 走 SshManager。
+    /// 空命令 / 空 intent / 非法超时在建进程或网络前拒绝；未传超时默认 10 秒。
     pub async fn run_command(
         &self,
         project_id: &str,
@@ -50,6 +56,7 @@ impl AiActions {
         command: String,
         target: String,
         server_id: Option<String>,
+        timeout_seconds: Option<u64>,
     ) -> Result<CommandResult, String> {
         let command = command.trim().to_string();
         if command.is_empty() {
@@ -58,19 +65,27 @@ impl AiActions {
         if intent.trim().is_empty() {
             return Err("intent 不能为空，请说明命令意图".to_string());
         }
+        let timeout = command_timeout(timeout_seconds)?;
         match target.as_str() {
             "local" => {
                 if server_id.is_some() {
                     return Err("本地目标不得使用 serverId".to_string());
                 }
                 let root = self.project_root(project_id)?;
-                self.run_local(&root, &command).await
+                self.run_local(&root, &command, timeout).await
             }
             "remote" => {
                 let sid =
                     server_id.ok_or_else(|| "远程目标必须提供 serverId".to_string())?;
                 self.ensure_ai_allowed(&sid)?;
-                self.ssh.exec(&sid, &command).await
+                let result = self.ssh.exec_with_timeout(&sid, &command, timeout).await?;
+                if result.timed_out {
+                    return Err(format!(
+                        "命令执行超时（{} 秒），已尝试终止远端命令",
+                        timeout.as_secs()
+                    ));
+                }
+                Ok(result)
             }
             other => Err(format!("未知命令目标：{other}")),
         }
@@ -303,24 +318,38 @@ impl AiActions {
         Ok(normalized)
     }
 
-    /// 本地命令：本地 shell `--login -c`，项目根 cwd，完整捕获 stdout/stderr/exit code。
-    async fn run_local(&self, root: &Path, command: &str) -> Result<CommandResult, String> {
+    /// 本地命令：本地 shell `--login -c`，项目根 cwd，完整捕获 stdout/stderr/exit code；
+    /// `kill_on_drop` 保证 timeout 丢弃 wait future 时终止子进程，避免后台残留。
+    async fn run_local(
+        &self,
+        root: &Path,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<CommandResult, String> {
         let shell = crate::term::find_shell().ok_or_else(crate::term::shell_missing_msg)?;
         let mut cmd = tokio::process::Command::new(&shell);
-        cmd.args(["--login", "-c", command]).current_dir(root);
+        cmd.args(["--login", "-c", command])
+            .current_dir(root)
+            .kill_on_drop(true);
         // Windows 下隐藏 Git Bash 的临时控制台窗口（与 ai.rs 的 pi 启动一致）
         #[cfg(windows)]
         {
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let out = cmd
-            .output()
+        let out = tokio::time::timeout(timeout, cmd.output())
             .await
+            .map_err(|_| {
+                format!(
+                    "命令执行超时（{} 秒），已尝试终止本地命令",
+                    timeout.as_secs()
+                )
+            })?
             .map_err(|e| format!("启动本地 shell 失败：{e}"))?;
         Ok(CommandResult {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             exit_code: out.status.code(),
+            timed_out: false,
         })
     }
 
@@ -353,6 +382,17 @@ fn normalize_path(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// run_command 超时：未传使用 10 秒，避免命令无界挂起；显式值限制为 1–3600 秒。
+fn command_timeout(timeout_seconds: Option<u64>) -> Result<Duration, String> {
+    let seconds = timeout_seconds.unwrap_or(DEFAULT_RUN_COMMAND_TIMEOUT_SECS);
+    if !(1..=MAX_RUN_COMMAND_TIMEOUT_SECS).contains(&seconds) {
+        return Err(format!(
+            "timeoutSeconds 必须在 1–{MAX_RUN_COMMAND_TIMEOUT_SECS} 秒之间"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 /// 项目根内判断：统一小写前缀比较（Windows 大小写不敏感）。
@@ -436,6 +476,7 @@ fn validate_db_command(kind: DbKind, command: &str, allowed: &[String]) -> Resul
         }
     }
     if segments.is_empty() {
+
         return Err("SQL/命令不能为空".to_string());
     }
     for seg in &segments {
@@ -475,6 +516,20 @@ mod tests {
         // 相对路径
         let p3 = normalize_path(Path::new(r"sub/../a.txt"));
         assert_eq!(p3, PathBuf::from(r"a.txt"));
+    }
+
+    #[test]
+    fn command_timeout_defaults_and_validates_bounds() {
+        assert_eq!(
+            command_timeout(None).unwrap(),
+            Duration::from_secs(DEFAULT_RUN_COMMAND_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            command_timeout(Some(30)).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert!(command_timeout(Some(0)).is_err());
+        assert!(command_timeout(Some(MAX_RUN_COMMAND_TIMEOUT_SECS + 1)).is_err());
     }
 
     #[test]

@@ -63,8 +63,7 @@ const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用�
 /// agent / yolo 模式的系统提示（有执行权限；Agent 逐调用审批，YOLO 已获用户显式授权）。
 const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
 你有执行权限（Agent 模式每次操作需用户批准；YOLO 模式自动执行，用户已显式授权）：
-- read/grep/find/ls/write/edit/delete_path：只能操作当前项目目录内的文件，项目外一律被拒。
-- run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。
+- run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。默认 10 秒超时，可用 timeoutSeconds（1–3600 秒）覆盖；预计超过 10 秒的命令应主动设置合理超时。
 - list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
 - db_query：受管数据库查询（mysql/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
@@ -778,8 +777,27 @@ async fn run_internal_action(
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            let timeout_seconds = match payload.get("timeoutSeconds") {
+                None => None,
+                Some(v) => match v.as_u64() {
+                    Some(seconds) => Some(seconds),
+                    None => {
+                        return json!({
+                            "ok": false,
+                            "error": "timeoutSeconds 必须是 1–3600 之间的整数秒"
+                        });
+                    }
+                },
+            };
             actions
-                .run_command(project_id, intent, command, target, server_id)
+                .run_command(
+                    project_id,
+                    intent,
+                    command,
+                    target,
+                    server_id,
+                    timeout_seconds,
+                )
                 .await
                 .map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
         }

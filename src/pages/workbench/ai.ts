@@ -58,7 +58,14 @@ const STYLE = `
   white-space: pre-wrap; word-break: break-all;
 }
 .ai-action-card .ai-action-actions { display: flex; gap: 6px; }
-.ai-action-card .ai-action-status { font-size: 11px; color: var(--text-2); display: inline-flex; align-items: center; gap: 4px; }
+.ai-action-card .ai-action-status { font-size: 11px; color: var(--text-2); display: inline-flex; align-items: center; gap: 5px; }
+.ai-action-spinner {
+  width: 11px; height: 11px; flex: none; border: 1.5px solid var(--border-strong);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: ai-action-spin .75s linear infinite;
+}
+@keyframes ai-action-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .ai-action-spinner { animation-duration: 1.8s; } }
 .ai-action-card .ai-action-result {
   font-size: 11px; color: var(--text-2); max-height: 90px; overflow-y: auto;
   white-space: pre-wrap; word-break: break-all;
@@ -238,6 +245,8 @@ interface ActionCard {
   summary: string;
   /** run_command 展示命令原文 */
   command?: string;
+  /** run_command 整体超时秒数（未传时后端默认 10 秒） */
+  timeoutSeconds?: number;
   /** 审批事件携带的 requestId（批准/拒绝回执用） */
   requestId?: string;
   /** 智能审批自动放行：status='smart' 时展示判定理由 */
@@ -623,12 +632,16 @@ function handleEvent(key: string, ev: AiEvent): void {
     const cur = pendingBy.get(sid) ?? null;
     const p = cur ?? emptyPending();
     const existing = p.actions.get(ev.toolCallId);
+    const timeoutArg = ev.args.timeoutSeconds;
     p.actions.set(ev.toolCallId, {
       toolCallId: ev.toolCallId,
       tool: ev.tool,
       intent: existing?.intent ?? argsIntent(ev.tool, ev.args),
       summary: existing?.summary ?? argsIntent(ev.tool, ev.args),
       command: typeof ev.args.command === 'string' ? ev.args.command : existing?.command,
+      timeoutSeconds: typeof timeoutArg === 'number' && Number.isInteger(timeoutArg)
+        ? timeoutArg
+        : existing?.timeoutSeconds ?? 10,
       requestId: existing?.requestId,
       status: project?.aiMode === 'agent' ? 'approving' : 'running',
       textLen: existing?.textLen ?? p.text.length,
@@ -650,6 +663,7 @@ function handleEvent(key: string, ev: AiEvent): void {
         intent: ev.intent || existing?.intent || '',
         summary: ev.summary || existing?.summary || '',
         command: existing?.command,
+        timeoutSeconds: existing?.timeoutSeconds,
         status: 'smart',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
@@ -666,6 +680,7 @@ function handleEvent(key: string, ev: AiEvent): void {
         intent: ev.intent || existing?.intent || '',
         summary: ev.summary || existing?.summary || '',
         command: existing?.command,
+        timeoutSeconds: existing?.timeoutSeconds,
         requestId: ev.requestId,
         status: existing?.status === 'running' ? 'running' : 'approving',
         smartReason: ev.smartReason,
@@ -716,6 +731,7 @@ function collectActions(p: Pending): AiActionRecord[] {
         : a.status === 'succeeded'
           ? 'succeeded'
           : 'approved',
+    timeoutSeconds: a.timeoutSeconds,
     textLen: a.textLen,
   }));
 }
@@ -802,9 +818,16 @@ function renderHistory(): void {
 /** 动作卡渲染：Agent 审批态带批准/拒绝按钮；执行中/终态/历史只读无按钮。
  *  历史一串动作卡的折叠由 renderActionGroup 整组负责，单卡不再单独折叠。 */
 function renderActionCard(a: ActionCard): string {
-  const statusText = ACTION_STATUS[a.status] ?? a.status;
-  const cls = a.status === 'succeeded' || a.status === 'failed' || a.status === 'rejected' ? a.status : '';
   const isCmd = a.tool === 'run_command';
+  // actionStart 后：YOLO/人工批准为 running；智能审批自动放行暂存 smart，二者都仍在执行中。
+  const isCmdRunning = isCmd && (a.status === 'running' || a.status === 'smart');
+  const statusText = a.status === 'smart' && isCmdRunning
+    ? '已智能放行 · 执行中…'
+    : ACTION_STATUS[a.status] ?? a.status;
+  const cls = a.status === 'succeeded' || a.status === 'failed' || a.status === 'rejected' ? a.status : '';
+  const loadingHtml = isCmdRunning
+    ? '<span class="ai-action-spinner" role="status" aria-label="命令执行中"></span>'
+    : '';
   const buttons = a.status === 'approving' && a.requestId
     ? `<div class="ai-action-actions">
         <button class="btn small primary" type="button" data-act-approve="${escapeHtml(a.toolCallId)}">批准</button>
@@ -817,16 +840,20 @@ function renderActionCard(a: ActionCard): string {
   const smartHtml = a.smartReason
     ? `<div class="ai-action-intent ai-action-smart">${a.status === 'approving' ? '智能审批拦截（转人工确认）' : '智能判定'}：${escapeHtml(a.smartReason)}</div>`
     : '';
+  const timeoutHtml = isCmd
+    ? `<div class="ai-action-intent">超时：${a.timeoutSeconds ?? 10} 秒</div>`
+    : '';
   return `<div class="ai-action-card ${cls}">
     <div class="ai-action-head">
       <span class="ai-action-name">${icon('wrench')} ${ACTION_NAMES[a.tool] ?? a.tool}</span>
-      <span class="ai-action-status">${statusText}</span>
+      <span class="ai-action-status">${loadingHtml}${statusText}</span>
     </div>
     <div class="ai-action-detail">
       ${a.intent ? `<div class="ai-action-intent">意图：${escapeHtml(a.intent)}</div>` : ''}
       ${isCmd && a.command
         ? `<code class="ai-action-cmd">${escapeHtml(a.command)}</code>`
         : a.summary ? `<div class="ai-action-intent ai-action-summary">${escapeHtml(a.summary)}</div>` : ''}
+      ${timeoutHtml}
       ${smartHtml}
       ${buttons}
       ${resultHtml}
@@ -843,7 +870,14 @@ function renderActionGroup(actions: AiActionRecord[], groupKey: string): string 
   const badHtml = failed ? `<span class="ai-action-group-bad">${failed} 失败</span>` : '';
   const warnHtml = !failed && rejected ? `<span class="ai-action-group-warn">${rejected} 已拒绝</span>` : '';
   const cards = actions
-    .map((a) => renderActionCard({ toolCallId: a.toolCallId, tool: a.tool, intent: a.intent, summary: a.summary, status: a.status }))
+    .map((a) => renderActionCard({
+      toolCallId: a.toolCallId,
+      tool: a.tool,
+      intent: a.intent,
+      summary: a.summary,
+      status: a.status,
+      timeoutSeconds: a.timeoutSeconds,
+    }))
     .join('');
   return `<div class="ai-action-group${expanded ? '' : ' collapsed'}" data-group-key="${escapeHtml(groupKey)}">
     <div class="ai-action-group-head">
@@ -892,7 +926,14 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
       ? interleaveActions(
           m.content,
           (m.actions ?? []).map((a) => ({
-            html: renderActionCard({ toolCallId: a.toolCallId, tool: a.tool, intent: a.intent, summary: a.summary, status: a.status }),
+            html: renderActionCard({
+              toolCallId: a.toolCallId,
+              tool: a.tool,
+              intent: a.intent,
+              summary: a.summary,
+              status: a.status,
+              timeoutSeconds: a.timeoutSeconds,
+            }),
             textLen: a.textLen,
           })),
         )

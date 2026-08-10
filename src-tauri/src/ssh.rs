@@ -184,7 +184,7 @@ impl SshManager {
 
     /// 执行单条远程命令并收集 stdout/stderr/退出码（复用底层连接；channel 用完即弃）。
     /// 空命令在建连前拒绝。AI 远程动作的锁检查在 ai_actions 入口，不在本方法内。
-    /// 无超时：命令挂起时长由调用方（ai_actions 的 AI 长命令）自行负责。
+    /// 无超时：仅保留给确需无界执行的内部调用；AI run_command 必须走 exec_with_timeout。
     pub async fn exec(
         self: &Arc<Self>,
         server_id: &str,
@@ -193,8 +193,8 @@ impl SshManager {
         self.exec_impl(server_id, command, None).await
     }
 
-    /// 带整体超时的单命令执行（`ssh_exec` 命令使用）：超时后尝试中断远端命令，
-    /// 返回已收集的输出与 `None` 退出码（前端按失败提示，详见 debug 日志）。
+    /// 带整体超时的单命令执行：超时后尝试中断远端命令，返回已收集输出并标记
+    /// `timed_out=true`（ssh_exec 映射为 code=null；AI run_command 转成明确失败）。
     pub async fn exec_with_timeout(
         self: &Arc<Self>,
         server_id: &str,
@@ -226,6 +226,7 @@ impl SshManager {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut exit_code: Option<i32> = None;
+        let mut timed_out = false;
         let read = async {
             while let Some(msg) = channel.wait().await {
                 match msg {
@@ -242,6 +243,7 @@ impl SshManager {
         };
         if let Some(d) = timeout {
             if tokio::time::timeout(d, read).await.is_err() {
+                timed_out = true;
                 // 超时：尽力中断远端命令（失败无碍，channel drop 也会关闭），保留已收集输出
                 let _ = channel.eof().await;
             }
@@ -252,6 +254,7 @@ impl SshManager {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             exit_code,
+            timed_out,
         })
     }
 

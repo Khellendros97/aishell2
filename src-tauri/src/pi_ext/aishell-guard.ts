@@ -111,7 +111,8 @@ export default function (pi: ExtensionAPI) {
 				const intent = typeof input.intent === "string" ? input.intent : "";
 				const command = typeof input.command === "string" ? input.command : "";
 				const target = input.target === "remote" ? `远程(${String(input.serverId || "")})` : "本地";
-				return { action: "run_command", intent, summary: `执行命令（${target}）：${command}` };
+				const timeout = typeof input.timeoutSeconds === "number" ? input.timeoutSeconds : 10;
+				return { action: "run_command", intent, summary: `执行命令（${target}，超时 ${timeout} 秒）：${command}` };
 			}
 			case "sftp_upload":
 				return {
@@ -188,6 +189,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (input.target === "local" && typeof input.serverId === "string" && input.serverId.trim()) {
 					return { block: true, reason: "run_command: 本地目标不得使用 serverId。" };
+				}
+				if (input.timeoutSeconds !== undefined
+					&& !(Number.isInteger(input.timeoutSeconds) && Number(input.timeoutSeconds) >= 1 && Number(input.timeoutSeconds) <= 3600)) {
+					return { block: true, reason: "run_command: timeoutSeconds 必须是 1–3600 之间的整数秒。" };
 				}
 				return undefined;
 			}
@@ -348,10 +353,11 @@ export default function (pi: ExtensionAPI) {
 		name: "run_command",
 		label: "Run Command",
 		description:
-			"在本地 shell（项目根目录）或远程服务器上执行命令，返回 stdout/stderr/退出码。必须提供 intent 说明命令意图。",
+			"在本地 shell（项目根目录）或远程服务器上执行命令，返回 stdout/stderr/退出码。必须提供 intent；默认 10 秒超时，可用 timeoutSeconds（1–3600 秒）覆盖。",
 		promptSnippet: "执行本地或远程命令",
 		promptGuidelines: [
 			"使用 run_command 时，intent 字段必须用一句中文说明本次命令的意图（会展示给用户审批）。",
+			"命令默认 10 秒超时；预计超过 10 秒时主动设置合理的 timeoutSeconds（1–3600），不要无界等待。",
 			"远程执行（target=remote）需要服务器 ID，且受服务器 AI 操作锁约束；锁定服务器会返回拒绝错误。",
 		],
 		parameters: Type.Object({
@@ -359,6 +365,11 @@ export default function (pi: ExtensionAPI) {
 			command: Type.String({ description: "要执行的命令" }),
 			target: StringEnum(["local", "remote"] as const),
 			serverId: Type.Optional(Type.String({ description: "target=remote 时必填：服务器 ID" })),
+			timeoutSeconds: Type.Optional(Type.Integer({
+				minimum: 1,
+				maximum: 3600,
+				description: "命令整体超时秒数；不传默认 10 秒",
+			})),
 		}),
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const payload: Record<string, unknown> = {
@@ -368,6 +379,7 @@ export default function (pi: ExtensionAPI) {
 				target: params.target,
 			};
 			if (params.serverId) payload.serverId = params.serverId;
+			if (params.timeoutSeconds !== undefined) payload.timeoutSeconds = params.timeoutSeconds;
 			return await rustAction(ctx, toolCallId, payload);
 		},
 	});

@@ -374,7 +374,14 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             .expect("登记项目应成功");
 
         let err = actions
-            .run_command("p-lock", "测试".to_string(), "printf hi".to_string(), "remote".to_string(), Some("s-lock".to_string()))
+            .run_command(
+                "p-lock",
+                "测试".to_string(),
+                "printf hi".to_string(),
+                "remote".to_string(),
+                Some("s-lock".to_string()),
+                None,
+            )
             .await
             .expect_err("锁定服务器应拒绝 AI 远程命令");
         assert!(
@@ -428,7 +435,14 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
         // 解锁后 AI 远程命令恢复（同一连接池，无需重连）
         store.set_server_locked("s-lock", false).expect("解锁应成功");
         let result = actions
-            .run_command("p-lock", "测试".to_string(), "printf ai-unlocked".to_string(), "remote".to_string(), Some("s-lock".to_string()))
+            .run_command(
+                "p-lock",
+                "测试".to_string(),
+                "printf ai-unlocked".to_string(),
+                "remote".to_string(),
+                Some("s-lock".to_string()),
+                None,
+            )
             .await
             .expect("解锁后 AI 远程命令应恢复");
         assert_eq!(result.stdout, "ai-unlocked");
