@@ -113,9 +113,31 @@ impl SshManager {
     }
 
     /// 取（或建立）到 server 的连接：map 命中且未断开则复用，否则连接 + 认证后入池。
+    /// 目标主机（Server.bastion_id 非空）走跳板：先建连/复用堡垒机连接，再在堡垒机上开
+    /// direct-tcpip 通道指向目标主机 host:port，把通道作为传输层完成目标主机的 SSH 握手
+    /// 与认证（两端凭据各自独立存 keyring `server:<id>`）。
     pub async fn get_or_connect(
         self: &Arc<Self>,
         server_id: &str,
+    ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        self.get_or_connect_inner(server_id, None).await
+    }
+
+    /// 测试专用（doc hidden）：与 `get_or_connect` 相同，但直连与跳板两段认证都用给定密码
+    /// 覆盖（None 走 keyring）——回环集成测试用它避免触碰真实 keyring。
+    #[doc(hidden)]
+    pub async fn get_or_connect_with_password(
+        self: &Arc<Self>,
+        server_id: &str,
+        password: &str,
+    ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        self.get_or_connect_inner(server_id, Some(password)).await
+    }
+
+    async fn get_or_connect_inner(
+        self: &Arc<Self>,
+        server_id: &str,
+        password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
         if let Some(handle) = self.live_handle(server_id).await {
             return Ok(handle);
@@ -124,7 +146,32 @@ impl SshManager {
             .store
             .server(server_id)
             .ok_or_else(|| format!("服务器不存在：{server_id}"))?;
-        let handle = self.connect_handle(&server, None).await?;
+        let handle = match &server.bastion_id {
+            // 普通服务器 / 堡垒机：直连
+            None => self.connect_handle(&server, password_override).await?,
+            // 目标主机：先连堡垒机，再经其转发（堡垒机本身不允许再挂堡垒机，杜绝链式跳板）
+            Some(bastion_id) => {
+                let bastion = self.store.server(bastion_id).ok_or_else(|| {
+                    format!("目标主机「{}」的堡垒机不存在：{bastion_id}", server.name)
+                })?;
+                if !bastion.is_bastion {
+                    return Err(format!(
+                        "目标主机「{}」的堡垒机「{}」未开启堡垒机功能",
+                        server.name, bastion.name
+                    ));
+                }
+                if bastion.bastion_id.is_some() {
+                    return Err(format!(
+                        "堡垒机「{}」不能作为另一台堡垒机的目标主机",
+                        bastion.name
+                    ));
+                }
+                let bastion_handle =
+                    Box::pin(self.get_or_connect_inner(bastion_id, password_override)).await?;
+                self.connect_via_jump(&server, &bastion, bastion_handle, password_override)
+                    .await?
+            }
+        };
         self.insert_and_watch(server_id, handle).await
     }
 
@@ -275,7 +322,7 @@ impl SshManager {
         map.get(server_id).filter(|h| !h.is_closed()).cloned()
     }
 
-    /// 建连 + 认证（各 10s 超时）。password_override 仅供测试注入，None 时走 Store/keyring。
+    /// 直连建连 + 认证（各 10s 超时）。password_override 仅供测试注入，None 时走 Store/keyring。
     async fn connect_handle(
         &self,
         server: &store::Server,
@@ -292,7 +339,7 @@ impl SshManager {
         }
         let config = Arc::new(client::Config::default());
         let addr = (server.host.as_str(), server.port);
-        let mut handle = tokio::time::timeout(
+        let handle = tokio::time::timeout(
             Duration::from_secs(10),
             client::connect(config, addr, CliHandler),
         )
@@ -309,7 +356,72 @@ impl SshManager {
                 server.name, server.host, server.port
             )
         })?;
+        self.authenticate_handle(handle, server, password_override).await
+    }
 
+    /// 经堡垒机连接目标主机：堡垒机连接复用连接池，在堡垒机上开 direct-tcpip 通道指向
+    /// 目标主机 host:port，再把通道当作传输层跑目标主机的 SSH 握手（russh connect_stream），
+    /// 随后按目标主机自身凭据认证。各步 10s 超时，错误信息带堡垒机名便于排查。
+    /// password_override 仅供测试注入（透传给认证）。
+    async fn connect_via_jump(
+        self: &Arc<Self>,
+        server: &store::Server,
+        bastion: &store::Server,
+        bastion_handle: Arc<client::Handle<CliHandler>>,
+        password_override: Option<&str>,
+    ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        if server.username.trim().is_empty() {
+            return Err(format!(
+                "目标主机「{}」未配置登录用户名，请在设置中补充",
+                server.name
+            ));
+        }
+        if server.auth_type == store::AuthType::Key {
+            reject_unsupported_key_format(server)?;
+        }
+        let via = format!("经堡垒机「{}」", bastion.name);
+        let channel = tokio::time::timeout(
+            Duration::from_secs(10),
+            bastion_handle.channel_open_direct_tcpip(
+                &server.host,
+                server.port as u32,
+                "127.0.0.1",
+                0,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "{via}连接目标主机「{}」超时（10s）：{}:{}",
+                server.name, server.host, server.port
+            )
+        })?
+        .map_err(|e| {
+            format!(
+                "{via}打开到目标主机「{}」（{}:{}）的转发通道失败：{e}",
+                server.name, server.host, server.port
+            )
+        })?;
+        let config = Arc::new(client::Config::default());
+        let handle = tokio::time::timeout(
+            Duration::from_secs(10),
+            client::connect_stream(config, channel.into_stream(), CliHandler),
+        )
+        .await
+        .map_err(|_| format!("{via}连接目标主机「{}」超时（10s）", server.name))?
+        .map_err(|e| format!("{via}连接目标主机「{}」失败：{e}", server.name))?;
+        self.authenticate_handle(handle, server, password_override).await
+    }
+
+    /// 在已建立 SSH 会话的 handle 上完成用户认证（各 10s 超时）。
+    /// 直连（connect_handle）与跳板（connect_via_jump）共用；password_override 仅供测试注入。
+    async fn authenticate_handle(
+        &self,
+        handle: client::Handle<CliHandler>,
+        server: &store::Server,
+        password_override: Option<&str>,
+    ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        let mut handle = handle;
         let accepted = match server.auth_type {
             store::AuthType::Password => {
                 let password = match password_override {
@@ -464,6 +576,8 @@ mod tests {
             username: "tester".to_string(),
             key_path: path.to_string(),
             locked: false,
+            is_bastion: false,
+            bastion_id: None,
         }
     }
 
@@ -503,6 +617,8 @@ mod tests {
             username: "root".to_string(),
             key_path: String::new(),
             locked: false,
+            is_bastion: false,
+            bastion_id: None,
         };
         let msg = auth_failed_msg(&server, "Disconnected");
         assert!(msg.starts_with(AUTH_FAILED_PREFIX));
@@ -555,6 +671,95 @@ mod tests {
         assert!(err.contains("无密码短语的 OpenSSH 私钥"));
 
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    /// 跳板错误路径（不连真实服务器、不碰真实 keyring）：
+    /// 目标主机的堡垒机不存在 / 未开启堡垒机 / 堡垒机本身又是目标主机 → 建网前拒绝并给出中文错误。
+    #[tokio::test]
+    async fn get_or_connect_rejects_invalid_jump_setups_before_network() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "aishell-jump-store-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let store = Arc::new(store::test_store(store_dir.clone()));
+
+        let bastion = |id: &str| store::Server {
+            id: id.to_string(),
+            name: format!("堡垒机{id}"),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            auth_type: store::AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: true,
+            bastion_id: None,
+        };
+        let target = |id: &str, bid: &str| store::Server {
+            id: id.to_string(),
+            name: format!("目标机{id}"),
+            host: "10.0.0.9".to_string(),
+            port: 22,
+            auth_type: store::AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: false,
+            bastion_id: Some(bid.to_string()),
+        };
+        // 合法堡垒机 + 合法目标
+        store::force_upsert_server(&store, bastion("b"));
+        store::force_upsert_server(&store, target("t-ok", "b"));
+        // 幽灵堡垒机引用
+        store::force_upsert_server(&store, target("t-ghost", "srv-missing"));
+        // 未开启堡垒机的普通服务器被引用
+        store::force_upsert_server(&store, {
+            let mut plain = bastion("p");
+            plain.is_bastion = false;
+            plain
+        });
+        store::force_upsert_server(&store, target("t-plain", "p"));
+        // 链式：堡垒机 b2 本身又是 b 的目标主机（同时 is_bastion=true，绕过校验构造非法态）
+        let mut b2 = target("b2", "b");
+        b2.is_bastion = true;
+        store::force_upsert_server(&store, b2);
+        store::force_upsert_server(&store, target("t-chain", "b2"));
+
+        let manager = Arc::new(SshManager::new(Arc::clone(&store)));
+
+        let err = manager
+            .get_or_connect("t-ghost")
+            .await
+            .err()
+            .expect("幽灵堡垒机应拒绝");
+        assert!(err.contains("堡垒机不存在"), "错误串不符: {err}");
+
+        let err = manager
+            .get_or_connect("t-plain")
+            .await
+            .err()
+            .expect("未开启堡垒机功能应拒绝");
+        assert!(err.contains("未开启堡垒机功能"), "错误串不符: {err}");
+
+        let err = manager
+            .get_or_connect("t-chain")
+            .await
+            .err()
+            .expect("链式跳板应拒绝");
+        assert!(err.contains("不能作为另一台堡垒机的目标主机"), "错误串不符: {err}");
+
+        // 合法目标：错误发生在真实的堡垒机连接阶段（127.0.0.1:22 无 sshd），
+        // 错误应指向堡垒机自身，证明先连堡垒机（而非直连目标机 10.0.0.9）
+        let err = manager
+            .get_or_connect("t-ok")
+            .await
+            .err()
+            .expect("无 sshd 的堡垒机连接应失败");
+        assert!(err.contains("堡垒机b"), "错误串不符: {err}");
+        assert!(!err.contains("10.0.0.9"), "不应直连目标主机: {err}");
+
         let _ = std::fs::remove_dir_all(store_dir);
     }
 }

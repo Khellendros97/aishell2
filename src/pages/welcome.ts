@@ -682,6 +682,18 @@ export const renderWelcome: PageRender = (root) => {
     }
     const pathInput = els.fPath.value.trim();
     const serverIds = selectedServerIds.slice();
+    // 过滤已不存在的服务器 id：跨页面操作（如工作台删除服务器）后本页内存快照可能过期，
+    // 直接全量覆盖会把幽灵 id 写回配置文件。
+    try {
+      const alive = new Set((await getState()).servers.map((s) => s.id));
+      if (serverIds.length) {
+        for (let i = serverIds.length - 1; i >= 0; i--) {
+          if (!alive.has(serverIds[i])) serverIds.splice(i, 1);
+        }
+      }
+    } catch {
+      /* 后端未就绪时保持原勾选 */
+    }
     // 所属目录：规范化 '/' 分隔路径（去首尾/重复分隔符），留空 = 未分类
     const folder = els.fFolder.value.trim().split('/').filter(Boolean).join('/');
 

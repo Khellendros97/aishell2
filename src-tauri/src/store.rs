@@ -179,6 +179,14 @@ pub struct Server {
     /// AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP；旧配置无此字段按未锁定。
     #[serde(default)]
     pub locked: bool,
+    /// 堡垒机开关：true = 本服务器作为跳板机，目标主机的 SSH/SFTP 连接经它转发；
+    /// 卡片上据此打「堡垒机」标签。旧配置无此字段按普通服务器。
+    #[serde(default)]
+    pub is_bastion: bool,
+    /// 所属堡垒机 id：Some = 本服务器是目标主机，连接时先连堡垒机再经其转发；
+    /// None = 普通服务器或堡垒机自身。旧配置无此字段按未绑定。
+    #[serde(default)]
+    pub bastion_id: Option<String>,
 }
 
 /// 数据库类型（AI 受管查询通道）。
@@ -572,6 +580,21 @@ pub fn test_store(dir: PathBuf) -> Store {
     Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap()
 }
 
+/// 测试专用：绕过 upsert_server 的业务校验直接写入/覆盖服务器，
+/// 用于构造合法 API 到不了的非法堡垒机绑定态（幽灵/非堡垒机引用、链式跳板）做错误路径测试。
+#[cfg(test)]
+pub fn force_upsert_server(store: &Store, server: Server) {
+    store
+        .with_state(|s| {
+            match s.servers.iter_mut().find(|sv| sv.id == server.id) {
+                Some(slot) => *slot = server,
+                None => s.servers.push(server),
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
 // ---------------------------------------------------------------- Store
 
 /// 线程安全（Send+Sync）：PathBuf + Mutex<AppState>。ssh/term 等模块持有 `Arc<Store>`。
@@ -731,7 +754,29 @@ impl Store {
     }
 
     /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
+    /// 堡垒机绑定约束（非法组合在写 keyring 前拒绝）：
+    /// - 一台服务器不能同时是堡垒机又是目标主机；
+    /// - 目标主机的 bastion_id 必须指向一台已开启堡垒机的服务器。
     pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
+        if server.is_bastion && server.bastion_id.is_some() {
+            return Err(format!(
+                "服务器「{}」不能同时作为堡垒机与目标主机",
+                server.name
+            ));
+        }
+        if let Some(bid) = &server.bastion_id {
+            let bastion_ok = self.with_state(|s| {
+                Ok(s.servers
+                    .iter()
+                    .any(|sv| sv.id == *bid && sv.is_bastion))
+            })?;
+            if !bastion_ok {
+                return Err(format!(
+                    "目标主机「{}」的堡垒机不存在或未开启堡垒机功能（{}）",
+                    server.name, bid
+                ));
+            }
+        }
         if let Some(pw) = password {
             self.secrets.set(&keyring_account_server(&server.id), pw)?;
         }
@@ -745,7 +790,20 @@ impl Store {
     }
 
     /// 移除服务器、级联从所有 projects[].server_ids 移除、删 keyring 条目（不存在不算错）。
+    /// 服务器是堡垒机且仍有目标主机时拒绝删除（避免留下指向幽灵堡垒机的目标），
+    /// 提示先到「SSH跳转设置」解除目标主机绑定。
     fn delete_server(&self, id: &str) -> Result<(), String> {
+        let has_targets = self.with_state(|s| {
+            Ok(s.servers
+                .iter()
+                .any(|sv| sv.bastion_id.as_deref() == Some(id)))
+        })?;
+        if has_targets {
+            let name = self.server(id).map(|sv| sv.name).unwrap_or_else(|| id.to_string());
+            return Err(format!(
+                "堡垒机「{name}」仍有目标主机绑定，请先在「SSH跳转设置」中解除目标主机绑定后再删除"
+            ));
+        }
         self.secrets.delete(&keyring_account_server(id))?;
         self.with_state(|s| {
             s.servers.retain(|sv| sv.id != id);
@@ -960,8 +1018,8 @@ impl Store {
     }
 
     /// 批量合并 Xshell 导入的服务器并按其目录自动建项目：一次 with_state 原子持久化，不触碰 SecretStore。
-    /// 服务器合并语义：ID 已存在 → 连接配置以导入为准，但**保留现有 AI 锁**（重新导入绝不能解锁）；
-    /// 配置完全一致（含锁位）→ unchanged；存在差异 → 覆盖并计 updated；不存在 → imported。
+    /// 服务器合并语义：ID 已存在 → 连接配置以导入为准，但**保留现有 AI 锁与堡垒机绑定**（重新导入绝不能
+    /// 解锁或改绑）；配置完全一致（含锁位）→ unchanged；存在差异 → 覆盖并计 updated；不存在 → imported。
     /// 项目：按 folder 分组，项目名 = folder 路径（如 "生产环境/Web"），空串统一归「未命名项目」；
     /// 按名字匹配已有项目则复用（仅补绑 serverIds，去重），否则新建项目（id 唯一 proj- 前缀；
     /// path=None；quick_commands 空；ai_mode 默认；folder=''）并计 projects_created。
@@ -978,6 +1036,8 @@ impl Store {
                     Some(slot) => {
                         let mut merged = sv.clone();
                         merged.locked = slot.locked;
+                        merged.is_bastion = slot.is_bastion;
+                        merged.bastion_id = slot.bastion_id.clone();
                         if *slot == merged {
                             result.unchanged += 1;
                         } else {
@@ -1551,6 +1611,8 @@ mod tests {
                     username: "deploy".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 Server {
                     id: "srv-2".to_string(),
@@ -1561,6 +1623,8 @@ mod tests {
                     username: "ubuntu".to_string(),
                     key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
             ],
             projects: vec![Project {
@@ -1648,6 +1712,8 @@ mod tests {
             "\"keyPath\"",
             "\"aiMode\"",
             "\"locked\"",
+            "\"isBastion\"",
+            "\"bastionId\"",
             "\"toolCallId\"",
             "\"projectFolders\"",
             "\"commandFolders\"",
@@ -1817,6 +1883,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 Some("pw-1"),
             )
@@ -1832,6 +1900,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
@@ -1877,6 +1947,8 @@ mod tests {
             username: "u".to_string(),
             key_path: String::new(),
             locked: false,
+            is_bastion: false,
+            bastion_id: None,
         };
         store.upsert_server(base.clone(), None).unwrap();
         let mut updated = base;
@@ -1886,6 +1958,140 @@ mod tests {
         let guard = store.state.lock().unwrap();
         assert_eq!(guard.servers.len(), 1, "同 id 应原地更新而非追加");
         assert_eq!(guard.servers[0].name, "新名");
+    }
+
+    #[test]
+    fn upsert_rejects_invalid_bastion_bindings() {
+        let dir = temp_config_dir("bastion-bind");
+        let store = test_store(dir);
+        let base = Server {
+            id: "srv-b".to_string(),
+            name: "堡垒机".to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: true,
+            bastion_id: None,
+        };
+        store.upsert_server(base.clone(), None).unwrap();
+
+        // 一台服务器不能同时是堡垒机又是目标主机
+        let both = Server { bastion_id: Some("srv-b".to_string()), ..base.clone() };
+        let err = store.upsert_server(both, None).unwrap_err();
+        assert!(err.contains("不能同时作为堡垒机与目标主机"), "错误串不符: {err}");
+
+        // 目标主机的堡垒机必须已开启堡垒机功能
+        let target_ok = Server {
+            id: "srv-t".to_string(),
+            name: "目标机".to_string(),
+            host: "10.0.0.2".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: false,
+            bastion_id: Some("srv-b".to_string()),
+        };
+        store.upsert_server(target_ok, None).unwrap();
+        // 未开启堡垒机的服务器不能作堡垒机引用
+        let plain = Server {
+            id: "srv-p".to_string(),
+            name: "普通机".to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+        };
+        store.upsert_server(plain.clone(), None).unwrap();
+        let bad_ref = Server {
+            id: "srv-t2".to_string(),
+            name: "目标2".to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: false,
+            bastion_id: Some("srv-p".to_string()),
+        };
+        let err = store.upsert_server(bad_ref, None).unwrap_err();
+        assert!(err.contains("未开启堡垒机功能"), "错误串不符: {err}");
+        // 不存在的堡垒机
+        let ghost = Server {
+            id: "srv-t3".to_string(),
+            name: "目标3".to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: false,
+            bastion_id: Some("srv-ghost".to_string()),
+        };
+        let err = store.upsert_server(ghost, None).unwrap_err();
+        assert!(err.contains("不存在或未开启"), "错误串不符: {err}");
+
+        // 合法绑定在 state 里完整保存
+        assert_eq!(store.server("srv-t").unwrap().bastion_id.as_deref(), Some("srv-b"));
+    }
+
+    #[test]
+    fn delete_bastion_with_targets_is_blocked() {
+        let dir = temp_config_dir("bastion-delete");
+        let store = test_store(dir);
+        let bastion = Server {
+            id: "srv-b".to_string(),
+            name: "堡垒机".to_string(),
+            host: "h".to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            locked: false,
+            is_bastion: true,
+            bastion_id: None,
+        };
+        store.upsert_server(bastion, None).unwrap();
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-t".to_string(),
+                    name: "目标机".to_string(),
+                    host: "h".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                    is_bastion: false,
+                    bastion_id: Some("srv-b".to_string()),
+                },
+                Some("pw-t"),
+            )
+            .unwrap();
+
+        // 有目标主机时删除被拒，state 与 keyring 均不受影响
+        let err = store.delete_server("srv-b").unwrap_err();
+        assert!(err.contains("SSH跳转设置"), "错误串不符: {err}");
+        assert!(store.server("srv-b").is_some(), "拒绝删除时不应动 state");
+        assert_eq!(store.read_secret("server:srv-t").unwrap(), "pw-t");
+
+        // 目标主机本身可正常删除（级联解绑项目）
+        store.delete_server("srv-t").unwrap();
+        assert!(store.server("srv-t").is_none());
+        // 目标主机清空后堡垒机可删除
+        store.delete_server("srv-b").unwrap();
+        assert!(store.server("srv-b").is_none());
     }
 
     #[test]
@@ -2088,6 +2294,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 Some("pw-1"),
             )
@@ -2103,6 +2311,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
@@ -2187,6 +2397,8 @@ mod tests {
             username: "u".to_string(),
             key_path: String::new(),
             locked: false,
+            is_bastion: false,
+            bastion_id: None,
         };
         // 有目录 → 项目名 = 目录路径；空目录 → 归「未命名项目」
         store
@@ -2964,6 +3176,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
@@ -3039,6 +3253,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 Some("pw-a"),
             )
@@ -3085,6 +3301,8 @@ mod tests {
                 username: "root".to_string(),
                 key_path: String::new(),
                 locked: false,
+                is_bastion: false,
+                bastion_id: None,
             },
             // 全部未分类 → 归「未命名项目」，不干扰计数断言
             folder: String::new(),
@@ -3144,6 +3362,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 folder: String::new(),
             }])
@@ -3244,6 +3464,8 @@ mod tests {
         }"#;
         let state: AppState = serde_json::from_str(old).unwrap();
         assert!(!state.servers[0].locked, "旧服务器默认未锁定");
+        assert!(!state.servers[0].is_bastion, "旧服务器默认不是堡垒机");
+        assert_eq!(state.servers[0].bastion_id, None, "旧服务器默认无堡垒机绑定");
         assert_eq!(state.projects[0].ai_mode, AiMode::Suggest, "旧项目默认 suggest");
         // 旧 ChatMsg 无 actions → 空
         let old_msg = r#"{"role":"assistant","content":"hi","snapshots":[],"fileRefs":[],"ts":1}"#;
@@ -3323,6 +3545,8 @@ mod tests {
             username: "u".to_string(),
             key_path: String::new(),
             locked: false,
+            is_bastion: false,
+            bastion_id: None,
         };
         store.upsert_server(srv("sv-a"), None).unwrap();
         store.upsert_server(srv("sv-b"), None).unwrap();
@@ -3360,6 +3584,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: true,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
@@ -3376,6 +3602,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 folder: String::new(),
             }])
@@ -3397,6 +3625,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 folder: String::new(),
             }])

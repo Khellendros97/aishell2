@@ -9,7 +9,7 @@
  */
 import type { DbConnection, DbKind, Server } from '../../../types';
 import { icon } from '../../../icons';
-import { deleteDbConnection, getState, saveDbConnection, setServerLocked, upsertProject, upsertServer } from '../../../api';
+import { deleteDbConnection, deleteServer, getState, saveDbConnection, setServerLocked, upsertProject, upsertServer } from '../../../api';
 import { bus, openTab, Workbench } from '../core';
 import { confirmDialog, showContextMenu, toast, uid } from '../../../ui';
 import { createServerForm } from '../../server-form';
@@ -38,6 +38,61 @@ export function mountServersPanel(container: HTMLElement): void {
         <div class="modal-foot">
           <button id="srv-modal-cancel" class="btn">取消</button>
           <button id="srv-modal-save" class="btn primary">创建并绑定到当前项目</button>
+        </div>
+      </div>
+    </div>
+  `);
+
+  /* ---------- SSH跳转设置对话框（堡垒机开关 + 目标主机列表；卡片「更多」菜单进入编辑态） ---------- */
+  container.insertAdjacentHTML('beforeend', `
+    <div class="modal-mask hidden" id="jump-modal">
+      <div class="modal jump-modal">
+        <div class="modal-head">
+          <h3 id="jump-modal-title">SSH跳转设置</h3>
+          <button id="jump-modal-close" class="icon-btn" title="关闭">${icon('x')}</button>
+        </div>
+        <div class="modal-body">
+          <div class="jump-section hidden" id="jump-bastion-wrap">
+            <div class="jump-section-title">堡垒机服务器</div>
+            <div class="jump-hint">开启「作为堡垒机」后，本服务器的 SSH/SFTP 连接将作为目标主机的跳板</div>
+            <div id="jump-bastion-form"></div>
+          </div>
+          <div class="jump-target-banner hidden" id="jump-target-banner"></div>
+          <div class="jump-toggle-row" id="jump-toggle-row">
+            <label class="jump-switch">
+              <input type="checkbox" id="jump-toggle">
+              <span class="jump-switch-slider"></span>
+            </label>
+            <div class="jump-toggle-text">
+              <div class="jump-toggle-title">作为堡垒机</div>
+              <div class="jump-toggle-hint">开启后服务器卡片显示「堡垒机」标签</div>
+            </div>
+          </div>
+          <div class="jump-section" id="jump-targets-wrap">
+            <div class="jump-section-head">
+              <span class="jump-section-title">目标主机</span>
+              <button id="jump-target-add" class="btn small">${icon('plus')} 添加目标主机</button>
+            </div>
+            <div class="jump-hint">目标主机与普通服务器属性相同，SSH/SFTP 连接经本堡垒机代理，卡片显示「堡垒机:名称」标签</div>
+            <div id="jump-target-list"></div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button id="jump-modal-cancel" class="btn">取消</button>
+          <button id="jump-modal-save" class="btn primary">保存</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-mask hidden" id="jump-target-modal">
+      <div class="modal">
+        <div class="modal-head">
+          <h3 id="jump-target-title">添加目标主机</h3>
+          <button id="jump-target-modal-close" class="icon-btn" title="关闭">${icon('x')}</button>
+        </div>
+        <div class="modal-body"><div id="jump-target-form"></div></div>
+        <div class="modal-foot">
+          <button id="jump-target-cancel" class="btn">取消</button>
+          <button id="jump-target-save" class="btn primary">保存</button>
         </div>
       </div>
     </div>
@@ -96,11 +151,19 @@ export function mountServersPanel(container: HTMLElement): void {
     try {
       await upsertServer(server, form.passwordValue());
       if (isNew) {
-        // 创建成功后立即绑定到当前项目（内存同步 + 落盘 + 通知各面板刷新）
+        // 创建成功后立即绑定到当前项目；先拉最新 project 合并，避免过期内存快照覆盖已删绑定
         const project = Workbench.state.project;
-        if (project && !project.serverIds.includes(server.id)) {
-          project.serverIds.push(server.id);
-          await upsertProject(project);
+        if (project) {
+          let latest = project;
+          try {
+            const state = await getState();
+            latest = state.projects.find((p) => p.id === project.id) ?? project;
+          } catch { /* 后端未就绪时用内存快照 */ }
+          if (!latest.serverIds.includes(server.id)) {
+            latest.serverIds.push(server.id);
+            await upsertProject(latest);
+            project.serverIds = latest.serverIds;
+          }
         }
       }
     } catch (err) {
@@ -122,6 +185,285 @@ export function mountServersPanel(container: HTMLElement): void {
     if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
   };
   document.addEventListener('keydown', onKeydown);
+
+  /* ---------- SSH跳转设置：堡垒机开关 + 目标主机列表 ----------
+     create 态（侧栏「SSH跳转」入口）：含堡垒机服务器表单，保存时创建堡垒机 + 目标主机并绑定到当前项目；
+     edit 态（卡片「更多 → SSH跳转设置」）：只编辑堡垒机开关与目标主机列表（服务器连接字段仍走「编辑」）；
+     目标主机自身（bastionId 非空）打开时只读展示归属，不做任何编辑。 */
+  const jumpModal = container.querySelector('#jump-modal') as HTMLElement;
+  const jumpTitle = container.querySelector('#jump-modal-title') as HTMLElement;
+  const jumpCancelBtn = container.querySelector('#jump-modal-cancel') as HTMLButtonElement;
+  const jumpSaveBtn = container.querySelector('#jump-modal-save') as HTMLButtonElement;
+  const jumpToggle = container.querySelector('#jump-toggle') as HTMLInputElement;
+  const jumpToggleRow = container.querySelector('#jump-toggle-row') as HTMLElement;
+  const jumpBastionWrap = container.querySelector('#jump-bastion-wrap') as HTMLElement;
+  const jumpTargetsWrap = container.querySelector('#jump-targets-wrap') as HTMLElement;
+  const jumpTargetBanner = container.querySelector('#jump-target-banner') as HTMLElement;
+  const jumpTargetList = container.querySelector('#jump-target-list') as HTMLElement;
+  const jumpBastionForm = createServerForm(container.querySelector('#jump-bastion-form') as HTMLElement);
+  const jumpTargetModal = container.querySelector('#jump-target-modal') as HTMLElement;
+  const jumpTargetTitle = container.querySelector('#jump-target-title') as HTMLElement;
+  const jumpTargetForm = createServerForm(container.querySelector('#jump-target-form') as HTMLElement);
+
+  /** 目标主机草稿：server 为当前值（新建条目 id 由 buildServer 生成）；password 为保存时的表单密码（null = 不写 keyring） */
+  interface JumpTargetDraft { server: Server; password: string | null; }
+  interface JumpDraft {
+    mode: 'create' | 'edit';
+    toggle: boolean;
+    targets: JumpTargetDraft[];
+  }
+  let jumpDraft: JumpDraft | null = null;
+  /** edit 态被配置的服务器（目标主机只读态用它展示归属） */
+  let jumpEditServer: Server | null = null;
+  /** edit 态打开时的目标主机 id 集合（保存时据此区分新增/编辑/删除） */
+  let jumpOriginalIds = new Set<string>();
+  let editingTarget: Server | null = null; // null = 目标主机新建；否则为正在编辑的目标
+
+  function openJumpModal(): void {
+    jumpModal.classList.remove('hidden');
+    requestAnimationFrame(() => jumpModal.classList.add('open'));
+  }
+  function closeJumpModal(): void {
+    jumpModal.classList.remove('open');
+    setTimeout(() => jumpModal.classList.add('hidden'), 160);
+  }
+  function openJumpTargetModal(): void {
+    jumpTargetModal.classList.remove('hidden');
+    requestAnimationFrame(() => jumpTargetModal.classList.add('open'));
+  }
+  function closeJumpTargetModal(): void {
+    jumpTargetModal.classList.remove('open');
+    setTimeout(() => jumpTargetModal.classList.add('hidden'), 160);
+  }
+
+  /** 渲染目标主机列表（按草稿顺序平铺） */
+  function renderJumpTargets(): void {
+    const targets = jumpDraft?.targets ?? [];
+    jumpTargetList.innerHTML = '';
+    if (!targets.length) {
+      jumpTargetList.innerHTML = '<div class="jump-empty">尚未添加目标主机</div>';
+      return;
+    }
+    for (const t of targets) {
+      const s = t.server;
+      const row = document.createElement('div');
+      row.className = 'jump-target-row';
+      row.innerHTML =
+        '<span class="jump-target-info">' +
+          '<span class="jump-target-name" title="' + esc(s.name) + '">' + esc(s.name) + '</span>' +
+          '<span class="jump-target-addr mono">' + esc(s.host) + ':' + esc(s.port) + ' · ' + esc(s.username || '未设账号') + '</span>' +
+        '</span>' +
+        '<button class="icon-btn" data-act="edit" title="编辑目标主机" aria-label="编辑目标主机">' + icon('pencil') + '</button>' +
+        '<button class="icon-btn" data-act="del" title="删除目标主机" aria-label="删除目标主机">' + icon('trash') + '</button>';
+      (row.querySelector('[data-act="edit"]') as HTMLButtonElement).onclick = () => openTargetEditModal(t.server);
+      (row.querySelector('[data-act="del"]') as HTMLButtonElement).onclick = () => {
+        if (!jumpDraft) return;
+        jumpDraft.targets = jumpDraft.targets.filter((x) => x.server.id !== s.id);
+        renderJumpTargets();
+      };
+      jumpTargetList.appendChild(row);
+    }
+  }
+
+  /** 目标主机弹窗（新增/编辑共用一个 server-form；密码留空 = 不写入 keyring） */
+  function openTargetEditModal(target: Server | null): void {
+    editingTarget = target;
+    jumpTargetTitle.textContent = target ? '编辑目标主机' : '添加目标主机';
+    jumpTargetForm.fill(target);
+    openJumpTargetModal();
+    jumpTargetForm.focusFirst();
+  }
+  function saveJumpTarget(): void {
+    const err = jumpTargetForm.validate();
+    if (err) {
+      toast(err, 'error');
+      return;
+    }
+    if (!jumpDraft) return;
+    const target = editingTarget; // 局部快照：跨函数赋值的 let 不做窄化
+    const srv = jumpTargetForm.buildServer(target);
+    const password = jumpTargetForm.passwordValue();
+    if (target) {
+      const slot = jumpDraft.targets.find((t) => t.server.id === target.id);
+      if (slot) {
+        slot.server = srv; // buildServer 保留 id / locked / isBastion / bastionId
+        slot.password = password;
+      } else {
+        jumpDraft.targets.push({ server: srv, password });
+      }
+    } else {
+      jumpDraft.targets.push({ server: srv, password });
+    }
+    closeJumpTargetModal();
+    renderJumpTargets();
+  }
+  jumpTargetModal.querySelector('#jump-target-modal-close')!.addEventListener('click', closeJumpTargetModal);
+  jumpTargetModal.querySelector('#jump-target-cancel')!.addEventListener('click', closeJumpTargetModal);
+  jumpTargetModal.querySelector('#jump-target-save')!.addEventListener('click', saveJumpTarget);
+  jumpTargetModal.addEventListener('mousedown', (e) => { if (e.target === jumpTargetModal) closeJumpTargetModal(); });
+
+  /** 侧栏列表「SSH跳转」入口：新建堡垒机（含堡垒机服务器表单 + 目标主机列表） */
+  function openJumpCreate(): void {
+    jumpDraft = { mode: 'create', toggle: true, targets: [] };
+    jumpEditServer = null;
+    jumpOriginalIds = new Set();
+    jumpTitle.textContent = 'SSH跳转设置';
+    jumpSaveBtn.classList.remove('hidden');
+    jumpCancelBtn.textContent = '取消';
+    jumpToggleRow.classList.remove('hidden');
+    jumpTargetBanner.classList.add('hidden');
+    jumpBastionWrap.classList.remove('hidden');
+    jumpTargetsWrap.classList.remove('hidden');
+    jumpToggle.checked = true;
+    jumpBastionForm.fill(null); // 每次打开重置表单（密码/密钥路径不留上次输入）
+    renderJumpTargets();
+    openJumpModal();
+    jumpBastionForm.focusFirst();
+  }
+
+  /** 卡片「更多 → SSH跳转设置」：编辑该服务器的堡垒机配置与目标主机 */
+  async function openJumpEdit(server: Server): Promise<void> {
+    jumpEditServer = server;
+    jumpDraft = { mode: 'edit', toggle: server.isBastion, targets: [] };
+    jumpTitle.textContent = `SSH跳转设置 · ${server.name}`;
+    jumpBastionWrap.classList.add('hidden');
+    jumpSaveBtn.classList.remove('hidden');
+    jumpCancelBtn.textContent = '取消';
+    const state = await getState().catch(() => null);
+    const all = state?.servers ?? [];
+    if (server.bastionId) {
+      // 目标主机：只读展示归属，不做任何编辑
+      const bastion = all.find((s) => s.id === server.bastionId);
+      jumpTargetBanner.classList.remove('hidden');
+      jumpTargetBanner.innerHTML = `${icon('link')} 该服务器是堡垒机「${esc(bastion?.name ?? '已删除')}」的目标主机，SSH/SFTP 连接经堡垒机代理转发。要调整归属请编辑堡垒机的「SSH跳转设置」。`;
+      jumpToggleRow.classList.add('hidden');
+      jumpTargetsWrap.classList.add('hidden');
+      jumpSaveBtn.classList.add('hidden');
+      jumpCancelBtn.textContent = '关闭';
+    } else {
+      jumpTargetBanner.classList.add('hidden');
+      jumpToggleRow.classList.remove('hidden');
+      jumpTargetsWrap.classList.remove('hidden');
+      jumpToggle.checked = server.isBastion;
+      jumpDraft.toggle = server.isBastion;
+      const targets = all.filter((s) => s.bastionId === server.id);
+      jumpOriginalIds = new Set(targets.map((s) => s.id));
+      jumpDraft.targets = targets.map((s) => ({ server: s, password: null }));
+      renderJumpTargets();
+    }
+    openJumpModal();
+  }
+
+  jumpToggle.addEventListener('change', () => {
+    if (jumpDraft) {
+      jumpDraft.toggle = jumpToggle.checked;
+      jumpTargetsWrap.classList.toggle('hidden', !jumpToggle.checked);
+    }
+  });
+  jumpModal.querySelector('#jump-modal-close')!.addEventListener('click', closeJumpModal);
+  jumpModal.querySelector('#jump-modal-cancel')!.addEventListener('click', closeJumpModal);
+  jumpModal.querySelector('#jump-target-add')!.addEventListener('click', () => openTargetEditModal(null));
+  jumpModal.addEventListener('mousedown', (e) => { if (e.target === jumpModal) closeJumpModal(); });
+
+  /** 把新创建的服务器绑定到当前项目（与「新建服务器」同语义：侧栏列表只展示项目绑定服务器）。
+   *  先拉后端最新 project 再合并：Workbench.state.project 是挂载时的内存快照，
+   *  若期间其他页面（欢迎页）删除过服务器，直接用旧快照全量 upsertProject 会把已删除的
+   *  绑定幽灵 id 写回配置文件。 */
+  async function bindToProject(ids: string[]): Promise<void> {
+    const project = Workbench.state.project;
+    if (!project) return;
+    let latest = project;
+    try {
+      const state = await getState();
+      latest = state.projects.find((p) => p.id === project.id) ?? project;
+    } catch {
+      /* 后端未就绪时退化为内存快照 */
+    }
+    const added = ids.filter((id) => !latest.serverIds.includes(id));
+    if (!added.length) return;
+    latest.serverIds.push(...added);
+    try {
+      await upsertProject(latest);
+      project.serverIds = latest.serverIds; // 同步内存单例，避免下次绑定再次覆盖
+    } catch {
+      /* 绑定失败不阻断保存（服务器本体已落盘） */
+    }
+  }
+
+  async function saveJump(): Promise<void> {
+    const draft = jumpDraft;
+    if (!draft) return;
+    try {
+      if (draft.mode === 'create') {
+        const err = jumpBastionForm.validate();
+        if (err) {
+          toast(err, 'error');
+          return;
+        }
+        const bastion = jumpBastionForm.buildServer(null);
+        bastion.isBastion = draft.toggle;
+        // 先建堡垒机，再建目标主机（目标引用堡垒机 id，必须先存在）
+        await upsertServer(bastion, jumpBastionForm.passwordValue());
+        if (draft.toggle) {
+          for (const t of draft.targets) {
+            t.server.bastionId = bastion.id;
+            await upsertServer(t.server, t.password);
+          }
+        }
+        await bindToProject([bastion.id, ...draft.targets.map((t) => t.server.id)]);
+      } else {
+        const server = jumpEditServer;
+        if (!server || server.bastionId) return; // 目标主机只读态没有保存按钮
+        if (!draft.toggle && server.isBastion) {
+          // 关闭堡垒机：目标主机解除绑定恢复为普通服务器（非删除）
+          const ok = await confirmDialog({
+            title: '关闭堡垒机',
+            message: `关闭堡垒机后将解除 ${draft.targets.length} 台目标主机的绑定，恢复为普通服务器（连接将不再经堡垒机代理）。确定继续吗？`,
+            danger: true,
+            okText: '解除绑定',
+          });
+          if (!ok) {
+            jumpToggle.checked = true;
+            draft.toggle = true;
+            return;
+          }
+          await upsertServer({ ...server, isBastion: false }, null);
+          for (const t of draft.targets) {
+            await upsertServer({ ...t.server, bastionId: null }, null);
+          }
+          // 关闭开关时同样删除被移除的目标主机（否则残留引用已关闭堡垒机的非法绑定）
+          for (const id of jumpOriginalIds) {
+            if (!draft.targets.some((t) => t.server.id === id)) {
+              await deleteServer(id);
+            }
+          }
+        } else {
+          if (draft.toggle !== server.isBastion) {
+            await upsertServer({ ...server, isBastion: draft.toggle }, null);
+          }
+          for (const t of draft.targets) {
+            if (!jumpOriginalIds.has(t.server.id)) {
+              t.server.bastionId = server.id; // 自动绑定到堡垒机
+            }
+            await upsertServer(t.server, t.password);
+          }
+          for (const id of jumpOriginalIds) {
+            if (!draft.targets.some((t) => t.server.id === id)) {
+              await deleteServer(id);
+            }
+          }
+          await bindToProject(draft.targets.filter((t) => !jumpOriginalIds.has(t.server.id)).map((t) => t.server.id));
+        }
+      }
+    } catch (err) {
+      toast(`保存SSH跳转设置失败: ${String(err)}`, 'error');
+      return;
+    }
+    closeJumpModal();
+    bus.emit('project-changed');
+    toast('SSH跳转设置已保存', 'success');
+  }
+  jumpModal.querySelector('#jump-modal-save')!.addEventListener('click', () => { void saveJump(); });
 
   /** 把服务器/本地终端引用加入 AI 输入框（@remote:服务器名称 / @local 标签，见 core.ts AiHandle.addServerRef） */
   function addRefToChat(ref: { serverId: string | null; name: string }): void {
@@ -198,7 +540,12 @@ export function mountServersPanel(container: HTMLElement): void {
     newBtn.innerHTML = `${icon('plus')} 新建`;
     newBtn.title = '新建服务器连接并绑定到当前项目';
     newBtn.onclick = openModal;
-    headActions.append(newBtn);
+    const jumpBtn = document.createElement('button');
+    jumpBtn.className = 'btn small';
+    jumpBtn.innerHTML = `${icon('link')} SSH跳转`;
+    jumpBtn.title = '新建 SSH 跳转（堡垒机 + 目标主机）';
+    jumpBtn.onclick = openJumpCreate;
+    headActions.append(newBtn, jumpBtn);
     head.append(headTitle, headActions);
 
     const list = document.createElement('div');
@@ -234,6 +581,12 @@ export function mountServersPanel(container: HTMLElement): void {
       const lockTitle = s.locked
         ? 'AI 远程操作已锁定，点击解锁（手动 SSH/SFTP 不受影响）'
         : 'AI 远程操作未锁定，点击锁定（手动 SSH/SFTP 不受影响）';
+      // 堡垒机 / 目标主机标签：堡垒机卡显示「堡垒机」，目标主机卡显示「堡垒机:名称」（名称取全量 servers 映射）
+      const bastionTags = s.isBastion
+        ? '<span class="tag purple">' + icon('server') + ' 堡垒机</span>'
+        : s.bastionId
+          ? '<span class="tag purple">' + icon('link') + ' 堡垒机:' + esc(byId.get(s.bastionId)?.name ?? '已删除') + '</span>'
+          : '';
       card.innerHTML =
         '<div class="wbs-server-top">' +
           '<span class="wbs-server-icon">' + icon('server') + '</span>' +
@@ -248,15 +601,16 @@ export function mountServersPanel(container: HTMLElement): void {
             icon(s.locked ? 'lock' : 'unlock') +
           '</button>' +
         '</div>' +
-        // 认证 tag 独立一行，避免与右上角 AI 锁按钮挤在一起
+        // 认证 / 堡垒机标签独立一行，避免与右上角按钮挤在一起
         '<div class="wbs-server-tags">' +
           '<span class="tag">' + (s.authType === 'key' ? icon('key') + ' 密钥' : '密码') + '</span>' +
+          bastionTags +
         '</div>' +
         '<div class="wbs-server-actions">' +
           '<button class="icon-btn wbs-chat" title="添加到对话" aria-label="添加到对话">' + icon('chatPlus') + '</button>' +
-          '<button class="icon-btn wbs-db" title="数据库连接（AI 受管查询）" aria-label="数据库连接">' + icon('database') + '</button>' +
           '<button class="icon-btn wbs-ssh" title="SSH 连接" aria-label="SSH 连接">' + icon('terminal') + '</button>' +
           '<button class="icon-btn wbs-sftp" title="SFTP 文件管理" aria-label="SFTP 文件管理">' + icon('folder') + '</button>' +
+          '<button class="icon-btn wbs-more" title="更多操作" aria-label="更多操作">' + icon('more') + '</button>' +
         '</div>';
       (card.querySelector('.wbs-chat') as HTMLButtonElement).onclick = (e) => {
         e.stopPropagation();
@@ -297,14 +651,19 @@ export function mountServersPanel(container: HTMLElement): void {
           data: { serverId: s.id },
         });
       };
-      (card.querySelector('.wbs-db') as HTMLButtonElement).onclick = (e) => {
+      /* 「更多」下拉菜单：数据库连接 / SSH跳转设置（非常用操作收纳进下拉，避免卡片操作区拥挤） */
+      (card.querySelector('.wbs-more') as HTMLButtonElement).onclick = (e) => {
         e.stopPropagation();
-        openDbConnectionsModal(s);
+        showContextMenu(e.clientX, e.clientY, [
+          { label: '数据库连接', iconName: 'database', action: () => openDbConnectionsModal(s) },
+          { label: 'SSH跳转设置', iconName: 'link', action: () => void openJumpEdit(s) },
+        ]);
       };
       return card;
     };
 
     // 平铺列表展示（服务器不再按目录分组）
+    const byId = new Map(servers.map((sv) => [sv.id, sv]));
     filtered.forEach((s) => list.appendChild(buildCard(s)));
   };
 

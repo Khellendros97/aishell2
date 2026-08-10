@@ -141,6 +141,9 @@ export function createServerForm(container: HTMLElement, opts: ServerFormOptions
         username: fUsername.value.trim(),
         keyPath: authType === 'key' ? fKeyPath.value.trim() : '',
         locked: editing?.locked ?? false,
+        // 堡垒机字段不在表单里：编辑时原样保留（目标主机经 SSH跳转设置绑定）
+        isBastion: editing?.isBastion ?? false,
+        bastionId: editing?.bastionId ?? null,
       };
     },
     passwordValue(): string | null {

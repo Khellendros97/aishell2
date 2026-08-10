@@ -204,6 +204,7 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 .tag.blue { background: var(--accent-dim); color: var(--accent-hover); }
 .tag.red { background: var(--red-dim); color: var(--red); }
 .tag.yellow { background: var(--yellow-dim); color: var(--yellow); }
+.tag.purple { background: rgba(182, 135, 232, 0.14); color: var(--purple); }
 
 /* ---------- 右键菜单（共享，explorer / 编辑器通用） ---------- */
 .ctx-menu {

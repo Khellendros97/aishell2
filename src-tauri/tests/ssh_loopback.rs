@@ -17,6 +17,7 @@ use aishell_lib::ssh::SshManager;
 use aishell_lib::store::{AuthType, Server, Store};
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelMsg};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 /// 测试专用 host key（Ed25519，无短语；仅供进程内测试 server 使用）。
@@ -193,6 +194,8 @@ async fn shell_echo_roundtrip() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: false,
+            is_bastion: false,
+            bastion_id: None,
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -279,6 +282,8 @@ async fn remote_exec_roundtrip() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: false,
+            is_bastion: false,
+            bastion_id: None,
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -344,6 +349,8 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             username: "test".to_string(),
             key_path: String::new(),
             locked: true,
+            is_bastion: false,
+            bastion_id: None,
         };
         store
             .upsert_server(server.clone(), None)
@@ -453,4 +460,215 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
 
     let (server_res, ()) = tokio::join!(running, test_body);
     server_res.expect("echo server 异常退出");
+}
+
+/// 转发跳板：接受 direct-tcpip 通道并把字节双向桥接到目标 TCP（等价真实 sshd 的 -J 转发）。
+/// 客户端 → 目标：`data()` 处理器写 TCP；目标 → 客户端：后台泵任务读 TCP 写 SSH channel。
+#[derive(Clone, Default)]
+struct ForwardBastion;
+
+impl russh::server::Server for ForwardBastion {
+    type Handler = ForwardSession;
+
+    fn new_client(&mut self, _peer_addr: Option<SocketAddr>) -> Self::Handler {
+        ForwardSession::default()
+    }
+}
+
+/// channel → 已连通目标 TCP 的写半（读半由泵任务持有）。
+#[derive(Default)]
+struct ForwardSession {
+    targets: std::collections::HashMap<ChannelId, tokio::net::tcp::OwnedWriteHalf>,
+}
+
+impl russh::server::Handler for ForwardSession {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if user == "test" && password == "test" {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        }
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::server::ChannelOpenHandle,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let id = channel.id();
+        // 连不通被转发目标 → 拒通道（客户端拿到 Connect failed 而非挂起）
+        let stream =
+            match tokio::net::TcpStream::connect((host_to_connect, port_to_connect as u16)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    reply
+                        .reject(russh::ChannelOpenFailure::Other {
+                            code: 5,
+                            reason: format!("forward connect failed: {e}"),
+                        })
+                        .await;
+                    return Ok(());
+                }
+            };
+        reply.accept().await;
+        let (mut read, write) = stream.into_split();
+        self.targets.insert(id, write);
+        // 泵：目标 TCP → SSH channel；EOF/出错时关通道
+        let handle = session.handle();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if handle.data(id, buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = handle.eof(id).await;
+            let _ = handle.close(id).await;
+        });
+        Ok(())
+    }
+
+    /// 客户端 → 目标：把数据写到对应 channel 的 TCP 写半
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(w) = self.targets.get_mut(&channel) {
+            let _ = w.write_all(data).await;
+        }
+        Ok(())
+    }
+}
+
+/// 跳板端到端集成测试：目标主机（echo server）经堡垒机（ForwardBastion 转发 direct-tcpip）
+/// 完成 SSH 握手、认证与 exec 往返。走 `get_or_connect_with_password`（doc hidden 测试接缝，
+/// 两段认证都用覆盖密码，不触碰真实 keyring）。断言：
+/// - 隧道打通后目标 exec 往返正常，连接按目标 serverId 入池可复用；
+/// - 断开目标后重建隧道成功（堡垒机连接仍在池中可复用）。
+#[tokio::test]
+async fn jump_target_exec_roundtrip_via_bastion() {
+    // 目标机：echo server（隧道的尽头）
+    let target_socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定目标机监听失败");
+    let target_addr = target_socket.local_addr().expect("取目标机地址失败");
+    let config = Arc::new(russh::server::Config {
+        keys: vec![
+            russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM.as_bytes())
+                .expect("解析测试 host key 失败"),
+        ],
+        ..Default::default()
+    });
+    let mut target_server = EchoServer;
+    let target_running = target_server.run_on_socket(Arc::clone(&config), &target_socket);
+    let target_shutdown = target_running.handle();
+
+    // 堡垒机：转发跳板
+    let bastion_socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定堡垒机监听失败");
+    let bastion_addr = bastion_socket.local_addr().expect("取堡垒机地址失败");
+    let mut bastion_server = ForwardBastion;
+    let bastion_running = bastion_server.run_on_socket(config, &bastion_socket);
+    let bastion_shutdown = bastion_running.handle();
+
+    let test_body = async {
+        let config_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-jump-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let ssh = Arc::new(SshManager::new(Arc::clone(&store)));
+
+        // 堡垒机 + 目标主机登记进 Store（走正式 upsert_server 校验；None = 不触碰 keyring）
+        store
+            .upsert_server(
+                Server {
+                    id: "bastion".to_string(),
+                    name: "测试堡垒机".to_string(),
+                    host: bastion_addr.ip().to_string(),
+                    port: bastion_addr.port(),
+                    auth_type: AuthType::Password,
+                    username: "test".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                    is_bastion: true,
+                    bastion_id: None,
+                },
+                None,
+            )
+            .expect("登记堡垒机应成功");
+        store
+            .upsert_server(
+                Server {
+                    id: "target".to_string(),
+                    name: "目标机".to_string(),
+                    host: target_addr.ip().to_string(),
+                    port: target_addr.port(),
+                    auth_type: AuthType::Password,
+                    username: "test".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                    is_bastion: false,
+                    bastion_id: Some("bastion".to_string()),
+                },
+                None,
+            )
+            .expect("登记目标主机应成功");
+
+        // 经跳板连接目标主机（两段认证都用覆盖密码 "test"）
+        ssh.get_or_connect_with_password("target", "test")
+            .await
+            .expect("经堡垒机连接目标主机应成功");
+
+        // 复用入池连接 exec
+        let exec = ssh
+            .exec("target", "printf jump-ok")
+            .await
+            .expect("经跳板 exec 应成功");
+        assert_eq!(exec.stdout, "jump-ok", "stdout 应为目标机命令输出");
+        assert_eq!(exec.exit_code, Some(0), "退出码应为 0");
+
+        // open_sftp 同样经跳板（目标 echo server 回复 SFTP 版本握手）
+        let _sftp = ssh
+            .open_sftp("target")
+            .await
+            .expect("经跳板 open_sftp 应成功");
+
+        // 断开目标主机后，堡垒机连接仍在池中（跳板复用）；再连目标会重建隧道
+        ssh.disconnect("target").await;
+        ssh.get_or_connect_with_password("target", "test")
+            .await
+            .expect("跳板断开后重建应成功");
+
+        ssh.disconnect("target").await;
+        ssh.disconnect("bastion").await;
+        target_shutdown.shutdown("target done".into());
+        bastion_shutdown.shutdown("bastion done".into());
+    };
+
+    let (t_res, b_res, ()) = tokio::join!(target_running, bastion_running, test_body);
+    t_res.expect("目标 echo server 异常退出");
+    b_res.expect("堡垒机转发 server 异常退出");
 }

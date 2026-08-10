@@ -63,3 +63,32 @@
 .db-cmd:hover { background: var(--bg-hover, rgba(128,128,128,.12)); }
 .db-cmd input { accent-color: var(--accent, #4a9eff); margin: 0; }
 .db-cmds-grid.write .db-cmd input { accent-color: var(--red, #e5534b); }
+
+/* ---------- SSH跳转设置弹窗（堡垒机开关 + 目标主机列表） ---------- */
+.jump-modal { width: 600px; }
+.jump-section { margin-top: 14px; }
+.jump-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.jump-section-title { font-size: 12px; font-weight: 600; color: var(--text-1); }
+.jump-hint { font-size: 11px; color: var(--text-2); margin: 2px 0 8px; line-height: 1.5; }
+.jump-toggle-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-m); background: var(--bg-2); }
+.jump-toggle-text { flex: 1; min-width: 0; }
+.jump-toggle-title { font-size: 12.5px; font-weight: 600; color: var(--text-0); }
+.jump-toggle-hint { font-size: 11px; color: var(--text-2); margin-top: 2px; }
+/* 堡垒机开关（与 db-switch 同款滑块） */
+.jump-switch { position: relative; width: 34px; height: 19px; flex: none; cursor: pointer; }
+.jump-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.jump-switch-slider { position: absolute; inset: 0; background: var(--bg-3); border: 1px solid var(--border); border-radius: 10px; transition: background .12s, border-color .12s; }
+.jump-switch-slider::after { content: ''; position: absolute; left: 1px; top: 1px; width: 15px; height: 15px; border-radius: 50%; background: var(--text-3); transition: transform .12s, background .12s; }
+.jump-switch input:checked + .jump-switch-slider { background: var(--accent-dim); border-color: var(--accent); }
+.jump-switch input:checked + .jump-switch-slider::after { transform: translateX(15px); background: var(--accent); }
+.jump-target-banner { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-m); background: var(--bg-2); font-size: 12px; color: var(--text-1); line-height: 1.6; }
+.jump-target-banner svg { flex: none; margin-top: 1px; color: var(--accent); }
+/* 目标主机列表 */
+#jump-target-list { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.jump-target-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-s); }
+.jump-target-row:hover { background: var(--bg-2); }
+.jump-target-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.jump-target-name { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jump-target-addr { font-size: 11.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jump-target-row .icon-btn { width: 26px; height: 26px; font-size: 14px; flex: none; }
+.jump-empty { color: var(--text-3); font-size: 12px; padding: 10px 4px; }

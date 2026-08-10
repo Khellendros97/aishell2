@@ -42,6 +42,10 @@ export interface Server {
   keyPath: string;
   /** AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP */
   locked: boolean;
+  /** 堡垒机开关：true = 本服务器作为跳板机，目标主机的 SSH/SFTP 连接经它转发；卡片打「堡垒机」标签 */
+  isBastion: boolean;
+  /** 所属堡垒机 id：非空 = 目标主机，连接时先连堡垒机再经其转发；卡片打「堡垒机:名称」标签 */
+  bastionId: string | null;
 }
 
 export interface QuickCommand {

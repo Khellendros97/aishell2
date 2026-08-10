@@ -615,6 +615,8 @@ mod tests {
                     username: "root".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
@@ -696,6 +698,8 @@ mod tests {
                     username: "root".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
@@ -711,6 +715,8 @@ mod tests {
                     username: "ubuntu".to_string(),
                     key_path: "C:\\key".to_string(),
                     locked: true,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
@@ -727,6 +733,8 @@ mod tests {
                     username: "u".to_string(),
                     key_path: String::new(),
                     locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
                 },
                 None,
             )
