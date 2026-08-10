@@ -16,7 +16,7 @@
  * - 加载失败：toast 错误原文 + 面板内错误条与「重试」
  */
 import './sftp.css';
-import type { FsEntry, FsStat, SshExecResult } from '../../types';
+import type { FsEntry, FsStat, SftpFavorite, SshExecResult } from '../../types';
 import {
   fsDelete, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
   sftpHome, sftpList, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec,
@@ -103,8 +103,8 @@ const sftpTabs = new Map<string, SftpTabState>();
 const HISTORY_MAX = 10;
 /** serverId → MRU 路径（最新在前）；首次需要时从 getState 播种，每 serverId 一次 */
 const historyByServer = new Map<string, string[]>();
-/** serverId → 收藏路径（按添加顺序） */
-const favoritesByServer = new Map<string, string[]>();
+/** serverId → 收藏条目（path + 标题，按添加顺序） */
+const favoritesByServer = new Map<string, SftpFavorite[]>();
 const seededHistory = new Set<string>();
 const seededFavorites = new Set<string>();
 /** 防抖落盘定时器 + 待写集合（多个服务器并发变更也不丢） */
@@ -130,7 +130,7 @@ function seedHistory(serverId: string): void {
     .catch(() => { /* 播种失败静默：本次会话历史从空开始，不影响其他功能 */ });
 }
 
-/** 播种某服务器的收藏夹：与本地合并（磁盘补进本地未有条目，保持本地顺序在前），语义同 seedHistory */
+/** 播种某服务器的收藏夹：与本地合并（磁盘补进本地未有条目，按 path 去重，保持本地顺序在前），语义同 seedHistory */
 function seedFavorites(serverId: string): void {
   if (seededFavorites.has(serverId)) return;
   seededFavorites.add(serverId);
@@ -140,7 +140,7 @@ function seedFavorites(serverId: string): void {
       if (!disk || disk.length === 0) return;
       const local = favoritesByServer.get(serverId) ?? [];
       const merged = local.slice();
-      for (const p of disk) if (!merged.includes(p)) merged.push(p);
+      for (const f of disk) if (!merged.some((m) => m.path === f.path)) merged.push(f);
       favoritesByServer.set(serverId, merged);
       sftpTabs.forEach((st) => { if (st.serverId === serverId) renderView(st); });
     })
@@ -152,7 +152,7 @@ function getHistory(serverId: string): string[] {
   return historyByServer.get(serverId) ?? [];
 }
 
-function getFavorites(serverId: string): string[] {
+function getFavorites(serverId: string): SftpFavorite[] {
   seedFavorites(serverId);
   return favoritesByServer.get(serverId) ?? [];
 }
@@ -1111,19 +1111,36 @@ function basenameOf(path: string): string {
   return path === '/' ? '/' : path.slice(path.lastIndexOf('/') + 1);
 }
 
-/** 星按钮：收藏 / 取消收藏当前路径，按钮态即时更新，防抖落盘 */
+/** 星按钮：收藏 / 取消收藏当前路径。收藏时先弹窗让用户编辑标题（默认目录名称），
+ *  防同名目录（如多台服务器的 etc/log）在收藏夹里无法区分；取消收藏不变。 */
 function toggleFavorite(st: SftpTabState): void {
   const list = getFavorites(st.serverId);
-  const idx = list.indexOf(st.cwd);
-  const next = idx >= 0 ? list.filter((p) => p !== st.cwd) : [...list, st.cwd];
-  favoritesByServer.set(st.serverId, next);
-  scheduleFavoritesSave(st.serverId);
-  renderView(st); // 星按钮态 + 侧边栏列表（开着时）一并刷新
+  if (list.some((f) => f.path === st.cwd)) {
+    // 已收藏 → 取消
+    favoritesByServer.set(st.serverId, list.filter((f) => f.path !== st.cwd));
+    scheduleFavoritesSave(st.serverId);
+    renderView(st);
+    return;
+  }
+  // 未收藏 → 弹窗编辑标题；取消则不收藏
+  void promptDialog({
+    title: '收藏目录',
+    label: `标题（默认取目录名称，可自定义以区分同名目录）· 路径：${st.cwd}`,
+    defaultValue: basenameOf(st.cwd),
+    okText: '收藏',
+    allowPath: true,
+  }).then((title) => {
+    if (title === null) return;
+    const t = title.trim() || basenameOf(st.cwd);
+    favoritesByServer.set(st.serverId, [...getFavorites(st.serverId), { path: st.cwd, title: t }]);
+    scheduleFavoritesSave(st.serverId);
+    renderView(st); // 星按钮态 + 侧边栏列表（开着时）一并刷新
+  });
 }
 
 /** 侧边栏 ✕：从收藏夹移除指定路径 */
 function removeFavorite(st: SftpTabState, path: string): void {
-  favoritesByServer.set(st.serverId, getFavorites(st.serverId).filter((p) => p !== path));
+  favoritesByServer.set(st.serverId, getFavorites(st.serverId).filter((f) => f.path !== path));
   scheduleFavoritesSave(st.serverId);
   renderView(st);
 }
@@ -1158,14 +1175,19 @@ function renderFavList(st: SftpTabState): void {
   }
   const ul = document.createElement('div');
   ul.className = 'sf-fav-list';
-  list.forEach((path) => {
+  list.forEach((fav) => {
+    const { path, title } = fav;
     const item = document.createElement('div');
     item.className = 'sf-fav-item' + (path === st.cwd ? ' current' : '');
     item.title = path; // 悬浮提示完整路径
-    const name = document.createElement('span');
-    name.className = 'nm';
-    name.textContent = basenameOf(path);
-    item.appendChild(name);
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = title;
+    item.appendChild(nm);
+    const sub = document.createElement('span');
+    sub.className = 'sub';
+    sub.textContent = path;
+    item.appendChild(sub);
     const rm = document.createElement('button');
     rm.className = 'icon-btn sf-fav-rm';
     rm.innerHTML = icon('x');
@@ -1516,7 +1538,7 @@ function renderView(st: SftpTabState): void {
   st.els.searchInput.classList.toggle('sf-search-open', st.searchOpen);
   st.els.favBtn.classList.toggle('active', st.favOpen);
   st.els.favPanel.hidden = !st.favOpen;
-  const isFav = getFavorites(st.serverId).includes(st.cwd);
+  const isFav = getFavorites(st.serverId).some((f) => f.path === st.cwd);
   st.els.starBtn.classList.toggle('active', isFav);
   st.els.starBtn.title = isFav ? '取消收藏' : '收藏当前路径';
   if (st.favOpen) renderFavList(st);

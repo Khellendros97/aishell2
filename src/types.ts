@@ -150,8 +150,8 @@ export interface AppState {
   uiExpanded: Record<string, string[]>;
   /** SFTP 路径历史：serverId → MRU 路径列表（最新在前，最多 10 条）；旧配置无此字段为空对象 */
   sftpHistory: Record<string, string[]>;
-  /** SFTP 收藏夹：serverId → 收藏路径列表（按添加顺序）；旧配置无此字段为空对象 */
-  sftpFavorites: Record<string, string[]>;
+  /** SFTP 收藏夹：serverId → 收藏条目（路径 + 标题，按添加顺序）；旧配置为纯路径数组，读取时自动迁移 */
+  sftpFavorites: Record<string, SftpFavorite[]>;
   /** 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表；旧配置无此字段为空对象 */
   dbConnections: Record<string, DbConnection[]>;
 }
@@ -202,6 +202,13 @@ export interface DbConnection {
   database: string;
   allowedCommands: string[];
   enabled: boolean;
+}
+
+/** SFTP 收藏条目 —— 与 store.rs SftpFavorite serde camelCase 对齐。
+ *  title 为收藏时用户编辑的显示标题（默认取目录名称），列表按标题展示以区分同名目录（如多台服务器的 etc/log）。 */
+export interface SftpFavorite {
+  path: string;
+  title: string;
 }
 
 /** ssh_exec 直执结果 —— 与 ssh.rs SshExecResult serde camelCase 对齐。

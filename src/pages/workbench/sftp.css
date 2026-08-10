@@ -26,7 +26,9 @@
 .sf-fav-item { display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: var(--radius-m); cursor: pointer; font-size: 12px; color: var(--text-1); }
 .sf-fav-item:hover { background: var(--bg-hover); }
 .sf-fav-item.current { color: var(--accent); }
-.sf-fav-item .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-fav-item .nm { flex: 0 1 auto; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.sf-fav-item .sub { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-3); }
+.sf-fav-item.current .sub { color: var(--accent-dim, var(--text-3)); }
 .sf-fav-item .sf-fav-rm { flex: none; width: 18px; height: 18px; font-size: 11px; opacity: 0; }
 .sf-fav-item:hover .sf-fav-rm { opacity: 1; }
 .sf-fav .empty-state { padding: 24px 8px; gap: 6px; }

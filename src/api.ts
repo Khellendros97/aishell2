@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpWriteResult, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpFavorite, SftpWriteResult, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -47,9 +47,9 @@ export const setUiExpanded = (key: string, values: string[]) =>
 /** 写入某服务器的 SFTP 路径历史（MRU：最新在前，前端防抖后调用） */
 export const setSftpHistory = (serverId: string, paths: string[]) =>
   call<void>('set_sftp_history', { serverId, paths });
-/** 写入某服务器的 SFTP 收藏夹路径（按添加顺序，前端防抖后调用） */
-export const setSftpFavorites = (serverId: string, paths: string[]) =>
-  call<void>('set_sftp_favorites', { serverId, paths });
+/** 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序，前端防抖后调用） */
+export const setSftpFavorites = (serverId: string, favorites: SftpFavorite[]) =>
+  call<void>('set_sftp_favorites', { serverId, favorites });
 /** 清除全部服务器配置：清空服务器与分类目录、所有项目解绑、删除全部 keyring 密钥 */
 export const clearAllServers = () => call<void>('clear_all_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；

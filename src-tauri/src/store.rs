@@ -214,6 +214,47 @@ impl DbKind {
     }
 }
 
+/// SFTP 收藏条目：path 为完整远端路径，title 为收藏时用户编辑的显示标题（默认取目录名）。
+/// 列表按 title 展示以区分同名目录（如多台服务器的 etc/log）；点击跳转仍按 path。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpFavorite {
+    pub path: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// 收藏夹兼容反序列化：旧配置 `serverId -> string[]`（纯路径）→ 新结构 `{path, title}[]`，
+/// 旧条目的 title 取路径目录名（rsplit('/') 首个片段，根目录取空串由前端兜底显示）。
+fn de_sftp_favorites<'de, D>(d: D) -> Result<HashMap<String, Vec<SftpFavorite>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Legacy(String),
+        New(SftpFavorite),
+    }
+    let raw = HashMap::<String, Vec<Entry>>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let v = v
+                .into_iter()
+                .map(|e| match e {
+                    Entry::Legacy(p) => {
+                        let title = p.rsplit('/').next().unwrap_or("").to_string();
+                        SftpFavorite { path: p, title }
+                    }
+                    Entry::New(f) => f,
+                })
+                .collect();
+            (k, v)
+        })
+        .collect())
+}
+
 /// 服务器数据库连接配置（AI 受管查询通道）。
 /// **不含密码字段**——密码只存 keyring（account `db:<serverId>:<connId>`）。
 /// allowed_commands 为 AI 可用命令白名单（首词，大写，如 SELECT / GET / HGETALL）；
@@ -410,10 +451,10 @@ pub struct AppState {
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
     pub sftp_history: HashMap<String, Vec<String>>,
-    /// SFTP 收藏夹：serverId → 收藏路径列表（按添加顺序，由前端维护）。
-    /// 旧配置无此字段按空 map 解析。
-    #[serde(default)]
-    pub sftp_favorites: HashMap<String, Vec<String>>,
+    /// SFTP 收藏夹：serverId → 收藏条目（路径 + 标题，按添加顺序，由前端维护）。
+    /// 旧配置为纯路径数组（Vec<String>），读取时经 de_sftp_favorites 自动迁移（标题取目录名）。
+    #[serde(default, deserialize_with = "de_sftp_favorites")]
+    pub sftp_favorites: HashMap<String, Vec<SftpFavorite>>,
     /// 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表。密码在 keyring。
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
@@ -899,14 +940,18 @@ impl Store {
         })
     }
 
-    /// 写入某服务器的 SFTP 收藏夹路径（按添加顺序）。
+    /// 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序）。
     /// 前端防抖后调用，仅覆盖该 serverId 不影响其他服务器。一次 with_state 原子落盘。
-    pub fn set_sftp_favorites(&self, server_id: String, paths: Vec<String>) -> Result<(), String> {
+    pub fn set_sftp_favorites(
+        &self,
+        server_id: String,
+        favorites: Vec<SftpFavorite>,
+    ) -> Result<(), String> {
         if server_id.is_empty() {
             return Err("服务器 ID 不能为空".to_string());
         }
         self.with_state(|s| {
-            s.sftp_favorites.insert(server_id, paths);
+            s.sftp_favorites.insert(server_id, favorites);
             Ok(())
         })
     }
@@ -1455,9 +1500,9 @@ pub async fn set_sftp_history(
 pub async fn set_sftp_favorites(
     store: State<'_, Arc<Store>>,
     server_id: String,
-    paths: Vec<String>,
+    favorites: Vec<SftpFavorite>,
 ) -> Result<(), String> {
-    store.set_sftp_favorites(server_id, paths)
+    store.set_sftp_favorites(server_id, favorites)
 }
 
 #[tauri::command]
@@ -2420,27 +2465,42 @@ mod tests {
 
     #[test]
     fn set_sftp_favorites_persists_across_reload() {
-        // 写入后重载 store：收藏夹仍在，且不影响其他服务器
+        // 写入后重载 store：收藏夹仍在（含标题），且不影响其他服务器
         let dir = temp_config_dir("sftp-favorites-persist");
         let store = test_store(dir.clone());
         store
-            .set_sftp_favorites("srv-1".to_string(), vec!["/data".to_string(), "/backup".to_string()])
+            .set_sftp_favorites(
+                "srv-1".to_string(),
+                vec![
+                    SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() },
+                    SftpFavorite { path: "/backup".to_string(), title: "备份".to_string() },
+                ],
+            )
             .unwrap();
         // 空 serverId 拒绝
         assert!(store
-            .set_sftp_favorites(String::new(), vec!["/data".to_string()])
+            .set_sftp_favorites(
+                String::new(),
+                vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+            )
             .is_err());
         let reloaded = test_store(dir.clone());
         let guard = reloaded.state.lock().unwrap();
         assert_eq!(
             guard.sftp_favorites.get("srv-1").unwrap(),
-            &vec!["/data".to_string(), "/backup".to_string()],
-            "收藏路径按添加顺序保留"
+            &vec![
+                SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() },
+                SftpFavorite { path: "/backup".to_string(), title: "备份".to_string() },
+            ],
+            "收藏条目（含标题）按添加顺序保留"
         );
         // 覆盖写（取消收藏后列表变短）同样落盘
         drop(guard);
         store
-            .set_sftp_favorites("srv-1".to_string(), vec!["/data".to_string()])
+            .set_sftp_favorites(
+                "srv-1".to_string(),
+                vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+            )
             .unwrap();
         let reloaded2 = test_store(dir);
         assert_eq!(
@@ -2451,8 +2511,38 @@ mod tests {
                 .sftp_favorites
                 .get("srv-1")
                 .unwrap(),
-            &vec!["/data".to_string()],
+            &vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
             "覆盖写后落盘为新列表"
+        );
+    }
+
+    #[test]
+    fn legacy_sftp_favorites_strings_migrate_to_titled() {
+        // 旧配置 `sftpFavorites: {serverId: ["/data", "/etc/log"]}`（纯路径）→ 读取时自动迁移为 {path,title}，
+        // title 取目录名；新格式条目原样保留。
+        let dir = temp_config_dir("sftp-fav-legacy");
+        let state_path = dir.join("aishell.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = serde_json::to_value(sample_state()).unwrap();
+        state["sftpFavorites"] = serde_json::json!({
+            "srv-1": ["/data", "/etc/log"],
+            "srv-2": [{ "path": "/opt/app", "title": "核心应用" }],
+        });
+        std::fs::write(&state_path, serde_json::to_string(&state).unwrap()).unwrap();
+        let store = test_store(dir);
+        let guard = store.state.lock().unwrap();
+        assert_eq!(
+            guard.sftp_favorites.get("srv-1").unwrap(),
+            &vec![
+                SftpFavorite { path: "/data".to_string(), title: "data".to_string() },
+                SftpFavorite { path: "/etc/log".to_string(), title: "log".to_string() },
+            ],
+            "旧纯路径条目按目录名补标题"
+        );
+        assert_eq!(
+            guard.sftp_favorites.get("srv-2").unwrap(),
+            &vec![SftpFavorite { path: "/opt/app".to_string(), title: "核心应用".to_string() }],
+            "新格式条目原样保留"
         );
     }
 
