@@ -33,3 +33,33 @@
 /* 服务器搜索行：搜索框（持久元素，不随列表重建，避免输入焦点丢失） */
 .wbs-search { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
 .wbs-search .input { flex: 1; min-width: 0; }
+
+/* 数据库连接配置弹窗（AI 受管查询通道） */
+.db-conn-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
+.db-conn-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border, #333); border-radius: 8px; }
+.db-conn-item:hover { background: var(--bg-2, rgba(128,128,128,.08)); }
+.db-conn-item.disabled .db-conn-icon,
+.db-conn-item.disabled .db-conn-main { opacity: .45; }
+.db-conn-icon { color: var(--text-2, #888); flex: none; }
+.db-conn-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.db-conn-name { font-weight: 600; }
+.db-conn-addr { font-size: 11.5px; color: var(--text-2, #888); }
+.db-conn-cmds { font-size: 11px; color: var(--text-3, #666); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.db-conn-ops { display: flex; gap: 4px; flex: none; }
+.db-conn-empty { color: var(--text-3, #666); font-size: 12.5px; padding: 12px 4px; }
+/* 启用开关：禁用后 AI 不可见、db_query 拒绝 */
+.db-switch { position: relative; width: 30px; height: 17px; flex: none; cursor: pointer; }
+.db-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.db-switch-track { position: absolute; inset: 0; background: var(--bg-3, #3a3d46); border: 1px solid var(--border, #333); border-radius: 9px; transition: background .12s, border-color .12s; }
+.db-switch-track::after { content: ''; position: absolute; left: 1px; top: 1px; width: 13px; height: 13px; border-radius: 50%; background: var(--text-3, #888); transition: transform .12s, background .12s; }
+.db-switch input:checked + .db-switch-track { background: var(--accent-dim, rgba(74,158,255,.25)); border-color: var(--accent, #4a9eff); }
+.db-switch input:checked + .db-switch-track::after { transform: translateX(13px); background: var(--accent, #4a9eff); }
+/* 命令勾选区（表单）：只读/写两组 + 已保存自定义项 */
+.db-cmds-field { grid-column: 1 / -1; }
+.db-cmds { display: flex; flex-direction: column; gap: 10px; border: 1px solid var(--border, #333); border-radius: var(--radius-s, 6px); padding: 10px 12px; background: var(--bg-2, rgba(128,128,128,.06)); max-height: 220px; overflow-y: auto; }
+.db-cmds-title { font-size: 11px; color: var(--text-2, #888); margin-bottom: 2px; }
+.db-cmds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 1px 8px; }
+.db-cmd { display: flex; align-items: center; gap: 5px; font-family: var(--font-mono, var(--mono, Consolas, monospace)); font-size: 11.5px; color: var(--text-1, #ccc); cursor: pointer; padding: 2px 4px; border-radius: 4px; user-select: none; }
+.db-cmd:hover { background: var(--bg-hover, rgba(128,128,128,.12)); }
+.db-cmd input { accent-color: var(--accent, #4a9eff); margin: 0; }
+.db-cmds-grid.write .db-cmd input { accent-color: var(--red, #e5534b); }

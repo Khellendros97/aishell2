@@ -17,7 +17,7 @@ import { tags } from '@lezer/highlight';
 import { oneDarkTheme } from '@codemirror/theme-one-dark';
 import { search, SearchQuery, getSearchQuery, openSearchPanel, closeSearchPanel, searchPanelOpen, setSearchQuery, findNext, findPrevious, replaceNext, replaceAll } from '@codemirror/search';
 import type { Panel, ViewUpdate } from '@codemirror/view';
-import { fsRead, fsWrite, onFsChanged, sftpRead, sftpWrite } from '../../api';
+import { fsRead, fsWrite, onFsChanged, sftpRead, sftpStat, sftpWrite } from '../../api';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
 import { icon } from '../../icons';
 import type { IconName } from '../../icons';
@@ -77,6 +77,12 @@ interface EditorEntry {
   /** 程序化载入文档期间禁止标记脏 */
   loading: boolean;
   view: EditorView;
+  /** 远端文件打开时的 stat 快照（保存前与远端比对，检测外部修改）；无快照 = 不检测 */
+  remoteStat?: { size: number; mtime: number } | null;
+  /** 远端已被外部修改（未解决前自动保存静默跳过，Ctrl+S 弹窗处理） */
+  conflict: boolean;
+  /** 冲突弹窗防重入 */
+  conflictDialogOpen: boolean;
 }
 
 const entries = new Map<string, EditorEntry>();
@@ -90,7 +96,15 @@ function filePathKey(path: string): string {
 }
 
 /* ---------- 保存：防抖自动保存与 Ctrl+S / 关闭落盘共用，写盘串行化 ---------- */
-function queueSave(entry: EditorEntry, silent: boolean): Promise<void> {
+/** 远端写回冲突（外部已修改）：携带后端返回的远端当前属性 */
+class RemoteConflictError extends Error {
+  constructor(readonly actualSize: number | null, readonly actualMtime: number | null) {
+    super('远端文件已被外部修改');
+  }
+}
+
+/** explicit：Ctrl+S 显式保存（冲突时弹三选对话框）；自动保存/关闭时仅提示一次不打断 */
+function queueSave(entry: EditorEntry, silent: boolean, explicit = false): Promise<void> {
   clearTimeout(entry.timer);
   entry.timer = undefined;
   const path = String(entry.tab.data.path ?? '');
@@ -98,9 +112,23 @@ function queueSave(entry: EditorEntry, silent: boolean): Promise<void> {
   const remote = Boolean(sftp?.serverId && sftp.remotePath);
   const content = entry.view.state.doc.toString();
   const version = entry.version;
-  // 远端文件（SFTP 打开）保存走 sftp_write，否则本地 fs_write
+  // 远端文件（SFTP 打开）保存走 sftp_write（带打开时快照做外部修改冲突检测），否则本地 fs_write
   const run = remote
-    ? entry.chain.then(() => sftpWrite(sftp!.serverId!, sftp!.remotePath!, content))
+    ? entry.chain.then(async () => {
+        const res = await sftpWrite(
+          sftp!.serverId!, sftp!.remotePath!, content,
+          entry.remoteStat?.size, entry.remoteStat?.mtime,
+        );
+        if (res.conflict) {
+          entry.conflict = true;
+          throw new RemoteConflictError(res.actualSize ?? null, res.actualMtime ?? null);
+        }
+        // 写盘成功：以后端落盘后属性重建基线（mtime/size 以服务器为准，避免下次误报）
+        entry.conflict = false;
+        if (res.actualSize != null && res.actualMtime != null) {
+          entry.remoteStat = { size: res.actualSize, mtime: res.actualMtime };
+        }
+      })
     : entry.chain.then(() => fsWrite(path, content));
   entry.chain = run.catch(() => undefined); // 失败不阻断后续写盘
   return run.then(
@@ -113,10 +141,88 @@ function queueSave(entry: EditorEntry, silent: boolean): Promise<void> {
       if (!silent) toast(remote ? '已保存到远端' : '已自动保存', 'success');
     },
     (err: unknown) => {
+      if (err instanceof RemoteConflictError) {
+        handleRemoteConflict(entry, err, explicit);
+        return;
+      }
       // 失败：toast 错误原文，保留脏标
       toast(String(err), 'error');
     },
   );
+}
+
+/** 远端被外部修改：explicit（Ctrl+S）弹三选确认；否则只提示一次（自动保存/关闭不打断流程）。 */
+function handleRemoteConflict(entry: EditorEntry, err: RemoteConflictError, explicit: boolean): void {
+  if (!explicit) {
+    if (!entry.conflict) {
+      toast(`「${entry.baseTitle}」远端已被外部修改，未覆盖保存（Ctrl+S 可处理）`, 'info');
+    }
+    return;
+  }
+  if (entry.conflictDialogOpen) return;
+  entry.conflictDialogOpen = true;
+  conflictDialog(entry.baseTitle, err.actualSize, err.actualMtime).then((choice) => {
+    entry.conflictDialogOpen = false;
+    if (!entries.has(entry.tab.id)) return; // 弹窗期间标签已关闭
+    if (choice === 'overwrite') {
+      entry.remoteStat = null; // 强制覆写：跳过冲突检测
+      void queueSave(entry, false);
+    } else if (choice === 'reload') {
+      entry.conflict = false;
+      void loadFile(entry, true).then(() => rebaseRemoteStat(entry));
+    }
+    // cancel：保留脏标与 conflict 标记，自动保存继续静默跳过
+  });
+}
+
+/** 重新加载后刷新基线：以远端当前 stat 为准，避免下次保存误报冲突 */
+async function rebaseRemoteStat(entry: EditorEntry): Promise<void> {
+  const sftp = entry.tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
+  if (!sftp?.serverId || !sftp.remotePath) return;
+  try {
+    const st = await sftpStat(sftp.serverId, sftp.remotePath);
+    entry.remoteStat = { size: st.size, mtime: st.mtime };
+  } catch {
+    entry.remoteStat = null; // 基线刷新失败：下次保存不检测，避免连环误报
+  }
+}
+
+/** 三选一冲突弹窗：覆盖保存 / 重新加载 / 取消（复用全局 modal 样式） */
+function conflictDialog(
+  name: string, actualSize: number | null, actualMtime: number | null,
+): Promise<'overwrite' | 'reload' | 'cancel'> {
+  const { promise, resolve } = Promise.withResolvers<'overwrite' | 'reload' | 'cancel'>();
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = `
+    <div class="modal" style="width:460px">
+      <div class="modal-head"><h3>远端文件已被外部修改</h3></div>
+      <div class="modal-body" style="color:var(--text-1);line-height:1.7">
+        文件「<span class="cf-file"></span>」在编辑器打开期间被其他进程修改
+        <span class="cf-stat"></span>。<br><br>
+        继续保存会覆盖外部修改；重新加载会放弃当前未保存的编辑。
+      </div>
+      <div class="modal-foot">
+        <button class="btn" data-act="reload">重新加载</button>
+        <button class="btn" data-act="cancel">取消</button>
+        <button class="btn danger-solid" data-act="overwrite">覆盖保存</button>
+      </div>
+    </div>`;
+  mask.querySelector('.cf-file')!.textContent = name;
+  const statParts: string[] = [];
+  if (actualSize != null) statParts.push(`当前大小 ${actualSize} 字节`);
+  if (actualMtime != null) statParts.push(`修改时间 ${new Date(actualMtime * 1000).toLocaleString()}`);
+  mask.querySelector('.cf-stat')!.textContent = statParts.length ? `（${statParts.join('、')}）` : '';
+  const close = (v: 'overwrite' | 'reload' | 'cancel'): void => {
+    mask.remove();
+    resolve(v);
+  };
+  mask.querySelectorAll<HTMLButtonElement>('button[data-act]').forEach((b) => {
+    b.addEventListener('click', () => close(b.dataset.act as 'overwrite' | 'reload' | 'cancel'));
+  });
+  document.body.appendChild(mask);
+  requestAnimationFrame(() => mask.classList.add('open'));
+  return promise;
 }
 
 function markDirty(entry: EditorEntry): void {
@@ -499,7 +605,7 @@ class FindBar implements Panel {
 
 /* ---------- 渲染器 ---------- */
 registerRenderer('editor', (container, tab) => {
-  const sftp = tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
+  const sftp = tab.data.sftp as { serverId?: string; remotePath?: string; stat?: { size: number; mtime: number } } | undefined;
   // 远端文件无本地 path：用远端路径承担文件名/语言/选区引用展示
   const path = String(tab.data.path ?? '') || (sftp?.remotePath ?? '');
   const name = path.split(/[\\/]/).pop() ?? '';
@@ -514,6 +620,10 @@ registerRenderer('editor', (container, tab) => {
     dirty: false, version: 0, timer: undefined,
     chain: Promise.resolve(), loading: false,
     view: undefined as unknown as EditorView,
+    // 打开时快照：远端外部修改冲突检测基线（无快照 = 不检测）
+    remoteStat: sftp?.stat ?? null,
+    conflict: false,
+    conflictDialogOpen: false,
   };
 
   entry.view = new EditorView({
@@ -531,7 +641,7 @@ registerRenderer('editor', (container, tab) => {
           {
             key: 'Mod-s',
             preventDefault: true,
-            run: () => { void queueSave(entry, false); return true; },
+            run: () => { void queueSave(entry, false, true); return true; },
           },
           {
             key: 'Mod-l',
@@ -579,8 +689,11 @@ registerRenderer('editor', (container, tab) => {
   const originalOnClose = tab.onClose;
   tab.onClose = (t: Tab): void => {
     void (async () => {
-      if (entry.dirty) {
+      if (entry.dirty && !entry.conflict) {
         try { await queueSave(entry, true); } catch { /* 错误已 toast，仍放行关闭 */ }
+      } else if (entry.dirty && entry.conflict) {
+        // 远端已被外部修改且未处理：不覆盖外部修改，也不弹窗打断关闭流程
+        toast(`「${entry.baseTitle}」远端已被外部修改，更改未保存`, 'info');
       }
       originalOnClose?.(t);
     })();

@@ -67,9 +67,14 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。
 - list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
+- db_query：受管数据库查询（mysql/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
 - 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
+凭据纪律（硬性，优先级高于任务效率）：
+- 不得主动查找、读取、提取任何密码/密钥/Token（包括从配置文件、二进制、环境变量、数据库中获取凭据）；任务确需凭据时，立即停止该步操作并说明原因，请用户在终端手动执行。
+- 查询数据库一律使用 db_query 工具（凭据由系统代管），不得尝试用 run_command 读取配置、连接数据库或提取密码；redis/mysql/clickhouse 客户端命令行也不得自行调用。
+- 输出中出现「***已脱敏***」表示系统已隐藏凭据内容，属正常现象，不得尝试用 base64、hex、分段读取等方式绕过获取。
 输出协议（必须严格遵守）：
 1. 需要用户手动执行的命令：每条命令单独放在一个 ```command 围栏代码块中，块内只有命令本身，不加解释。
 2. 给用户直接复用的文本（说明、模板等）：放在 ```text 围栏代码块中。
@@ -238,7 +243,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -645,7 +650,7 @@ fn handle_extension_ui_request(
                 .build()
                 .expect("创建动作执行 runtime 失败")
         });
-        let result = runtime.block_on(run_internal_action(actions, project_id, &payload));
+        let result = runtime.block_on(run_internal_action(actions, store2, project_id, &payload));
         write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}));
     } else if method == "confirm" && title.starts_with("AISHELL_MODE_REQUEST:") {
         // AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：
@@ -686,6 +691,8 @@ fn handle_extension_ui_request(
         let intent = info.get("intent").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let summary = info.get("summary").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
 
+        // 智能审批判定为危险的拦截理由（人工审批卡展示「为何被拦」）
+        let mut flagged_reason: Option<String> = None;
         if store2.approval_mode() == ApprovalMode::Smart {
             let runtime = rt.get_or_insert_with(|| {
                 tokio::runtime::Builder::new_current_thread()
@@ -715,8 +722,10 @@ fn handle_extension_ui_request(
                     );
                     return;
                 }
-                // 危险：照常人工审批
-                Ok((true, _)) => {}
+                // 危险：照常人工审批，判定理由随事件透传（卡片展示拦截原因）
+                Ok((true, reason)) => {
+                    flagged_reason = Some(reason);
+                }
                 // 判定失败：回退人工审批（危险方向保守）
                 Err(_) => {}
             }
@@ -734,6 +743,7 @@ fn handle_extension_ui_request(
                 "action": action,
                 "intent": intent,
                 "summary": summary,
+                "smartReason": flagged_reason,
             }),
         );
     }
@@ -743,6 +753,7 @@ fn handle_extension_ui_request(
 /// 执行扩展内部动作请求，返回回写扩展的结果 JSON（{ok:true,text}|{ok:false,error}）。
 async fn run_internal_action(
     actions: &Arc<AiActions>,
+    store: &Arc<Store>,
     project_id: &str,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
@@ -770,30 +781,16 @@ async fn run_internal_action(
             actions
                 .run_command(project_id, intent, command, target, server_id)
                 .await
-                .map(|r| {
-                    let mut text = String::new();
-                    if !r.stdout.is_empty() {
-                        text.push_str(&r.stdout);
-                    }
-                    if !r.stderr.is_empty() {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(&r.stderr);
-                    }
-                    if text.len() > MAX_RESULT_CHARS {
-                        text.truncate(MAX_RESULT_CHARS);
-                        text.push_str("\n…(输出已截断)");
-                    }
-                    if text.is_empty() {
-                        text = "（命令无输出）".to_string();
-                    }
-                    let code = r
-                        .exit_code
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "null".to_string());
-                    json!({"ok": true, "text": format!("退出码 {code}\n{text}")})
-                })
+                .map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
+        }
+        "db_query" => {
+            let server_id = str_field("serverId");
+            let connection_id = str_field("connectionId");
+            let command = str_field("command");
+            actions
+                .db_query(server_id, connection_id, command)
+                .await
+                .map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
         }
         "sftp_upload" => {
             let server_id = str_field("serverId");
@@ -833,9 +830,40 @@ async fn run_internal_action(
     }
 }
 
+/// 命令类结果组装（run_command / db_query 共用）：stdout+stderr → 脱敏 → 截断 → 退出码。
+fn assemble_command_text(store: &Arc<Store>, r: crate::ai_actions::CommandResult) -> String {
+    let mut text = String::new();
+    if !r.stdout.is_empty() {
+        text.push_str(&r.stdout);
+    }
+    if !r.stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&r.stderr);
+    }
+    // 输出脱敏（先于截断）：配置里的密码不进 LLM 上下文，也不进 pi 会话落盘
+    let (masked, redacted) = crate::redact::redact_secrets(&text, &store.known_secrets());
+    text = masked;
+    if redacted > 0 {
+        text.push_str(&format!("\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"));
+    }
+    if text.len() > MAX_RESULT_CHARS {
+        text.truncate(MAX_RESULT_CHARS);
+        text.push_str("\n…(输出已截断)");
+    }
+    if text.is_empty() {
+        text = "（命令无输出）".to_string();
+    }
+    let code = r
+        .exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    format!("退出码 {code}\n{text}")
+}
+
 /// 向 pi stdin 写一条 JSONL（严格单个 LF 结尾；不手拼 JSON）。
-fn write_stdin_json(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {
-    let mut buf = serde_json::to_vec(value).unwrap_or_default();
+fn write_stdin_json(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {    let mut buf = serde_json::to_vec(value).unwrap_or_default();
     buf.push(b'\n');
     if let Ok(mut w) = stdin.lock() {
         let _ = w.write_all(&buf);
@@ -874,6 +902,16 @@ pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String
         .split_once(':')
         .map(|(p, _)| p.to_string())
         .ok_or_else(|| "key 格式错误，应为 <projectId>:<sessionId>".to_string())?;
+
+    // prompt 脱敏：终端快照/文件引用全文由前端拼入 prompt，可能含配置里读到的凭据；
+    // 在进入 pi（及其会话落盘）前屏蔽，命中时附提示防模型误解为「密码为空」而换姿势重读。
+    let known = mgr.store.known_secrets();
+    let (masked, redacted) = crate::redact::redact_secrets(&prompt, &known);
+    let prompt = if redacted > 0 {
+        format!("{masked}\n\n[AIShell 提示：以上内容有 {redacted} 处凭据已脱敏，属正常安全机制，请勿尝试绕过获取。]")
+    } else {
+        masked
+    };
 
     let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     // 旧进程已死但读取线程尚未摘除时，先清理再重起

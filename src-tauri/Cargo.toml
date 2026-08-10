@@ -1,6 +1,6 @@
 [package]
 name = "aishell"
-version = "0.2.0"
+version = "0.2.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -35,6 +35,8 @@ tauri-plugin-dialog = "2.7.2"
 base64 = "0.22"
 # 智能审批：直连 LLM API 判定操作是否危险（不走 pi）
 reqwest = { version = "0.12", features = ["json"] }
+# 输出脱敏与凭据提取前置规则（redact / smart_approval）
+regex = "1"
 
 # WebView2 设置（禁用浏览器快捷键，避免劫持终端 Ctrl+Shift+C/V）；版本与 wry 对齐
 [target.'cfg(windows)'.dependencies]

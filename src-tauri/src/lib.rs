@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod ai_actions;
+pub mod redact;
 pub mod smart_approval;
 #[cfg(windows)]
 pub mod gitinstall;
@@ -138,6 +139,8 @@ pub fn run() {
             store::sessions_get,
             store::session_upsert,
             store::set_server_locked,
+            store::save_db_connection,
+            store::delete_db_connection,
             store::create_project_folder,
             store::rename_project_folder,
             store::delete_project_folder,

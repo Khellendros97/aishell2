@@ -8,7 +8,7 @@
  */
 import type { FileRef, PathRef, Project, ServerRef, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
-import { showContextMenu, uid, type CtxMenuItems } from '../../ui';
+import { promptDialog, showContextMenu, uid, type CtxMenuItems } from '../../ui';
 
 export type TabData = Record<string, unknown>;
 
@@ -107,6 +107,8 @@ export function openTab({
     console.error('未注册的标签类型:', type);
     return null;
   }
+  // 终端同名自动编号：第二个同标题终端显示「标题 #2」（编号不复用，取现有最大后缀+1）
+  if (type === 'terminal') title = uniqueTerminalTitle(title);
 
   const tab = {
     id, type, title, icon: TYPE_ICONS[type] || icon('file'), data, onClose, api: null,
@@ -120,6 +122,7 @@ export function openTab({
   (tab.el.querySelector('.tab-close') as HTMLButtonElement).onclick = () => closeTab(id);
   /* 终端标签右键菜单（原生右键菜单已全局禁用，需 preventDefault）：
      添加到对话 = 把该终端对应服务器/本地引用加入 AI 输入框（SSH → @remote:服务器名称，本地 → @local）；
+     重命名 = 修改标签显示名（会话级，不持久化；编号不受影响）；
      复制 SSH 渠道 = 以同 serverId 新开唯一 id 终端标签；关闭标签。
      仅 type==='terminal' 的标签挂载，其他类型标签不显示。 */
   if (type === 'terminal') {
@@ -133,6 +136,10 @@ export function openTab({
         : { serverId: null, name: '本地终端' };
       const items: CtxMenuItems = [
         { label: '添加到对话', iconName: 'chatPlus', action: () => Workbench.ai?.addServerRef?.(ref) },
+        {
+          label: '重命名', iconName: 'pencil',
+          action: () => void renameTerminalTab(tab),
+        },
       ];
       if (kind === 'ssh') {
         items.push(
@@ -163,6 +170,31 @@ export function setTabTitle(id: string, title: string): void {
     tab.title = title;
     tab.el.querySelector('.tab-title')!.textContent = title;
   }
+}
+
+/** 终端同名自动编号：同名「30.37」开第二个 → 「30.37 #2」；编号不复用（取现有最大后缀+1） */
+function uniqueTerminalTitle(base: string): string {
+  let max = 0;
+  for (const t of tabs) {
+    if (t.type !== 'terminal') continue;
+    const m = t.title.match(/^(.*?)(?:\s+#(\d+))?$/);
+    if (m && m[1] === base) max = Math.max(max, Number(m[2] ?? 1));
+  }
+  return max === 0 ? base : `${base} #${max + 1}`;
+}
+
+/** 终端标签重命名：promptDialog 输入新名，空串/路径分隔符由弹窗校验拦截 */
+function renameTerminalTab(tab: Tab): void {
+  void promptDialog({
+    title: '重命名终端标签',
+    label: '标签名称（会话级，仅当前窗口有效）',
+    defaultValue: tab.title,
+    placeholder: '例如：抓包终端',
+    okText: '重命名',
+  }).then((name: string | null) => {
+    const trimmed = (name ?? '').trim();
+    if (trimmed) setTabTitle(tab.id, trimmed);
+  });
 }
 
 export function activateTab(id: string): void {

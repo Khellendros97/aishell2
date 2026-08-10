@@ -668,6 +668,7 @@ function handleEvent(key: string, ev: AiEvent): void {
         command: existing?.command,
         requestId: ev.requestId,
         status: existing?.status === 'running' ? 'running' : 'approving',
+        smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
       });
       pendingBy.set(sid, p);
@@ -813,8 +814,8 @@ function renderActionCard(a: ActionCard): string {
   const resultHtml = a.result && (a.status === 'succeeded' || a.status === 'failed')
     ? `<div class="ai-action-result">${escapeHtml(a.result)}</div>`
     : '';
-  const smartHtml = a.status === 'smart' && a.smartReason
-    ? `<div class="ai-action-intent ai-action-smart">智能判定：${escapeHtml(a.smartReason)}</div>`
+  const smartHtml = a.smartReason
+    ? `<div class="ai-action-intent ai-action-smart">${a.status === 'approving' ? '智能审批拦截（转人工确认）' : '智能判定'}：${escapeHtml(a.smartReason)}</div>`
     : '';
   return `<div class="ai-action-card ${cls}">
     <div class="ai-action-head">

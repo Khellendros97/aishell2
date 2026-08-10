@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, FsEntry, FsStat, Project, Server, Settings, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpWriteResult, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -74,6 +74,13 @@ export const setAiMode = (projectId: string, mode: AiMode) =>
 export const setServerLocked = (id: string, locked: boolean) =>
   call<void>('set_server_locked', { id, locked });
 
+/* ---------------- 数据库连接（AI 受管查询通道） ----------------
+   password 传 null 表示不修改已保存的密码；连接列表随 getState 返回。 */
+export const saveDbConnection = (serverId: string, connection: DbConnection, password: string | null) =>
+  call<void>('save_db_connection', { serverId, connection, password });
+export const deleteDbConnection = (serverId: string, connId: string) =>
+  call<void>('delete_db_connection', { serverId, connId });
+
 /* ---------------- term ----------------
    id 由前端生成、先订阅事件再调 term_create，避免输出竞态丢失。
    term_create 失败时错误串原样 reject（如「未找到 Git Bash」「未找到可用 shell」）。 */
@@ -127,9 +134,10 @@ export const sftpStat = (serverId: string, path: string) =>
 /** 读取远端文本文件：>5MB 或二进制会 reject（与 fs_read 同一编辑约束） */
 export const sftpRead = (serverId: string, remotePath: string) =>
   call<string>('sftp_read', { serverId, remotePath });
-/** 覆写远端文本文件（保存场景允许覆盖） */
-export const sftpWrite = (serverId: string, remotePath: string, content: string) =>
-  call<void>('sftp_write', { serverId, remotePath, content });
+/** 覆写远端文本文件（保存场景允许覆盖）；expectedSize/expectedMtime 为打开时快照，
+ *  远端属性不一致时后端不写入并返回 conflict=true（前端弹「外部修改」确认） */
+export const sftpWrite = (serverId: string, remotePath: string, content: string, expectedSize?: number, expectedMtime?: number) =>
+  call<SftpWriteResult>('sftp_write', { serverId, remotePath, content, expectedSize, expectedMtime });
 /** 上传本地文件/目录到远端目录（重名自动改名）；返回最终落地名称 */
 export const sftpUpload = (serverId: string, localPath: string, remoteDir: string) =>
   call<string>('sftp_upload', { serverId, localPath, remoteDir });

@@ -152,6 +152,8 @@ export interface AppState {
   sftpHistory: Record<string, string[]>;
   /** SFTP 收藏夹：serverId → 收藏路径列表（按添加顺序）；旧配置无此字段为空对象 */
   sftpFavorites: Record<string, string[]>;
+  /** 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表；旧配置无此字段为空对象 */
+  dbConnections: Record<string, DbConnection[]>;
 }
 
 export interface FsEntry {
@@ -172,6 +174,34 @@ export interface FsStat {
   mode: number | null;
   readonly: boolean;
   linkTarget: string | null;
+}
+
+/** sftp_write 写回结果 —— 与 sftp.rs SftpWriteResult serde camelCase 对齐。
+ *  conflict=true 表示远端已被外部修改、本次未写入（actual 为远端当前属性）；
+ *  conflict=false 表示已写入（actual 为落盘后属性，前端据此重建下次保存的基线）。 */
+export interface SftpWriteResult {
+  conflict: boolean;
+  actualSize: number | null;
+  actualMtime: number | null;
+}
+
+/** 数据库类型（AI 受管查询通道）—— 与 store.rs DbKind serde lowercase 对齐 */
+export type DbKind = 'mysql' | 'clickhouse' | 'redis';
+
+/** 服务器数据库连接配置（AI 受管查询通道）—— 与 store.rs DbConnection serde camelCase 对齐。
+ *  密码不在 JSON 中（keyring account `db:<serverId>:<connId>`）。
+ *  allowedCommands 为 AI 可用命令白名单（首词，大写）；空 = 该类型默认只读集。
+ *  enabled 为启用开关：禁用后 AI 不可见也不可执行（list_servers 隐藏、db_query 拒绝）。 */
+export interface DbConnection {
+  id: string;
+  name: string;
+  kind: DbKind;
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  allowedCommands: string[];
+  enabled: boolean;
 }
 
 /** ssh_exec 直执结果 —— 与 ssh.rs SshExecResult serde camelCase 对齐。

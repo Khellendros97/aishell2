@@ -181,6 +181,77 @@ pub struct Server {
     pub locked: bool,
 }
 
+/// 数据库类型（AI 受管查询通道）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DbKind {
+    #[default]
+    Mysql,
+    Clickhouse,
+    Redis,
+}
+
+impl DbKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DbKind::Mysql => "mysql",
+            DbKind::Clickhouse => "clickhouse",
+            DbKind::Redis => "redis",
+        }
+    }
+
+    /// 该类型默认只读命令集（allowed_commands 为空时生效；用户可在连接配置里增删）。
+    pub fn default_read_commands(self) -> &'static [&'static str] {
+        match self {
+            DbKind::Mysql | DbKind::Clickhouse => &["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"],
+            DbKind::Redis => &[
+                "GET", "MGET", "KEYS", "SCAN", "TYPE", "TTL", "PTTL", "EXISTS", "DBSIZE",
+                "INFO", "PING", "STRLEN", "LLEN", "SCARD", "ZCARD", "HLEN", "HGET",
+                "HGETALL", "HKEYS", "HVALS", "SMEMBERS", "LRANGE", "ZRANGE", "SISMEMBER",
+                "HEXISTS", "SRANDMEMBER", "RANDOMKEY", "ZSCORE", "HSTRLEN", "GETRANGE",
+            ],
+        }
+    }
+}
+
+/// 服务器数据库连接配置（AI 受管查询通道）。
+/// **不含密码字段**——密码只存 keyring（account `db:<serverId>:<connId>`）。
+/// allowed_commands 为 AI 可用命令白名单（首词，大写，如 SELECT / GET / HGETALL）；
+/// 空列表 = 使用该类型默认只读集；含写命令（如 UPDATE）时 AI 执行需人工审批。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbConnection {
+    pub id: String,
+    pub name: String,
+    pub kind: DbKind,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// 默认库（mysql/clickhouse 用；redis 忽略）
+    #[serde(default)]
+    pub database: String,
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+    /// 启用状态：禁用后 AI 不可见也不可执行（list_servers 隐藏、db_query 拒绝）；旧配置无此字段按启用处理。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl DbConnection {
+    /// 生效的命令白名单：未配置时回落到该类型默认只读集。
+    pub fn effective_commands(&self) -> Vec<String> {
+        if self.allowed_commands.is_empty() {
+            self.kind
+                .default_read_commands()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.allowed_commands.clone()
+        }
+    }
+}
+
 /// Xshell 一键导入结果（camelCase 与前端 src/types.ts 的 XshellImportResult 对齐）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -343,6 +414,10 @@ pub struct AppState {
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
     pub sftp_favorites: HashMap<String, Vec<String>>,
+    /// 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表。密码在 keyring。
+    /// 旧配置无此字段按空 map 解析。
+    #[serde(default)]
+    pub db_connections: HashMap<String, Vec<DbConnection>>,
 }
 
 /// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
@@ -361,6 +436,11 @@ const KEYRING_ACCOUNT_BRAVE: &str = "brave:apikey";
 
 fn keyring_account_server(id: &str) -> String {
     format!("server:{id}")
+}
+
+/// 数据库连接密码 keyring account：`db:<serverId>:<connId>`。
+fn keyring_account_db(server_id: &str, conn_id: &str) -> String {
+    format!("db:{server_id}:{conn_id}")
 }
 
 fn keyring_set(account: &str, value: &str) -> Result<(), String> {
@@ -459,6 +539,51 @@ pub struct Store {
 
 const STATE_FILE: &str = "aishell.json";
 
+/// 会话内全部自由文本脱敏（消息正文/快照/文件引用/动作摘要与意图），返回是否有变更。幂等：
+/// 已脱敏内容再次处理字符串不变，不会误报 changed。
+/// 先做会话级值收集（跨消息共享同一凭据的 KV 值），再逐字段替换——
+/// 这样命令行 `-p'值'`、正文复述、动作摘要里的裸文本形态也能被掩盖。
+fn redact_session(session: &mut ChatSession, known: &[String]) -> bool {
+    let mut secrets = known.to_vec();
+    for msg in &session.messages {
+        crate::redact::harvest_secrets(&msg.content, &mut secrets);
+        for snap in &msg.snapshots {
+            crate::redact::harvest_secrets(&snap.content, &mut secrets);
+        }
+        for r in &msg.file_refs {
+            crate::redact::harvest_secrets(&r.content, &mut secrets);
+        }
+        for a in &msg.actions {
+            crate::redact::harvest_secrets(&a.summary, &mut secrets);
+            crate::redact::harvest_secrets(&a.intent, &mut secrets);
+        }
+    }
+    secrets.sort();
+    secrets.dedup();
+    let mut changed = false;
+    let mut redact_field = |field: &mut String| {
+        let (masked, _) = crate::redact::redact_secrets(field, &secrets);
+        if masked != *field {
+            *field = masked;
+            changed = true;
+        }
+    };
+    for msg in &mut session.messages {
+        redact_field(&mut msg.content);
+        for snap in &mut msg.snapshots {
+            redact_field(&mut snap.content);
+        }
+        for r in &mut msg.file_refs {
+            redact_field(&mut r.content);
+        }
+        for a in &mut msg.actions {
+            redact_field(&mut a.summary);
+            redact_field(&mut a.intent);
+        }
+    }
+    changed
+}
+
 impl Store {
     /// 加载 <config_dir>/aishell.json；文件不存在时用默认 state（settings 全空、llm 默认、其余为空）。
     pub fn new(config_dir: PathBuf) -> Result<Self, String> {
@@ -471,17 +596,35 @@ impl Store {
     ) -> Result<Self, String> {
         fs::create_dir_all(&config_dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
         let state_path = config_dir.join(STATE_FILE);
-        let state = match fs::read(&state_path) {
+        let state: AppState = match fs::read(&state_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| format!("配置文件 {STATE_FILE} 解析失败: {e}"))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppState::default(),
             Err(e) => return Err(format!("读取配置文件失败: {e}")),
         };
-        Ok(Self {
+        let store = Self {
             config_dir,
             state: Mutex::new(state),
             secrets,
-        })
+        };
+        // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
+        // 加载时按现行规则清洗，有变更立即原子写回。
+        let known = store.known_secrets();
+        let dirty = {
+            let mut guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let mut dirty = false;
+            for sess in guard.sessions.values_mut().flatten() {
+                if redact_session(sess, &known) {
+                    dirty = true;
+                }
+            }
+            dirty
+        };
+        if dirty {
+            let guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            store.persist_locked(&guard)?;
+        }
+        Ok(store)
     }
 
     /// 锁内变更状态并原子持久化；f 返回 Err 时不变更也不落盘。
@@ -925,7 +1068,11 @@ impl Store {
         Ok(guard.sessions.get(project_id).cloned().unwrap_or_default())
     }
 
-    fn session_upsert(&self, project_id: &str, session: ChatSession) -> Result<(), String> {
+    fn session_upsert(&self, project_id: &str, mut session: ChatSession) -> Result<(), String> {
+        // 落盘前脱敏：快照/文件引用/消息正文可能含配置里读到的凭据（硬约束：密码永不进 JSON）。
+        // 注意 known_secrets() 自身要锁 state，必须先于 with_state 调用（std Mutex 不可重入）。
+        let known = self.known_secrets();
+        redact_session(&mut session, &known);
         self.with_state(|s| {
             let list = s.sessions.entry(project_id.to_string()).or_default();
             match list.iter_mut().find(|x| x.id == session.id) {
@@ -948,6 +1095,34 @@ impl Store {
     /// 读 keyring 密钥；account 形如 `server:<id>` / `llm:apikey`（service "AIShell"）。
     pub fn read_secret(&self, account: &str) -> Result<String, String> {
         self.secrets.get(account)
+    }
+
+    /// 已知密钥字面量（LLM/Brave API Key + 各服务器密码 + 数据库连接密码），供 redact 脱敏精确匹配。
+    /// 空值与 <4 字符的短值剔除（短值误伤面大），结果去重。读取失败的条目静默跳过。
+    pub fn known_secrets(&self) -> Vec<String> {
+        let mut out: Vec<String> = [KEYRING_ACCOUNT_LLM, KEYRING_ACCOUNT_BRAVE]
+            .iter()
+            .filter_map(|acc| self.secrets.get(acc).ok())
+            .collect();
+        let guard = self.state.lock();
+        if let Ok(g) = guard {
+            for sv in &g.servers {
+                if let Ok(v) = self.secrets.get(&keyring_account_server(&sv.id)) {
+                    out.push(v);
+                }
+                if let Some(conns) = g.db_connections.get(&sv.id) {
+                    for c in conns {
+                        if let Ok(v) = self.secrets.get(&keyring_account_db(&sv.id, &c.id)) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        out.retain(|s| s.len() >= 4);
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// 当前 LLM 配置（clone）。
@@ -1025,6 +1200,73 @@ impl Store {
             sv.locked = locked;
             Ok(())
         })
+    }
+
+    /// 服务器数据库连接列表（clone 返回，不含密码）。
+    pub fn db_connections(&self, server_id: &str) -> Vec<DbConnection> {
+        self.state
+            .lock()
+            .map(|g| g.db_connections.get(server_id).cloned().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// 取单个数据库连接（不含密码）；不存在返回 None。
+    pub fn db_connection(&self, server_id: &str, conn_id: &str) -> Option<DbConnection> {
+        self.db_connections(server_id)
+            .into_iter()
+            .find(|c| c.id == conn_id)
+    }
+
+    /// 读数据库连接密码（keyring account `db:<serverId>:<connId>`）。
+    pub fn db_secret(&self, server_id: &str, conn_id: &str) -> Result<String, String> {
+        self.secrets.get(&keyring_account_db(server_id, conn_id))
+    }
+
+    /// 保存数据库连接：password 为 Some 时写 keyring（含空串，视为清空/覆盖），None 保持原值。
+    /// 连接不存在则插入，已存在则更新（按 id 匹配）。
+    pub fn save_db_connection(
+        &self,
+        server_id: &str,
+        connection: DbConnection,
+        password: Option<&str>,
+    ) -> Result<(), String> {
+        if connection.id.trim().is_empty() || connection.name.trim().is_empty() {
+            return Err("连接名称不能为空".to_string());
+        }
+        if connection.host.trim().is_empty() {
+            return Err("数据库主机不能为空".to_string());
+        }
+        if connection.port == 0 {
+            return Err("数据库端口无效".to_string());
+        }
+        // redis 无需账号（redis-cli 无 user 概念）；mysql/clickhouse 必须有
+        if connection.user.trim().is_empty() && connection.kind != DbKind::Redis {
+            return Err("数据库用户不能为空".to_string());
+        }
+        if let Some(pw) = password {
+            self.secrets
+                .set(&keyring_account_db(server_id, &connection.id), pw)?;
+        }
+        self.with_state(|s| {
+            let list = s.db_connections.entry(server_id.to_string()).or_default();
+            match list.iter_mut().find(|c| c.id == connection.id) {
+                Some(slot) => *slot = connection,
+                None => list.push(connection),
+            }
+            Ok(())
+        })
+    }
+
+    /// 删除数据库连接（配置 + keyring 密码一并清理）。
+    pub fn delete_db_connection(&self, server_id: &str, conn_id: &str) -> Result<(), String> {
+        self.with_state(|s| {
+            if let Some(list) = s.db_connections.get_mut(server_id) {
+                list.retain(|c| c.id != conn_id);
+            }
+            Ok(())
+        })?;
+        let _ = self.secrets.delete(&keyring_account_db(server_id, conn_id));
+        Ok(())
     }
 }
 
@@ -1120,6 +1362,25 @@ pub async fn set_server_locked(
     locked: bool,
 ) -> Result<(), String> {
     store.set_server_locked(&id, locked)
+}
+
+#[tauri::command]
+pub async fn save_db_connection(
+    store: State<'_, Arc<Store>>,
+    server_id: String,
+    connection: DbConnection,
+    password: Option<String>,
+) -> Result<(), String> {
+    store.save_db_connection(&server_id, connection, password.as_deref())
+}
+
+#[tauri::command]
+pub async fn delete_db_connection(
+    store: State<'_, Arc<Store>>,
+    server_id: String,
+    conn_id: String,
+) -> Result<(), String> {
+    store.delete_db_connection(&server_id, &conn_id)
 }
 
 #[tauri::command]
@@ -1226,8 +1487,7 @@ mod tests {
         AppState {
             settings: Settings {
                 workspace_dir: Some("D:\\AIShellWorkspace".to_string()),
-                llm: LlmConfig::default(),
-                search: SearchConfig::default(),
+                llm: LlmConfig::default(),                search: SearchConfig::default(),
                 theme: Theme::Dark,
                 auto_switch_ai_workdir: true,
                 project_view: ProjectView::Card,
@@ -1321,6 +1581,7 @@ mod tests {
             ui_expanded: HashMap::new(),
             sftp_history: HashMap::new(),
             sftp_favorites: HashMap::new(),
+            db_connections: HashMap::new(),
         }
     }
 
@@ -2482,6 +2743,159 @@ mod tests {
             "delete_project 应清理 sessions"
         );
         assert!(store.state.lock().unwrap().projects.is_empty());
+    }
+
+    #[test]
+    fn sessions_masked_on_upsert_and_on_load() {
+        let dir = temp_config_dir("session-mask");
+        let store = test_store(dir.clone());
+        let msg = |content: &str| ChatMsg {
+            role: "user".to_string(),
+            content: content.to_string(),
+            snapshots: vec![TermSnapshot {
+                id: "snap-1".to_string(),
+                command: "cat /srun3/etc/flow_log.conf".to_string(),
+                content: content.to_string(),
+                ts: 1,
+            }],
+            file_refs: vec![],
+            server_refs: vec![],
+            path_refs: vec![],
+            actions: vec![],
+            ts: 1,
+        };
+        // upsert 时脱敏：明文不进内存态，也不进落盘（硬约束：密码永不进 JSON）
+        let sess = ChatSession {
+            id: "sess-mask".to_string(),
+            title: "T".to_string(),
+            messages: vec![
+                msg(r#"db_password="hunter2""#),
+                ChatMsg {
+                    role: "assistant".to_string(),
+                    content: "正文复述密码 hunter2 也应掩盖".to_string(),
+                    snapshots: vec![],
+                    file_refs: vec![],
+                    server_refs: vec![],
+                    path_refs: vec![],
+                    actions: vec![AiActionRecord {
+                        tool_call_id: "call-1".to_string(),
+                        tool: "run_command".to_string(),
+                        intent: "查询在线记录".to_string(),
+                        summary: "执行命令（远程）：mysql -uicc -p'hunter2' -e 'select 1'".to_string(),
+                        status: "succeeded".to_string(),
+                        text_len: None,
+                    }],
+                    ts: 2,
+                },
+            ],
+        };
+        store.session_upsert("proj-mask", sess).unwrap();
+        let raw = std::fs::read_to_string(dir.join(STATE_FILE)).unwrap();
+        assert!(!raw.contains("hunter2"), "落盘文件不得含凭据明文");
+        assert!(raw.contains("***已脱敏***"));
+        let back = store.sessions_get("proj-mask").unwrap();
+        assert!(!back[0].messages[0].snapshots[0].content.contains("hunter2"));
+        assert!(back[0].messages[0].content.contains("***已脱敏***"));
+
+        // 加载迁移：历史文件含明文（模拟旧版本遗留），重载后立即清洗并原子写回
+        drop(store);
+        std::fs::write(dir.join(STATE_FILE), raw.replace("***已脱敏***", "hunter2")).unwrap();
+        let store2 = test_store(dir.clone());
+        let raw2 = std::fs::read_to_string(dir.join(STATE_FILE)).unwrap();
+        assert!(!raw2.contains("hunter2"), "加载迁移应清洗历史明文并写回");
+        let back2 = store2.sessions_get("proj-mask").unwrap();
+        assert!(back2[0].messages[0].snapshots[0].content.contains("***已脱敏***"));
+
+        // 幂等：已脱敏文件重载不再触发写回（内容不再变化）
+        drop(store2);
+        let store3 = test_store(dir.clone());
+        let raw3 = std::fs::read_to_string(dir.join(STATE_FILE)).unwrap();
+        assert_eq!(raw2, raw3);
+        drop(store3);
+    }
+
+    #[test]
+    fn db_connection_crud_persists_secret() {
+        let dir = temp_config_dir("db-conn");
+        let store = test_store(dir.clone());
+        let conn = DbConnection {
+            id: "db-1".to_string(),
+            name: "计费库".to_string(),
+            kind: DbKind::Mysql,
+            host: "127.0.0.1".to_string(),
+            port: 3506,
+            user: "icc".to_string(),
+            database: "srun4k".to_string(),
+            allowed_commands: vec![],
+            enabled: true,
+        };
+        // 默认只读集回退
+        assert_eq!(conn.effective_commands(), vec!["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]);
+        // 保存 + keyring
+        store.save_db_connection("srv-a", conn.clone(), Some("pw-db-1")).unwrap();
+        assert_eq!(store.db_connections("srv-a"), vec![conn.clone()]);
+        assert_eq!(store.db_secret("srv-a", "db-1").unwrap(), "pw-db-1");
+        // 更新（None 保持密码）
+        let mut v2 = conn.clone();
+        v2.name = "计费库改".to_string();
+        store.save_db_connection("srv-a", v2.clone(), None).unwrap();
+        assert_eq!(store.db_connections("srv-a"), vec![v2.clone()]);
+        assert_eq!(store.db_secret("srv-a", "db-1").unwrap(), "pw-db-1");
+        // 重载后配置落盘仍在；keyring 密码独立于配置存储（MemorySecrets 不跨实例，此处只验配置）
+        let reloaded = test_store(dir);
+        assert_eq!(reloaded.db_connections("srv-a"), vec![v2]);
+        // 删除清理配置与 keyring
+        store.delete_db_connection("srv-a", "db-1").unwrap();
+        assert!(store.db_connections("srv-a").is_empty());
+        assert!(store.db_secret("srv-a", "db-1").is_err());
+        // 校验失败不落盘
+        let bad = DbConnection { id: "db-x".to_string(), name: "".to_string(), ..conn };
+        assert!(store.save_db_connection("srv-a", bad, Some("pw")).is_err());
+        assert!(store.db_connections("srv-a").is_empty());
+    }
+
+    #[test]
+    fn db_secrets_join_known_secrets() {
+        let dir = temp_config_dir("db-known");
+        let store = test_store(dir);
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-a".to_string(),
+                    name: "N".to_string(),
+                    host: "h".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "u".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                },
+                None,
+            )
+            .unwrap();
+        let conn = DbConnection {
+            id: "db-1".to_string(),
+            name: "N".to_string(),
+            kind: DbKind::Redis,
+            host: "127.0.0.1".to_string(),
+            port: 16386,
+            user: "".to_string(),
+            database: String::new(),
+            allowed_commands: vec![],
+            enabled: true,
+        };
+        store.save_db_connection("srv-a", conn, Some("srun_3000@redis")).unwrap();
+        let known = store.known_secrets();
+        assert!(known.contains(&"srun_3000@redis".to_string()), "数据库密码应参与输出脱敏");
+    }
+
+    #[test]
+    fn old_db_connection_without_enabled_parses_as_enabled() {
+        // 旧配置无 enabled 字段 → serde 默认 true（无感升级，已有连接不受新增字段影响）
+        let old = r#"{"id":"db-1","name":"计费库","kind":"mysql","host":"127.0.0.1","port":3306,"user":"u","database":"d","allowedCommands":["SELECT"]}"#;
+        let conn: DbConnection = serde_json::from_str(old).unwrap();
+        assert!(conn.enabled);
+        assert_eq!(conn.effective_commands(), vec!["SELECT".to_string()]);
     }
 
     #[test]

@@ -26,9 +26,25 @@ const VALID_MODES = ["suggest", "agent", "yolo"] as const;
 type AiMode = (typeof VALID_MODES)[number];
 
 /** 仅 agent/yolo 提供的变更工具（suggest 一律拒绝） */
-const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers"];
+const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query"];
 /** agent 模式逐调用审批的受控工具 */
 const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download"];
+
+/** db_query 只读首词（union 表，与 Rust ai_actions::is_db_read_only 语义一致，见 store.rs DbKind::default_read_commands）。
+ *  guard 侧无法感知连接类型，故用并集静态分类：命中 → 读（放行）；未命中 → 写（agent 模式人工审批）。
+ *  权威白名单校验仍在 Rust（ai_actions::validate_db_command），此处误判最坏只是多一次审批或少一次提示。 */
+const DB_READ_KEYWORDS: Record<string, true> = {
+	SELECT: true, SHOW: true, DESC: true, DESCRIBE: true, EXPLAIN: true,
+	GET: true, MGET: true, KEYS: true, SCAN: true, TYPE: true, TTL: true, PTTL: true,
+	EXISTS: true, DBSIZE: true, INFO: true, PING: true, STRLEN: true, LLEN: true,
+	SCARD: true, ZCARD: true, HLEN: true, HGET: true, HGETALL: true, HKEYS: true,
+	HVALS: true, SMEMBERS: true, LRANGE: true, ZRANGE: true, SISMEMBER: true,
+	HEXISTS: true, SRANDMEMBER: true, RANDOMKEY: true, ZSCORE: true, HSTRLEN: true, GETRANGE: true,
+};
+function isDbReadCommand(command: string): boolean {
+	const first = (command.trim().split(/\s+/)[0] || "").toUpperCase();
+	return first in DB_READ_KEYWORDS;
+}
 
 /** 工具结果统一形态（pi docs：execute 返回 content/details） */
 function okResult(text: string) {
@@ -108,6 +124,12 @@ export default function (pi: ExtensionAPI) {
 					action: "sftp_download",
 					intent: `下载 ${String(input.remotePath || "")} 到 ${String(input.localDir || "")}`,
 					summary: `SFTP 下载自服务器 ${String(input.serverId || "")}`,
+				};
+			case "db_query":
+				return {
+					action: "db_query",
+					intent: `数据库写操作（连接 ${String(input.connectionId || "")}，服务器 ${String(input.serverId || "")}）`,
+					summary: `db_query：${typeof input.command === "string" ? input.command : ""}`,
 				};
 			default:
 				return { action: tool, intent: "执行操作", summary: "" };
@@ -201,6 +223,22 @@ export default function (pi: ExtensionAPI) {
 			case "list_servers":
 				// 只读查询：项目绑定的可操作服务器列表（无路径参数）
 				return undefined;
+			case "db_query": {
+				// 仅工作/全自动模式提供；参数校验（白名单权威裁决在 Rust）
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不提供数据库查询。" };
+				}
+				if (!(typeof input.serverId === "string" && input.serverId.trim())) {
+					return { block: true, reason: "db_query: 缺少 serverId。" };
+				}
+				if (!(typeof input.connectionId === "string" && input.connectionId.trim())) {
+					return { block: true, reason: "db_query: 缺少 connectionId。" };
+				}
+				if (!(typeof input.command === "string" && input.command.trim())) {
+					return { block: true, reason: "db_query: command 不能为空。" };
+				}
+				return undefined;
+			}
 			case "request_agent_mode":
 				// 仅建议模式专属工具（suggest 的 --tools 白名单才含它）：agent/yolo 下防御性阻止
 				if (mode !== "suggest") {
@@ -213,21 +251,33 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/* ---------- 工具调用钩子：路径/参数校验 + Agent 逐调用审批 ---------- */
+	async function approve(ctx: Parameters<typeof pi.on>[1], tool: string, input: Record<string, unknown>, toolCallId: string): Promise<boolean> {
+		const info = approvalInfo(tool, input);
+		let ok = false;
+		try {
+			ok = await ctx.ui.confirm("AISHELL_APPROVAL:" + toolCallId, JSON.stringify(info));
+		} catch {
+			// 中止/窗口卸载/客户端取消（cancelled:true）统一按拒绝
+			ok = false;
+		}
+		return ok;
+	}
 	pi.on("tool_call", async (event, ctx) => {
 		const tool = event.toolName;
 		const input = event.input as Record<string, unknown>;
 		const blocked = validate(tool, input);
 		if (blocked) return blocked;
-		if (mode === "agent" && CONTROLLED_TOOLS.includes(tool)) {
-			const info = approvalInfo(tool, input);
-			let ok = false;
-			try {
-				ok = await ctx.ui.confirm("AISHELL_APPROVAL:" + event.toolCallId, JSON.stringify(info));
-			} catch {
-				// 中止/窗口卸载/客户端取消（cancelled:true）统一按拒绝
-				ok = false;
+		if (mode === "agent") {
+			if (CONTROLLED_TOOLS.includes(tool)) {
+				if (!(await approve(ctx, tool, input, event.toolCallId))) {
+					return { block: true, reason: "用户拒绝了该操作" };
+				}
+			} else if (tool === "db_query" && !isDbReadCommand(String(input.command || ""))) {
+				// 数据库写命令（用户加入白名单的 UPDATE/DELETE 等）：agent 模式人工审批
+				if (!(await approve(ctx, tool, input, event.toolCallId))) {
+					return { block: true, reason: "用户拒绝了该操作" };
+				}
 			}
-			if (!ok) return { block: true, reason: "用户拒绝了该操作" };
 		}
 		return undefined;
 	});
@@ -319,6 +369,32 @@ export default function (pi: ExtensionAPI) {
 			};
 			if (params.serverId) payload.serverId = params.serverId;
 			return await rustAction(ctx, toolCallId, payload);
+		},
+	});
+
+	pi.registerTool({
+		name: "db_query",
+		label: "数据库查询",
+		description:
+			"受管数据库查询（mysql/clickhouse/redis，凭据由系统代管，AI 拿不到密码）。serverId + connectionId 指定连接，command 为 SQL 或单条 redis 命令。仅允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN 及 redis 的 GET/KEYS/SCAN 等）；白名单外命令会被拒绝，写命令需用户审批。",
+		promptSnippet: "查询数据库",
+		promptGuidelines: [
+			"查询数据库前先调用 list_servers 获取 serverId；connectionId 从该服务器配置的数据库连接中选择（用户可在服务器设置-数据库连接中查看/配置）。",
+			"凭据由系统代管，禁止用 run_command 自行连接数据库、读取配置文件或提取密码。",
+			"命令被拒绝时如实说明原因，改用允许的命令重试；不确定允许哪些命令时先问用户。",
+		],
+		parameters: Type.Object({
+			serverId: Type.String({ description: "目标服务器 ID" }),
+			connectionId: Type.String({ description: "数据库连接 ID（服务器设置-数据库连接中配置）" }),
+			command: Type.String({ description: "SQL 语句或单条 redis 命令（如 SELECT * FROM t LIMIT 10 / GET user:1）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, {
+				action: "db_query",
+				serverId: params.serverId,
+				connectionId: params.connectionId,
+				command: params.command,
+			});
 		},
 	});
 

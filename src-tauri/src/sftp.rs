@@ -9,11 +9,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use russh_sftp::client::SftpSession;
+use serde::Serialize;
 use tauri::State;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::fsops::{unique_local_name, FsEntry, FsStat};
 use crate::ssh::SshManager;
+
+/// sftp_write 结果：conflict=true 表示远端已被外部修改且未写入（actual_* 为远端当前属性）；
+/// conflict=false 表示已写入（actual_* 为落盘后属性，供前端重建下次保存的基线）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpWriteResult {
+    pub conflict: bool,
+    pub actual_size: Option<u64>,
+    pub actual_mtime: Option<i64>,
+}
 
 /// 流式拷贝缓冲大小（64KB）。
 const COPY_BUF: usize = 64 * 1024;
@@ -372,24 +383,38 @@ pub async fn sftp_read(
 }
 
 /// 覆写远端文本文件（保存场景允许覆盖；目录目标报错）。
+/// 可选 `expected_size` / `expected_mtime`（编辑器打开时的 stat 快照）：
+/// 远端当前属性与快照不一致时**不写入**，返回 conflict=true + 实际属性，
+/// 由前端弹「外部修改」确认（覆盖/重新加载）；无快照时直接覆写。
+/// 写入成功后重新 stat 并随结果返回（作为下次保存的基线）。
 #[tauri::command]
 pub async fn sftp_write(
     ssh: State<'_, Arc<SshManager>>,
     server_id: String,
     remote_path: String,
     content: String,
-) -> Result<(), String> {
+    expected_size: Option<u64>,
+    expected_mtime: Option<i64>,
+) -> Result<SftpWriteResult, String> {
     if remote_path.trim().is_empty() {
         return Err("远端路径不能为空".to_string());
     }
     let sftp = ssh.inner().open_sftp(&server_id).await?;
-    if sftp
+    let md = sftp
         .metadata(&remote_path)
         .await
-        .map_err(|e| format!("读取远端 {remote_path} 失败: {e}"))?
-        .is_dir()
-    {
+        .map_err(|e| format!("读取远端 {remote_path} 失败: {e}"))?;
+    if md.is_dir() {
         return Err(format!("远端 {remote_path} 是目录，不能写入"));
+    }
+    let size = md.size.unwrap_or(0);
+    let mtime = md.mtime.unwrap_or(0) as i64;
+    if stat_conflict(expected_size, expected_mtime, size, mtime) {
+        return Ok(SftpWriteResult {
+            conflict: true,
+            actual_size: Some(size),
+            actual_mtime: Some(mtime),
+        });
     }
     let mut f = sftp
         .create(&remote_path)
@@ -401,7 +426,64 @@ pub async fn sftp_write(
     f.shutdown()
         .await
         .map_err(|e| format!("关闭远端文件 {remote_path} 失败: {e}"))?;
-    Ok(())
+    // 落盘后重新 stat：mtime/size 以服务器实际值为准（前端以此重建基线）
+    let (after_size, after_mtime) = sftp
+        .metadata(&remote_path)
+        .await
+        .ok()
+        .map(|md| (md.size.unwrap_or(0), md.mtime.unwrap_or(0) as i64))
+        .unwrap_or((size, mtime));
+    Ok(SftpWriteResult {
+        conflict: false,
+        actual_size: Some(after_size),
+        actual_mtime: Some(after_mtime),
+    })
+}
+
+/// 校验预期快照与远端当前属性是否一致（编辑器「外部修改冲突」检测）。
+/// 仅比较提供的维度；全部未提供时不检测（普通写盘路径）。
+fn stat_conflict(
+    expected_size: Option<u64>,
+    expected_mtime: Option<i64>,
+    actual_size: u64,
+    actual_mtime: i64,
+) -> bool {
+    match (expected_size, expected_mtime) {
+        (None, None) => false,
+        (Some(s), _) if s != actual_size => true,
+        (_, Some(m)) if m != actual_mtime => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stat_conflict;
+
+    #[test]
+    fn no_expected_never_conflicts() {
+        assert!(!stat_conflict(None, None, 100, 1000));
+    }
+
+    #[test]
+    fn size_mismatch_conflicts() {
+        assert!(stat_conflict(Some(500), Some(1713000000), 501, 1713000000));
+        assert!(!stat_conflict(Some(500), Some(1713000000), 500, 1713000000));
+    }
+
+    #[test]
+    fn mtime_mismatch_conflicts_even_if_size_same() {
+        // 同大小但被改写（外部 touch 或原样覆盖）也要拦
+        assert!(stat_conflict(Some(500), Some(1713000000), 500, 1713000001));
+    }
+
+    #[test]
+    fn partial_dimension_only_compares_given() {
+        assert!(!stat_conflict(Some(500), None, 500, 999999));
+        assert!(stat_conflict(Some(500), None, 501, 999999));
+        assert!(!stat_conflict(None, Some(1713000000), 999, 1713000000));
+        assert!(stat_conflict(None, Some(1713000000), 999, 1713000001));
+    }
 }
 
 /// 远端移动/重命名：to 为完整目标路径；目标已存在报错（防误覆盖，与 fs_move 语义一致）。

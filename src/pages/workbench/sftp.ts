@@ -415,7 +415,8 @@ function openRemoteFile(st: SftpTabState, it: RemoteEntry): void {
     id: `editor:sftp:${st.serverId}:${it.path}`,
     type: 'editor',
     title: it.name,
-    data: { sftp: { serverId: st.serverId, remotePath: it.path }, name: it.name },
+    // stat 快照 = 打开时远端属性，保存前用于「外部修改」冲突检测（editor.ts）
+    data: { sftp: { serverId: st.serverId, remotePath: it.path, stat: { size: it.size, mtime: it.mtime } }, name: it.name },
   });
 }
 

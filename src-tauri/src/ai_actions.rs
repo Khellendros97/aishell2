@@ -18,7 +18,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::ssh::SshManager;
-use crate::store::Store;
+use crate::store::{DbKind, Store};
 
 /// 命令执行结果（serde camelCase：stdout / stderr / exitCode）。
 #[derive(Debug, Clone, Serialize)]
@@ -174,14 +174,106 @@ impl AiActions {
                     "- serverId={}，名称={}，地址={}:{}，用户={}，认证={}，状态={}",
                     sv.id, sv.name, sv.host, sv.port, sv.username, auth, status
                 ));
+                // 数据库连接（AI 受管查询通道）：connectionId 供 db_query 使用；禁用的连接对 AI 不可见
+                let conns = self.store.db_connections(sid);
+                let enabled: Vec<_> = conns.iter().filter(|c| c.enabled).collect();
+                if enabled.is_empty() {
+                    let note = if conns.is_empty() {
+                        "无（需用户先在「服务器设置-数据库连接」中配置，AI 才能 db_query）".to_string()
+                    } else {
+                        format!("无启用中的连接（{} 条已禁用）", conns.len())
+                    };
+                    lines.push(format!("  - 数据库连接：{note}"));
+                } else {
+                    for c in &enabled {
+                        let db = if c.database.is_empty() { "-".to_string() } else { c.database.clone() };
+                        lines.push(format!(
+                            "  - 数据库连接 connectionId={}，名称={}，类型={}，地址={}:{}，默认库={}，AI 可执行命令={}",
+                            c.id,
+                            c.name,
+                            c.kind.as_str(),
+                            c.host,
+                            c.port,
+                            db,
+                            c.effective_commands().join("/")
+                        ));
+                    }
+                }
             }
         }
         if lines.is_empty() {
             return Ok("项目未绑定任何远程服务器".to_string());
         }
         let mut text = format!("项目绑定服务器（{} 台）：\n{}", lines.len(), lines.join("\n"));
-        text.push_str("\n提示：远程 run_command / sftp_upload / sftp_download 请使用上述 serverId；锁定服务器会返回「已锁定」错误。");
+        text.push_str("\n提示：远程 run_command / sftp_upload / sftp_download 请使用上述 serverId；锁定服务器会返回「已锁定」错误。数据库查询用 db_query，connectionId 取上述「数据库连接」条目中的 connectionId。");
         Ok(text)
+    }
+
+    /// AI 受管数据库查询（db_query 工具的执行体）：
+    /// 凭据由系统代管（keyring `db:<serverId>:<connId>`），经 SSH 在服务器本机执行客户端，
+    /// 连接目标恒为服务器本机（数据库只对 127.0.0.1 开放也天然可达）。
+    /// 命令白名单（连接配置，默认只读集）在此最终裁决；白名单外一律拒绝。
+    pub async fn db_query(
+        &self,
+        server_id: String,
+        connection_id: String,
+        command: String,
+    ) -> Result<CommandResult, String> {
+        self.ensure_ai_allowed(&server_id)?;
+        let conn = self
+            .store
+            .db_connection(&server_id, &connection_id)
+            .ok_or_else(|| format!("数据库连接不存在：{connection_id}"))?;
+        if !conn.enabled {
+            return Err(format!(
+                "数据库连接「{}」已禁用，请在「服务器设置-数据库连接」中启用",
+                conn.name
+            ));
+        }
+        let allowed = conn.effective_commands();
+        validate_db_command(conn.kind, &command, &allowed)?;
+        let pass = self
+            .store
+            .db_secret(&server_id, &connection_id)
+            .map_err(|_| format!("数据库连接「{}」未配置密码，请先在服务器设置中配置", conn.name))?;
+        let command = match conn.kind {
+            DbKind::Mysql => embed_script(
+                &[
+                    ("DB_HOST", conn.host.as_str()),
+                    ("DB_PORT", &conn.port.to_string()),
+                    ("DB_USER", conn.user.as_str()),
+                    ("DB_PASS", pass.as_str()),
+                    ("DB_NAME", conn.database.as_str()),
+                    ("DB_SQL", command.as_str()),
+                ],
+                MYSQL_SCRIPT_BODY,
+                &[],
+            ),
+            DbKind::Clickhouse => embed_script(
+                &[
+                    ("CH_HOST", conn.host.as_str()),
+                    ("CH_PORT", &conn.port.to_string()),
+                    ("CH_USER", conn.user.as_str()),
+                    ("CH_PASS", pass.as_str()),
+                    ("CH_DB", conn.database.as_str()),
+                    ("CH_SQL", command.as_str()),
+                ],
+                CLICKHOUSE_SCRIPT_BODY,
+                &[],
+            ),
+            DbKind::Redis => embed_script(
+                &[
+                    ("R_HOST", conn.host.as_str()),
+                    ("R_PORT", &conn.port.to_string()),
+                    ("R_CMD", command.as_str()),
+                    // 密码经 shell 内 export 传给 redis-cli（REDISCLI_AUTH 官方防泄漏通道，不进 argv）
+                    ("REDISCLI_AUTH", pass.as_str()),
+                ],
+                REDIS_SCRIPT_BODY,
+                &["REDISCLI_AUTH"],
+            ),
+        };
+        self.ssh.exec(&server_id, &command).await
     }
 
     /* ---------- 内部 ---------- */
@@ -278,6 +370,95 @@ fn ensure_inside(root: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------- 受管数据库查询
+
+/// 值经 base64 内嵌进命令串（base64 字符集对 shell 安全，无注入面；不依赖 SSH env——
+/// OpenSSH 默认 AcceptEnv 为空，set_env 会被服务端静默丢弃，实测 env 全丢导致连接参数失效）。
+fn b64(v: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(v)
+}
+
+/// mysql/mariadb 执行：临时 defaults-file（0600）承载凭据（ps 不可见）并**独占**（--defaults-file
+/// 不读 ~/.my.cnf，避免其 [client] user=root 覆盖连接用户，实测坑）；SQL 走临时文件，用完即删。
+/// 客户端 PATH 无关探测（command -v 失败时在 /srun3、/usr、/opt 常见部署目录查找）。
+const MYSQL_SCRIPT_BODY: &str = r#"CFG=$(mktemp /tmp/aishell-db.XXXXXX.conf); SQL=$(mktemp /tmp/aishell-db.XXXXXX.sql); chmod 600 "$CFG" "$SQL"; printf '[client]\nhost=%s\nport=%s\nuser=%s\npassword=%s\n' "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_PASS" > "$CFG"; printf '%s' "$DB_SQL" > "$SQL"; CLI=$(command -v mariadb 2>/dev/null || command -v mysql 2>/dev/null || find /srun3 /usr/local/bin /usr/bin /opt -maxdepth 4 \( -name mariadb -o -name mysql \) -type f 2>/dev/null | head -1); if [ -z "$CLI" ]; then echo "数据库客户端未找到（mariadb/mysql），请确认服务器已安装" >&2; rm -f "$CFG" "$SQL"; exit 127; fi; if [ -n "$DB_NAME" ]; then timeout 60 "$CLI" --defaults-file="$CFG" -D "$DB_NAME" < "$SQL"; else timeout 60 "$CLI" --defaults-file="$CFG" < "$SQL"; fi; RC=$?; rm -f "$CFG" "$SQL"; exit $RC"#;
+
+/// clickhouse-client 执行：临时 config.xml（0600）承载凭据，SQL 走 stdin；客户端 PATH 无关探测。
+const CLICKHOUSE_SCRIPT_BODY: &str = r#"CFG=$(mktemp /tmp/aishell-db-ch.XXXXXX.xml); SQL=$(mktemp /tmp/aishell-db-ch.XXXXXX.sql); chmod 600 "$CFG" "$SQL"; printf '<config><host>%s</host><port>%s</port><user>%s</user><password>%s</password><database>%s</database></config>' "$CH_HOST" "$CH_PORT" "$CH_USER" "$CH_PASS" "$CH_DB" > "$CFG"; printf '%s' "$CH_SQL" > "$SQL"; CLI=$(command -v clickhouse-client 2>/dev/null || find /srun3 /usr/local/bin /usr/bin /opt -maxdepth 4 -name clickhouse-client -type f 2>/dev/null | head -1); if [ -z "$CLI" ]; then echo "clickhouse-client 未找到，请确认服务器已安装" >&2; rm -f "$CFG" "$SQL"; exit 127; fi; timeout 60 "$CLI" --config-file="$CFG" < "$SQL"; RC=$?; rm -f "$CFG" "$SQL"; exit $RC"#;
+
+/// redis-cli 执行：密码经 REDISCLI_AUTH（shell 内 export，不进 argv）；客户端 PATH 无关探测；
+/// 命令按空白拆成独立参数（redis-cli 每个 argv 是一个命令 token，单 argv 多词会被当作
+/// 一个未知命令，实测 SCAN 0 COUNT 20 报错）；空命令直接报错防交互挂起；整体 timeout 防通道滞留。
+const REDIS_SCRIPT_BODY: &str = r#"if [ -z "$R_CMD" ]; then echo "redis 命令为空" >&2; exit 2; fi; CLI=$(command -v redis-cli 2>/dev/null || find /srun3 /usr/local/bin /usr/bin /opt -maxdepth 4 -name redis-cli -type f 2>/dev/null | head -1); if [ -z "$CLI" ]; then echo "redis-cli 未找到，请确认服务器已安装" >&2; exit 127; fi; read -r -a R_ARGS <<< "$R_CMD"; exec timeout 60 env REDISCLI_AUTH="$REDISCLI_AUTH" "$CLI" -h "$R_HOST" -p "$R_PORT" "${R_ARGS[@]}""#;
+
+/// 把键值对 base64 内嵌为「变量=$(echo '<b64>' | base64 -d)」前缀 + 脚本主体。
+/// redis 的 REDISCLI_AUTH 需 export 进环境（子进程可见），其余为普通 shell 变量。
+fn embed_script(values: &[(&str, &str)], body: &str, export_keys: &[&str]) -> String {
+    let mut s = String::new();
+    for (k, v) in values {
+        let prefix = if export_keys.contains(k) { "export " } else { "" };
+        s.push_str(&format!("{prefix}{k}=$(echo '{}' | base64 -d 2>/dev/null || true); ", b64(v)));
+    }
+    s.push_str(body);
+    s
+}
+
+/// 提取命令首词（大写）：SQL/redis 命令关键字均大小写不敏感。
+fn first_token_upper(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_uppercase()
+}
+
+/// 命令白名单校验（权威，最终裁决）：
+/// - mysql/clickhouse：按 `;` 分段逐段校验首词（防 `SELECT 1; DROP TABLE x` 多语句绕过）；
+/// - redis：单命令，首词在白名单且不含 shell 元字符（防御纵深）。
+fn validate_db_command(kind: DbKind, command: &str, allowed: &[String]) -> Result<(), String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("SQL/命令不能为空".to_string());
+    }
+    let allowed_upper: Vec<String> = allowed.iter().map(|s| s.to_uppercase()).collect();
+    let mut segments: Vec<String> = Vec::new();
+    match kind {
+        DbKind::Mysql | DbKind::Clickhouse => {
+            segments = trimmed.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+        DbKind::Redis => {
+            // redis 命令不应含 shell 元字符（$ 命令替换、` 反引号、| 管道、&&、; 等）
+            if trimmed.contains([';', '|', '&', '>', '<', '`', '$', '(', ')']) {
+                return Err("redis 命令包含非法字符（; | & < > 反引号 $ 等），仅允许单条命令".to_string());
+            }
+            segments.push(trimmed.to_string());
+        }
+    }
+    if segments.is_empty() {
+        return Err("SQL/命令不能为空".to_string());
+    }
+    for seg in &segments {
+        let tok = first_token_upper(seg);
+        if !allowed_upper.contains(&tok) {
+            return Err(format!(
+                "命令「{}」不在该连接的允许列表内。允许：{}。如需执行请先在服务器设置-数据库连接中配置",
+                tok,
+                allowed_upper.join(" / ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 读/写判定（供 guard 审批分流与测试；只读 = 命令首词在默认只读集中）。
+/// 用户扩展白名单里的写命令（如 UPDATE）不在此列——它们由 guard 人工审批放行。
+pub fn is_db_read_only(kind: DbKind, command: &str) -> bool {
+    let default_read = kind.default_read_commands();
+    let tok = first_token_upper(command);
+    default_read.iter().any(|c| c.eq_ignore_ascii_case(&tok))
+}
+
 // ---------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -307,6 +488,138 @@ mod tests {
         assert!(ensure_inside(root, Path::new(r"D:\proj2\a.ts")).is_err());
         assert!(ensure_inside(root, Path::new(r"D:\other\a.ts")).is_err());
         assert!(ensure_inside(root, Path::new(r"D:\proj-x\a.ts")).is_err());
+    }
+
+    #[test]
+    fn validate_db_command_enforces_whitelist_per_segment() {
+        use crate::store::DbKind;
+        let allowed: Vec<String> = ["SELECT", "SHOW", "DESC"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 合法只读
+        assert!(validate_db_command(DbKind::Mysql, "SELECT * FROM online_radius LIMIT 5", &allowed).is_ok());
+        assert!(validate_db_command(DbKind::Mysql, "show databases;", &allowed).is_ok());
+        assert!(validate_db_command(DbKind::Mysql, "SELECT 1; SELECT 2", &allowed).is_ok());
+        // 多语句夹写操作：第二段 DROP 不在白名单 → 拒绝（防绕过）
+        assert!(validate_db_command(DbKind::Mysql, "SELECT 1; DROP TABLE users", &allowed).is_err());
+        // 首词不在白名单
+        assert!(validate_db_command(DbKind::Mysql, "UPDATE t SET a=1", &allowed).is_err());
+        assert!(validate_db_command(DbKind::Mysql, "DELETE FROM t", &allowed).is_err());
+        // 空命令
+        assert!(validate_db_command(DbKind::Mysql, "   ", &allowed).is_err());
+    }
+
+    #[test]
+    fn validate_db_command_redis_single_command_no_shell_metachars() {
+        use crate::store::DbKind;
+        let allowed: Vec<String> = ["GET", "KEYS", "HGETALL"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(validate_db_command(DbKind::Redis, "GET user:1", &allowed).is_ok());
+        assert!(validate_db_command(DbKind::Redis, "KEYS user:*", &allowed).is_ok());
+        assert!(validate_db_command(DbKind::Redis, "HGETALL hash:1", &allowed).is_ok());
+        // shell 元字符一律拒绝（防管道/命令替换注入）
+        assert!(validate_db_command(DbKind::Redis, "GET a | cat /etc/passwd", &allowed).is_err());
+        assert!(validate_db_command(DbKind::Redis, "GET a; echo x", &allowed).is_err());
+        assert!(validate_db_command(DbKind::Redis, "GET $(id)", &allowed).is_err());
+        // 首词不在白名单
+        assert!(validate_db_command(DbKind::Redis, "SET a 1", &allowed).is_err());
+    }
+
+    #[test]
+    fn is_db_read_only_classifies_by_first_token() {
+        use crate::store::DbKind;
+        assert!(is_db_read_only(DbKind::Mysql, "SELECT 1"));
+        assert!(is_db_read_only(DbKind::Mysql, "show tables"));
+        assert!(!is_db_read_only(DbKind::Mysql, "UPDATE t SET a=1"));
+        assert!(!is_db_read_only(DbKind::Mysql, "INSERT INTO t VALUES (1)"));
+        assert!(is_db_read_only(DbKind::Redis, "GET k"));
+        assert!(is_db_read_only(DbKind::Redis, "HGETALL h"));
+        assert!(!is_db_read_only(DbKind::Redis, "SET k v"));
+        assert!(is_db_read_only(DbKind::Clickhouse, "SELECT * FROM t LIMIT 1"));
+    }
+
+    #[test]
+    fn db_query_rejects_unknown_connection_and_missing_secret() {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-ai-actions-db-query-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(crate::store::test_store(dir.clone()));
+        store
+            .upsert_server(
+                crate::store::Server {
+                    id: "srv-a".to_string(),
+                    name: "计费机".to_string(),
+                    host: "10.0.0.1".to_string(),
+                    port: 22,
+                    auth_type: crate::store::AuthType::Password,
+                    username: "root".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                },
+                None,
+            )
+            .unwrap();
+        let actions = AiActions::new(Arc::clone(&store), Arc::new(crate::ssh::SshManager::new(Arc::clone(&store))));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // 连接不存在
+        let err = rt.block_on(actions.db_query(
+            "srv-a".to_string(),
+            "db-missing".to_string(),
+            "SELECT 1".to_string(),
+        ));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("数据库连接不存在"));
+        // 存在但未配密码
+        store
+            .save_db_connection(
+                "srv-a",
+                crate::store::DbConnection {
+                    id: "db-1".to_string(),
+                    name: "计费库".to_string(),
+                    kind: crate::store::DbKind::Mysql,
+                    host: "127.0.0.1".to_string(),
+                    port: 3506,
+                    user: "icc".to_string(),
+                    database: "srun4k".to_string(),
+                    allowed_commands: vec![],
+                    enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+        let err2 = rt.block_on(actions.db_query(
+            "srv-a".to_string(),
+            "db-1".to_string(),
+            "SELECT 1".to_string(),
+        ));
+        assert!(err2.is_err());
+        assert!(err2.unwrap_err().contains("未配置密码"));
+        // 白名单外命令（未配密码前也会先过白名单？——顺序：白名单先于密码，见实现）
+        let err3 = rt.block_on(actions.db_query(
+            "srv-a".to_string(),
+            "db-1".to_string(),
+            "DROP TABLE x".to_string(),
+        ));
+        assert!(err3.is_err());
+        // 禁用连接：白名单/密码之前先拒绝
+        let mut disabled = store.db_connection("srv-a", "db-1").unwrap();
+        disabled.enabled = false;
+        store.save_db_connection("srv-a", disabled, None).unwrap();
+        let err4 = rt.block_on(actions.db_query(
+            "srv-a".to_string(),
+            "db-1".to_string(),
+            "SELECT 1".to_string(),
+        ));
+        assert!(err4.is_err());
+        assert!(err4.unwrap_err().contains("已禁用"));
     }
 
     #[test]
