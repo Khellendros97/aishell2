@@ -388,7 +388,7 @@ export default function (pi: ExtensionAPI) {
 		name: "db_query",
 		label: "数据库查询",
 		description:
-			"受管数据库查询（mysql/clickhouse/redis，凭据由系统代管，AI 拿不到密码）。serverId + connectionId 指定连接，command 为 SQL 或单条 redis 命令。仅允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN 及 redis 的 GET/KEYS/SCAN 等）；白名单外命令会被拒绝，写命令需用户审批。",
+			"受管数据库查询（mysql/clickhouse/postgres/redis，凭据由系统代管，AI 拿不到密码）。serverId + connectionId 指定连接，command 为 SQL 或单条 redis 命令。仅允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN 及 redis 的 GET/KEYS/SCAN 等）；白名单外命令会被拒绝，写命令需用户审批。",
 		promptSnippet: "查询数据库",
 		promptGuidelines: [
 			"查询数据库前先调用 list_servers 获取 serverId；connectionId 从该服务器配置的数据库连接中选择（用户可在服务器设置-数据库连接中查看/配置）。",

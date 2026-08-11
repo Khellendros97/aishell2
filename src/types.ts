@@ -229,7 +229,7 @@ export interface SftpWriteResult {
 }
 
 /** 数据库类型（AI 受管查询通道）—— 与 store.rs DbKind serde lowercase 对齐 */
-export type DbKind = 'mysql' | 'clickhouse' | 'redis';
+export type DbKind = 'mysql' | 'clickhouse' | 'redis' | 'postgres';
 
 /** 服务器数据库连接配置（AI 受管查询通道）—— 与 store.rs DbConnection serde camelCase 对齐。
  *  密码不在 JSON 中（keyring account `db:<serverId>:<connId>`）。

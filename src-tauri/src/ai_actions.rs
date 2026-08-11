@@ -287,6 +287,18 @@ impl AiActions {
                 REDIS_SCRIPT_BODY,
                 &["REDISCLI_AUTH"],
             ),
+            DbKind::Postgres => embed_script(
+                &[
+                    ("PG_HOST", conn.host.as_str()),
+                    ("PG_PORT", &conn.port.to_string()),
+                    ("PG_USER", conn.user.as_str()),
+                    ("PG_PASS", pass.as_str()),
+                    ("PG_DB", conn.database.as_str()),
+                    ("PG_SQL", command.as_str()),
+                ],
+                POSTGRES_SCRIPT_BODY,
+                &[],
+            ),
         };
         self.ssh.exec(&server_id, &command).await
     }
@@ -432,6 +444,12 @@ const CLICKHOUSE_SCRIPT_BODY: &str = r#"CFG=$(mktemp /tmp/aishell-db-ch.XXXXXX.x
 /// 一个未知命令，实测 SCAN 0 COUNT 20 报错）；空命令直接报错防交互挂起；整体 timeout 防通道滞留。
 const REDIS_SCRIPT_BODY: &str = r#"if [ -z "$R_CMD" ]; then echo "redis 命令为空" >&2; exit 2; fi; CLI=$(command -v redis-cli 2>/dev/null || find /srun3 /usr/local/bin /usr/bin /opt -maxdepth 4 -name redis-cli -type f 2>/dev/null | head -1); if [ -z "$CLI" ]; then echo "redis-cli 未找到，请确认服务器已安装" >&2; exit 127; fi; read -r -a R_ARGS <<< "$R_CMD"; exec timeout 60 env REDISCLI_AUTH="$REDISCLI_AUTH" "$CLI" -h "$R_HOST" -p "$R_PORT" "${R_ARGS[@]}""#;
 
+/// postgres 执行：密码经 PGPASSWORD 环境变量（libpq 官方防泄漏通道，不进 argv，ps 不可见）；
+/// SQL 走临时文件 + `psql -f`（同 mysql 模式，避免 stdin 交互异常）；`-X` 跳过 psqlrc、
+/// `-v ON_ERROR_STOP=1` 遇错即停、`-P pager=off` 关闭分页；statement_timeout 经 PGOPTIONS
+/// 注入（libpq 透传给服务端，55s < 外层 timeout 60）；客户端 PATH 无关探测。
+const POSTGRES_SCRIPT_BODY: &str = r#"SQL=$(mktemp /tmp/aishell-db-pg.XXXXXX.sql); chmod 600 "$SQL"; printf '%s' "$PG_SQL" > "$SQL"; CLI=$(command -v psql 2>/dev/null || find /srun3 /usr/local/bin /usr/bin /opt -maxdepth 4 -name psql -type f 2>/dev/null | head -1); if [ -z "$CLI" ]; then echo "psql 未找到，请确认服务器已安装" >&2; rm -f "$SQL"; exit 127; fi; export PGPASSWORD="$PG_PASS"; timeout 60 env PGOPTIONS="-c statement_timeout=55s" "$CLI" -X -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" ${PG_DB:+-d "$PG_DB"} -v ON_ERROR_STOP=1 -P pager=off -f "$SQL"; RC=$?; rm -f "$SQL"; exit $RC"#;
+
 /// 把键值对 base64 内嵌为「变量=$(echo '<b64>' | base64 -d)」前缀 + 脚本主体。
 /// redis 的 REDISCLI_AUTH 需 export 进环境（子进程可见），其余为普通 shell 变量。
 fn embed_script(values: &[(&str, &str)], body: &str, export_keys: &[&str]) -> String {
@@ -454,7 +472,7 @@ fn first_token_upper(command: &str) -> String {
 }
 
 /// 命令白名单校验（权威，最终裁决）：
-/// - mysql/clickhouse：按 `;` 分段逐段校验首词（防 `SELECT 1; DROP TABLE x` 多语句绕过）；
+/// - mysql/clickhouse/postgres：按 `;` 分段逐段校验首词（防 `SELECT 1; DROP TABLE x` 多语句绕过）；
 /// - redis：单命令，首词在白名单且不含 shell 元字符（防御纵深）。
 fn validate_db_command(kind: DbKind, command: &str, allowed: &[String]) -> Result<(), String> {
     let trimmed = command.trim();
@@ -464,7 +482,7 @@ fn validate_db_command(kind: DbKind, command: &str, allowed: &[String]) -> Resul
     let allowed_upper: Vec<String> = allowed.iter().map(|s| s.to_uppercase()).collect();
     let mut segments: Vec<String> = Vec::new();
     match kind {
-        DbKind::Mysql | DbKind::Clickhouse => {
+        DbKind::Mysql | DbKind::Clickhouse | DbKind::Postgres => {
             segments = trimmed.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         }
         DbKind::Redis => {
@@ -563,6 +581,22 @@ mod tests {
         assert!(validate_db_command(DbKind::Mysql, "DELETE FROM t", &allowed).is_err());
         // 空命令
         assert!(validate_db_command(DbKind::Mysql, "   ", &allowed).is_err());
+        // postgres 与 mysql 同为 SQL 分段校验：白名单内通过
+        assert!(validate_db_command(DbKind::Postgres, "SELECT id FROM users LIMIT 3", &allowed).is_ok());
+        assert!(validate_db_command(DbKind::Postgres, "SELECT 1; SHOW search_path", &allowed).is_ok());
+        // 多语句绕过：分段逐段校验，写命令拒绝
+        let err = validate_db_command(DbKind::Postgres, "SELECT 1; DROP TABLE users", &allowed).unwrap_err();
+        assert!(err.contains("DROP"), "应拒绝白名单外的 DROP: {err}");
+        assert!(validate_db_command(DbKind::Postgres, "   ", &allowed).is_err());
+    }
+
+    #[test]
+    fn is_db_read_only_accepts_postgres_read_words() {
+        use crate::store::DbKind;
+        assert!(is_db_read_only(DbKind::Postgres, "SELECT * FROM t"));
+        assert!(is_db_read_only(DbKind::Postgres, "explain analyze select 1"));
+        assert!(!is_db_read_only(DbKind::Postgres, "UPDATE t SET a=1"));
+        assert!(!is_db_read_only(DbKind::Postgres, "VACUUM"));
     }
 
     #[test]
