@@ -90,8 +90,46 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 | `GET /api/auth/me` | Bearer/Cookie | 当前用户：`{"user":{id,name,dept,avatarURL,role,status,…}}` |
 | `POST /api/auth/refresh` | Cookie/body | 轮换令牌：body `{"refreshToken":"…"}` 或携带 Cookie；响应 `{"user":…,"expiresIn":7200}`，新令牌写入 Cookie |
 | `POST /api/auth/logout` | Cookie/body | 吊销 refresh token 并清 Cookie，返回 204 |
+| `GET /api/usage` | Bearer/Cookie | **个人用量报表**：仅统计当前用户本人（见 §4.1） |
 
 > 说明：客户端推荐用 OAuth 令牌端点续期（`/oauth/token` 的 `grant_type=refresh_token`，见 OAuth2 接入文档 §4.3）；`/api/auth/refresh` 为同源会话接口，二者签发的令牌同源等价，二选一即可。`/api/auth/login` 仅限管理员账号，员工客户端一律走 OAuth 授权流程。
+
+### 4.1 个人用量 `GET /api/usage`
+
+参数与聚合口径与管理端用量一致，但 `userId` 参数**强制忽略**（服务端固定按当前令牌用户统计），客户端无法越权查询他人数据。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `days` | 14 | 统计天数，1–90 |
+| `kind` | 全部 | `llm` 或 `search` |
+| `model` | 全部 | 模型名过滤（仅 LLM） |
+
+响应结构：
+
+```json
+{
+  "from": "2026-07-29",
+  "to": "2026-08-11",
+  "timezone": "UTC",
+  "summary": {
+    "requests": 128, "llmRequests": 100, "searchRequests": 28,
+    "promptTokens": 123456, "completionTokens": 54321, "totalTokens": 177777,
+    "averageLatencyMs": 214.5, "errorCount": 2
+  },
+  "daily": [ { "date": "2026-08-11", "requests": 12, "llmRequests": 9, "searchRequests": 3,
+               "promptTokens": 0, "completionTokens": 0, "errorCount": 0 } ],
+  "models": [ { "model": "gpt-4o", "requests": 80, "promptTokens": 0,
+                "completionTokens": 0, "totalTokens": 0 } ],
+  "breakdown": [ { "date": "2026-08-11", "userId": 7, "userName": "张三", "dept": "研发部",
+                   "kind": "llm", "model": "gpt-4o", "requests": 5,
+                   "promptTokens": 0, "completionTokens": 0, "totalTokens": 0,
+                   "averageLatencyMs": 180.0, "errorCount": 0 } ]
+}
+```
+
+- `summary` 不含 `activeUsers`（个人报表无此维度）；
+- `daily` 按查询天数补齐为连续日期（无调用的日期为 0）；
+- 计量口径：LLM 按 token 数、搜索按请求次数，UTC 自然日（与 §5 配额口径一致）。
 
 ## 5. 配额（429）语义
 
@@ -131,4 +169,7 @@ curl -N $BASE/api/proxy/llm/v1/chat/completions \
 
 # 搜索
 curl "$BASE/api/proxy/search?q=hello" -H "Authorization: Bearer $TOKEN"
+
+# 个人用量报表
+curl "$BASE/api/usage?days=14" -H "Authorization: Bearer $TOKEN"
 ```

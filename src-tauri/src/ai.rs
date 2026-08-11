@@ -40,10 +40,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::json;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ai_actions::AiActions;
-use crate::store::{AiMode, ApprovalMode, Store};
+use crate::store::{AiMode, ApprovalMode, CloudMode, Store};
 
 /// suggest 模式的系统提示（保持现状：无 bash，写仅 .aishell/）。
 const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
@@ -144,6 +144,12 @@ pub struct AiManager {
     actions: Arc<AiActions>,
 }
 
+/// 托管模式 LLM 代理端点：{serverUrl}/api/proxy/llm/v1（开放 API 文档 §2）。
+/// 独立成纯函数便于单测（server_url 来自编译期注入，测试环境不可用）。
+fn hosted_llm_base(server_url: &str) -> String {
+    format!("{}/api/proxy/llm/v1", server_url.trim_end_matches('/'))
+}
+
 impl AiManager {
     pub fn new(store: Arc<Store>, pi_dir: PathBuf, agent_dir: PathBuf, ssh: Arc<crate::ssh::SshManager>, pi_debug: String) -> Self {
         let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh));
@@ -157,7 +163,7 @@ impl AiManager {
         }
     }
 
-    /// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
+/// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
     fn write_models_json(&self) -> Result<(), String> {
         let cfg = self.store.llm_config();
         let model_id = &cfg.model_id;
@@ -166,12 +172,25 @@ impl AiManager {
             let id = model_id.to_lowercase();
             id.contains("reasoner") || id.contains("v4")
         };
+        // 托管模式（CR-3.1）：provider 指向公司服务器代理端点，apiKey 用 $AISHELL_CLOUD_TOKEN
+        // （spawn 时注入当前 access_token）；个人模式维持现状（本地 baseUrl + $DEEPSEEK_API_KEY）。
+        let hosted = self.store.cloud_mode() == CloudMode::Hosted;
+        let (base_url, api_key_env) = if hosted {
+            let server = crate::cloud::server_url()
+                .ok_or_else(|| "当前构建未配置云服务，无法使用托管模式".to_string())?;
+            (hosted_llm_base(&server), "$AISHELL_CLOUD_TOKEN")
+        } else {
+            (
+                cfg.base_url.trim_end_matches('/').to_string(),
+                "$DEEPSEEK_API_KEY",
+            )
+        };
         let models = json!({
             "providers": {
                 "deepseek": {
-                    "baseUrl": cfg.base_url.trim_end_matches('/'),
+                    "baseUrl": base_url,
                     "api": "openai-completions",
-                    "apiKey": "$DEEPSEEK_API_KEY",
+                    "apiKey": api_key_env,
                     "models": [{
                         "id": model_id,
                         "name": model_id,
@@ -191,7 +210,15 @@ impl AiManager {
 
     /// 为 key 拉起 pi 进程并启动 stdout 读取线程（读线程负责 done/error 事件、审批转发、
     /// 内部动作执行与异常退出摘除）。
-    fn spawn(&self, app: &AppHandle, key: &str, project_id: &str) -> Result<(), String> {
+    /// `cloud_token`：托管模式下的 access_token（ai_chat 在 spawn 前 async 续期保证未过期）；
+    /// 个人模式传 None。
+    fn spawn(
+        &self,
+        app: &AppHandle,
+        key: &str,
+        project_id: &str,
+        cloud_token: Option<String>,
+    ) -> Result<(), String> {
         let pi_bin = self.pi_dir.join(PI_BIN_NAME);
         if !pi_bin.is_file() {
             return Err(format!(
@@ -201,10 +228,17 @@ impl AiManager {
             ));
         }
         self.write_models_json()?;
-        let api_key = self
-            .store
-            .read_secret("llm:apikey")
-            .map_err(|_| "请先在设置中配置 DeepSeek API Key".to_string())?;
+        let hosted = self.store.cloud_mode() == CloudMode::Hosted;
+        // 托管模式：LLM 走公司服务器代理（token 由调用方续期传入，缺失即登录失效）
+        let api_key = if hosted {
+            cloud_token.ok_or_else(|| {
+                "登录已过期，请前往账号页重新登录后使用公司服务".to_string()
+            })?
+        } else {
+            self.store
+                .read_secret("llm:apikey")
+                .map_err(|_| "请先在设置中配置 DeepSeek API Key".to_string())?
+        };
         let cfg = self.store.llm_config();
         let effort = serde_json::to_string(&cfg.effort)
             .map_err(|e| format!("effort 序列化失败: {e}"))?
@@ -231,9 +265,17 @@ impl AiManager {
         // 联网搜索扩展落盘（enabled 开关决定是否挂载，与 key 是否配置无关）
         let search_path = self.agent_dir.join("aishell-search.ts");
         std::fs::write(&search_path, SEARCH_EXT).map_err(|e| format!("写入搜索扩展失败: {e}"))?;
-        let search_enabled = self.store.settings().search.enabled;
+        // 搜索能力：托管模式以服务端能力清单为准（CR-4.3）；个人模式按本地设置。
         // 搜索 key 未配置时不注入 env：工具仍挂载，调用时由扩展返回中文引导错误
-        let brave_key = self.store.read_secret("brave:apikey").ok();
+        let (search_enabled, brave_key) = if hosted {
+            let caps = self.store.cloud_profile().1;
+            (caps.map(|c| c.search).unwrap_or(false), None)
+        } else {
+            (
+                self.store.settings().search.enabled,
+                self.store.read_secret("brave:apikey").ok(),
+            )
+        };
 
         // 初始工具集按模式下发（agent/yolo 直接启用变更工具，避免依赖扩展加载期 setActiveTools）；
         // 热切换仍由 /aishell-mode 命令 + 扩展 applyToolset 增量同步。
@@ -280,10 +322,20 @@ impl AiManager {
             &system_prompt,
         ])
         .env("PI_CODING_AGENT_DIR", &self.agent_dir)
-        .env("DEEPSEEK_API_KEY", &api_key)
         .env("AISHELL_AI_MODE", mode.as_str());
-        if let Some(key) = brave_key {
-            cmd.env("BRAVE_API_KEY", key);
+        if hosted {
+            // 托管模式（CR-3.1 / CR-4.1）：models.json 引用 $AISHELL_CLOUD_TOKEN；
+            // 搜索扩展读 $AISHELL_SEARCH_URL + $AISHELL_SEARCH_TOKEN 走公司服务器代理
+            cmd.env("AISHELL_CLOUD_TOKEN", &api_key);
+            if let Some(server) = crate::cloud::server_url() {
+                cmd.env("AISHELL_SEARCH_URL", format!("{server}/api/proxy/search"));
+            }
+            cmd.env("AISHELL_SEARCH_TOKEN", &api_key);
+        } else {
+            cmd.env("DEEPSEEK_API_KEY", &api_key);
+            if let Some(key) = brave_key {
+                cmd.env("BRAVE_API_KEY", key);
+            }
         }
         cmd.current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -699,7 +751,14 @@ fn handle_extension_ui_request(
                     .build()
                     .expect("创建智能审批 runtime 失败")
             });
-            match runtime.block_on(crate::smart_approval::judge(store2, &action, &intent, &summary)) {
+            let cloud_mgr = app2.state::<Arc<crate::cloud::CloudManager>>();
+            match runtime.block_on(crate::smart_approval::judge(
+                store2,
+                &cloud_mgr,
+                &action,
+                &intent,
+                &summary,
+            )) {
                 // 非危险：直接放行，并向前端发带 smart 标记的 approval 事件（渲染「已智能放行」卡）
                 Ok((false, reason)) => {
                     write_stdin_json(
@@ -915,7 +974,13 @@ fn err_message(ev: &serde_json::Value) -> String {
 
 /// 发送一条 prompt：进程不存在则先 spawn；上一轮未完成（busy）先取消审批并写 abort 再发。
 #[tauri::command]
-pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String, prompt: String) -> Result<(), String> {
+pub async fn ai_chat(
+    mgr: State<'_, Arc<AiManager>>,
+    cloud: State<'_, Arc<crate::cloud::CloudManager>>,
+    app: AppHandle,
+    key: String,
+    prompt: String,
+) -> Result<(), String> {
     let project_id = key
         .split_once(':')
         .map(|(p, _)| p.to_string())
@@ -931,18 +996,28 @@ pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String
         masked
     };
 
-    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
-    // 旧进程已死但读取线程尚未摘除时，先清理再重起
-    if let Some(p) = procs.get_mut(&key) {
-        if let Ok(Some(_)) = p.child.try_wait() {
-            procs.remove(&key);
+    // 进程就绪检查：guard 限定在块内，避免跨 await 持有（MutexGuard 非 Send）
+    let need_spawn = {
+        let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        // 旧进程已死但读取线程尚未摘除时，先清理再重起
+        if let Some(p) = procs.get_mut(&key) {
+            if let Ok(Some(_)) = p.child.try_wait() {
+                procs.remove(&key);
+            }
         }
+        !procs.contains_key(&key)
+    };
+    if need_spawn {
+        // 托管模式：spawn 前确保 access_token 有效（CR-1.6 请求前续期，避免请求中途 401）；
+        // 刷新失败（吊销/禁用）在此返回中文引导错误（CR-3.4）
+        let cloud_token = if mgr.store.cloud_mode() == crate::store::CloudMode::Hosted {
+            Some(cloud.valid_access_token(&mgr.store).await?)
+        } else {
+            None
+        };
+        mgr.spawn(&app, &key, &project_id, cloud_token)?;
     }
-    if !procs.contains_key(&key) {
-        drop(procs);
-        mgr.spawn(&app, &key, &project_id)?;
-        procs = mgr.procs.lock().map_err(|e| e.to_string())?;
-    }
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     let Some(proc) = procs.get_mut(&key) else {
         return Err("pi 进程未就绪".to_string());
     };
@@ -1084,4 +1159,89 @@ pub async fn ai_respond_approval(
     buf.push(b'\n');
     w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{test_store, CloudCapabilities, CloudUser};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("aishell-ai-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn manager(store: Arc<Store>, tag: &str) -> AiManager {
+        let agent_dir = temp_dir(tag);
+        AiManager::new(
+            store.clone(),
+            PathBuf::from("pi-unused"),
+            agent_dir,
+            Arc::new(crate::ssh::SshManager::new(store)),
+            String::new(),
+        )
+    }
+
+    /// CR-3.1：托管模式代理端点拼接（serverUrl 可能带尾斜杠，需规范化）。
+    #[test]
+    fn hosted_llm_base_normalizes_server_url() {
+        assert_eq!(
+            hosted_llm_base("https://cloud.example.com"),
+            "https://cloud.example.com/api/proxy/llm/v1"
+        );
+        assert_eq!(
+            hosted_llm_base("http://localhost:8080/"),
+            "http://localhost:8080/api/proxy/llm/v1",
+            "尾斜杠应去除，避免双斜杠"
+        );
+    }
+
+    /// CR-3.1：托管模式但构建未注入 serverUrl → write_models_json 报错（云功能未接入）。
+    #[test]
+    fn write_models_json_hosted_without_injection_errors() {
+        let store = Arc::new(test_store(temp_dir("models-hosted-noenv")));
+        store.cloud_set_tokens("acc", "ref").unwrap();
+        store
+            .cloud_login_info(
+                CloudUser {
+                    name: "张三".into(),
+                    avatar: None,
+                    dept: None,
+                },
+                CloudCapabilities::default(),
+            )
+            .unwrap();
+        let ai = manager(store, "models-hosted-noenv");
+        let err = ai.write_models_json().unwrap_err();
+        assert!(
+            err.contains("未配置云服务"),
+            "未注入 serverUrl 时应提示未接入: {err}"
+        );
+    }
+
+    /// CR-3.1：个人模式 models.json 维持本地 baseUrl + $DEEPSEEK_API_KEY，不含代理痕迹。
+    #[test]
+    fn write_models_json_personal_keeps_local_config() {
+        let store = Arc::new(test_store(temp_dir("models-personal")));
+        let ai = manager(store, "models-personal");
+        ai.write_models_json().unwrap();
+        let text = std::fs::read_to_string(ai.agent_dir.join("models.json")).unwrap();
+        assert!(
+            text.contains("https://api.deepseek.com/v1"),
+            "个人模式 baseUrl 保持本地: {text}"
+        );
+        assert!(text.contains("$DEEPSEEK_API_KEY"));
+        assert!(!text.contains("AISHELL_CLOUD_TOKEN"));
+        assert!(!text.contains("/api/proxy/"), "个人模式不应出现代理地址: {text}");
+    }
+
+    /// 托管模式不注入无意义类型（构造 smoke：类型可编译、SshManager 空实例可构造）。
+    #[test]
+    fn manager_constructs_with_cloud_config_types() {
+        let store = Arc::new(test_store(temp_dir("smoke")));
+        store.cloud_set_mode(crate::store::CloudMode::Hosted).unwrap();
+        let _ = manager(store, "smoke");
+    }
 }

@@ -97,9 +97,7 @@ fn build_status(store: &Store) -> CloudStatus {
         logged_in,
         user,
         capabilities: caps,
-        server_url: SERVER_URL
-            .filter(|s| !s.is_empty())
-            .map(|s| s.trim_end_matches('/').to_string()),
+        server_url: server_url(),
         mode: store.cloud_mode(),
     }
 }
@@ -119,16 +117,20 @@ fn random_hex(len: usize) -> Result<String, String> {
         .collect::<String>())
 }
 
+/// 构建注入的服务器地址（去尾斜杠）；未注入返回 None。
+/// 供 ai.rs（托管模式 baseUrl 拼接）与 smart_approval.rs 复用。
+pub fn server_url() -> Option<String> {
+    SERVER_URL
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+}
+
 /// 取 OAuth 应用凭据；未配置时返回可执行中文错误（前端据此隐藏云功能）。
 /// 服务器地址去掉尾部斜杠，避免拼接出 `//oauth/token` 双斜杠（配置常带 `/`）。
 fn credentials() -> Result<(String, String, String), String> {
     match (SERVER_URL, CLIENT_ID, CLIENT_SECRET) {
         (Some(u), Some(i), Some(s)) if !u.is_empty() && !i.is_empty() && !s.is_empty() => {
-            Ok((
-                u.trim_end_matches('/').to_string(),
-                i.to_string(),
-                s.to_string(),
-            ))
+            Ok((server_url().unwrap_or_default(), i.to_string(), s.to_string()))
         }
         _ => Err("当前构建未配置云服务（缺少服务器地址或应用凭据）".to_string()),
     }

@@ -1,7 +1,12 @@
 /**
- * AIShell 联网搜索扩展 —— web_search 工具（Brave Search）。
- * 由 src-tauri/src/ai.rs 每次 spawn 重写进 agent_dir 并以 --extension 加载；
- * API Key 经 spawn 环境变量 BRAVE_API_KEY 注入（keyring 保管，永不进 JSON / 不回传前端）。
+ * AIShell 联网搜索扩展 —— web_search 工具。
+ * 由 src-tauri/src/ai.rs 每次 spawn 重写进 agent_dir 并以 --extension 加载；密钥经 spawn
+ * 环境变量注入（永不进 JSON / 不回传前端）。
+ *
+ * 两种模式（由 ai.rs 按设置决定注入哪组 env）：
+ * - 个人模式（默认）：Brave Search 官方 API，`BRAVE_API_KEY` + `X-Subscription-Token`；
+ * - 托管模式（公司服务器代理）：注入 `AISHELL_SEARCH_URL` + `AISHELL_SEARCH_TOKEN`，
+ *   请求带 `Authorization: Bearer <token>` 打到云平台 `/api/proxy/search`（开放 API 文档 §3）。
  * 请求实现移植自 omp（@oh-my-pi/pi-coding-agent）src/web/search/providers/brave.ts。
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -9,6 +14,10 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 const BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search";
+/** 托管模式代理地址（ai.rs 注入；存在即托管模式） */
+const PROXY_URL = process.env.AISHELL_SEARCH_URL;
+const PROXY_TOKEN = process.env.AISHELL_SEARCH_TOKEN;
+const HOSTED = !!PROXY_URL;
 const DEFAULT_COUNT = 10;
 const MAX_COUNT = 20;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -29,17 +38,35 @@ function truncate(s: string, max: number): string {
 	return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
-/** 从 Brave 错误体提取可读 detail（形如 {"error":{"detail":"..."}}），失败返回原文 */
+/** 从错误体提取可读信息：兼容云平台 `{"error":"中文"}` 与 Brave `{"error":{"detail":…}}` */
 function extractErrorDetail(body: string): string {
     try {
-        const parsed = JSON.parse(body) as { error?: { detail?: string } };
+        const parsed = JSON.parse(body) as { error?: string | { detail?: string } };
+        if (typeof parsed.error === "string") return parsed.error;
         if (parsed.error?.detail) return parsed.error.detail;
     } catch { /* 非 JSON 时原样返回 */ }
     return body;
 }
 
-/** 状态码 → 中文可执行错误（返回给 LLM 由它转告用户） */
+/** 状态码 → 中文可执行错误（返回给 LLM 由它转告用户）。
+ *  托管模式走云平台错误语义（开放 API 文档 §3.2：服务端错误已为中文 JSON）；个人模式维持 Brave 映射。 */
 function formatHttpError(status: number, detail: string): string {
+    if (HOSTED) {
+        switch (status) {
+            case 401:
+                return "公司账号登录已过期，请前往账号页重新登录后重试";
+            case 403:
+                return "公司账号被禁用，请联系管理员";
+            case 429:
+                return `搜索配额已达上限（429）：${truncate(detail, 200)}`;
+            case 502:
+                return "搜索服务上游暂时不可用（502），请稍后重试";
+            case 503:
+                return `搜索服务尚未配置或已停用（503）：${truncate(detail, 200)}`;
+            default:
+                return `搜索失败（${status}）：${truncate(detail, 200)}`;
+        }
+    }
     switch (status) {
         case 401:
         case 403:
@@ -76,16 +103,22 @@ export default function (pi: ExtensionAPI) {
 			if (signal?.aborted) {
 				return { content: [{ type: "text", text: "已取消" }], details: {} };
 			}
-			const apiKey = process.env.BRAVE_API_KEY;
-			if (!apiKey) {
-				throw new Error("未配置 Brave Search API Key，请前往 设置 → 系统设置 → 联网搜索 填写后重试");
+			// 托管模式：无 token = 登录失效；个人模式：无 Brave key = 未配置
+			const token = HOSTED ? PROXY_TOKEN : process.env.BRAVE_API_KEY;
+			if (!token) {
+				throw new Error(
+					HOSTED
+						? "公司账号登录已过期，请前往账号页重新登录后使用公司搜索服务"
+						: "未配置 Brave Search API Key，请前往 设置 → 系统设置 → 联网搜索 填写后重试",
+				);
 			}
 			const count = Math.min(Math.max(params.count ?? DEFAULT_COUNT, 1), MAX_COUNT);
-			const url = new URL(BRAVE_SEARCH_URL);
+			const url = new URL(HOSTED ? PROXY_URL! : BRAVE_SEARCH_URL);
 			url.searchParams.set("q", params.query);
 			url.searchParams.set("count", String(count));
 			url.searchParams.set("extra_snippets", "true");
-			if (params.recency) {
+			if (params.recency && !HOSTED) {
+				// freshness 为 Brave 私有参数；托管模式由服务端透传解析，不附加
 				url.searchParams.set("freshness", RECENCY_FRESHNESS[params.recency]);
 			}
 
@@ -93,17 +126,25 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 				response = await fetch(url, {
-					headers: { Accept: "application/json", "X-Subscription-Token": apiKey },
+					headers: HOSTED
+						? { Accept: "application/json", Authorization: `Bearer ${token}` }
+						: { Accept: "application/json", "X-Subscription-Token": token },
 					signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
 				});
 			} catch (err) {
 				if (err instanceof DOMException && err.name === "TimeoutError") {
-					throw new Error("Brave 搜索请求超时（30 秒），请稍后重试");
+					throw new Error(
+						HOSTED
+							? "搜索请求超时（30 秒），请稍后重试"
+							: "Brave 搜索请求超时（30 秒），请稍后重试",
+					);
 				}
 				if (err instanceof DOMException && err.name === "AbortError") {
 					return { content: [{ type: "text", text: "已取消" }], details: {} };
 				}
-				throw new Error(`Brave 搜索网络错误：${err instanceof Error ? err.message : String(err)}`);
+				throw new Error(
+					`${HOSTED ? "搜索" : "Brave 搜索"}网络错误：${err instanceof Error ? err.message : String(err)}`,
+				);
 			}
 
 			if (!response.ok) {

@@ -15,7 +15,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::json;
 
-use crate::store::Store;
+use crate::store::{CloudMode, Store};
 
 /// 判定超时：超时视为判定失败（回退人工审批）。
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -98,6 +98,7 @@ const SYSTEM_PROMPT: &str = r#"你是 AIShell 的 AI 助手操作安全审查器
 /// `Err` 表示判定失败（网络/状态码/解析），调用方按人工审批处理。
 pub async fn judge(
     store: &Arc<Store>,
+    cloud: &Arc<crate::cloud::CloudManager>,
     action: &str,
     intent: &str,
     summary: &str,
@@ -106,11 +107,26 @@ pub async fn judge(
     if let Some(reason) = precheck_credential_access(summary) {
         return Ok((true, reason));
     }
-    let api_key = store
-        .read_secret("llm:apikey")
-        .map_err(|_| "未配置 API Key，无法智能审批".to_string())?;
     let cfg = store.llm_config();
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    // 托管模式（CR-3.3）：判定请求改发公司服务器代理 + Bearer access_token（请求前续期）；
+    // 个人模式维持现状（本地 baseUrl + keyring 密钥）。
+    let (url, auth_token) = if store.cloud_mode() == CloudMode::Hosted {
+        let token = cloud
+            .valid_access_token(store)
+            .await
+            .map_err(|e| format!("智能审批登录失效: {e}"))?;
+        let server = crate::cloud::server_url()
+            .ok_or_else(|| "当前构建未配置云服务，无法智能审批".to_string())?;
+        (format!("{server}/api/proxy/llm/v1/chat/completions"), token)
+    } else {
+        let api_key = store
+            .read_secret("llm:apikey")
+            .map_err(|_| "未配置 API Key，无法智能审批".to_string())?;
+        (
+            format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
+            api_key,
+        )
+    };
     let body = json!({
         "model": cfg.model_id,
         "messages": [
@@ -129,7 +145,7 @@ pub async fn judge(
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
     let resp = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Authorization", format!("Bearer {auth_token}"))
         .json(&body)
         .send()
         .await

@@ -771,7 +771,14 @@ impl Store {
             .map_err(|e| format!("原子替换配置文件失败: {e}"))
     }
 
+    /// 配置完整性（CR-2.5）：托管模式 + 已登录（refresh_token 在 keyring）即视为完整，
+    /// 不再要求本地 API Key；否则按个人模式要求 workspace 目录。
+    /// 先取令牌再取 state 锁（避免 state→secrets 的锁序交叉）。
     fn is_config_complete(&self) -> bool {
+        let hosted_logged_in = self.cloud_mode() == CloudMode::Hosted && self.cloud_tokens().1.is_some();
+        if hosted_logged_in {
+            return true;
+        }
         let Ok(guard) = self.state.lock() else {
             return false;
         };
@@ -3825,6 +3832,32 @@ mod tests {
         assert_eq!(store.cloud_mode(), CloudMode::Hosted);
         store.cloud_set_mode(CloudMode::Personal).unwrap();
         assert_eq!(store.cloud_mode(), CloudMode::Personal);
+    }
+
+    #[test]
+    fn is_config_complete_hosted_logged_in_needs_no_local_key() {
+        let store = test_store(temp_config_dir("cfg-complete-hosted"));
+        // 个人模式 + 无 workspace → 不完整（未登录默认个人）
+        assert!(!store.is_config_complete());
+        // 托管模式 + 已登录 → 完整（无需 workspace / 本地 key，CR-2.5）
+        store.cloud_set_tokens("acc", "ref").unwrap();
+        store.cloud_set_mode(CloudMode::Hosted).unwrap();
+        assert!(store.is_config_complete(), "托管 + 已登录应视为配置完整");
+        // 登录失效（清令牌）→ 回不完整，即使仍是托管模式
+        store.cloud_clear_tokens().unwrap();
+        assert!(!store.is_config_complete(), "托管但登录失效不应视为完整");
+        // 有 workspace 时个人模式完整（回归）
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some("C:\\ws".into()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(store.is_config_complete());
     }
 
     #[test]
