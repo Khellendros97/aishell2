@@ -261,6 +261,13 @@ async fn handle_callback(
                         write_callback_response(stream, false, &e).await;
                         return true;
                     }
+                    // 诊断：能力清单决定 web_search/知识库工具挂载，服务端配置变更需重登刷新
+                    crate::term::diag(&format!(
+                        "[cloud] 登录成功，capabilities: models={} search={} knowledge={}",
+                        store.cloud_profile().1.map(|c| c.models.len()).unwrap_or(0),
+                        store.cloud_profile().1.map(|c| c.search).unwrap_or(false),
+                        store.cloud_profile().1.map(|c| c.knowledge).unwrap_or(false),
+                    ));
                     write_callback_response(stream, true, "授权成功，公司账号已关联到 AIShell。")
                         .await;
                     emit_changed(app, store);
