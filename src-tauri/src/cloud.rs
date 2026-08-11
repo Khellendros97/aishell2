@@ -442,6 +442,8 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
     if !status.is_success() {
         return Err(format!("拉取用户信息失败（HTTP {status}）"));
     }
+    // 诊断：完整 me 响应（capabilities 决定工具挂载，字段结构需与服务端对齐）
+    crate::term::diag(&format!("[cloud] /api/auth/me 响应: {body}"));
     let data = body.get("data").unwrap_or(&body);
     let user_obj = data.get("user").or_else(|| body.get("user")).unwrap_or(data);
     let str_field = |v: &serde_json::Value, keys: &[&str]| -> Option<String> {
