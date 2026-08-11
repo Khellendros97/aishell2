@@ -688,6 +688,15 @@ const DB_KIND_LABEL: Record<DbKind, string> = {
   mysql: 'MySQL',
   clickhouse: 'ClickHouse',
   redis: 'Redis',
+  postgres: 'PostgreSQL',
+};
+
+/** 各类型默认端口：新建连接按类型预填，切换类型时若端口仍为旧默认则联动更新 */
+const DB_DEFAULT_PORTS: Record<DbKind, number> = {
+  mysql: 3306,
+  clickhouse: 9000,
+  redis: 6379,
+  postgres: 5432,
 };
 
 /** 各类型 AI 可用命令清单（表单勾选区用）：只读组与后端 store.rs DbKind::default_read_commands 严格一致；
@@ -700,6 +709,10 @@ const DB_COMMAND_GROUPS: Record<DbKind, { title: string; write: boolean; command
   clickhouse: [
     { title: '只读命令（AI 可直接执行）', write: false, commands: ['SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'EXPLAIN'] },
     { title: '写命令（勾选后 AI 执行前需人工审批）', write: true, commands: ['INSERT', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'OPTIMIZE', 'RENAME'] },
+  ],
+  postgres: [
+    { title: '只读命令（AI 可直接执行）', write: false, commands: ['SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'EXPLAIN'] },
+    { title: '写命令（勾选后 AI 执行前需人工审批）', write: true, commands: ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'GRANT', 'REVOKE', 'VACUUM', 'ANALYZE'] },
   ],
   redis: [
     { title: '只读命令（AI 可直接执行）', write: false, commands: [
@@ -721,6 +734,7 @@ const DB_DEFAULT_COMMANDS: Record<DbKind, string[]> = {
   mysql: DB_COMMAND_GROUPS.mysql[0].commands,
   clickhouse: DB_COMMAND_GROUPS.clickhouse[0].commands,
   redis: DB_COMMAND_GROUPS.redis[0].commands,
+  postgres: DB_COMMAND_GROUPS.postgres[0].commands,
 };
 
 /** 数据库连接配置弹窗：列表视图 ↔ 表单视图（新增/编辑），密码永不回显。 */
@@ -837,7 +851,7 @@ function openDbConnectionsModal(server: Server): void {
           <div class="field"><label>密码</label>
             <input class="input mono" data-f="password" type="password" placeholder="${isNew ? '必填' : '留空保持原密码'}"></div>
           <div class="field db-cmds-field" data-hide-redis><label>默认库</label>
-            <input class="input" data-f="database" value="${esc(d.database)}" placeholder="mysql/clickhouse 用；redis 忽略"></div>
+            <input class="input" data-f="database" value="${esc(d.database)}" placeholder="mysql/clickhouse/postgres 用；redis 忽略"></div>
           <div class="field db-cmds-field"><label>AI 可用命令</label>
             <div class="db-cmds" data-cmds></div>
             <div class="hint">只读命令 AI 可直接执行；勾选写命令后，AI 执行前需人工审批。密码保存在系统凭据库，AI 不可见。</div>
@@ -881,12 +895,19 @@ function openDbConnectionsModal(server: Server): void {
       const isRedis = kindSel.value === 'redis';
       redisHidden.forEach((el) => el.classList.toggle('hidden', isRedis));
     };
-    // 切换类型：勾选重置为新类型默认只读集（不同类型命令语义不同，不保留旧勾选）
+    // 切换类型：勾选重置为新类型默认只读集（不同类型命令语义不同，不保留旧勾选）；
+    // 端口若仍是旧类型默认值（用户未手改）则联动到新类型默认端口
     kindSel.addEventListener('change', () => {
       const k = kindSel.value as DbKind;
       renderCmdGroups(k, new Set(DB_DEFAULT_COMMANDS[k]), []);
+      const portInput = root.querySelector('[data-f=port]') as HTMLInputElement;
+      if (Number(portInput.value) === DB_DEFAULT_PORTS[prevKind]) {
+        portInput.value = String(DB_DEFAULT_PORTS[k]);
+      }
+      prevKind = k;
       syncKindFields();
     });
+    let prevKind = d.kind;
     syncKindFields();
 
     root.querySelector('[data-act=save]')?.addEventListener('click', () => {

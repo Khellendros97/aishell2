@@ -197,6 +197,7 @@ pub enum DbKind {
     Mysql,
     Clickhouse,
     Redis,
+    Postgres,
 }
 
 impl DbKind {
@@ -205,13 +206,16 @@ impl DbKind {
             DbKind::Mysql => "mysql",
             DbKind::Clickhouse => "clickhouse",
             DbKind::Redis => "redis",
+            DbKind::Postgres => "postgres",
         }
     }
 
     /// 该类型默认只读命令集（allowed_commands 为空时生效；用户可在连接配置里增删）。
     pub fn default_read_commands(self) -> &'static [&'static str] {
         match self {
-            DbKind::Mysql | DbKind::Clickhouse => &["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"],
+            DbKind::Mysql | DbKind::Clickhouse | DbKind::Postgres => {
+                &["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]
+            }
             DbKind::Redis => &[
                 "GET", "MGET", "KEYS", "SCAN", "TYPE", "TTL", "PTTL", "EXISTS", "DBSIZE",
                 "INFO", "PING", "STRLEN", "LLEN", "SCARD", "ZCARD", "HLEN", "HGET",
