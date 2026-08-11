@@ -38,14 +38,75 @@ function truncate(s: string, max: number): string {
 	return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
-/** 从错误体提取可读信息：兼容云平台 `{"error":"中文"}` 与 Brave `{"error":{"detail":…}}` */
+/** 从错误体提取可读信息：兼容云平台 `{"error":"中文"}`、Brave `{"error":{"detail":…}}`、
+ *  博查 `{"code":…,"msg":…}`（开放 API 文档 §3.2）。 */
 function extractErrorDetail(body: string): string {
     try {
-        const parsed = JSON.parse(body) as { error?: string | { detail?: string } };
+        const parsed = JSON.parse(body) as {
+            error?: string | { detail?: string };
+            msg?: string;
+            message?: string;
+        };
         if (typeof parsed.error === "string") return parsed.error;
         if (parsed.error?.detail) return parsed.error.detail;
+        if (parsed.msg) return parsed.msg;
+        if (parsed.message) return parsed.message;
     } catch { /* 非 JSON 时原样返回 */ }
     return body;
+}
+
+/** 归一化后的单条搜索结果（Brave 与博查字段映射后的通用形态）。 */
+interface ParsedResult {
+    title: string;
+    url: string;
+    description: string;
+    extraSnippets: string[];
+    /** 站点名/发布时间等补充信息（Brave 无、博查 siteName + datePublished） */
+    meta: string;
+}
+
+/** 解析搜索响应，兼容两种上游结构（开放 API 文档 §3.2）：
+ *  - Brave：`web.results[]`，字段 title/url/description/extra_snippets/page_age；
+ *  - 博查：`data.webPages.value[]`，字段 name/url/snippet/siteName/datePublished，外层 code/msg。
+ *  纯函数（无外部依赖），便于逻辑审查与回归。 */
+function parseSearchResults(data: unknown): ParsedResult[] {
+    const obj = data as Record<string, unknown>;
+    // Brave
+    const brave = (obj.web as Record<string, unknown> | undefined)?.results;
+    if (Array.isArray(brave)) {
+        return brave.map((raw) => {
+            const r = raw as Record<string, unknown>;
+            return {
+                title: typeof r.title === "string" ? r.title : "",
+                url: typeof r.url === "string" ? r.url : "",
+                description: typeof r.description === "string" ? r.description : "",
+                extraSnippets: Array.isArray(r.extra_snippets)
+                    ? r.extra_snippets.filter((s): s is string => typeof s === "string")
+                    : [],
+                meta: typeof r.page_age === "string" ? r.page_age : "",
+            };
+        });
+    }
+    // 博查（code=200 成功；data.webPages.value[]）
+    const bocha = (obj.data as Record<string, unknown> | undefined)?.webPages as
+        | Record<string, unknown>
+        | undefined;
+    const value = bocha?.value;
+    if (Array.isArray(value)) {
+        return value.map((raw) => {
+            const r = raw as Record<string, unknown>;
+            const site = typeof r.siteName === "string" ? r.siteName : "";
+            const date = typeof r.datePublished === "string" ? r.datePublished : "";
+            return {
+                title: typeof r.name === "string" ? r.name : "",
+                url: typeof r.url === "string" ? r.url : "",
+                description: typeof r.snippet === "string" ? r.snippet : "",
+                extraSnippets: [],
+                meta: [date, site].filter(Boolean).join(" · "),
+            };
+        });
+    }
+    return [];
 }
 
 /** 状态码 → 中文可执行错误（返回给 LLM 由它转告用户）。
@@ -152,27 +213,20 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(formatHttpError(response.status, detail));
 			}
 
-			interface BraveResult {
-				title?: string | null;
-				url?: string | null;
-				description?: string | null;
-				extra_snippets?: string[] | null;
-				age?: string | null;
-			}
-			const data = (await response.json()) as { web?: { results?: BraveResult[] } };
+			const results = parseSearchResults(await response.json().catch(() => null));
 
 			const lines: string[] = [];
 			let total = 0;
-			for (const r of data.web?.results ?? []) {
+			for (const r of results) {
 				if (!r.url) continue;
 				const snippets: string[] = [];
-				if (r.description?.trim()) snippets.push(r.description.trim());
-				for (const s of r.extra_snippets ?? []) {
+				if (r.description.trim()) snippets.push(r.description.trim());
+				for (const s of r.extraSnippets) {
 					if (!s?.trim() || snippets.includes(s.trim())) continue;
 					snippets.push(s.trim());
 				}
-				const age = r.age ? `（${r.age}）` : "";
-				const entry = `${lines.length + 1}. ${r.title || r.url}${age}\n   ${r.url}\n   ${truncate(snippets.join("\n"), MAX_SNIPPET_CHARS)}`;
+				const meta = r.meta ? `（${r.meta}）` : "";
+				const entry = `${lines.length + 1}. ${r.title || r.url}${meta}\n   ${r.url}\n   ${truncate(snippets.join("\n"), MAX_SNIPPET_CHARS)}`;
 				if (lines.length >= MAX_RESULTS || (lines.length > 0 && total + entry.length > MAX_TOTAL_CHARS)) {
 					break;
 				}
@@ -187,7 +241,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			return {
-				content: [{ type: "text", text: `Brave 搜索结果（${lines.length} 条）：\n${lines.join("\n")}` }],
+				content: [{ type: "text", text: `搜索结果（${lines.length} 条）：\n${lines.join("\n")}` }],
 				details: {},
 			};
 		},
