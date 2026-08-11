@@ -97,7 +97,9 @@ fn build_status(store: &Store) -> CloudStatus {
         logged_in,
         user,
         capabilities: caps,
-        server_url: SERVER_URL.filter(|s| !s.is_empty()).map(String::from),
+        server_url: SERVER_URL
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string()),
         mode: store.cloud_mode(),
     }
 }
@@ -118,10 +120,15 @@ fn random_hex(len: usize) -> Result<String, String> {
 }
 
 /// 取 OAuth 应用凭据；未配置时返回可执行中文错误（前端据此隐藏云功能）。
+/// 服务器地址去掉尾部斜杠，避免拼接出 `//oauth/token` 双斜杠（配置常带 `/`）。
 fn credentials() -> Result<(String, String, String), String> {
     match (SERVER_URL, CLIENT_ID, CLIENT_SECRET) {
         (Some(u), Some(i), Some(s)) if !u.is_empty() && !i.is_empty() && !s.is_empty() => {
-            Ok((u.to_string(), i.to_string(), s.to_string()))
+            Ok((
+                u.trim_end_matches('/').to_string(),
+                i.to_string(),
+                s.to_string(),
+            ))
         }
         _ => Err("当前构建未配置云服务（缺少服务器地址或应用凭据）".to_string()),
     }
@@ -174,6 +181,23 @@ fn callback_response_html(ok: bool, message: &str) -> String {
     )
 }
 
+/// 向回调浏览器写出**完整 HTTP 响应**（状态行 + 头 + body）。
+/// 早期实现只写裸 HTML，真实浏览器无法解析协议报文，表现为「无法访问此页面」。
+async fn write_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    ok: bool,
+    message: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+    let html = callback_response_html(ok, message);
+    let status = if ok { "200 OK" } else { "400 Bad Request" };
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+        html.len()
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+}
+
 /// 处理一次本地回调连接：解析 code/state → 校验 → 换令牌 → 拉用户 → 落库 → 广播。
 /// 返回 true 表示本次登录流程已结束（监听任务应退出）。
 async fn handle_callback(
@@ -183,7 +207,7 @@ async fn handle_callback(
     app: &AppHandle,
     expected_state: &str,
 ) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     let mut buf = [0u8; 8192];
     let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -201,12 +225,7 @@ async fn handle_callback(
     };
 
     if path != REDIRECT_PATH {
-        let _ = stream
-            .write_all(
-                callback_response_html(false, "回调路径不匹配，请检查服务端白名单配置。")
-                    .as_bytes(),
-            )
-            .await;
+        write_callback_response(stream, false, "回调路径不匹配，请检查服务端白名单配置。").await;
         return false;
     }
 
@@ -216,15 +235,11 @@ async fn handle_callback(
 
     // state 校验：缺失或与发起时不一致 → 拒绝（防 CSRF 授权注入）
     if state.as_deref() != Some(expected_state) {
-        let _ = stream
-            .write_all(callback_response_html(false, "state 校验失败，请重新发起登录。").as_bytes())
-            .await;
+        write_callback_response(stream, false, "state 校验失败，请重新发起登录。").await;
         return true;
     }
     let Some(code) = code else {
-        let _ = stream
-            .write_all(callback_response_html(false, "回调缺少授权码（code）。").as_bytes())
-            .await;
+        write_callback_response(stream, false, "回调缺少授权码（code）。").await;
         return true;
     };
 
@@ -233,7 +248,7 @@ async fn handle_callback(
         Ok((access, refresh, expires_in)) => {
             // 刷新轮换后 refresh_token 一并更新；access 过期时间入内存缓存
             if let Err(e) = store.cloud_set_tokens(&access, &refresh) {
-                let _ = stream.write_all(callback_response_html(false, &e).as_bytes()).await;
+                write_callback_response(stream, false, &e).await;
                 return true;
             }
             cloud.set_memory_access(&access, expires_in);
@@ -241,19 +256,10 @@ async fn handle_callback(
             match profile {
                 Ok((user, caps)) => {
                     if let Err(e) = store.cloud_login_info(user, caps) {
-                        let _ = stream
-                            .write_all(callback_response_html(false, &e).as_bytes())
-                            .await;
+                        write_callback_response(stream, false, &e).await;
                         return true;
                     }
-                    let _ = stream
-                        .write_all(
-                            callback_response_html(
-                                true,
-                                "授权成功，公司账号已关联到 AIShell。",
-                            )
-                            .as_bytes(),
-                        )
+                    write_callback_response(stream, true, "授权成功，公司账号已关联到 AIShell。")
                         .await;
                     emit_changed(app, store);
                     true
@@ -261,14 +267,14 @@ async fn handle_callback(
                 Err(e) => {
                     // me 拉取失败：令牌已存但资料未落库 → 清登录态，避免半登录
                     let _ = store.cloud_clear();
-                    let _ = stream.write_all(callback_response_html(false, &e).as_bytes()).await;
+                    write_callback_response(stream, false, &e).await;
                     emit_changed(app, store);
                     true
                 }
             }
         }
         Err(e) => {
-            let _ = stream.write_all(callback_response_html(false, &e).as_bytes()).await;
+            write_callback_response(stream, false, &e).await;
             true
         }
     }
@@ -407,6 +413,8 @@ async fn exchange_tokens(code: &str) -> Result<(String, String, u64), String> {
 }
 
 /// GET {server}/api/auth/me：用户资料 + 能力清单（防御解析：字段缺失按默认）。
+/// 服务端结构不确定（可能带 data 包装 / user 嵌套 / 不同字段名），做多层兜底：
+/// 用户对象定位 = body → body.data → body.data.user → body.user。
 async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String> {
     let (server, ..) = credentials()?;
     let url = format!("{server}/api/auth/me");
@@ -425,21 +433,40 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
     if !status.is_success() {
         return Err(format!("拉取用户信息失败（HTTP {status}）"));
     }
-    let str_field = |v: &serde_json::Value, key: &str| -> Option<String> {
-        v.get(key)
-            .or_else(|| v.get(key.replace('_', "")))
-            .and_then(|x| x.as_str())
+    let data = body.get("data").unwrap_or(&body);
+    let user_obj = data.get("user").or_else(|| body.get("user")).unwrap_or(data);
+    let str_field = |v: &serde_json::Value, keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
             .map(String::from)
     };
     let user = CloudUser {
-        name: str_field(&body, "name").unwrap_or_else(|| "未知用户".to_string()),
-        avatar: str_field(&body, "avatar"),
-        dept: str_field(&body, "dept"),
+        name: str_field(
+            user_obj,
+            &["name", "username", "nickname", "display_name", "displayName"],
+        )
+        .unwrap_or_else(|| "未知用户".to_string()),
+        avatar: str_field(
+            user_obj,
+            &["avatar", "avatarURL", "avatar_url", "avatarUrl", "photo", "portrait"],
+        ),
+        dept: str_field(
+            user_obj,
+            &["dept", "department", "department_name", "departmentName"],
+        ),
     };
-    // capabilities 可能是顶层字段或嵌套在 user 下；两种命名都试
-    let caps_raw = body
+    // 诊断：头像未解析到时打印原始响应到 Debug 面板，区分
+    // 「服务端未返回/字段名不匹配/服务端用户无头像」（term::diag → debug:log 事件流）
+    if user.avatar.is_none() {
+        crate::term::diag(&format!(
+            "[cloud] /api/auth/me 未解析到头像，原始响应: {body}"
+        ));
+    }
+    // capabilities：用户对象 → data → body 三级兜底
+    let caps_raw = user_obj
         .get("capabilities")
-        .or_else(|| body.get("user").and_then(|u| u.get("capabilities")));
+        .or_else(|| data.get("capabilities"))
+        .or_else(|| body.get("capabilities"));
     let mut caps = CloudCapabilities::default();
     if let Some(c) = caps_raw {
         caps.models = c
@@ -453,11 +480,7 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
             .unwrap_or_default();
         caps.search = c.get("search").and_then(|v| v.as_bool()).unwrap_or(false);
         caps.knowledge = c.get("knowledge").and_then(|v| v.as_bool()).unwrap_or(false);
-        caps.latest_version = c
-            .get("latest_version")
-            .or_else(|| c.get("latestVersion"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        caps.latest_version = str_field(c, &["latest_version", "latestVersion"]);
     }
     Ok((user, caps))
 }
@@ -473,7 +496,7 @@ async fn run_callback_server(
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", REDIRECT_PORT)).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[cloud] 回调端口 {REDIRECT_PORT} 监听失败: {e}");
+            crate::term::diag(&format!("[cloud] 回调端口 {REDIRECT_PORT} 监听失败: {e}"));
             return;
         }
     };
