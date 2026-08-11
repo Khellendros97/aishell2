@@ -8,12 +8,12 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { getVersion } from '@tauri-apps/api/app';
 import { icon } from '../icons';
 import { navigate } from '../router';
-import { setTheme } from '../api';
+import { onCloudChanged, setTheme } from '../api';
 import { applyTheme, currentTheme, onThemeChange } from '../theme';
 import { toast } from '../ui';
 import { wbLifecycle } from '../pages/workbench/lifecycle';
 
-export type TopbarPage = 'welcome' | 'settings' | null;
+export type TopbarPage = 'welcome' | 'settings' | 'account' | null;
 
 const appWin = getCurrentWindow();
 const appLogoUrl = new URL('../assets/logo.svg', import.meta.url).href;
@@ -38,6 +38,7 @@ export function renderTopbar(root: HTMLElement, activePage: TopbarPage): HTMLEle
     <div class="spacer"></div>
     <button class="btn ghost small" data-nav="welcome">项目</button>
     <button class="btn ghost small" data-nav="settings">设置</button>
+    <button class="btn ghost small tb-account" data-nav="account">账号<span class="tb-badge" hidden></span></button>
     <button class="icon-btn tb-theme" title="切换亮色 / 深色主题"></button>
     <div class="tb-win-controls">
       <button class="tb-win-btn tb-win-min" title="最小化">${icon('minus')}</button>
@@ -46,6 +47,28 @@ export function renderTopbar(root: HTMLElement, activePage: TopbarPage): HTMLEle
     </div>`;
   (bar.querySelector('[data-nav=welcome]') as HTMLButtonElement).onclick = () => navigate('#/welcome');
   (bar.querySelector('[data-nav=settings]') as HTMLButtonElement).onclick = () => navigate('#/settings');
+  (bar.querySelector('[data-nav=account]') as HTMLButtonElement).onclick = () => navigate('#/account');
+
+  /* 账号角标（CR-2.4）：托管模式 + 未登录（登录失效）时提示「重新登录」。
+     topbar 随路由重建，订阅在按钮失联后自退订防泄漏（同主题按钮模式）。 */
+  const accountBtn = bar.querySelector('.tb-account') as HTMLButtonElement;
+  const badge = bar.querySelector('.tb-badge') as HTMLSpanElement;
+  const syncBadge = (loggedIn: boolean, mode: string, configured: boolean) => {
+    const need = configured && mode === 'hosted' && !loggedIn;
+    badge.hidden = !need;
+    if (need) badge.title = '登录已过期，请重新登录';
+  };
+  const offCloud = onCloudChanged((s) => {
+    if (!accountBtn.isConnected) { void offCloud.then((un) => un()).catch(() => {}); return; }
+    syncBadge(s.loggedIn, s.mode, s.serverUrl !== null);
+  }).catch(() => () => {});
+  // 初始态：拉一次状态填充角标（失败静默，未接入/未登录无角标）
+  import('../api').then(({ cloudStatus }) =>
+    cloudStatus().then((s) => {
+      if (!accountBtn.isConnected) return;
+      syncBadge(s.loggedIn, s.mode, s.serverUrl !== null);
+    }).catch(() => {}),
+  );
 
   /* 版本号(tauri.conf.json version,异步填充;失败静默留空) */
   getVersion()

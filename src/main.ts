@@ -9,6 +9,7 @@ import { applyTheme } from './theme';
 import { renderTopbar } from './components/topbar';
 import { renderWelcome } from './pages/welcome';
 import { renderSettings } from './pages/settings';
+import { renderAccount } from './pages/account';
 import { renderWorkbench } from './pages/workbench/workbench';
 import { wbLifecycle } from './pages/workbench/lifecycle';
 
@@ -41,6 +42,9 @@ function renderSubPage(name: string, params: URLSearchParams): void {
   if (name === '/settings') {
     renderTopbar(pageEl, 'settings');
     cleanup = renderSettings(pageEl, params) ?? null;
+  } else if (name === '/account') {
+    renderTopbar(pageEl, 'account');
+    cleanup = renderAccount(pageEl, params) ?? null;
   } else {
     renderTopbar(pageEl, 'welcome');
     cleanup = renderWelcome(pageEl, params) ?? null;

@@ -8,12 +8,12 @@
  * 与原型差异：项目数据异步装载（getState），面板由 ./sidebar/*.ts 与 ./ai.ts 挂载；
  * 页面就绪后自动开一个本地终端标签（id 'term-local'）。
  */
-import { getState } from '../../api';
+import { cloudStatus, getState, onCloudChanged } from '../../api';
 import { renderTopbar } from '../../components/topbar';
 import { navigate } from '../../router';
 import { toast } from '../../ui';
 import { icon } from '../../icons';
-import type { Project } from '../../types';
+import type { CloudStatus, Project } from '../../types';
 import { bus, closeTab, getActiveTab, getTabs, initWorkbench, openTab, Workbench } from './core';
 import type { Tab } from './core';
 import { wbLifecycle } from './lifecycle';
@@ -43,6 +43,8 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
         <div class="activity-icon active" data-panel="explorer" title="文件资源管理器">${icon('folder')}</div>
         <div class="activity-icon" data-panel="servers" title="服务器列表">${icon('monitor')}</div>
         <div class="activity-icon" data-panel="commands" title="命令收藏">${icon('star')}</div>
+        <!-- 云账号入口（CR-1.1b）：置于 AI 开关上方；未接入云服务时隐藏 -->
+        <div class="activity-icon avatar-entry" data-nav-account title="账号" hidden>${icon('user')}</div>
         <div class="activity-icon ai-toggle" data-panel="ai" title="AI 助手">${icon('bot')}</div>
       </div>
       <div id="sidebar">
@@ -242,8 +244,33 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     data: { kind: 'local', cwd: project.path },
   });
 
+  /* ---------- 云账号入口（CR-1.1b） ---------- */
+  const avatarEntry = root.querySelector('[data-nav-account]') as HTMLElement;
+  const renderAvatar = (s: CloudStatus) => {
+    if (!s.serverUrl) { avatarEntry.hidden = true; return; } // 未接入云服务：隐藏入口
+    avatarEntry.hidden = false;
+    if (s.loggedIn && s.user?.avatar) {
+      const img = document.createElement('img');
+      img.alt = '';
+      img.className = 'avatar-img';
+      img.src = s.user.avatar;
+      // 头像加载失败回退通用图标（CSP 禁内联脚本，用事件绑定）
+      img.addEventListener('error', () => { avatarEntry.innerHTML = icon('user'); });
+      avatarEntry.innerHTML = '';
+      avatarEntry.appendChild(img);
+      avatarEntry.title = `${s.user.name}（点击进入账号页）`;
+    } else {
+      avatarEntry.innerHTML = icon('user');
+      avatarEntry.title = '登录公司账号';
+    }
+  };
+  avatarEntry.addEventListener('click', () => navigate('#/account'));
+  void cloudStatus().then(renderAvatar).catch(() => {});
+  const offCloud = onCloudChanged(renderAvatar).catch(() => () => {});
+
   return () => {
     offTabActivated();
+    void offCloud.then((un) => un()).catch(() => {});
     // 卸载当前面板（反注册其 bus 监听 / 停轮询），再关闭全部标签
     unmountPanel?.();
     unmountPanel = null;

@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod ai_actions;
+pub mod cloud;
 pub mod redact;
 pub mod smart_approval;
 #[cfg(windows)]
@@ -87,6 +88,8 @@ pub fn run() {
             app.manage(ssh);
             app.manage(terms);
             app.manage(ai.clone());
+            // 云服务 OAuth2 会话（登录 state + 令牌内存缓存；令牌权威存储在 keyring）
+            app.manage(Arc::new(cloud::CloudManager::default()));
             term::set_debug_app(app.handle().clone());
             // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
             // 捆绑安装器。放后台线程并延迟触发：等主事件循环泵消息、主窗口显示后再弹框
@@ -190,6 +193,11 @@ pub fn run() {
             ai::ai_set_thinking,
             ai::set_ai_mode,
             ai::ai_respond_approval,
+            cloud::cloud_begin_login,
+            cloud::cloud_cancel_login,
+            cloud::cloud_logout,
+            cloud::cloud_status,
+            cloud::cloud_set_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

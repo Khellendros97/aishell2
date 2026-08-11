@@ -7,13 +7,20 @@
  * 项目-服务器单维度重构移除；xshell 导入已移至欢迎页按目录自动建项目，服务器在项目语义下管理。
  */
 import type { AppState, LlmConfig, Settings, Theme } from '../types';
-import { getState, openDialog, saveSettings, setTheme } from '../api';
+import { cloudStatus, getState, onCloudChanged, openDialog, saveSettings, setTheme } from '../api';
 import { toast } from '../ui';
 import { icon } from '../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../theme';
 import type { PageRender } from '../main';
 import './settings.css';
+
+/** 极简 HTML 转义（模型名回显防注入） */
+function esc(s: unknown): string {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[c] as string);
+}
 
 export const renderSettings: PageRender = (root, params) => {
   root.classList.add('settings-page');
@@ -43,15 +50,16 @@ export const renderSettings: PageRender = (root, params) => {
           </div>
           <fieldset class="llm-group">
             <legend>大模型配置</legend>
-            <div class="field">
+            <div class="hint" id="cloud-hosted-llm-note" hidden>托管模式下模型与密钥由公司服务器统一管理（<a href="#/account">前往账号页</a>）</div>
+            <div class="field" id="llm-model-field">
               <label>模型 ID</label>
               <input id="f-model-id" class="input" placeholder="deepseek-v4-flash">
             </div>
-            <div class="field">
+            <div class="field" id="llm-base-field">
               <label>Base URL</label>
               <input id="f-base-url" class="input mono" placeholder="https://api.deepseek.com/v1">
             </div>
-            <div class="field">
+            <div class="field" id="llm-key-field">
               <label>API Key</label>
               <div class="input-row">
                 <input id="f-api-key" class="input mono" type="password" placeholder="已保存则不显示，留空表示不修改">
@@ -70,12 +78,13 @@ export const renderSettings: PageRender = (root, params) => {
           </fieldset>
           <fieldset class="llm-group">
             <legend>联网搜索</legend>
+            <div class="hint" id="cloud-hosted-search-note" hidden>搜索由公司服务器代理，本地无需配置 Brave Key</div>
             <div class="field">
               <label>启用 AI 联网搜索</label>
               <input id="f-search-enabled" type="checkbox">
               <div class="hint">启用后 AI 助手可通过 Brave Search 获取最新信息（问时效性问题时自动使用）</div>
             </div>
-            <div class="field">
+            <div class="field" id="search-key-field">
               <label>Brave Search API Key</label>
               <div class="input-row">
                 <input id="f-brave-key" class="input mono" type="password" placeholder="已保存则不显示，留空表示不修改">
@@ -115,7 +124,7 @@ export const renderSettings: PageRender = (root, params) => {
   const warnBanner = root.querySelector('#warn-banner') as HTMLElement;
   const fTheme = root.querySelector('#f-theme') as HTMLSelectElement;
   const fWorkspace = root.querySelector('#f-workspace') as HTMLInputElement;
-  const fModelId = root.querySelector('#f-model-id') as HTMLInputElement;
+  let fModelId = root.querySelector('#f-model-id') as HTMLInputElement | HTMLSelectElement;
   const fBaseUrl = root.querySelector('#f-base-url') as HTMLInputElement;
   const fApiKey = root.querySelector('#f-api-key') as HTMLInputElement;
   const fEffort = root.querySelector('#f-effort') as HTMLSelectElement;
@@ -123,10 +132,13 @@ export const renderSettings: PageRender = (root, params) => {
   const fBraveKey = root.querySelector('#f-brave-key') as HTMLInputElement;
   const fAiWorkdir = root.querySelector('#f-ai-workdir') as HTMLInputElement;
   const fApprovalMode = root.querySelector('#f-approval-mode') as HTMLSelectElement;
+  /* 托管模式形态（CR-2.2）：模型下拉 / 只读说明的切换开关 */
+  let cloudMode: 'hosted' | 'personal' = 'personal';
+  let cloudModels: string[] = [];
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: true, projectView: 'card', approvalMode: 'smart' },
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: true, projectView: 'card', approvalMode: 'smart', cloud: { mode: 'personal', user: null, capabilities: null } },
     servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {},
   };
 
@@ -141,6 +153,7 @@ export const renderSettings: PageRender = (root, params) => {
     /* 主题取内存当前值:顶栏即时切换后 db 缓存已过期,不能用 s.theme */
     fTheme.value = currentTheme();
     fWorkspace.value = s.workspaceDir || '';
+    applyCloudMode();
     fModelId.value = s.llm.modelId || '';
     fBaseUrl.value = s.llm.baseUrl || '';
     fApiKey.value = ''; // 已保存的 key 永不回传，留空 = 不修改
@@ -149,6 +162,36 @@ export const renderSettings: PageRender = (root, params) => {
     fBraveKey.value = ''; // 同上：Brave key 永不回传
     fAiWorkdir.checked = s.autoSwitchAiWorkdir ?? true;
     fApprovalMode.value = s.approvalMode ?? 'smart';
+  }
+
+  /* 托管模式（CR-2.2）：LLM 的 baseUrl/API Key 与 Brave Key 输入隐藏、展示只读说明；
+     模型 ID 输入框换成服务端能力下拉（仍写回 llm.modelId）；搜索开关以服务端能力为准。 */
+  function applyCloudMode() {
+    const hosted = cloudMode === 'hosted';
+    const llmNote = root.querySelector('#cloud-hosted-llm-note') as HTMLElement;
+    const searchNote = root.querySelector('#cloud-hosted-search-note') as HTMLElement;
+    const llmBase = root.querySelector('#llm-base-field') as HTMLElement;
+    const llmKey = root.querySelector('#llm-key-field') as HTMLElement;
+    const searchKey = root.querySelector('#search-key-field') as HTMLElement;
+    const modelField = root.querySelector('#llm-model-field') as HTMLElement;
+    llmNote.hidden = !hosted;
+    searchNote.hidden = !hosted;
+    llmBase.hidden = hosted;
+    llmKey.hidden = hosted;
+    searchKey.hidden = hosted;
+    fSearchEnabled.disabled = hosted;
+    if (hosted && cloudModels.length > 0) {
+      // 模型下拉：以服务端能力为准，选择值仍写入 llm.modelId
+      const opts = cloudModels.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      modelField.innerHTML = `<label>模型 ID</label><select id="f-model-id" class="select">${opts}</select>`;
+      const sel = modelField.querySelector('#f-model-id') as HTMLSelectElement;
+      if (db.settings.llm.modelId && cloudModels.includes(db.settings.llm.modelId)) sel.value = db.settings.llm.modelId;
+      fModelId = sel;
+    } else if (!hosted) {
+      // 回个人模式：还原输入框（值由 loadSystemSettings 后续填充）
+      modelField.innerHTML = '<label>模型 ID</label><input id="f-model-id" class="input" placeholder="deepseek-v4-flash">';
+      fModelId = modelField.querySelector('#f-model-id') as HTMLInputElement;
+    }
   }
 
   // Workspace 浏览…：真实目录选择
@@ -203,22 +246,26 @@ export const renderSettings: PageRender = (root, params) => {
       fWorkspace.focus();
       return;
     }
+    const hosted = cloudMode === 'hosted';
     const llm: LlmConfig = {
       modelId: fModelId.value.trim(),
-      baseUrl: fBaseUrl.value.trim(),
+      /* 托管模式：baseUrl 由服务器接管（后续阶段 ai.rs 重写），此处保持原值不覆盖 */
+      baseUrl: hosted ? (db.settings.llm.baseUrl || '') : fBaseUrl.value.trim(),
       effort: fEffort.value as LlmConfig['effort'],
     };
-    const apiKey = fApiKey.value.trim();
-    const braveKey = fBraveKey.value.trim();
+    /* 托管模式：密钥输入区隐藏，不修改 keyring（传 null） */
+    const apiKey = hosted ? null : (fApiKey.value.trim() || null);
+    const braveKey = hosted ? null : (fBraveKey.value.trim() || null);
     /* theme 带内存当前值:避免本页打开期间顶栏切换的主题被表单旧值覆盖;
        projectView 由欢迎页视图切换维护,本页保存时原样保留 */
     const settings: Settings = {
-      workspaceDir, llm, search: { enabled: fSearchEnabled.checked }, theme: currentTheme(),
+      workspaceDir, llm, search: { enabled: hosted ? (db.settings.search?.enabled ?? false) : fSearchEnabled.checked }, theme: currentTheme(),
       autoSwitchAiWorkdir: fAiWorkdir.checked, projectView: db.settings.projectView ?? 'card',
       approvalMode: fApprovalMode.value as Settings['approvalMode'],
+      cloud: db.settings.cloud ?? { mode: 'personal', user: null, capabilities: null },
     };
     try {
-      await saveSettings(settings, apiKey || null, braveKey || null);
+      await saveSettings(settings, apiKey, braveKey);
       db.settings = settings;
       toast('设置已保存', 'success');
     } catch (err) {
@@ -234,6 +281,15 @@ export const renderSettings: PageRender = (root, params) => {
     })
     .catch((err) => toast(String(err), 'error'));
 
+  /* 托管/个人模式（CR-2.2）：账号页切换后本页表单形态即时刷新 */
+  const applyCloudStatus = (s: { mode: 'hosted' | 'personal'; capabilities: { models: string[] } | null }) => {
+    cloudMode = s.mode;
+    cloudModels = s.capabilities?.models ?? [];
+    loadSystemSettings();
+  };
+  void cloudStatus().then(applyCloudStatus).catch(() => {});
+  const offCloudSettings = onCloudChanged(applyCloudStatus).catch(() => () => {});
+
   // 命令面板（Ctrl+T）等全局操作清空/变更数据后广播，此处重新拉取
   const onDataChanged = () => {
     void getState()
@@ -245,5 +301,6 @@ export const renderSettings: PageRender = (root, params) => {
   return () => {
     window.removeEventListener('aishell:data-changed', onDataChanged);
     offTheme();
+    void offCloudSettings.then((un) => un()).catch(() => {});
   };
 };

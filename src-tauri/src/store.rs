@@ -86,6 +86,56 @@ pub struct SearchConfig {
     pub enabled: bool,
 }
 
+/// 云服务接入模式：hosted = 公司服务器托管；personal = 本地自配密钥。
+/// 未登录默认 personal；登录成功后自动切 hosted（CR-2.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudMode {
+    #[default]
+    Personal,
+    Hosted,
+}
+
+/// 登录用户展示资料（token 永不进 JSON，见 keyring 账户 cloud:*）。
+/// 与 src/types.ts CloudUser serde camelCase 对齐。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudUser {
+    pub name: String,
+    #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub dept: Option<String>,
+}
+
+/// 服务端能力清单（登录后由 /api/auth/me 带回并缓存，供托管模式 UI 使用）。
+/// 字段缺失按关闭/空处理（防御服务端旧版本）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCapabilities {
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub search: bool,
+    #[serde(default)]
+    pub knowledge: bool,
+    #[serde(default)]
+    pub latest_version: Option<String>,
+}
+
+/// 云服务配置段（aishell.json）：只存非敏感资料，token 只在 keyring（CR-1.5）。
+/// 旧配置无此字段按 personal 模式、未登录处理。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudConfig {
+    #[serde(default)]
+    pub mode: CloudMode,
+    #[serde(default)]
+    pub user: Option<CloudUser>,
+    #[serde(default)]
+    pub capabilities: Option<CloudCapabilities>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -107,6 +157,9 @@ pub struct Settings {
     /// 审批模式（智能审批/全部审批）；旧配置无此字段按智能审批
     #[serde(default)]
     pub approval_mode: ApprovalMode,
+    /// 云服务接入（公司服务器托管）；旧配置无此字段按未接入处理
+    #[serde(default)]
+    pub cloud: CloudConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +538,9 @@ pub struct ScannedSession {
 const KEYRING_SERVICE: &str = "AIShell";
 const KEYRING_ACCOUNT_LLM: &str = "llm:apikey";
 const KEYRING_ACCOUNT_BRAVE: &str = "brave:apikey";
+/// 云服务 OAuth 令牌（CR-1.5）：access_token 过期由 refresh_token 轮换，均只存 keyring。
+const KEYRING_ACCOUNT_CLOUD_ACCESS: &str = "cloud:access_token";
+const KEYRING_ACCOUNT_CLOUD_REFRESH: &str = "cloud:refresh_token";
 
 fn keyring_account_server(id: &str) -> String {
     format!("server:{id}")
@@ -751,6 +807,83 @@ impl Store {
             s.settings.theme = theme;
             Ok(())
         })
+    }
+
+    // ---------------------------------------------------------------- 云服务（CR-1）
+
+    /// 读取云令牌对（access, refresh）；keyring 条目缺失返回 (None, None)。
+    pub fn cloud_tokens(&self) -> (Option<String>, Option<String>) {
+        let non_empty = |v: String| if v.is_empty() { None } else { Some(v) };
+        let access = self.secrets.get(KEYRING_ACCOUNT_CLOUD_ACCESS).ok().and_then(non_empty);
+        let refresh = self.secrets.get(KEYRING_ACCOUNT_CLOUD_REFRESH).ok().and_then(non_empty);
+        (access, refresh)
+    }
+
+    /// 写入云令牌对（授权成功/刷新轮换后调用；refresh_token 每次使用都会轮换）。
+    pub fn cloud_set_tokens(&self, access: &str, refresh: &str) -> Result<(), String> {
+        self.secrets.set(KEYRING_ACCOUNT_CLOUD_ACCESS, access)?;
+        self.secrets.set(KEYRING_ACCOUNT_CLOUD_REFRESH, refresh)?;
+        Ok(())
+    }
+
+    /// 仅更新 access_token（刷新成功但 refresh_token 轮换失败时仍可续期一次）。
+    pub fn cloud_set_access_token(&self, access: &str) -> Result<(), String> {
+        self.secrets.set(KEYRING_ACCOUNT_CLOUD_ACCESS, access)
+    }
+
+    /// 删除云令牌两个账户；条目不存在不算错。
+    pub fn cloud_clear_tokens(&self) -> Result<(), String> {
+        self.secrets.delete(KEYRING_ACCOUNT_CLOUD_ACCESS)?;
+        self.secrets.delete(KEYRING_ACCOUNT_CLOUD_REFRESH)?;
+        Ok(())
+    }
+
+    /// 登录成功：写入用户资料与能力清单，自动切托管模式（CR-2.1）。
+    pub fn cloud_login_info(&self, user: CloudUser, caps: CloudCapabilities) -> Result<(), String> {
+        self.with_state(|s| {
+            s.settings.cloud.mode = CloudMode::Hosted;
+            s.settings.cloud.user = Some(user);
+            s.settings.cloud.capabilities = Some(caps);
+            Ok(())
+        })
+    }
+
+    /// 登出/登录失效：清 keyring 令牌 + 清 aishell.json cloud 段，模式回个人。
+    /// 本地个人模式配置（llm/search）不受影响（CR-1.7）。
+    pub fn cloud_clear(&self) -> Result<(), String> {
+        self.cloud_clear_tokens()?;
+        self.with_state(|s| {
+            s.settings.cloud.mode = CloudMode::Personal;
+            s.settings.cloud.user = None;
+            s.settings.cloud.capabilities = None;
+            Ok(())
+        })
+    }
+
+    pub fn cloud_mode(&self) -> CloudMode {
+        self.state
+            .lock()
+            .map(|g| g.settings.cloud.mode)
+            .unwrap_or(CloudMode::Personal)
+    }
+
+    /// 原子切换托管/个人模式（账号页手动切换；登录失效自动回 personal 走 cloud_clear）。
+    pub fn cloud_set_mode(&self, mode: CloudMode) -> Result<(), String> {
+        self.with_state(|s| {
+            s.settings.cloud.mode = mode;
+            Ok(())
+        })
+    }
+
+    /// 当前登录用户资料与能力清单（展示用缓存；token 不在此）。
+    pub fn cloud_profile(&self) -> (Option<CloudUser>, Option<CloudCapabilities>) {
+        match self.state.lock() {
+            Ok(g) => (
+                g.settings.cloud.user.clone(),
+                g.settings.cloud.capabilities.clone(),
+            ),
+            Err(_) => (None, None),
+        }
     }
 
     /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
@@ -1600,6 +1733,7 @@ mod tests {
                 auto_switch_ai_workdir: true,
                 project_view: ProjectView::Card,
                 approval_mode: ApprovalMode::Smart,
+                cloud: CloudConfig::default(),
             },
             servers: vec![
                 Server {
@@ -3237,6 +3371,7 @@ mod tests {
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::Card,
                     approval_mode: ApprovalMode::Smart,
+                    cloud: CloudConfig::default(),
                 },
                 Some("sk-test-key"),
                 None,
@@ -3411,6 +3546,7 @@ mod tests {
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::List,
                     approval_mode: ApprovalMode::Smart,
+                    cloud: CloudConfig::default(),
                 },
                 None,
                 Some("bsk-1"),
@@ -3636,5 +3772,81 @@ mod tests {
         assert_eq!(sv.name, "K2");
         assert_eq!(sv.port, 2222);
         assert!(sv.locked, "配置更新后锁仍保留");
+    }
+
+    // ---------------------------------------------------------------- 云服务（CR-1）
+
+    #[test]
+    fn cloud_tokens_roundtrip_and_clear() {
+        let store = test_store(temp_config_dir("cloud-tokens"));
+        assert_eq!(store.cloud_tokens(), (None, None), "初始无令牌");
+        store.cloud_set_tokens("acc-1", "ref-1").unwrap();
+        assert_eq!(store.cloud_tokens(), (Some("acc-1".into()), Some("ref-1".into())));
+        store.cloud_set_access_token("acc-2").unwrap();
+        assert_eq!(store.cloud_tokens().0.as_deref(), Some("acc-2"), "仅更新 access");
+        store.cloud_clear_tokens().unwrap();
+        assert_eq!(store.cloud_tokens(), (None, None), "清空后无令牌");
+        // 重复清除不算错
+        store.cloud_clear_tokens().unwrap();
+    }
+
+    #[test]
+    fn cloud_login_info_switches_hosted_and_clear_restores_personal() {
+        let store = test_store(temp_config_dir("cloud-login"));
+        assert_eq!(store.cloud_mode(), CloudMode::Personal, "默认个人模式");
+        let user = CloudUser {
+            name: "张三".into(),
+            avatar: Some("https://example.com/a.png".into()),
+            dept: Some("研发部".into()),
+        };
+        let caps = CloudCapabilities {
+            models: vec!["gpt-4o".into()],
+            search: true,
+            knowledge: false,
+            latest_version: Some("0.3.0".into()),
+        };
+        store.cloud_set_tokens("acc", "ref").unwrap();
+        store.cloud_login_info(user.clone(), caps.clone()).unwrap();
+        assert_eq!(store.cloud_mode(), CloudMode::Hosted, "登录后自动切托管");
+        let (u, c) = store.cloud_profile();
+        assert_eq!(u, Some(user));
+        assert_eq!(c, Some(caps));
+        // 登出：令牌 + 资料全清，模式回个人
+        store.cloud_clear().unwrap();
+        assert_eq!(store.cloud_mode(), CloudMode::Personal);
+        assert_eq!(store.cloud_profile(), (None, None));
+        assert_eq!(store.cloud_tokens(), (None, None));
+    }
+
+    #[test]
+    fn cloud_mode_switch_persists() {
+        let store = test_store(temp_config_dir("cloud-mode"));
+        store.cloud_set_mode(CloudMode::Hosted).unwrap();
+        assert_eq!(store.cloud_mode(), CloudMode::Hosted);
+        store.cloud_set_mode(CloudMode::Personal).unwrap();
+        assert_eq!(store.cloud_mode(), CloudMode::Personal);
+    }
+
+    #[test]
+    fn cloud_config_survives_reload_and_legacy_json_defaults() {
+        let dir = temp_config_dir("cloud-reload");
+        let user = CloudUser { name: "李四".into(), avatar: None, dept: None };
+        {
+            let store = test_store(dir.clone());
+            store.cloud_login_info(user.clone(), CloudCapabilities::default()).unwrap();
+            store.cloud_set_tokens("acc", "ref").unwrap();
+        }
+        // 重新加载：cloud 段持久（aishell.json）；令牌在 keyring——MemorySecrets 每实例独立，
+        // 跨实例为空属预期（生产 KeyringSecrets 为系统级持久，见 cloud_tokens_roundtrip 单测）
+        let store = test_store(dir.clone());
+        assert_eq!(store.cloud_mode(), CloudMode::Hosted);
+        assert_eq!(store.cloud_profile().0, Some(user));
+        assert_eq!(store.cloud_tokens(), (None, None), "内存密钥后端跨实例不保留");
+        // 旧配置无 cloud 段：serde 默认 personal（构造无 cloud 的 JSON 验证）
+        let legacy = r#"{"settings":{"workspaceDir":"C:\\ws","llm":{"modelId":"m","baseUrl":"b","effort":"low"},"search":{"enabled":false},"theme":"dark","autoSwitchAiWorkdir":true,"projectView":"card","approvalMode":"smart"},"servers":[],"projects":[],"sessions":{}}"#;
+        std::fs::write(dir.join("aishell.json"), legacy).unwrap();
+        let store2 = test_store(dir.clone());
+        assert_eq!(store2.cloud_mode(), CloudMode::Personal, "旧配置按未接入处理");
+        assert_eq!(store2.cloud_profile(), (None, None));
     }
 }

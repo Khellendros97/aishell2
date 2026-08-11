@@ -37,6 +37,8 @@ base64 = "0.22"
 reqwest = { version = "0.12", features = ["json"] }
 # 输出脱敏与凭据提取前置规则（redact / smart_approval）
 regex = "1"
+# 云服务 OAuth2 授权 state（CSRF 防注入）用密码学随机
+getrandom = "0.3"
 
 # WebView2 设置（禁用浏览器快捷键，避免劫持终端 Ctrl+Shift+C/V）；版本与 wry 对齐
 [target.'cfg(windows)'.dependencies]

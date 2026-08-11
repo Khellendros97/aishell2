@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpFavorite, SftpWriteResult, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpFavorite, SftpWriteResult, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -203,6 +203,23 @@ export const aiRespondApproval = (key: string, requestId: string, confirmed: boo
   call<void>('ai_respond_approval', { key, requestId, confirmed });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
+
+/* ---------------- cloud（云服务 OAuth2，CR-1） ----------------
+   协议以 docs/AIShell云服务-OAuth2接入文档.md 为准；token 永不返回前端。 */
+/** 发起登录：返回授权 URL（系统浏览器打开）；后端同时起本地回环回调监听。
+ *  未注入云配置的构建返回中文错误（正常路径不调用）。 */
+export const cloudBeginLogin = () => call<string>('cloud_begin_login');
+/** 取消进行中的登录（作废 state 并关闭回调监听） */
+export const cloudCancelLogin = () => call<void>('cloud_cancel_login');
+/** 退出登录：尽力吊销服务端 refresh_token，本地清 keyring + cloud 段 */
+export const cloudLogout = () => call<void>('cloud_logout');
+/** 当前云状态（登录态/用户/能力/服务器地址/模式；token 不在此） */
+export const cloudStatus = () => call<CloudStatus>('cloud_status');
+/** 切换托管/个人模式 */
+export const cloudSetMode = (mode: CloudMode) => call<void>('cloud_set_mode', { mode });
+/** 登录/登出/登录失效/模式切换后广播（载荷 = CloudStatus） */
+export const onCloudChanged = (cb: (s: CloudStatus) => void): Promise<UnlistenFn> =>
+  listen<CloudStatus>('cloud:changed', (e) => cb(e.payload));
 
 /* ---------------- misc ---------------- */
 export { open as openDialog } from '@tauri-apps/plugin-dialog';

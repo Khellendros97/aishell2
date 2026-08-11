@@ -10,12 +10,13 @@
  * 新建项目先 ensureProjectDirs 拿最终路径，再 upsertProject 落盘；
  * 浏览按钮走 @tauri-apps/plugin-dialog；卡片点击经 router.navigate 进入工作台。
  */
-import type { AppState, Project, Server, XshellImportResult } from '../types';
+import type { AppState, CloudStatus, Project, Server, XshellImportResult } from '../types';
 import {
-  createProjectFolder, deleteProject, deleteProjectFolder, deleteServer, ensureProjectDirs,
-  getState, importXshellFromDir, importXshellSessions, openDialog, renameProjectFolder,
-  saveSettings, setUiExpanded, upsertProject, upsertServer,
+  cloudBeginLogin, cloudStatus, createProjectFolder, deleteProject, deleteProjectFolder, deleteServer,
+  ensureProjectDirs, getState, importXshellFromDir, importXshellSessions, onCloudChanged, openDialog,
+  renameProjectFolder, saveSettings, setUiExpanded, upsertProject, upsertServer,
 } from '../api';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { attachCombo, confirmDialog, promptDialog, toast, uid } from '../ui';
 import { icon } from '../icons';
 import { navigate } from '../router';
@@ -62,6 +63,12 @@ export const renderWelcome: PageRender = (root) => {
       <div class="page-head">
         <h2>我的项目</h2>
         <span class="tag" id="proj-count">0 个项目</span>
+      </div>
+
+      <!-- 云登录快捷通道（CR-1.9）：未登录且构建注入了 serverUrl 时显示 -->
+      <div id="cloud-login-bar" class="cloud-login-bar hidden">
+        <span>登录公司账号，免配置使用 AI</span>
+        <button class="btn primary small" id="btn-cloud-login">登录</button>
       </div>
 
       <div class="welcome-toolbar">
@@ -214,6 +221,7 @@ export const renderWelcome: PageRender = (root) => {
       autoSwitchAiWorkdir: true,
       projectView: 'card',
       approvalMode: 'smart',
+      cloud: { mode: 'personal', user: null, capabilities: null },
     },
     servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {},
   };
@@ -1004,8 +1012,24 @@ export const renderWelcome: PageRender = (root) => {
   };
   window.addEventListener('aishell:data-changed', onDataChanged);
 
+  /* ---------- 云登录快捷通道（CR-1.9） ---------- */
+  const cloudBar = root.querySelector('#cloud-login-bar') as HTMLElement;
+  const renderCloudBar = (s: CloudStatus) => {
+    cloudBar.classList.toggle('hidden', !(s.serverUrl && !s.loggedIn));
+  };
+  cloudBar.querySelector('#btn-cloud-login')!.addEventListener('click', () => {
+    cloudBeginLogin()
+      .then((url) => openUrl(url))
+      .then(() => toast('请在浏览器中完成授权…', 'info'))
+      .catch((err) => toast(`登录发起失败: ${String(err)}`, 'error'));
+    // 登录成功后 cloud:changed 驱动引导条隐藏；无需在此等待
+  });
+  void cloudStatus().then(renderCloudBar).catch(() => {});
+  const offCloudBar = onCloudChanged(renderCloudBar).catch(() => () => {});
+
   return () => {
     document.removeEventListener('keydown', onKeydown);
     window.removeEventListener('aishell:data-changed', onDataChanged);
+    void offCloudBar.then((un) => un()).catch(() => {});
   };
 };

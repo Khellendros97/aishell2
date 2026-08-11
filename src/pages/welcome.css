@@ -16,6 +16,16 @@
 .welcome-page .page-head h2 { font-size: 16px; font-weight: 600; }
 .welcome-page .page-head .spacer { flex: 1; }
 
+/* 云登录快捷通道（CR-1.9）：未登录且构建注入 serverUrl 时显示 */
+.welcome-page .cloud-login-bar {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 14px; padding: 10px 14px;
+  border: 1px solid var(--accent-dim); border-radius: var(--radius-m);
+  background: var(--accent-dim);
+  font-size: 13px; color: var(--text-0);
+}
+.welcome-page .cloud-login-bar .spacer { flex: 1; }
+
 /* ---------- 工具行：搜索 / 全部展开折叠 / 视图切换 / Xshell 导入 / 分类目录 / 新建项目 ---------- */
 .welcome-page .welcome-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
 .welcome-page .welcome-toolbar #proj-search { flex: 1; min-width: 200px; max-width: 340px; }

@@ -25,6 +25,43 @@ export interface Settings {
   projectView: 'card' | 'list';
   /** 审批模式（智能审批/全部审批）；旧配置无此字段按智能审批 */
   approvalMode: 'smart' | 'all';
+  /** 云服务接入（公司服务器托管）；旧配置无此字段按未接入处理 */
+  cloud: CloudConfig;
+}
+
+/** 云服务接入模式（与 store.rs CloudMode serde lowercase 对齐） */
+export type CloudMode = 'hosted' | 'personal';
+
+/** 登录用户展示资料（token 永不进 JSON、永不返回前端） */
+export interface CloudUser {
+  name: string;
+  avatar: string | null;
+  dept: string | null;
+}
+
+/** 服务端能力清单（登录后缓存，供托管模式 UI 使用） */
+export interface CloudCapabilities {
+  models: string[];
+  search: boolean;
+  knowledge: boolean;
+  latestVersion: string | null;
+}
+
+/** 云服务配置段（aishell.json）：只存非敏感资料，token 在 keyring */
+export interface CloudConfig {
+  mode: CloudMode;
+  user: CloudUser | null;
+  capabilities: CloudCapabilities | null;
+}
+
+/** cloud_status 返回值 / cloud:changed 事件载荷（与 Rust cloud.rs CloudStatus 对齐；token 不在此） */
+export interface CloudStatus {
+  loggedIn: boolean;
+  user: CloudUser | null;
+  capabilities: CloudCapabilities | null;
+  /** 构建期注入的服务器地址；null = 未接入云服务（一切云功能隐藏） */
+  serverUrl: string | null;
+  mode: CloudMode;
 }
 
 /** 与 store.rs Theme serde lowercase 对齐 */

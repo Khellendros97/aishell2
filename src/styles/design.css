@@ -278,6 +278,12 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   display: block; object-fit: contain; flex: none;
 }
 .page-topbar .spacer { flex: 1; }
+.page-topbar .tb-account { position: relative; }
+.page-topbar .tb-badge {
+  position: absolute; top: 3px; right: 5px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--red); box-shadow: 0 0 0 2px var(--bg-1);
+}
 
 /* 自绘标题栏窗口控制（无边框窗口；data-tauri-drag-region 由 JS 打在 .page-topbar 上） */
 .page-topbar[data-tauri-drag-region] { user-select: none; }
