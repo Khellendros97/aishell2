@@ -460,7 +460,7 @@ export function mountAiPanel(container: HTMLElement): void {
   Workbench.ai = aiHandle;
 
   /* 自动切换 AI 工作区域：激活终端标签（含新开终端）时跟随切换；
-     bus 无 off API：卸载后 unmounted 守卫 + container.isConnected 守卫使监听失效 */
+     AI 面板页级常驻（每页只挂一次），卸载后 unmounted 守卫 + container.isConnected 守卫兜底 */
   bus.on('tab-activated', (t) => {
     if (unmounted || !container.isConnected) return;
     if (autoSwitchAiWorkdir) updateWorkareaFromTab(t);

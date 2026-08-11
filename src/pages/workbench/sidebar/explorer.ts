@@ -2,8 +2,9 @@
  * 文件资源管理器面板 —— 移植自 .proto/workbench-sidebar.js 的「面板 1」。
  * 差异：真实 fs_list 懒加载（目录首次展开时读取，而非 mock 全量树）；
  * 删除/新建/远端拖入都走后端命令并 toast 真实错误；样式类改 wbs-explorer- 前缀。
- * 契约：mountExplorerPanel(container) 由 workbench.ts 侧栏框架挂载（container = #sidebar-content，
- * 面板不碰 #sidebar-head）；explorerHead 描述符由框架渲染标题与 actions 区。
+ * 契约：mountExplorerPanel(panelRoot) 由 workbench.ts 侧栏框架挂载（panelRoot = 每次切换新建的
+ * 独立容器，卸载即弃；面板不碰 #sidebar-head），返回 cleanup 停轮询并反注册监听；
+ * explorerHead 描述符由框架渲染标题与 actions 区。
  */
 import { bus, getActiveTab, getTabs, openTab, Workbench } from '../core';
 import { confirmDialog, copyText, showContextMenu, toast, type CtxItem } from '../../../ui';
@@ -62,7 +63,6 @@ interface TreeNode {
 }
 
 let container: HTMLElement | null = null;
-let mounted = false;
 let rootNode: TreeNode | null = null;
 /** 单击聚焦的当前行路径（快捷键操作目标；渲染时行加 .sel） */
 let selectedPath: string | null = null;
@@ -1074,27 +1074,32 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-/* ---------- 挂载 ---------- */
-export function mountExplorerPanel(el: HTMLElement): void {
+/* ---------- 挂载 ----------
+   契约：panelRoot 为本面板私有容器（框架每次切换新建，卸载即弃）；
+   返回 cleanup：反注册 bus 监听、停轮询、作废在途加载（loadSeq 递增使旧 token 全部失效） */
+export function mountExplorerPanel(el: HTMLElement): () => void {
   container = el;
-  if (!mounted) {
-    mounted = true;
-    bus.on('project-changed', () => {
-      // 项目路径变化 → 重建根；仅 quickCommands 等变化 → 刷新已加载目录
-      const raw = Workbench.state.project?.path;
-      const path = raw ? normPath(raw) : null;
-      if (path !== (rootNode?.path ?? null)) {
-        rootNode = null;
-        clearExpanded();
-      }
-      if (!getRoot()) { render(); return; }
-      // 切到新项目：播种其历史展开状态（每项目每会话一次；须在 getRoot 重建之后，
-      // 否则重建期的 persist 会先于种子落盘、覆盖该项目历史展开状态）
-      void seedExpanded();
-      void refreshAll();
-    });
-  }
+  const offProjectChanged = bus.on('project-changed', () => {
+    // 项目路径变化 → 重建根；仅 quickCommands 等变化 → 刷新已加载目录
+    const raw = Workbench.state.project?.path;
+    const path = raw ? normPath(raw) : null;
+    if (path !== (rootNode?.path ?? null)) {
+      rootNode = null;
+      clearExpanded();
+    }
+    if (!getRoot()) { render(); return; }
+    // 切到新项目：播种其历史展开状态（每项目每会话一次；须在 getRoot 重建之后，
+    // 否则重建期的 persist 会先于种子落盘、覆盖该项目历史展开状态）
+    void seedExpanded();
+    void refreshAll();
+  });
   render();
   void seedExpanded();
   startPolling();
+  return () => {
+    offProjectChanged();
+    if (pollTimer !== null) { window.clearInterval(pollTimer); pollTimer = null; }
+    loadSeq++; // 作废在途 fsList/loadDir/refreshAll，旧 token 结果不再渲染
+    if (container === el) container = null;
+  };
 }

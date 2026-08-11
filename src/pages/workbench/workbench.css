@@ -31,6 +31,9 @@
 /* flex column 布局：让面板内容（如 explorer 树）能用 flex:1 撑满可视高度，
    百分比 min-height 在此处无效（本元素无显式 height） */
 #sidebar-content { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+/* 面板独立容器：每次切换面板新建（workbench.ts mountPanel），卸载后整体丢弃。
+   复制 #sidebar-content 的滚动/布局语义，使面板内 container.scrollTop 等行为不变 */
+.wbs-panel-root { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 
 /* 左右面板可调宽分隔条；支持鼠标拖拽与键盘方向键微调 */
 .wb-resize-handle {

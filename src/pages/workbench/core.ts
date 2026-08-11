@@ -63,13 +63,20 @@ const TYPE_ICONS: Record<string, string> = { editor: icon('file'), sftp: icon('g
 /* ---------- 事件总线 ----------
    'tab-activated'   (tab|null)      激活标签变化（关闭最后一个标签时发 null）
    'tab-closed'      (tab)
-   'project-changed' ()              项目数据被某模块修改（各模块可据此刷新） */
+   'project-changed' ()              项目数据被某模块修改（各模块可据此刷新）
+   on() 返回反注册函数：侧栏面板卸载 / 页面清理时必须调用，监听器不得只增不减 */
 const listeners = new Map<BusEvent, BusCallback[]>();
 export const bus = {
-  on(ev: BusEvent, cb: BusCallback): void {
+  on(ev: BusEvent, cb: BusCallback): () => void {
     const list = listeners.get(ev) ?? [];
     list.push(cb);
     listeners.set(ev, list);
+    return () => {
+      const cur = listeners.get(ev);
+      if (!cur) return;
+      const idx = cur.indexOf(cb);
+      if (idx >= 0) cur.splice(idx, 1);
+    };
   },
   emit(ev: BusEvent, arg: Tab | null = null): void {
     (listeners.get(ev) ?? []).forEach((cb) => cb(arg));

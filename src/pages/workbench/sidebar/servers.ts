@@ -5,7 +5,8 @@
  * （upsert_server + upsert_project，与设置页表单同字段语义：密码留空 = 不写入 keyring）。
  * 与原型差异：不做在线状态探活（计划明确去掉随机 mock 状态点），认证方式以 tag 呈现。
  * 新增（非原型）：远程服务器支持按 名称/host/账号 搜索；列表平铺展示（服务器不再有目录维度，分类能力已转移给项目）。
- * 侧栏框架契约：导出 head 描述符（title），mountServersPanel(container) 只渲染内容区。
+ * 侧栏框架契约：导出 head 描述符（title）；mountServersPanel(panelRoot) 只渲染内容区
+ * （panelRoot = 每次切换新建的独立容器，卸载即弃），返回 cleanup 反注册全部监听。
  */
 import type { DbConnection, DbKind, Server } from '../../../types';
 import { icon } from '../../../icons';
@@ -17,15 +18,12 @@ import './servers.css';
 
 export const serversHead = { title: '服务器列表' };
 
-/** 数据变更监听句柄：面板切换会重建 DOM 但 window 监听不自动消失，重挂载时先移除旧的 */
-let dataChangedHandler: (() => void) | null = null;
-
 const esc = (s: string | number): string =>
   String(s).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>
   )[c]);
 
-export function mountServersPanel(container: HTMLElement): void {
+export function mountServersPanel(container: HTMLElement): () => void {
   /* ---------- 新建 / 编辑服务器模态框（字段与校验逻辑复用 server-form.ts；密码留空 = 保持原值，永不回显） ---------- */
   container.insertAdjacentHTML('beforeend', `
     <div class="modal-mask hidden" id="srv-modal">
@@ -673,15 +671,15 @@ export function mountServersPanel(container: HTMLElement): void {
   });
 
   void render();
-  /* 守卫陈旧挂载闭包：bus 无 off API（core.ts 契约），面板每次切换都重挂载并重复订阅，
-     旧闭包持有的 searchWrap 已被 innerHTML 清空（isConnected=false），无守卫时旧 render 会把
-     孤立搜索框重新 append 回活容器 —— 表现为锁切换/命令收藏后搜索框被复制一个（workbench.ts
-     同契约注释：监听器用 isConnected 守卫，换页后自动失效） */
-  bus.on('project-changed', () => { if (searchWrap.isConnected) void render(); });
-  // 命令面板（Ctrl+T）等全局操作清空/变更数据后广播，侧栏常驻需同步刷新
-  if (dataChangedHandler) window.removeEventListener('aishell:data-changed', dataChangedHandler);
-  dataChangedHandler = () => { if (container.isConnected) void render(); };
-  window.addEventListener('aishell:data-changed', dataChangedHandler);
+  /* 面板联动刷新：项目数据变更（其他模块改绑定/命令收藏等）与命令面板（Ctrl+T）全局数据广播。
+     cleanup 由框架在切换/卸载时调用，监听器随面板销毁，不再依赖 isConnected 守卫 */
+  const offProjectChanged = bus.on('project-changed', () => void render());
+  const onDataChanged = (): void => void render();
+  window.addEventListener('aishell:data-changed', onDataChanged);
+  return () => {
+    offProjectChanged();
+    window.removeEventListener('aishell:data-changed', onDataChanged);
+  };
 }
 
 /* ---------- 数据库连接配置弹窗（AI 受管查询通道） ---------- */

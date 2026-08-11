@@ -145,21 +145,30 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     commands: commandsHead,
   };
   const sidebarActions = root.querySelector('#sidebar-actions') as HTMLElement;
-  const MOUNTS: Record<string, (container: HTMLElement) => void> = {
+  /* 面板契约：mount(panelRoot) 返回 cleanup（反注册监听 / 停定时器 / 作废闭包）。
+     每个面板挂在独立新建的 panelRoot 上 —— 不再共享 #sidebar-content：
+     卸载后面板的迟到的异步渲染只能写进已脱离 DOM 的旧根，天然不可见 */
+  const MOUNTS: Record<string, (container: HTMLElement) => (() => void) | void> = {
     explorer: mountExplorerPanel,
     servers: mountServersPanel,
     commands: mountCommandsPanel,
   };
   let currentPanel = 'explorer';
   let aiMounted = false;
+  let unmountPanel: (() => void) | null = null;
 
   function mountPanel(panel: string): void {
+    unmountPanel?.();
+    unmountPanel = null;
     const head = HEADS[panel];
     sidebarTitle.textContent = head?.title ?? PANELS[panel] ?? panel;
     sidebarActions.innerHTML = '';
     head?.renderActions?.(sidebarActions);
     sidebarContent.innerHTML = '';
-    MOUNTS[panel]?.(sidebarContent);
+    const panelRoot = document.createElement('div');
+    panelRoot.className = 'wbs-panel-root';
+    sidebarContent.appendChild(panelRoot);
+    unmountPanel = MOUNTS[panel]?.(panelRoot) ?? null;
     activityBar.querySelectorAll('.activity-icon').forEach((el) => {
       el.classList.toggle('active', el.getAttribute('data-panel') === panel);
     });
@@ -194,13 +203,11 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     setPanel(panel);
   });
 
-  /* 正在显示 commands 时活跃标签变为非终端（或 null）→ 自动切回 explorer。
-     bus 无 off API（core.ts 契约）：监听器用 root.isConnected 守卫，换页后自动失效。 */
+  /* 正在显示 commands 时活跃标签变为非终端（或 null）→ 自动切回 explorer；页面卸载时反注册 */
   const onTabActivated = (tab: Tab | null): void => {
-    if (!root.isConnected) return;
     if (currentPanel === 'commands' && (!tab || tab.type !== 'terminal')) setPanel('explorer');
   };
-  bus.on('tab-activated', onTabActivated);
+  const offTabActivated = bus.on('tab-activated', onTabActivated);
 
   /* ---------- 项目装载（异步） ---------- */
   let project: Project | null = null;
@@ -214,6 +221,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     toast('没有可用项目，请先在欢迎页创建项目', 'error');
     navigate('#/welcome');
     return () => {
+      offTabActivated();
       resizeCleanups.forEach((cleanup) => cleanup());
       getTabs().forEach((t) => closeTab(t.id));
     };
@@ -235,9 +243,12 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
   });
 
   return () => {
+    offTabActivated();
+    // 卸载当前面板（反注册其 bus 监听 / 停轮询），再关闭全部标签
+    unmountPanel?.();
+    unmountPanel = null;
     resizeCleanups.forEach((cleanup) => cleanup());
     // 关闭全部标签（closeTab 触发各渲染器 onClose → term_close 等后端清理）
     getTabs().forEach((t) => closeTab(t.id));
-    // bus 监听无 off API：已用 root.isConnected 守卫，换页后自动失效
   };
 }

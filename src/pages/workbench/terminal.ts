@@ -24,7 +24,7 @@
  * 订阅/命令全部以 this.tab.id 为键，同一服务器并行终端互不串流。
  */
 import { Terminal } from '@xterm/xterm';
-import type { ITheme } from '@xterm/xterm';
+import type { IBuffer, ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -122,8 +122,45 @@ function isZshPromptLine(s: string): boolean {
   return /^\S+@\S+(\s+[^\n]*)?\s%(\s|$)/.test(s);
 }
 
-/** zsh 提示符匹配（行首 user@host 前缀 + 非贪婪到首个 `% `），供 readCommandFromBuffer 取切点。 */
+/** zsh 提示符匹配（行首 user@host 前缀 + 非贪婪到首个 `% `），供 extractCommandFromBuffer 取切点。 */
 const ZSH_PROMPT_RE = /(?:^|\n)\S+@\S+[^\n]*?% /g;
+
+/**
+ * 从 xterm buffer 提取光标所在输入行的命令文本（纯函数，供 TermSession 与测试复用）。
+ * 向上收集 wrapped 续行与多行输入的前段，切掉提示符前缀（Git Bash 默认 PS1 以 `$ `/`# ` 结尾；
+ * macOS zsh 默认 PS1 以 `% ` 结尾，锚定 user@host 前缀防误切命令里的百分号）；
+ * 找不到提示符标记时退化为光标行全文（自定义 PS1 场景）。
+ * 窗口为 200 行（旧 12 行）：长命令折行超窗时沿续行段继续向上找输入首行；
+ * 提示符切割只在非续行（输入首行）上进行 —— 续行里的 `$ `（如 echo "$ "）是命令体内容，不误切。
+ */
+export function extractCommandFromBuffer(buf: IBuffer): string {
+  const start = buf.baseY + buf.cursorY;
+  let text = '';
+  let cursorLine = '';
+  for (let row = start; row >= 0 && start - row < 200; row--) {
+    const ln = buf.getLine(row);
+    if (!ln) break;
+    const seg = ln.translateToString(true);
+    if (row === start) cursorLine = seg;
+    const below = buf.getLine(row + 1);
+    const sep = row === start ? '' : below?.isWrapped ? '' : '\n';
+    text = seg + sep + text;
+    if (!ln.isWrapped) {
+      // zsh：取行首锚定的最后一处提示符匹配，切点指向 `% ` 起始
+      let zCut = -1;
+      ZSH_PROMPT_RE.lastIndex = 0;
+      let zm: RegExpExecArray | null;
+      while ((zm = ZSH_PROMPT_RE.exec(seg))) zCut = zm.index + zm[0].length - 2;
+      const cut = Math.max(seg.lastIndexOf('$ '), seg.lastIndexOf('# '), zCut);
+      // text.slice(seg.length) 保留行间分隔符（续行 '' / 真换行 '\n'），只切掉提示符前缀
+      if (cut >= 0) return (seg.slice(cut + 2) + text.slice(seg.length)).trim();
+    }
+    /* 超出旧 12 行窗口后只沿续行段继续向上（长命令折行）；遇到非续行仍无标记 →
+       按旧语义退化，防止把上一条命令的回显/输出吃进来 */
+    if (start - row >= 11 && !ln.isWrapped) break;
+  }
+  return cursorLine.trim();
+}
 
 class TermSession {
   /** 主题切换时模块级 liveTerms 需要重写 options.theme,不封装 */
@@ -272,7 +309,7 @@ class TermSession {
     });
 
     // 激活本标签时聚焦终端（与原型 input.focus 语义一致）。
-    // bus 无 off API：用 tab.el.isConnected 守卫，关闭/换页后的残留监听自动失效。
+    // 监听随标签常驻：用 tab.el.isConnected 守卫，关闭/换页后的残留监听自动失效。
     bus.on('tab-activated', (t) => {
       if (!this.tab.el.isConnected) return;
       if (t && t.id === this.tab.id && !this.failed && !this.exited) this.term.focus();
@@ -448,34 +485,9 @@ class TermSession {
     this.renderDrawer();
   }
 
-  /**
-   * 从 xterm buffer 提取光标所在输入行的命令文本。
-   * 向上收集 wrapped 续行与多行输入的前段，切掉提示符前缀（Git Bash 默认 PS1 以 `$ `/`# ` 结尾；
-   * macOS zsh 默认 PS1 以 `% ` 结尾，锚定 user@host 前缀防误切命令里的百分号）；
-   * 找不到提示符标记时退化为光标行全文（自定义 PS1 场景）。
-   */
+  /** 从 xterm buffer 提取光标所在输入行的命令文本（实现见模块级纯函数 extractCommandFromBuffer） */
   private readCommandFromBuffer(): string {
-    const buf = this.term.buffer.active;
-    const start = buf.baseY + buf.cursorY;
-    let text = '';
-    let cursorLine = '';
-    for (let row = start; row >= 0 && start - row < 12; row--) {
-      const ln = buf.getLine(row);
-      if (!ln) break;
-      const seg = ln.translateToString(true);
-      if (row === start) cursorLine = seg;
-      const below = buf.getLine(row + 1);
-      const sep = row === start ? '' : below?.isWrapped ? '' : '\n';
-      text = seg + sep + text;
-      // zsh：取行首锚定的最后一处提示符匹配，切点指向 `% ` 起始
-      let zCut = -1;
-      ZSH_PROMPT_RE.lastIndex = 0;
-      let zm: RegExpExecArray | null;
-      while ((zm = ZSH_PROMPT_RE.exec(text))) zCut = zm.index + zm[0].length - 2;
-      const cut = Math.max(text.lastIndexOf('$ '), text.lastIndexOf('# '), zCut);
-      if (cut >= 0) return text.slice(cut + 2).trim();
-    }
-    return cursorLine.trim();
+    return extractCommandFromBuffer(this.term.buffer.active);
   }
 
   /* ---------- 后端输出：写 xterm + 区块 output 捕获 ---------- */

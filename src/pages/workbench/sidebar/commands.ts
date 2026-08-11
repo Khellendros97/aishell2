@@ -2,8 +2,9 @@
  * 命令收藏面板 —— 移植自 .proto/workbench-sidebar.js 的「面板 3」。
  * 差异：持久化走 upsert_project 命令（原型是 A.save(db)）；无可用终端时 toast
  * 「没有可用的终端标签页」；样式类改 wbs-commands- 前缀 + 共享 .wbs-content。
- * 契约：mountCommandsPanel(container) 由 workbench.ts 侧栏框架挂载（container = #sidebar-content，
- * 面板不碰 #sidebar-head）；commandsHead 描述符由框架渲染标题与 actions 区。
+ * 契约：mountCommandsPanel(panelRoot) 由 workbench.ts 侧栏框架挂载（panelRoot = 每次切换新建的
+ * 独立容器，卸载即弃；面板不碰 #sidebar-head），返回 cleanup 反注册 bus 监听并作废在途渲染；
+ * commandsHead 描述符由框架渲染标题与 actions 区。
  * 注意：commands 面板的准入（活跃标签须为终端）与 tab-activated 自动切回 explorer 由框架负责（照抄原型）。
  * 新增（非原型，对应待优化 6/7）：
  * - 顶部搜索框按 标题/命令内容 过滤（搜索中匹配的目录自动展开，忽略折叠态）；
@@ -37,7 +38,8 @@ export const commandsHead = {
 interface DisplayedCommand { qc: QuickCommand; owner: Project }
 
 let container: HTMLElement | null = null;
-let mounted = false;
+/** 渲染代际记号：每次 render / 卸载递增，async render 在 await 后校验，在途旧渲染一律丢弃 */
+let renderSeq = 0;
 
 /* 搜索行（持久元素）：搜索框 + 新建分类目录 + 全部展开/折叠，不随列表重建，避免输入焦点丢失 */
 let searchWrap: HTMLElement | null = null;
@@ -398,7 +400,11 @@ async function collectCommands(): Promise<DisplayedCommand[]> {
 
 async function render(): Promise<void> {
   if (!container) return;
+  const gen = ++renderSeq;
+  const host = container;
   const displayed = await collectCommands();
+  /* 代际/宿主校验：await 期间面板被卸载或又有新 render 触发 → 本次结果直接丢弃 */
+  if (gen !== renderSeq || host !== container || !host.isConnected) return;
   latestCommands = displayed.map((d) => d.qc);
   const liveIds = new Set(displayed.map((d) => d.qc.id));
 
@@ -516,15 +522,17 @@ async function render(): Promise<void> {
 }
 
 /* ---------- 挂载 ---------- */
-export function mountCommandsPanel(el: HTMLElement): void {
+export function mountCommandsPanel(el: HTMLElement): () => void {
   container = el;
   /* 面板切换重建 DOM：搜索词重置为空（与服务器面板同行为），折叠态保留 */
   searchQuery = '';
   if (searchInput) { searchInput.value = ''; }
-  if (!mounted) {
-    mounted = true;
-    /* 其他模块（终端区块/本面板）改 quickCommands 后联动刷新 */
-    bus.on('project-changed', () => void render());
-  }
+  /* 其他模块（终端区块/本面板）改 quickCommands 后联动刷新 */
+  const offProjectChanged = bus.on('project-changed', () => void render());
   void render();
+  return () => {
+    offProjectChanged();
+    renderSeq++; // 作废在途 async render
+    if (container === el) container = null;
+  };
 }
