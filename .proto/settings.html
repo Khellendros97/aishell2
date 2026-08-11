@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AIShell - 设置</title>
+<link rel="stylesheet" href="shared/design.css">
+<style>
+  /* ===== 设置页整体布局：顶栏之下 flex，左侧窄导航 + 右侧内容 ===== */
+  #warn-banner {
+    display: none; align-items: center; gap: 8px;
+    margin: 0; padding: 8px 16px; font-size: 12.5px;
+    background: rgba(229, 192, 123, 0.12); color: var(--yellow);
+    border-bottom: 1px solid var(--yellow);
+  }
+  #warn-banner.show { display: flex; }
+
+  #settings-layout { display: flex; height: calc(100vh - var(--topbar-h)); }
+
+  /* 左侧导航 */
+  #settings-nav {
+    width: 180px; flex: none; background: var(--bg-1);
+    border-right: 1px solid var(--border); padding: 10px 8px; display: flex; flex-direction: column; gap: 2px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-radius: var(--radius-s); font-size: 13px;
+    color: var(--text-1); cursor: pointer; user-select: none;
+    border-left: 2px solid transparent;
+  }
+  .nav-item:hover { background: var(--bg-hover); color: var(--text-0); }
+  .nav-item.active { background: var(--accent-dim); color: var(--text-0); border-left-color: var(--accent); }
+
+  /* 右侧内容区 */
+  #settings-content { flex: 1; min-width: 0; overflow-y: auto; background: var(--bg-0); padding: 24px 28px; }
+  .settings-panel { max-width: 860px; }
+
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .panel-title { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 600; }
+  .panel-title .tag { font-weight: 400; }
+
+  /* 服务器卡片网格 */
+  .server-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+  .server-card { display: flex; flex-direction: column; gap: 8px; }
+  .sc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .sc-name { font-size: 13.5px; font-weight: 600; min-width: 0; }
+  .sc-actions { display: flex; gap: 2px; flex: none; }
+  .sc-host { font-size: 12.5px; color: var(--text-1); }
+  .sc-meta { display: flex; align-items: center; gap: 8px; }
+  .sc-user { font-size: 12px; color: var(--text-2); }
+
+  /* 密钥 tag（design.css 无 purple 变体，自定义） */
+  .tag.purple { background: rgba(182, 135, 232, 0.14); color: var(--purple); }
+
+  /* 输入行：input + 按钮 */
+  .input-row { display: flex; gap: 8px; align-items: center; }
+  .input-row .input { flex: 1; }
+  .input-row .btn, .input-row .icon-btn { flex: none; }
+
+  /* 大模型配置分组 */
+  .llm-group {
+    border: 1px solid var(--border); border-radius: var(--radius-m);
+    padding: 14px 16px 0; margin-bottom: 4px;
+  }
+  .llm-group legend {
+    padding: 0 6px; font-size: 12px; font-weight: 600; color: var(--text-1);
+  }
+
+  .form-actions { margin-top: 18px; display: flex; justify-content: flex-end; }
+</style>
+</head>
+<body>
+<script src="shared/mock.js"></script>
+
+<div id="warn-banner">⚠ 缺少必要配置，请先完成系统设置</div>
+
+<div id="settings-layout">
+  <!-- 左侧导航 -->
+  <nav id="settings-nav">
+    <div class="nav-item active" data-panel="servers">🖥️ 服务器配置</div>
+    <div class="nav-item" data-panel="system">⚙️ 系统设置</div>
+  </nav>
+
+  <!-- 右侧内容 -->
+  <main id="settings-content">
+    <!-- 服务器配置 -->
+    <section id="panel-servers" class="settings-panel">
+      <div class="panel-head">
+        <div class="panel-title">服务器 <span id="server-count" class="tag">0</span></div>
+        <button id="btn-new-server" class="btn primary">＋ 新建服务器</button>
+      </div>
+      <div id="server-grid" class="server-grid"></div>
+      <div id="server-empty" class="empty-state hidden">
+        <div class="icon">🖥️</div>
+        <div>暂无服务器，点击右上角「新建服务器」开始配置</div>
+      </div>
+    </section>
+
+    <!-- 系统设置 -->
+    <section id="panel-system" class="settings-panel hidden">
+      <div class="panel-head"><div class="panel-title">系统设置</div></div>
+      <div class="field">
+        <label>Workspace 目录<span class="req">*</span></label>
+        <div class="input-row">
+          <input id="f-workspace" class="input mono" placeholder="D:\AIShellWorkspace">
+          <button id="btn-browse-ws" class="btn small">浏览…</button>
+        </div>
+        <div class="hint">项目默认创建目录</div>
+      </div>
+
+      <fieldset class="llm-group">
+        <legend>大模型配置</legend>
+        <div class="field">
+          <label>模型 ID</label>
+          <input id="f-model-id" class="input" placeholder="deepseek-chat">
+        </div>
+        <div class="field">
+          <label>Base URL</label>
+          <input id="f-base-url" class="input mono" placeholder="https://api.deepseek.com/v1">
+        </div>
+        <div class="field">
+          <label>API Key</label>
+          <div class="input-row">
+            <input id="f-api-key" class="input mono" type="password" placeholder="sk-...">
+            <button id="btn-toggle-key" class="icon-btn" title="显示 / 隐藏">👁</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>思考强度</label>
+          <select id="f-effort" class="select">
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+        </div>
+      </fieldset>
+
+      <div class="form-actions">
+        <button id="btn-save-system" class="btn primary">保存</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 新建 / 编辑服务器模态框 -->
+<div id="server-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="server-modal-title">新建服务器</h3>
+      <button id="server-modal-close" class="icon-btn" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>服务器名称<span class="req">*</span></label>
+        <input id="f-name" class="input" placeholder="例如：生产-Web-01">
+      </div>
+      <div class="field">
+        <label>IP 地址<span class="req">*</span></label>
+        <input id="f-host" class="input mono" placeholder="例如：47.102.118.66">
+      </div>
+      <div class="field">
+        <label>SSH 端口<span class="req">*</span></label>
+        <input id="f-port" class="input mono" type="number" min="1" max="65535" value="22">
+      </div>
+      <div class="field">
+        <label>认证方式<span class="req">*</span></label>
+        <select id="f-auth" class="select">
+          <option value="password">账号密码</option>
+          <option value="key">密钥</option>
+        </select>
+      </div>
+      <div class="field" data-auth="password">
+        <label>账号</label>
+        <input id="f-username" class="input" placeholder="例如：deploy">
+      </div>
+      <div class="field" data-auth="password">
+        <label>密码</label>
+        <input id="f-password" class="input" type="password" placeholder="••••••••">
+      </div>
+      <div class="field" data-auth="key">
+        <label>密钥文件路径</label>
+        <div class="input-row">
+          <input id="f-keypath" class="input mono" placeholder="C:\Users\demo\.ssh\id_ed25519">
+          <button id="btn-browse-key" class="btn small">浏览…</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button id="server-modal-cancel" class="btn">取消</button>
+      <button id="server-modal-save" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="settings.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>AIShell</title></head>
+<body>
+<script src="shared/mock.js"></script>
+<script>
+  // 启动逻辑：缺少必要配置（workspace 目录）→ 配置页；否则 → 欢迎页
+  const db = AIShell.load();
+  location.replace(db.settings.workspaceDir ? 'welcome.html' : 'settings.html?reason=missing-config');
+</script>
+</body>
+</html>

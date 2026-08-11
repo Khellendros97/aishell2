@@ -1,0 +1,94 @@
+/* SFTP 面板模块样式 —— 移植自 .proto/workbench-sftp.js 的 sf-style（只增不改 shared/design.css）。
+   新增：.sf-error（加载失败错误条 + 重试）。加载态复用 design.css 的 .empty-state。 */
+.sf-root { flex: 1 1 auto; min-width: 0; height: 100%; min-height: 0; display: flex; flex-direction: column; background: var(--bg-0); position: relative; }
+/* 主行 = 目录区 + 收藏夹侧边栏（flex 行，侧栏默认 hidden） */
+.sf-main { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: row; }
+.sf-toolbar { flex: none; position: relative; display: flex; align-items: center; gap: 2px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--bg-1); }
+.sf-view.active { color: var(--accent); background: var(--bg-hover); }
+.sf-fav-toggle.active, .sf-search-toggle.active { color: var(--accent); background: var(--bg-hover); }
+/* 地址栏包裹层：相对定位，路径历史下拉浮层与内嵌星按钮都相对它定位 */
+.sf-path-wrap { flex: 1 1 0; min-width: 0; margin: 0 8px; position: relative; display: flex; }
+.sf-path { flex: 1 1 auto; min-width: 0; margin: 0; height: 28px; padding: 0 30px 0 10px; font-family: var(--font-mono); font-size: 12.5px; }
+.sf-go { flex: none; height: 28px; padding: 0 12px; font-size: 12.5px; }
+/* 收藏星按钮：定位在地址栏输入框内部右端（浏览器 URL 栏式），active = 当前路径已收藏（黄色实心观感走颜色） */
+.sf-path-wrap .sf-star { position: absolute; right: 3px; top: 50%; transform: translateY(-50%); width: 24px; height: 24px; font-size: 13px; }
+.sf-star.active { color: var(--yellow); }
+.sf-star.active svg { fill: currentColor; }
+/* 搜索输入框：默认隐藏，展开时显示 */
+.sf-search { display: none; flex: none; width: 170px; height: 28px; margin-left: 4px; padding: 0 10px; font-size: 12.5px; }
+.sf-search.sf-search-open { display: inline-block; }
+/* 收藏夹侧边栏 */
+.sf-fav { flex: none; width: 200px; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--bg-1); }
+.sf-fav[hidden] { display: none; }
+.sf-fav-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--text-1); }
+.sf-fav-head .icon-btn { width: 22px; height: 22px; font-size: 12px; }
+.sf-fav-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 4px; }
+.sf-fav-item { display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: var(--radius-m); cursor: pointer; font-size: 12px; color: var(--text-1); }
+.sf-fav-item:hover { background: var(--bg-hover); }
+.sf-fav-item.current { color: var(--accent); }
+.sf-fav-item .nm { flex: 0 1 auto; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.sf-fav-item .sub { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-3); }
+.sf-fav-item.current .sub { color: var(--accent-dim, var(--text-3)); }
+.sf-fav-item .sf-fav-rm { flex: none; width: 18px; height: 18px; font-size: 11px; opacity: 0; }
+.sf-fav-item:hover .sf-fav-rm { opacity: 1; }
+.sf-fav .empty-state { padding: 24px 8px; gap: 6px; }
+.sf-fav .empty-state .icon { font-size: 26px; }
+/* 路径历史下拉浮层（挂在 toolbar 内，绝对定位于地址栏下方） */
+.sf-history { position: absolute; top: calc(100% + 2px); left: 0; right: 0; z-index: 50; max-height: 260px; overflow: auto; padding: 4px; background: var(--bg-2); border: 1px solid var(--border-strong); border-radius: var(--radius-m); box-shadow: var(--shadow-m); }
+.sf-history-item { padding: 6px 10px; font-family: var(--font-mono); font-size: 12px; color: var(--text-1); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: var(--radius-s); }
+.sf-history-item:hover { background: var(--bg-hover); color: var(--text-0); }
+.sf-history-item.current { color: var(--accent); }
+/* 列表视图可排序表头 */
+.sf-table th.sf-sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.sf-table th.sf-sortable:hover { color: var(--text-0); }
+.sf-table th.sf-sort-active { color: var(--accent); }
+.sf-sort-ind { display: inline-flex; vertical-align: -2px; margin-left: 4px; font-size: 11px; }
+.sf-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px; }
+.sf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 4px; }
+.sf-item { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 4px; border-radius: var(--radius-m); border: 1px solid transparent; cursor: pointer; user-select: none; text-align: center; }
+.sf-item:hover { background: var(--bg-hover); border-color: var(--border); }
+.sf-item.sel { background: var(--bg-active); }
+.sf-item .sf-icon { font-size: 30px; line-height: 1; }
+.sf-item .sf-name { font-size: 12px; color: var(--text-1); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 剪贴板中的条目（剪切/复制后半透明，粘贴成功后随重渲染清除） */
+.sf-item.sf-cut .sf-name,
+.sf-item.sf-cut .sf-icon,
+.sf-table tr.sf-cut td { opacity: 0.45; }
+/* 行内重命名输入（grid 与 table 共用） */
+.sf-rename { width: 100%; min-width: 0; height: 22px; padding: 1px 6px; font-size: 12.5px; }
+.sf-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.sf-table th { text-align: left; color: var(--text-2); font-weight: 500; font-size: 11px; padding: 4px 10px; border-bottom: 1px solid var(--border-strong); }
+.sf-table td { padding: 4px 10px; border-bottom: 1px solid var(--border); }
+.sf-table tr { cursor: pointer; }
+.sf-table tr:hover td { background: var(--bg-hover); }
+.sf-table tr.sel td { background: var(--bg-active); }
+.sf-table .sf-t-name { display: flex; align-items: center; gap: 8px; color: var(--text-0); min-width: 0; }
+.sf-table .sf-t-name .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sf-table .sf-t-size { color: var(--text-2); font-family: var(--font-mono); text-align: right; white-space: nowrap; }
+.sf-table .sf-t-time { color: var(--text-2); white-space: nowrap; }
+/* 加载失败错误条 */
+.sf-error { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 48px 24px; text-align: center; }
+.sf-error .msg { color: var(--red); font-size: 12.5px; line-height: 1.5; max-width: 100%; word-break: break-all; white-space: pre-wrap; }
+
+/* 属性 / 权限设置对话框（复用全局 .modal-mask/.modal；行样式同侧栏属性框） */
+.sf-prop-modal { width: 460px; }
+.sf-prop-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.sf-prop-title .sf-prop-icon { font-size: 18px; color: var(--accent); display: flex; flex: none; }
+.sf-prop-title .sf-prop-name { font-weight: 600; font-size: 14px; word-break: break-all; }
+.sf-prop-rows { border-top: 1px solid var(--border); }
+.sf-prop-row { display: flex; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.sf-prop-row:last-child { border-bottom: none; }
+.sf-prop-label { flex: none; width: 68px; color: var(--text-2); }
+.sf-prop-value { min-width: 0; color: var(--text-0); word-break: break-all; }
+.sf-chmod-modal { width: 440px; }
+.sf-chmod-path { font-size: 12px; color: var(--text-2); word-break: break-all; margin-bottom: 10px; }
+.sf-chmod-label { display: block; font-size: 12.5px; color: var(--text-1); margin-bottom: 6px; }
+.sf-chmod-input { width: 100%; height: 30px; padding: 0 10px; font-family: var(--font-mono); font-size: 13px; }
+.sf-chmod-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.sf-chmod-chip { font-family: var(--font-mono); font-size: 12px; padding: 2px 8px; border-radius: var(--radius-m); border: 1px solid var(--border); background: var(--bg-2); color: var(--text-1); cursor: pointer; }
+.sf-chmod-chip:hover { border-color: var(--accent); color: var(--accent); }
+.sf-chmod-chip.active { border-color: var(--accent); color: var(--accent); }
+.sf-chmod-error { color: var(--red); font-size: 12px; margin-top: 6px; min-height: 16px; }
+
+/* 平铺视图拖拽框选（fixed 定位于 viewport，条目相交用同坐标系判断） */
+.sf-marquee { position: fixed; z-index: 60; border: 1px dashed var(--accent); background: var(--accent-dim); pointer-events: none; }

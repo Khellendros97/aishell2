@@ -1,0 +1,94 @@
+/* 服务器面板样式（wbs-server-* 私有前缀；.wbs-content 为面板共享约定，各面板 css 各自声明一份相同规则） */
+.wbs-content { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px 12px; }
+.wbs-server-card { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.wbs-server-top { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.wbs-server-icon {
+  width: 30px; height: 30px; flex: none; border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent-dim); color: var(--accent-hover); font-size: 16px;
+}
+.wbs-server-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.wbs-server-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wbs-server-addr { font-size: 11.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wbs-server-tags { display: flex; align-items: center; gap: 4px; min-width: 0; margin-left: 39px; }
+.wbs-server-tags .tag { display: inline-flex; align-items: center; gap: 3px; }
+.wbs-lock { margin-left: auto; width: 26px; height: 26px; font-size: 14px; }
+.wbs-edit { width: 26px; height: 26px; font-size: 14px; }
+.wbs-lock.locked { background: var(--red-dim); color: var(--red); }
+.wbs-lock.locked:hover { background: var(--red-dim); color: var(--red); }
+.wbs-server-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.wbs-server-actions .icon-btn {
+  width: 26px; height: 26px; font-size: 14px;
+  border: 1px solid var(--border); background: var(--bg-1);
+}
+.wbs-server-actions .icon-btn:hover { background: var(--bg-3); border-color: var(--border-strong); }
+/* 远程服务器标题行（新建按钮） */
+.wbs-server-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin: 6px 2px 4px; font-size: 11px; color: var(--text-2);
+}
+.wbs-server-head .btn { flex: none; height: 22px; font-size: 11px; padding: 0 8px; }
+.wbs-server-head-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+
+/* 服务器搜索行：搜索框（持久元素，不随列表重建，避免输入焦点丢失） */
+.wbs-search { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
+.wbs-search .input { flex: 1; min-width: 0; }
+
+/* 数据库连接配置弹窗（AI 受管查询通道） */
+.db-conn-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
+.db-conn-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border, #333); border-radius: 8px; }
+.db-conn-item:hover { background: var(--bg-2, rgba(128,128,128,.08)); }
+.db-conn-item.disabled .db-conn-icon,
+.db-conn-item.disabled .db-conn-main { opacity: .45; }
+.db-conn-icon { color: var(--text-2, #888); flex: none; }
+.db-conn-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.db-conn-name { font-weight: 600; }
+.db-conn-addr { font-size: 11.5px; color: var(--text-2, #888); }
+.db-conn-cmds { font-size: 11px; color: var(--text-3, #666); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.db-conn-ops { display: flex; gap: 4px; flex: none; }
+.db-conn-empty { color: var(--text-3, #666); font-size: 12.5px; padding: 12px 4px; }
+/* 启用开关：禁用后 AI 不可见、db_query 拒绝 */
+.db-switch { position: relative; width: 30px; height: 17px; flex: none; cursor: pointer; }
+.db-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.db-switch-track { position: absolute; inset: 0; background: var(--bg-3, #3a3d46); border: 1px solid var(--border, #333); border-radius: 9px; transition: background .12s, border-color .12s; }
+.db-switch-track::after { content: ''; position: absolute; left: 1px; top: 1px; width: 13px; height: 13px; border-radius: 50%; background: var(--text-3, #888); transition: transform .12s, background .12s; }
+.db-switch input:checked + .db-switch-track { background: var(--accent-dim, rgba(74,158,255,.25)); border-color: var(--accent, #4a9eff); }
+.db-switch input:checked + .db-switch-track::after { transform: translateX(13px); background: var(--accent, #4a9eff); }
+/* 命令勾选区（表单）：只读/写两组 + 已保存自定义项 */
+.db-cmds-field { grid-column: 1 / -1; }
+.db-cmds { display: flex; flex-direction: column; gap: 10px; border: 1px solid var(--border, #333); border-radius: var(--radius-s, 6px); padding: 10px 12px; background: var(--bg-2, rgba(128,128,128,.06)); max-height: 220px; overflow-y: auto; }
+.db-cmds-title { font-size: 11px; color: var(--text-2, #888); margin-bottom: 2px; }
+.db-cmds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 1px 8px; }
+.db-cmd { display: flex; align-items: center; gap: 5px; font-family: var(--font-mono, var(--mono, Consolas, monospace)); font-size: 11.5px; color: var(--text-1, #ccc); cursor: pointer; padding: 2px 4px; border-radius: 4px; user-select: none; }
+.db-cmd:hover { background: var(--bg-hover, rgba(128,128,128,.12)); }
+.db-cmd input { accent-color: var(--accent, #4a9eff); margin: 0; }
+.db-cmds-grid.write .db-cmd input { accent-color: var(--red, #e5534b); }
+
+/* ---------- SSH跳转设置弹窗（堡垒机开关 + 目标主机列表） ---------- */
+.jump-modal { width: 600px; }
+.jump-section { margin-top: 14px; }
+.jump-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.jump-section-title { font-size: 12px; font-weight: 600; color: var(--text-1); }
+.jump-hint { font-size: 11px; color: var(--text-2); margin: 2px 0 8px; line-height: 1.5; }
+.jump-toggle-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-m); background: var(--bg-2); }
+.jump-toggle-text { flex: 1; min-width: 0; }
+.jump-toggle-title { font-size: 12.5px; font-weight: 600; color: var(--text-0); }
+.jump-toggle-hint { font-size: 11px; color: var(--text-2); margin-top: 2px; }
+/* 堡垒机开关（与 db-switch 同款滑块） */
+.jump-switch { position: relative; width: 34px; height: 19px; flex: none; cursor: pointer; }
+.jump-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.jump-switch-slider { position: absolute; inset: 0; background: var(--bg-3); border: 1px solid var(--border); border-radius: 10px; transition: background .12s, border-color .12s; }
+.jump-switch-slider::after { content: ''; position: absolute; left: 1px; top: 1px; width: 15px; height: 15px; border-radius: 50%; background: var(--text-3); transition: transform .12s, background .12s; }
+.jump-switch input:checked + .jump-switch-slider { background: var(--accent-dim); border-color: var(--accent); }
+.jump-switch input:checked + .jump-switch-slider::after { transform: translateX(15px); background: var(--accent); }
+.jump-target-banner { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-m); background: var(--bg-2); font-size: 12px; color: var(--text-1); line-height: 1.6; }
+.jump-target-banner svg { flex: none; margin-top: 1px; color: var(--accent); }
+/* 目标主机列表 */
+#jump-target-list { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.jump-target-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-s); }
+.jump-target-row:hover { background: var(--bg-2); }
+.jump-target-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.jump-target-name { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jump-target-addr { font-size: 11.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jump-target-row .icon-btn { width: 26px; height: 26px; font-size: 14px; flex: none; }
+.jump-empty { color: var(--text-3); font-size: 12px; padding: 10px 4px; }

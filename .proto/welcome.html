@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIShell - 项目</title>
+<link rel="stylesheet" href="shared/design.css">
+<style>
+  body { display: flex; flex-direction: column; height: 100vh; }
+
+  main { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 32px; }
+  .welcome-logo-watermark {
+    position: fixed; z-index: 0; pointer-events: none; opacity: 0.08;
+    left: 50vw; top: calc(var(--topbar-h) + (100vh - var(--topbar-h)) / 2);
+    width: min(44vw, 420px); transform: translate(-50%, -50%);
+  }
+  main > :not(.welcome-logo-watermark) { position: relative; z-index: 1; }
+
+  /* ---------- 页面标题栏 ---------- */
+  .page-head { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+  .page-head h2 { font-size: 16px; font-weight: 600; }
+  .page-head .spacer { flex: 1; }
+
+  /* ---------- 项目卡片网格 ---------- */
+  .proj-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+
+  .project-card { display: flex; flex-direction: column; gap: 10px; }
+  .pc-head { display: flex; align-items: center; gap: 4px; }
+  .pc-name { flex: 1; min-width: 0; font-size: 14px; font-weight: 600; }
+  .pc-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+  .pc-path { font-size: 12px; color: var(--text-2); }
+  .pc-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  /* ---------- 表单校验 ---------- */
+  .input.invalid { border-color: var(--red); }
+  .field .error { margin-top: 4px; font-size: 11px; color: var(--red); }
+
+  /* ---------- 路径输入行 ---------- */
+  .path-row { display: flex; gap: 8px; }
+  .path-row .input { flex: 1; min-width: 0; }
+
+  /* ---------- 服务器多选列表 ---------- */
+  .server-list { display: flex; flex-direction: column; gap: 8px; max-height: 200px; overflow-y: auto; padding-right: 2px; }
+  .server-card { padding: 10px 12px; }
+  .sc-head { display: flex; align-items: center; gap: 8px; }
+  .sc-name { flex: 1; min-width: 0; font-weight: 500; }
+  .sc-meta { margin-top: 4px; font-size: 12px; color: var(--text-2); }
+  .server-empty { font-size: 12px; color: var(--text-2); padding: 6px 2px; }
+
+  /* ---------- 新建服务器快捷区 ---------- */
+  .server-add {
+    margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border-strong);
+    border-radius: var(--radius-m); color: var(--text-1); font-size: 12.5px;
+    text-align: center; cursor: pointer; user-select: none;
+    transition: border-color 0.12s, background 0.12s, color 0.12s;
+  }
+  .server-add:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--text-0); }
+
+  .server-mini { margin-top: 10px; padding: 14px 14px 8px; border: 1px dashed var(--border-strong); border-radius: var(--radius-m); background: var(--bg-2); }
+  .mini-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; }
+  .mini-grid .field { margin-bottom: 12px; }
+  .mini-actions { display: flex; justify-content: flex-end; gap: 8px; padding-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<main>
+  <img class="welcome-logo-watermark" src="shared/logo.svg" alt="" aria-hidden="true">
+  <!-- 标题栏：项目名 + 计数 + 操作按钮 -->
+  <div class="page-head">
+    <h2>我的项目</h2>
+    <span class="tag" id="proj-count">0 个项目</span>
+    <div class="spacer"></div>
+    <button class="btn ghost small" id="btn-reset" title="恢复初始演示数据">重置演示数据</button>
+    <button class="btn primary" id="btn-new">＋ 新建项目</button>
+  </div>
+
+  <!-- 项目卡片网格 -->
+  <div class="proj-grid" id="proj-grid"></div>
+
+  <!-- 空状态 -->
+  <div class="empty-state hidden" id="empty-state">
+    <div class="icon">📁</div>
+    <div>还没有项目，创建一个项目开始使用 AIShell</div>
+    <button class="btn primary" id="btn-empty-new">新建项目</button>
+  </div>
+</main>
+
+<!-- 新建 / 编辑项目模态框 -->
+<div class="modal-mask" id="proj-modal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="modal-title">新建项目</h3>
+      <button class="icon-btn" id="modal-close" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <!-- 项目名称 -->
+      <div class="field">
+        <label>项目名称<span class="req">*</span></label>
+        <input class="input" id="f-name" placeholder="例如：数据中台 ETL">
+        <div class="error hidden" id="f-name-err">请输入项目名称</div>
+      </div>
+
+      <!-- 项目路径 -->
+      <div class="field">
+        <label>项目路径</label>
+        <div class="path-row">
+          <input class="input" id="f-path" placeholder="例如：D:\projects\my-app">
+          <button class="btn" id="btn-browse">浏览…</button>
+        </div>
+        <div class="hint">选择目录后将在其下创建 .aishell 工作目录；留空则在全局 workspace 目录中新建项目目录。</div>
+      </div>
+
+      <!-- 绑定远程服务器（可多选） -->
+      <div class="field">
+        <label>绑定远程服务器（可多选）</label>
+        <div class="server-list" id="server-list"></div>
+
+        <!-- 新建服务器快捷区 -->
+        <div class="server-add" id="server-add-toggle">＋ 新建服务器连接</div>
+        <div class="server-mini hidden" id="server-mini">
+          <div class="mini-grid">
+            <div class="field">
+              <label>名称<span class="req">*</span></label>
+              <input class="input" id="mini-name" placeholder="例如：测试服务器">
+            </div>
+            <div class="field">
+              <label>IP 地址<span class="req">*</span></label>
+              <input class="input" id="mini-host" placeholder="例如：192.168.1.10">
+            </div>
+            <div class="field">
+              <label>端口<span class="req">*</span></label>
+              <input class="input mono" id="mini-port" type="number" min="1" max="65535" value="22">
+            </div>
+            <div class="field">
+              <label>认证方式</label>
+              <select class="select" id="mini-auth">
+                <option value="password">密码</option>
+                <option value="key">密钥</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>账号</label>
+              <input class="input" id="mini-user" placeholder="例如：root">
+            </div>
+            <div class="field">
+              <label id="mini-secret-label">密码</label>
+              <input class="input" id="mini-secret" placeholder="输入服务器密码">
+            </div>
+          </div>
+          <div class="error hidden" id="mini-err"></div>
+          <div class="mini-actions">
+            <button class="btn" id="mini-cancel">收起</button>
+            <button class="btn primary" id="mini-save">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="btn-cancel">取消</button>
+      <button class="btn primary" id="btn-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="shared/mock.js"></script>
+<script src="welcome.js"></script>
+</body>
+</html>

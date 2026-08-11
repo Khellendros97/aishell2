@@ -1,0 +1,63 @@
+/* 编辑器模块样式：CodeMirror 铺满标签页面板（.tab-pane 为 flex 列容器） */
+.ed-root {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.ed-root .cm-editor {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+}
+.ed-root .cm-editor.cm-focused { outline: none; }
+.ed-root .cm-content {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* 亮色主题:CM 默认样式打底,显式对齐应用变量(oneDark 由 Compartment 卸载) */
+[data-theme='light'] .ed-root .cm-editor { background: var(--bg-0); color: var(--text-0); }
+[data-theme='light'] .ed-root .cm-gutters {
+  background: var(--bg-0); color: var(--text-2); border-right: 1px solid var(--border);
+}
+[data-theme='light'] .ed-root .cm-activeLine { background: rgba(0, 0, 0, 0.045); }
+[data-theme='light'] .ed-root .cm-activeLineGutter { background: rgba(0, 0, 0, 0.06); }
+[data-theme='light'] .ed-root .cm-cursor { border-left-color: var(--text-0); }
+[data-theme='light'] .ed-root .cm-selectionBackground,
+[data-theme='light'] .ed-root .cm-editor.cm-focused .cm-selectionBackground {
+  background: rgba(59, 118, 225, 0.25) !important;
+}
+
+/* ===== 查找/替换栏（Ctrl+F / Ctrl+H 顶部浮层，风格对齐应用按钮/输入框） ===== */
+.ed-root .cm-panels.cm-panels-top {
+  background: var(--bg-1); color: var(--text-0); border-bottom: 1px solid var(--border);
+}
+.ed-findbar { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; }
+.ed-findbar .ed-find-row { display: flex; align-items: center; gap: 6px; }
+.ed-findbar .ed-find-input {
+  padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius-s);
+  background: var(--bg-2); color: var(--text-0); font-size: 12px; font-family: var(--font-ui);
+  outline: none;
+}
+.ed-findbar .ed-find-input:focus { border-color: var(--accent); }
+/* 两行输入框左对齐：查找/替换输入同宽同起点 */
+.ed-findbar .ed-find-row .ed-find-input,
+.ed-findbar .ed-find-replace .ed-find-input { width: 220px; box-sizing: border-box; }
+.ed-find-count {
+  min-width: 76px; text-align: center; font-family: var(--font-mono); font-size: 11px;
+  color: var(--text-2); user-select: none; white-space: nowrap;
+}
+.ed-findbar .icon-btn { width: 24px; height: 24px; font-size: 13px; }
+.ed-findbar .ed-find-toggle.active { color: var(--accent); border-color: var(--accent); background: var(--bg-active); }
+/* 第二行：替换输入 + 替换/全部替换；左侧留出与首行 chevron 按钮（24px）+ 间隙（6px）等宽的缩进，保证两个输入框左对齐 */
+.ed-findbar .ed-find-replace { display: flex; align-items: center; gap: 6px; margin-left: 30px; }
+.ed-findbar .ed-find-replace.hidden { display: none; }
+
+/* 查找高亮：全部匹配 + 当前匹配（两套主题独立配色） */
+[data-theme='light'] .ed-root .cm-searchMatch { background: rgba(255, 213, 0, 0.5); border-radius: 2px; }
+[data-theme='light'] .ed-root .cm-searchMatch-selected { background: rgba(255, 106, 0, 0.55); }
+[data-theme='dark'] .ed-root .cm-searchMatch { background: rgba(0, 255, 255, 0.32); border-radius: 2px; }
+[data-theme='dark'] .ed-root .cm-searchMatch-selected { background: rgba(255, 0, 255, 0.42); }

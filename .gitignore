@@ -1,0 +1,31 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# pi runtime（scripts/fetch-pi.sh 拉取）
+src-tauri/resources/pi/
+# Git 安装程序（scripts/fetch-git.sh 拉取，首启静默安装用）
+src-tauri/resources/git/
+src-tauri/target
+tmp/

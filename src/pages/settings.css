@@ -1,0 +1,47 @@
+/* 系统设置页 —— 移植自 .proto/settings.html 的 <style>，选择器限定在 .settings-page 内避免污染其他页面。
+   原「服务器配置」面板样式（服务器卡片 / 搜索 / 分组折叠 / 拖拽 / Xshell 导入）已随重构移除。 */
+.page-root { display: flex; flex-direction: column; height: 100vh; }
+
+.settings-page #warn-banner {
+  display: none; align-items: center; gap: 8px;
+  margin: 0; padding: 8px 16px; font-size: 12.5px;
+  background: var(--yellow-dim); color: var(--yellow);
+  border-bottom: 1px solid var(--yellow);
+}
+.settings-page #warn-banner.show { display: flex; }
+
+.settings-page #settings-layout { flex: 1; min-height: 0; display: flex; }
+
+/* 内容区 */
+.settings-page #settings-content { flex: 1; min-width: 0; overflow-y: auto; background: var(--bg-0); padding: 24px 28px; }
+.settings-page .settings-panel { max-width: 860px; }
+
+.settings-page .panel-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.settings-page .panel-title { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 600; flex: none; }
+
+/* 输入行：input + 按钮 */
+.settings-page .input-row { display: flex; gap: 8px; align-items: center; }
+.settings-page .input-row .input { flex: 1; }
+.settings-page .input-row .btn, .settings-page .input-row .icon-btn { flex: none; }
+
+/* 大模型配置分组 */
+.settings-page .llm-group {
+  border: 1px solid var(--border); border-radius: var(--radius-m);
+  padding: 14px 16px 0; margin-bottom: 4px;
+}
+.settings-page .llm-group legend {
+  padding: 0 6px; font-size: 12px; font-weight: 600; color: var(--text-1);
+}
+
+.settings-page .form-actions { margin-top: 18px; display: flex; justify-content: flex-end; }
+
+/* hint 内超链接：外部浏览器打开（点击事件在 settings.ts 拦截并 openUrl） */
+.settings-page .hint a {
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.settings-page .hint a:hover { opacity: 0.85; }

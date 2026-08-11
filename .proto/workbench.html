@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AIShell - 工作台</title>
+<link rel="stylesheet" href="shared/design.css">
+<style>
+  /* ===== 工作台整体布局（契约：以下 ID 归 core 所有，模块不得改动结构） ===== */
+  #workbench { display: flex; height: calc(100vh - var(--topbar-h)); }
+
+  /* 最左功能图标栏 */
+  #activity-bar {
+    width: var(--activity-bar-w); flex: none; background: var(--bg-1);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column; align-items: center;
+    padding-top: 6px; gap: 2px;
+  }
+  .activity-icon {
+    width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+    font-size: 18px; color: var(--text-1); cursor: pointer; border-radius: var(--radius-m);
+    border-left: 2px solid transparent; position: relative;
+  }
+  .activity-icon:hover { color: var(--text-0); background: var(--bg-hover); }
+  .activity-icon.active { color: var(--accent); border-left-color: var(--accent); border-radius: 0 var(--radius-m) var(--radius-m) 0; }
+
+  /* 左侧功能面板 */
+  #sidebar { width: var(--sidebar-w); flex: none; background: var(--bg-1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  #sidebar-head {
+    height: 34px; flex: none; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 10px 0 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-1); text-transform: uppercase;
+  }
+  #sidebar-content { flex: 1; overflow-y: auto; }
+
+  /* 左右面板可调宽分隔条 */
+  .wb-resize-handle {
+    position: relative; z-index: 4; flex: none; width: 6px; height: 100%;
+    cursor: col-resize; touch-action: none; background: transparent;
+  }
+  .wb-resize-handle::after {
+    content: ''; position: absolute; inset: 0 2px; background: var(--border-strong); opacity: 0;
+  }
+  .wb-resize-handle:hover::after, .wb-resize-handle.active::after { opacity: 1; }
+  body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-select: none !important; }
+
+  /* 中央工作区 */
+  #center { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg-0); }
+  #tab-bar {
+    height: var(--tab-h); flex: none; display: flex; align-items: stretch;
+    background: var(--bg-1); border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: thin;
+  }
+  #tab-bar::-webkit-scrollbar { height: 4px; }
+  .wb-tab {
+    display: flex; align-items: center; gap: 6px; padding: 0 8px 0 12px; max-width: 200px; min-width: 110px;
+    border-right: 1px solid var(--border); color: var(--text-1); cursor: pointer; user-select: none; flex: none;
+    border-top: 2px solid transparent; font-size: 12.5px;
+  }
+  .wb-tab:hover { background: var(--bg-hover); }
+  .wb-tab.active { background: var(--bg-0); color: var(--text-0); border-top-color: var(--accent); }
+  .wb-tab .tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .wb-tab .tab-close { border: none; background: none; color: var(--text-2); cursor: pointer; border-radius: 3px; width: 18px; height: 18px; font-size: 12px; line-height: 1; }
+  .wb-tab .tab-close:hover { background: var(--bg-active); color: var(--text-0); }
+  #tab-content { flex: 1; min-height: 0; position: relative; }
+  .tab-pane { position: absolute; inset: 0; display: none; }
+  .tab-pane.active { display: flex; flex-direction: column; }
+
+  /* 右侧 AI 面板 */
+  #ai-panel { width: var(--ai-panel-w); flex: none; background: var(--bg-1); border-left: 1px solid var(--border); display: flex; flex-direction: column; }
+</style>
+</head>
+<body>
+<script src="shared/mock.js"></script>
+<script>AIShell.renderTopbar();</script>
+
+<div id="workbench">
+  <!-- 契约：activity-bar 的图标由 sidebar 模块绑定事件；data-panel 取值为 explorer | servers | commands -->
+  <div id="activity-bar">
+    <div class="activity-icon active" data-panel="explorer" title="文件资源管理器">📁</div>
+    <div class="activity-icon" data-panel="servers" title="服务器列表">🖥️</div>
+    <div class="activity-icon" data-panel="commands" title="快捷指令">⚡</div>
+  </div>
+  <div id="sidebar">
+    <div id="sidebar-head"><span id="sidebar-title">文件资源管理器</span><span id="sidebar-actions"></span></div>
+    <div id="sidebar-content"></div>
+  </div>
+  <div id="sidebar-resizer" class="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整左侧边栏宽度" tabindex="0"></div>
+  <div id="center">
+    <div id="tab-bar"></div>
+    <div id="tab-content"></div>
+  </div>
+  <div id="ai-resizer" class="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整 AI 面板宽度" tabindex="0"></div>
+  <div id="ai-panel"></div>
+</div>
+
+<script>
+  (() => {
+    const root = document.getElementById('workbench');
+    const activity = document.getElementById('activity-bar');
+    if (!root || !activity) return;
+    const bind = (handle, panel, side) => {
+      if (!handle || !panel) return;
+      const min = side === 'left' ? 180 : 280;
+      const max = side === 'left' ? 520 : 560;
+      const prop = side === 'left' ? '--sidebar-w' : '--ai-panel-w';
+      const apply = (value) => {
+        const other = side === 'left' ? document.getElementById('ai-panel') : document.getElementById('sidebar');
+        const handles = [...root.querySelectorAll('.wb-resize-handle')].reduce((sum, el) => sum + el.offsetWidth, 0);
+        const upper = Math.max(min, root.clientWidth - activity.offsetWidth - (other ? other.offsetWidth : 0) - handles - 360);
+        const width = Math.round(Math.max(min, Math.min(max, Math.min(value, upper))));
+        root.style.setProperty(prop, width + 'px');
+        handle.setAttribute('aria-valuenow', String(width));
+      };
+      let startX = 0;
+      let startWidth = 0;
+      const move = (e) => apply(startWidth + (side === 'left' ? e.clientX - startX : startX - e.clientX));
+      const up = () => {
+        handle.classList.remove('active');
+        document.body.classList.remove('wb-resizing');
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+      };
+      handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        startX = e.clientX;
+        startWidth = panel.getBoundingClientRect().width;
+        handle.classList.add('active');
+        document.body.classList.add('wb-resizing');
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', up);
+      });
+      handle.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        e.preventDefault();
+        const delta = e.key === 'ArrowRight' ? 16 : -16;
+        apply(panel.getBoundingClientRect().width + (side === 'left' ? delta : -delta));
+      });
+      apply(panel.getBoundingClientRect().width);
+    };
+    bind(document.getElementById('sidebar-resizer'), document.getElementById('sidebar'), 'left');
+    bind(document.getElementById('ai-resizer'), document.getElementById('ai-panel'), 'right');
+  })();
+</script>
+
+<script src="workbench-core.js"></script>
+<script src="workbench-sidebar.js"></script>
+<script src="workbench-editor.js"></script>
+<script src="workbench-sftp.js"></script>
+<script src="workbench-terminal.js"></script>
+<script src="workbench-ai.js"></script>
+</body>
+</html>

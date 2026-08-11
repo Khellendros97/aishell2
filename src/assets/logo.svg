@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">AIShell 机器人终端 Logo</title>
+  <desc id="desc">透明背景上的小机器人头像，面部显示终端提示符大于号与下划线。</desc>
+  <defs>
+    <linearGradient id="head" x1="256" y1="126" x2="256" y2="414" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FAFCFF"/>
+      <stop offset="1" stop-color="#DDE9FF"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="256" y1="186" x2="256" y2="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#182238"/>
+      <stop offset="1" stop-color="#0D1220"/>
+    </linearGradient>
+  </defs>
+
+  <path d="M256 126V88" stroke="#4F8EF7" stroke-width="24" stroke-linecap="round"/>
+  <circle cx="256" cy="68" r="24" fill="#4F8EF7"/>
+  <circle cx="256" cy="68" r="10" fill="#FFFFFF"/>
+
+  <rect x="88" y="238" width="48" height="92" rx="24" fill="#4F8EF7"/>
+  <rect x="376" y="238" width="48" height="92" rx="24" fill="#4F8EF7"/>
+
+  <rect x="116" y="126" width="280" height="288" rx="74" fill="url(#head)" stroke="#4F8EF7" stroke-width="12"/>
+  <rect x="132" y="142" width="248" height="256" rx="58" fill="none" stroke="#FFFFFF" stroke-width="8" opacity="0.55"/>
+
+  <rect x="154" y="186" width="204" height="154" rx="40" fill="url(#screen)"/>
+  <path d="M188 230l42 34-42 34" fill="none" stroke="#4EC98A" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M258 300h72" fill="none" stroke="#4EC98A" stroke-width="28" stroke-linecap="round"/>
+
+  <circle cx="204" cy="374" r="10" fill="#A9B8D8"/>
+  <circle cx="256" cy="374" r="10" fill="#A9B8D8"/>
+  <circle cx="308" cy="374" r="10" fill="#A9B8D8"/>
+</svg>

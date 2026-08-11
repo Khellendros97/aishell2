@@ -1,0 +1,117 @@
+/* 欢迎页 —— 项目唯一维度主页样式（服务器不再独立成维度，只能在项目语义下管理）。
+   移植自 .proto/welcome.html 的 <style>，选择器限定在 .welcome-page 内避免污染其他页面。
+   分组标题样式沿用设置页 server-group 的风格但改名 .proj-group-*，避免与历史样式混淆。 */
+.page-root { display: flex; flex-direction: column; height: 100vh; }
+
+.welcome-page main { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 32px; }
+.welcome-page .welcome-logo-watermark {
+  position: fixed; z-index: 0; pointer-events: none; opacity: 0.08;
+  left: 50vw; top: calc(var(--topbar-h) + (100vh - var(--topbar-h)) / 2);
+  width: min(44vw, 420px); transform: translate(-50%, -50%);
+}
+.welcome-page main > :not(.welcome-logo-watermark) { position: relative; z-index: 1; }
+
+/* ---------- 页面标题栏 ---------- */
+.welcome-page .page-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.welcome-page .page-head h2 { font-size: 16px; font-weight: 600; }
+.welcome-page .page-head .spacer { flex: 1; }
+
+/* ---------- 工具行：搜索 / 全部展开折叠 / 视图切换 / Xshell 导入 / 分类目录 / 新建项目 ---------- */
+.welcome-page .welcome-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.welcome-page .welcome-toolbar #proj-search { flex: 1; min-width: 200px; max-width: 340px; }
+.welcome-page .view-switch {
+  display: inline-flex; align-items: center; gap: 2px; flex: none;
+  padding: 2px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-s);
+}
+.welcome-page .view-switch .icon-btn { width: 26px; height: 24px; font-size: 13px; border-radius: 4px; }
+.welcome-page .view-switch .icon-btn.active { background: var(--bg-3); color: var(--accent); }
+
+/* ---------- Xshell 导入提示条（needsAttention>0 时展示） ---------- */
+.welcome-page .import-note {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 14px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+  background: var(--yellow-dim); color: var(--yellow); border-radius: var(--radius-s);
+}
+
+/* ---------- 项目分类目录分组 ---------- */
+.welcome-page .proj-group { margin-bottom: 10px; }
+/* 组标题行：文件夹图标 + 名称 + 计数；点击展开/收起，重命名/删除按钮在行内（事件委托见 welcome.ts） */
+.welcome-page .proj-group-title {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12.5px; font-weight: 600; color: var(--text-1);
+  cursor: pointer; user-select: none; padding: 3px 6px; border-radius: 6px;
+}
+.welcome-page .proj-group-title:hover { background: var(--bg-hover); }
+/* 折叠指示：收起 = 闭合文件夹 / 展开 = 打开的文件夹 */
+.welcome-page .proj-group-title .pgt-folder { display: inline-flex; flex: none; color: var(--text-2); }
+.welcome-page .proj-group-title .pgt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.welcome-page .proj-group-title .tag { font-weight: 400; }
+.welcome-page .proj-group-title .icon-btn { width: 22px; height: 22px; font-size: 12px; }
+/* 拖拽放置目标（把项目拖到组标题上改所属目录） */
+.welcome-page .proj-group-title.drop-target { outline: 1px dashed var(--accent); background: var(--accent-dim); }
+.welcome-page .proj-group-body {
+  margin: 4px 0 8px 6px; padding-left: 10px; border-left: 1px solid var(--border);
+}
+.welcome-page .project-card.dragging, .welcome-page .proj-row.dragging { opacity: 0.45; }
+
+/* ---------- 项目卡片网格 ---------- */
+.welcome-page .proj-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+
+.welcome-page .project-card { display: flex; flex-direction: column; gap: 10px; }
+.welcome-page .pc-head { display: flex; align-items: center; gap: 4px; }
+.welcome-page .pc-name { flex: 1; min-width: 0; font-size: 14px; font-weight: 600; }
+.welcome-page .pc-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+.welcome-page .pc-path { font-size: 12px; color: var(--text-2); }
+.welcome-page .pc-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ---------- 列表视图 ---------- */
+.welcome-page .proj-list { display: flex; flex-direction: column; gap: 8px; }
+.welcome-page .proj-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; cursor: pointer; }
+.welcome-page .proj-row .pr-chevron { width: 22px; height: 22px; font-size: 12px; flex: none; }
+.welcome-page .proj-row .pr-name { flex: 1.1; min-width: 140px; font-size: 13.5px; font-weight: 600; }
+.welcome-page .proj-row .pr-path { flex: 2; min-width: 160px; font-size: 12px; color: var(--text-2); }
+.welcome-page .proj-row .pr-count { flex: none; }
+.welcome-page .proj-row .pr-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+/* 展开行内的绑定服务器子表：名称 / host / 账号 / 认证方式 + 编辑删除 */
+.welcome-page .pr-detail { padding: 2px 12px 12px 34px; }
+.welcome-page .pr-servers { display: flex; flex-direction: column; gap: 6px; }
+.welcome-page .pr-server {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; background: var(--bg-1);
+  border: 1px solid var(--border); border-radius: var(--radius-s);
+}
+.welcome-page .pr-server .ps-name { flex: none; min-width: 120px; font-size: 12.5px; font-weight: 600; }
+.welcome-page .pr-server .ps-host { flex: 1; min-width: 110px; font-size: 12px; color: var(--text-2); }
+.welcome-page .pr-server .ps-user { flex: none; font-size: 12px; color: var(--text-1); }
+.welcome-page .pr-server .ps-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+.welcome-page .pr-add-server { margin-top: 8px; }
+.welcome-page .pr-empty-servers { font-size: 12px; color: var(--text-2); padding: 4px 2px; }
+
+/* ---------- 表单校验 ---------- */
+.welcome-page .field .error { margin-top: 4px; font-size: 11px; color: var(--red); }
+
+/* ---------- 路径输入行(通用规则已移至 design.css .path-row) ---------- */
+
+/* ---------- 服务器多选列表（平铺，仅搜索过滤） ---------- */
+.welcome-page .server-list { display: flex; flex-direction: column; gap: 8px; max-height: 200px; overflow-y: auto; padding-right: 2px; }
+.welcome-page .server-card { padding: 10px 12px; }
+.welcome-page .sc-head { display: flex; align-items: center; gap: 8px; }
+.welcome-page .sc-name { flex: 1; min-width: 0; font-weight: 500; }
+.welcome-page .sc-meta { margin-top: 4px; font-size: 12px; color: var(--text-2); }
+.welcome-page .server-empty { font-size: 12px; color: var(--text-2); padding: 6px 2px; }
+/* 勾选列表搜索框行（静态骨架，不随列表重建） */
+.welcome-page .server-search-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.welcome-page .server-search-row .input { flex: 1; min-width: 0; }
+
+/* ---------- 新建服务器快捷区 ---------- */
+.welcome-page .server-add {
+  margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-m); color: var(--text-1); font-size: 12.5px;
+  text-align: center; cursor: pointer; user-select: none;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
+}
+.welcome-page .server-add:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--text-0); }
+
+.welcome-page .server-mini { margin-top: 10px; padding: 14px 14px 8px; border: 1px dashed var(--border-strong); border-radius: var(--radius-m); background: var(--bg-2); }
+/* 表单字段双列网格见 design.css .server-form-grid（server-form.ts 共用） */
+.welcome-page .mini-actions { display: flex; justify-content: flex-end; gap: 8px; padding-bottom: 6px; }
