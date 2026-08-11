@@ -74,8 +74,14 @@ if (process.argv.includes('--check')) {
 
 // 透传额外参数给 tauri build（去掉 --check 自身）
 const extra = process.argv.slice(2).filter((a) => a !== '--check');
-const r = spawnSync('npm.cmd', ['run', 'tauri', 'build', ...extra], {
-  stdio: 'inherit',
-  shell: false,
-});
+// Windows 下 npm 是 .cmd，Node 无法直接 spawn（静默 ENOENT）→ 经 cmd /c 执行；
+// POSIX 直接 spawn npm（可执行文件）。
+const r =
+  process.platform === 'win32'
+    ? spawnSync('cmd.exe', ['/c', 'npm', 'run', 'tauri', 'build', ...extra], { stdio: 'inherit' })
+    : spawnSync('npm', ['run', 'tauri', 'build', ...extra], { stdio: 'inherit' });
+if (r.error) {
+  console.error(`[build-release] 启动构建失败: ${r.error.message}`);
+  process.exit(1);
+}
 process.exit(r.status ?? 1);
