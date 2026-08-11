@@ -87,7 +87,7 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 | 方法/路径 | 鉴权 | 说明 |
 |---|---|---|
 | `GET /api/health` | 无 | 健康检查，返回 `{"status":"ok"}` |
-| `GET /api/auth/me` | Bearer/Cookie | 当前用户：`{"user":{id,name,dept,avatarURL,role,status,…}}` |
+| `GET /api/auth/me` | Bearer/Cookie | 当前用户 + 平台能力清单：`{"user":{…},"capabilities":{…}}`（见 §4.2） |
 | `POST /api/auth/refresh` | Cookie/body | 轮换令牌：body `{"refreshToken":"…"}` 或携带 Cookie；响应 `{"user":…,"expiresIn":7200}`，新令牌写入 Cookie |
 | `POST /api/auth/logout` | Cookie/body | 吊销 refresh token 并清 Cookie，返回 204 |
 | `GET /api/usage` | Bearer/Cookie | **个人用量报表**：仅统计当前用户本人（见 §4.1） |
@@ -130,6 +130,25 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 - `summary` 不含 `activeUsers`（个人报表无此维度）；
 - `daily` 按查询天数补齐为连续日期（无调用的日期为 0）；
 - 计量口径：LLM 按 token 数、搜索按请求次数，UTC 自然日（与 §5 配额口径一致）。
+
+### 4.2 能力清单（me 响应中的 capabilities）
+
+客户端托管模式据此渲染模型下拉、搜索开关等（对应 CR-2.2 / CR-4.3）：
+
+```json
+{
+  "user": { "id": 7, "name": "张三", "dept": "研发部", "role": "user", "status": "active" },
+  "capabilities": {
+    "models": ["deepseek-v4-flash"],
+    "search": true,
+    "knowledge": false
+  }
+}
+```
+
+- `models`：服务端**已启用**的 LLM 模型列表（上游 `model_id`），随上游配置实时变化；
+- `search`：是否存在启用的搜索上游；
+- `knowledge`：知识库服务尚未开放，恒为 `false`（开放后客户端再按 `true` 挂载 `kb_search` 工具，CR-5.1）。
 
 ## 5. 配额（429）语义
 
