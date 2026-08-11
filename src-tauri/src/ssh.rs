@@ -104,6 +104,17 @@ pub struct SshManager {
     sessions: Mutex<HashMap<String, Arc<client::Handle<CliHandler>>>>,
 }
 
+/// 转发通道失败的可能原因提示（错误信息追加用；纯函数便于单测）。
+/// AdministrativelyProhibited = 堡垒机 sshd 拒绝打开转发通道（典型：AllowTcpForwarding no），
+/// 与「在堡垒机上手动 ssh 目标主机」不矛盾——后者是出站客户端连接，不经转发许可。
+fn tcp_forward_hint(err: &str) -> &'static str {
+    if err.to_lowercase().contains("administrativelyprohibited") {
+        "\n可能原因：堡垒机 sshd 禁用了 TCP 转发（AllowTcpForwarding no 或 PermitOpen 限制）。请在堡垒机 /etc/ssh/sshd_config 设置 AllowTcpForwarding yes 并重启 sshd（systemctl restart sshd）后重试。"
+    } else {
+        ""
+    }
+}
+
 impl SshManager {
     pub fn new(store: Arc<store::Store>) -> Self {
         SshManager {
@@ -397,9 +408,13 @@ impl SshManager {
             )
         })?
         .map_err(|e| {
+            let e_str = e.to_string();
             format!(
-                "{via}打开到目标主机「{}」（{}:{}）的转发通道失败：{e}",
-                server.name, server.host, server.port
+                "{via}打开到目标主机「{}」（{}:{}）的转发通道失败：{e_str}{}",
+                server.name,
+                server.host,
+                server.port,
+                tcp_forward_hint(&e_str)
             )
         })?;
         let config = Arc::new(client::Config::default());
@@ -676,6 +691,17 @@ mod tests {
 
     /// 跳板错误路径（不连真实服务器、不碰真实 keyring）：
     /// 目标主机的堡垒机不存在 / 未开启堡垒机 / 堡垒机本身又是目标主机 → 建网前拒绝并给出中文错误。
+    #[test]
+    fn tcp_forward_hint_adds_actionable_guide_for_admin_prohibited() {
+        // AdministrativelyProhibited（大小写不敏感）：给出 AllowTcpForwarding 排查指引
+        let hint = tcp_forward_hint("Failed to open channel (AdministrativelyProhibited)");
+        assert!(hint.contains("AllowTcpForwarding"), "应提示转发开关: {hint}");
+        assert!(hint.contains("sshd_config"));
+        // 其他错误：无附加提示
+        assert_eq!(tcp_forward_hint("Connection reset by peer"), "");
+        assert_eq!(tcp_forward_hint("Network is unreachable"), "");
+    }
+
     #[tokio::test]
     async fn get_or_connect_rejects_invalid_jump_setups_before_network() {
         let store_dir = std::env::temp_dir().join(format!(
