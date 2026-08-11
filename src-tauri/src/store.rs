@@ -859,6 +859,20 @@ impl Store {
         })
     }
 
+    /// 仅刷新用户资料与能力清单（启动时 me 轮询用），**不改模式**——
+    /// 用户可能手动切到了个人模式，刷新不应把它切回托管。
+    pub fn cloud_update_profile(
+        &self,
+        user: CloudUser,
+        caps: CloudCapabilities,
+    ) -> Result<(), String> {
+        self.with_state(|s| {
+            s.settings.cloud.user = Some(user);
+            s.settings.cloud.capabilities = Some(caps);
+            Ok(())
+        })
+    }
+
     /// 登出/登录失效：清 keyring 令牌 + 清 aishell.json cloud 段，模式回个人。
     /// 本地个人模式配置（llm/search）不受影响（CR-1.7）。
     pub fn cloud_clear(&self) -> Result<(), String> {
@@ -3836,6 +3850,36 @@ mod tests {
         assert_eq!(store.cloud_mode(), CloudMode::Hosted);
         store.cloud_set_mode(CloudMode::Personal).unwrap();
         assert_eq!(store.cloud_mode(), CloudMode::Personal);
+    }
+
+    #[test]
+    fn cloud_update_profile_refreshes_without_changing_mode() {
+        let store = test_store(temp_config_dir("cloud-profile-refresh"));
+        store.cloud_set_tokens("acc", "ref").unwrap();
+        store
+            .cloud_login_info(
+                CloudUser { name: "旧名".into(), avatar: None, dept: None },
+                CloudCapabilities::default(),
+            )
+            .unwrap();
+        // 用户手动切回个人模式
+        store.cloud_set_mode(CloudMode::Personal).unwrap();
+        // 启动刷新：更新资料与能力，模式保持 personal
+        store
+            .cloud_update_profile(
+                CloudUser { name: "张三".into(), avatar: None, dept: None },
+                CloudCapabilities {
+                    models: vec!["gpt-4o".into()],
+                    search: true,
+                    knowledge: false,
+                    latest_version: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.cloud_mode(), CloudMode::Personal, "启动刷新不应改模式");
+        let (u, c) = store.cloud_profile();
+        assert_eq!(u.as_ref().map(|u| u.name.as_str()), Some("张三"));
+        assert_eq!(c.map(|c| c.search), Some(true));
     }
 
     #[test]

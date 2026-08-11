@@ -533,6 +533,47 @@ async fn run_callback_server(
     }
 }
 
+// ---------------------------------------------------------------- 启动刷新
+
+/// 应用启动时（lib.rs setup 异步调用）：已登录则拉取最新用户资料与能力清单，
+/// 服务端配置变更（models/search/knowledge）无需用户重登即可生效。
+/// 流程：未登录直接跳过 → valid_access_token（过期自动轮换）→ me → 更新缓存并广播；
+/// 刷新失败（吊销/禁用）→ 登录失效，清登录态（账号页与角标随之刷新）。
+pub async fn refresh_on_startup(
+    app: &AppHandle,
+    store: &Arc<Store>,
+    cloud: &Arc<CloudManager>,
+) {
+    // 未登录（keyring 无 refresh_token）不处理
+    if store.cloud_tokens().1.is_none() {
+        return;
+    }
+    match cloud.valid_access_token(store).await {
+        Ok(token) => match fetch_me(&token).await {
+            Ok((user, caps)) => {
+                if let Err(e) = store.cloud_update_profile(user, caps) {
+                    crate::term::diag(&format!("[cloud] 启动刷新资料失败: {e}"));
+                    return;
+                }
+                crate::term::diag(&format!(
+                    "[cloud] 启动刷新：models={} search={} knowledge={}",
+                    store.cloud_profile().1.map(|c| c.models.len()).unwrap_or(0),
+                    store.cloud_profile().1.map(|c| c.search).unwrap_or(false),
+                    store.cloud_profile().1.map(|c| c.knowledge).unwrap_or(false),
+                ));
+                emit_changed(app, store);
+            }
+            Err(e) => crate::term::diag(&format!("[cloud] 启动刷新 me 拉取失败: {e}")),
+        },
+        Err(e) => {
+            // refresh 失效（服务端吊销/账号禁用）→ 登录失效，清登录态
+            crate::term::diag(&format!("[cloud] 启动刷新登录失效: {e}"));
+            let _ = store.cloud_clear();
+            emit_changed(app, store);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- Tauri commands
 
 /// 发起登录：生成 state、启动本地回调监听，返回授权 URL（前端 openUrl 打开系统浏览器）。

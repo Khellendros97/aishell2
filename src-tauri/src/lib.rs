@@ -90,6 +90,13 @@ pub fn run() {
             app.manage(ai.clone());
             // 云服务 OAuth2 会话（登录 state + 令牌内存缓存；令牌权威存储在 keyring）
             app.manage(Arc::new(cloud::CloudManager::default()));
+            // 启动异步刷新：已登录则重拉 me（用户资料/能力清单），服务端配置变更无需重登
+            let cloud_mgr = app.state::<Arc<cloud::CloudManager>>().inner().clone();
+            let store2 = app.state::<Arc<store::Store>>().inner().clone();
+            let app2 = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                cloud::refresh_on_startup(&app2, &store2, &cloud_mgr).await;
+            });
             term::set_debug_app(app.handle().clone());
             // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
             // 捆绑安装器。放后台线程并延迟触发：等主事件循环泵消息、主窗口显示后再弹框
