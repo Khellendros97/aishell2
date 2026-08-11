@@ -58,13 +58,17 @@ OpenAI 兼容格式，请求体**原样透传**到模型上游（仅注入服务
 
 ## 3. 搜索 `GET|POST /api/proxy/search`
 
+> 服务端按上游配置适配搜索提供商（当前支持 `brave` / `bocha`，见 §3.3）；请求入口、鉴权、参数 `q`/`count` 对客户端完全不变，差异仅在**参数透传范围**与**响应体结构**。
+
 ### 3.1 请求
 
 - `GET`：参数走 query string；
 - `POST`：参数走 JSON body（≤ 1 MB），值支持**字符串 / 数字 / 布尔 / 数组**，其余类型 → 400；
 - GET 与 POST 参数可混用（POST body 覆盖同名的 query 参数）；
 - 必填 `q`：搜索关键词，缺失 → `400 搜索请求缺少 q 参数`；
-- 其余参数（`count`、`extra_snippets` 等）原样透传给搜索上游。
+- 其余参数的透传范围**取决于服务端配置的搜索提供商**：
+  - `brave`：全部参数（`count`、`extra_snippets`、`country`、`freshness` 等）原样透传；
+  - `bocha`：**仅映射 `q`→`query`、`count`→`count`**，其余参数静默忽略；`count` 无法解析为正整数时不发送（上游取默认值）。
 
 ```bash
 # GET
@@ -73,14 +77,35 @@ curl "https://cloud.example.com/api/proxy/search?q=hello&count=2" -H "Authorizat
 # POST
 curl -X POST https://cloud.example.com/api/proxy/search \
   -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"q":"hello","count":3,"extra_snippets":true}'
+  -d '{"q":"hello","count":3}'
 ```
 
-### 3.2 响应与错误
+### 3.2 响应
 
-- 成功：上游响应透传（同 §2.2）；
+成功时上游响应**原样透传**（状态码与响应头处理同 §2.2），body 结构取决于搜索提供商：
+
+| 客户端字段 | Brave（`brave`） | 博查（`bocha`） |
+|---|---|---|
+| 结果数组 | `web.results[]` | `data.webPages.value[]` |
+| 标题 | `title` | `name` |
+| 链接 | `url` | `url` |
+| 摘要 | `description` | `snippet`（`summary` 详细摘要需请求级开启，当前适配层未转发） |
+| 站点/时间 | `page_age` 等 | `siteName`、`siteIcon`、`datePublished` |
+| 外层包装 | 无 | `code` / `msg` / `log_id`（`code=200` 为成功） |
+
+- `count` 上限：Brave 20 / 博查 50，超出行为由上游决定，网关不截断；
 - 上游请求超时上限 30 秒；
-- 错误码同 §2.3（额外：`503 搜索服务尚未配置/已停用`）。
+- 错误体：网关自身错误为统一 JSON `{"error":"…"}`；上游错误的状态码与错误体**透传**，博查错误体为 `{"code":…,"msg":…}`，与 Brave 不同。
+
+### 3.3 错误
+
+错误码同 §2.3（额外：`503 搜索服务尚未配置/已停用`）。
+
+### 3.4 搜索提供商说明
+
+- 提供商由服务端上游配置决定，上游密钥均在服务端注入，客户端不感知鉴权差异；
+- 国内部署推荐 `bocha`（博查）：Brave API 在部分网络不可达；微软 Bing Search API v7 已于 2025-08 退役，不再可用；
+- 客户端按 §3.2 的实际响应结构解析即可；如需博查专有请求参数（`freshness`、`summary` 等），联系服务端在适配层补充映射后再使用。
 
 ## 4. 会话与用户接口
 
