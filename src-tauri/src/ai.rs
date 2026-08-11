@@ -191,6 +191,14 @@ impl AiManager {
                     "baseUrl": base_url,
                     "api": "openai-completions",
                     "apiKey": api_key_env,
+                    // 托管模式：云平台服务端不接受 developer role（实测 400 unknown variant），
+                    // pi docs models.md：compat.supportsDeveloperRole=false → 系统提示走 system role；
+                    // 个人模式保持默认（DeepSeek 官方支持 developer）
+                    "compat": if hosted {
+                        json!({"supportsDeveloperRole": false})
+                    } else {
+                        json!({})
+                    },
                     "models": [{
                         "id": model_id,
                         "name": model_id,
