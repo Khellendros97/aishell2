@@ -17,6 +17,32 @@
  *   - CI：GitHub Actions 项目级 variables/secrets 注入。
  */
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** 云配置取值顺序：进程/用户环境变量优先，其次项目根 release.env（gitignore 本地文件，不入库）。
+ *  release.env 格式：`KEY=VALUE` 每行，# 开头为注释；供 VS Code 集成终端等
+ *  无法继承 setx 新变量的场景，任何终端跑本脚本都能读到。 */
+function loadReleaseEnv() {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  let text;
+  try {
+    text = readFileSync(path.join(root, 'release.env'), 'utf8');
+  } catch {
+    return; // 无本地文件：仅用环境变量
+  }
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const k = line.slice(0, eq).trim();
+    const v = line.slice(eq + 1).trim();
+    if (k && !(k in process.env)) process.env[k] = v;
+  }
+}
+loadReleaseEnv();
 
 const REQUIRED = [
   ['AISHELL_SERVER_URL', '云平台服务器地址'],
