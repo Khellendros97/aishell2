@@ -571,7 +571,12 @@ export const renderAccount: PageRender = (root) => {
         </div>
       </div>`;
     document.body.appendChild(mask);
-    const close = () => mask.remove();
+    // .modal-mask 默认透明且 pointer-events:none，必须加 .open 才可见可交互（全局设计规范）
+    requestAnimationFrame(() => mask.classList.add('open'));
+    const close = () => {
+      mask.classList.remove('open');
+      setTimeout(() => mask.remove(), 160);
+    };
     mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
     mask.querySelector('[data-mem-cancel]')!.addEventListener('click', close);
     const errEl = mask.querySelector('#mem-form-err') as HTMLElement;
@@ -619,8 +624,14 @@ export const renderAccount: PageRender = (root) => {
         <div class="modal-foot"><button class="btn small" data-mem-close>关闭</button></div>
       </div>`;
     document.body.appendChild(mask);
-    mask.addEventListener('mousedown', (e) => { if (e.target === mask) mask.remove(); });
-    mask.querySelector('[data-mem-close]')!.addEventListener('click', () => mask.remove());
+    // .modal-mask 默认透明且 pointer-events:none，必须加 .open 才可见可交互
+    requestAnimationFrame(() => mask.classList.add('open'));
+    const close = () => {
+      mask.classList.remove('open');
+      setTimeout(() => mask.remove(), 160);
+    };
+    mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
+    mask.querySelector('[data-mem-close]')!.addEventListener('click', close);
     const histBody = mask.querySelector('#mem-history-body') as HTMLElement;
     try {
       const events = await memoryHistory(card.id);
