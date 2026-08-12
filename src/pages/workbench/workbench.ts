@@ -46,9 +46,9 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
         <div class="activity-icon" data-panel="servers" title="服务器列表">${icon('monitor')}</div>
         <div class="activity-icon" data-panel="commands" title="命令收藏">${icon('star')}</div>
         <div class="activity-icon" data-panel="skills" title="Skill">${icon('sparkles')}</div>
-        <!-- 云账号入口（CR-1.1b）：置于 AI 开关上方；未接入云服务时隐藏 -->
-        <div class="activity-icon avatar-entry" data-nav-account title="账号" hidden>${icon('user')}</div>
         <div class="activity-icon ai-toggle" data-panel="ai" title="AI 助手">${icon('bot')}</div>
+        <!-- 云账号入口（CR-1.1b）：置于 AI 开关下方（activity-bar 最底部）；未接入云服务时隐藏 -->
+        <div class="activity-icon avatar-entry" data-nav-account title="账号" hidden>${icon('user')}</div>
       </div>
       <div id="sidebar">
         <div id="sidebar-head"><span id="sidebar-title">文件资源管理器</span><span id="sidebar-actions"></span></div>
