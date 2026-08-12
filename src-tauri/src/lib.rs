@@ -78,19 +78,21 @@ pub fn run() {
                 }
                 s
             };
+            let cloud_mgr = Arc::new(cloud::CloudManager::default());
             let ai = Arc::new(ai::AiManager::new(
                 store.clone(),
                 pi_dir,
                 config_dir.join("pi-agent"),
                 ssh.clone(),
                 pi_debug,
+                Some(cloud_mgr.clone()),
             ));
             app.manage(store);
             app.manage(ssh);
             app.manage(terms);
             app.manage(ai.clone());
             // 云服务 OAuth2 会话（登录 state + 令牌内存缓存；令牌权威存储在 keyring）
-            app.manage(Arc::new(cloud::CloudManager::default()));
+            app.manage(cloud_mgr);
             // 启动异步刷新：已登录则重拉 me（用户资料/能力清单），服务端配置变更无需重登
             let cloud_mgr = app.state::<Arc<cloud::CloudManager>>().inner().clone();
             let store2 = app.state::<Arc<store::Store>>().inner().clone();

@@ -1044,6 +1044,59 @@ pub async fn memory_promote(
     Ok(new_id)
 }
 
+/// 上报对话历史触发自动沉淀（POST /api/memories/sediment，记忆卡片 API 文档 §10）。
+/// 供 ai.rs 在每次对话回合结束后调用——pi 封装无法在 LLM 请求体携带 sessionId/projectName，
+/// 由客户端把本回合历史显式上报，走与 LLM 请求完全相同的自动沉淀管线。
+/// 服务器按 sessionId 聚合缓冲（8 条/2000 字/闲置 5 分钟），客户端只需每回合推送，不感知
+/// flush 细节（默认 flush=true 立即入队）；仅 user/assistant 消息参与沉淀。
+/// 失败返回中文错误（调用方记录诊断日志，不打断对话）。
+pub async fn sediment_dialogue(
+    cloud: &Arc<CloudManager>,
+    store: &Arc<Store>,
+    messages: Vec<serde_json::Value>,
+    session_id: Option<&str>,
+    project_name: Option<&str>,
+) -> Result<(), String> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let body = sediment_body(&messages, session_id, project_name);
+    let v = cloud_api_request(
+        cloud,
+        store,
+        reqwest::Method::POST,
+        "/api/memories/sediment",
+        &[],
+        Some(body),
+    )
+    .await?;
+    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    if !ok {
+        return Err("沉淀上报未被服务端接受（ok=false）".to_string());
+    }
+    Ok(())
+}
+
+/// 构造 /api/memories/sediment 请求体（纯函数）：messages 必填；空白 sessionId/projectName 省略。
+fn sediment_body(
+    messages: &[serde_json::Value],
+    session_id: Option<&str>,
+    project_name: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({ "messages": messages });
+    if let Some(s) = session_id {
+        if !s.trim().is_empty() {
+            body["sessionId"] = serde_json::json!(s.trim());
+        }
+    }
+    if let Some(p) = project_name {
+        if !p.trim().is_empty() {
+            body["projectName"] = serde_json::json!(p.trim());
+        }
+    }
+    body
+}
+
 /// 极简 URL 编码（授权 URL 参数；redirect_uri 只含 `:/-_` 无需全量编码，保守处理特殊字符）。
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1063,6 +1116,7 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_query_handles_encoded_and_plain() {
@@ -1238,5 +1292,37 @@ mod tests {
         assert_eq!(api_error_text(502, "Bad Gateway"), "Bad Gateway（HTTP 502）");
         // 空体
         assert_eq!(api_error_text(204, ""), "无响应内容（HTTP 204）");
+    }
+
+    #[test]
+    fn sediment_body_builds_document_shape() {
+        let messages = vec![
+            json!({"role": "user", "content": "Redis 密码去哪找"}),
+            json!({"role": "assistant", "content": "配置中心 vault"}),
+        ];
+        let body = sediment_body(&messages, Some("chat-1"), Some("aishell-cloud"));
+        assert_eq!(body["sessionId"], "chat-1");
+        assert_eq!(body["projectName"], "aishell-cloud");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][0]["role"], "user");
+        // 空白 sessionId/projectName 不进入请求体（服务端按缺失处理）
+        let body2 = sediment_body(&messages, Some("  "), None);
+        assert!(body2.get("sessionId").is_none(), "空白 sessionId 不应发送");
+        assert!(body2.get("projectName").is_none());
+        // 空消息直接短路（不发起请求）
+        let body3 = sediment_body(&[], None, None);
+        assert_eq!(body3["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sediment_dialogue_empty_messages_noop() {
+        // 空消息不触碰云会话/网络：构造最小实例验证短路语义
+        let dir = std::env::temp_dir().join(format!("aishell-sediment-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(crate::store::test_store(dir));
+        let cloud = Arc::new(CloudManager::default());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let res = rt.block_on(sediment_dialogue(&cloud, &store, vec![], None, None));
+        assert!(res.is_ok(), "空消息应无操作成功返回");
     }
 }

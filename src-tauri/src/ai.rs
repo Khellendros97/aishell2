@@ -134,6 +134,8 @@ pub struct AiProc {
     /// 启动时技能快照指纹（origin|name|enabled|scope|正文 稳定序列化）；ai_chat 发现
     /// 该项目指纹变化时 kill/wait/摘除后按同一 session 文件重生，下一条消息即生效。
     skill_fingerprint: String,
+    /// 最近一次发送的 user prompt（已脱敏）；读取线程在回合结束时上报记忆沉淀用。
+    last_prompt: Arc<Mutex<String>>,
 }
 
 /// AI 进程管理器：每 key 一个长驻 pi 进程，进程生命周随工作台（ai_kill_project / Drop）结束。
@@ -148,6 +150,8 @@ pub struct AiManager {
     actions: Arc<AiActions>,
     /// 最近一次 load_skills 中被项目同名技能覆盖的全局技能（name + 路径），ai_debug_info 输出用。
     covered_skills: Mutex<Vec<String>>,
+    /// 云会话（托管模式记忆沉淀上报用）；测试/个人构建为 None。
+    cloud: Option<Arc<crate::cloud::CloudManager>>,
 }
 
 /// 最终启用技能集合：先分别过滤 enabled=true，再按「项目技能在前、全局技能在后；各组按 name 排序」。
@@ -222,7 +226,14 @@ fn hosted_llm_base(server_url: &str) -> String {
 }
 
 impl AiManager {
-    pub fn new(store: Arc<Store>, pi_dir: PathBuf, agent_dir: PathBuf, ssh: Arc<crate::ssh::SshManager>, pi_debug: String) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        pi_dir: PathBuf,
+        agent_dir: PathBuf,
+        ssh: Arc<crate::ssh::SshManager>,
+        pi_debug: String,
+        cloud: Option<Arc<crate::cloud::CloudManager>>,
+    ) -> Self {
         let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh));
         AiManager {
             store,
@@ -232,6 +243,7 @@ impl AiManager {
             procs: Arc::new(Mutex::new(HashMap::new())),
             actions,
             covered_skills: Mutex::new(Vec::new()),
+            cloud,
         }
     }
 
@@ -491,6 +503,7 @@ impl AiManager {
         let busy = Arc::new(AtomicBool::new(false));
         let killed = Arc::new(AtomicBool::new(false));
         let approvals: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let last_prompt = Arc::new(Mutex::new(String::new()));
         let app2 = app.clone();
         let key2 = key.to_string();
         let event = format!("ai:event:{key2}");
@@ -503,6 +516,8 @@ impl AiManager {
         let actions = Arc::clone(&self.actions);
         let project_id2 = project_id.to_string();
         let store2 = Arc::clone(&self.store);
+        let cloud2 = self.cloud.clone();
+        let last_prompt2 = Arc::clone(&last_prompt);
         thread::spawn(move || {
             // 已开始执行的 write/edit 工具 → 规范化绝对路径（end 成功时据此发 fs:changed）
             let mut pending_paths: HashMap<String, String> = HashMap::new();
@@ -512,6 +527,8 @@ impl AiManager {
             let mut terminal_emitted = false;
             // 当前 assistant 消息是否已流过文本增量（工具来回多段消息时分段用）
             let mut text_started = false;
+            // 当前回合 assistant 文本累计（跨工具循环 turn 累积；回合结束上报沉淀后清空）
+            let mut turn_text = String::new();
             // 内部动作需要 async 执行：懒建 tokio runtime（进程内动作次数极少）
             let mut rt: Option<tokio::runtime::Runtime> = None;
             let reader = BufReader::new(stdout);
@@ -532,6 +549,7 @@ impl AiManager {
                             Some("text_delta") => {
                                 if let Some(delta) = ae.get("delta").and_then(serde_json::Value::as_str) {
                                     text_started = true;
+                                    turn_text.push_str(delta);
                                     let _ = app2.emit(&event, json!({"type": "delta", "text": delta}));
                                 }
                             }
@@ -561,6 +579,19 @@ impl AiManager {
                         if !terminal_emitted {
                             terminal_emitted = true;
                             let _ = app2.emit(&event, json!({"type": "done"}));
+                            // 托管模式回合结束：上报本回合对话历史触发云记忆自动沉淀
+                            // （服务器按 sessionId 聚合缓冲，客户端只推送、不感知缓存细节）
+                            let user = last_prompt2.lock().map(|g| g.clone()).unwrap_or_default();
+                            report_sediment(
+                                &mut rt,
+                                &cloud2,
+                                &store2,
+                                &project_id2,
+                                &key2,
+                                &user,
+                                &turn_text,
+                            );
+                            turn_text.clear();
                         }
                     }
                     // 工具活动：受控工具在 agent/yolo 下以动作卡（actionStart/actionEnd）呈现，
@@ -775,6 +806,7 @@ impl AiManager {
                     killed,
                     approvals,
                     skill_fingerprint: loaded.fingerprint,
+                    last_prompt,
                 },
             );
         Ok(())
@@ -1114,6 +1146,51 @@ fn err_message(ev: &serde_json::Value) -> String {
     }
 }
 
+/// 托管模式回合结束：把本回合（脱敏后的 user prompt + assistant 全文）上报云记忆沉淀接口
+/// （POST /api/memories/sediment，默认 flush=true；服务器按 sessionId 聚合缓冲去重）。
+/// 仅托管模式且云会话存在时上报；失败只记诊断日志，绝不打断对话或影响前端。
+fn report_sediment(
+    rt: &mut Option<tokio::runtime::Runtime>,
+    cloud: &Option<Arc<crate::cloud::CloudManager>>,
+    store: &Arc<Store>,
+    project_id: &str,
+    key: &str,
+    user_text: &str,
+    assistant_text: &str,
+) {
+    let Some(cloud) = cloud else { return };
+    if store.cloud_mode() != CloudMode::Hosted {
+        return;
+    }
+    let user_text = user_text.trim();
+    if user_text.is_empty() {
+        return;
+    }
+    let session_id = key.split_once(':').map(|(_, s)| s.to_string());
+    let project_name = store.project(project_id).map(|p| p.name);
+    let mut messages = vec![json!({"role": "user", "content": user_text})];
+    let assistant = assistant_text.trim();
+    if !assistant.is_empty() {
+        messages.push(json!({"role": "assistant", "content": assistant}));
+    }
+    let rt = rt.get_or_insert_with(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("构建记忆沉淀上报 runtime 失败")
+    });
+    let res = rt.block_on(crate::cloud::sediment_dialogue(
+        cloud,
+        store,
+        messages,
+        session_id.as_deref(),
+        project_name.as_deref(),
+    ));
+    if let Err(e) = res {
+        crate::term::diag(&format!("[cloud] 记忆沉淀上报失败: {e}"));
+    }
+}
+
 /// 发送一条 prompt：进程不存在则先 spawn；上一轮未完成（busy）先取消审批并写 abort 再发。
 #[tauri::command]
 pub async fn ai_chat(
@@ -1210,6 +1287,8 @@ pub async fn ai_chat(
     let mut buf = serde_json::to_vec(&json!({"type": "prompt", "message": prompt}))
         .map_err(|e| e.to_string())?;
     buf.push(b'\n');
+    // 记录本次脱敏后的 user prompt：回合结束时读取线程上报记忆沉淀用
+    *proc.last_prompt.lock().map_err(|e| e.to_string())? = prompt.clone();
     proc.stdin
         .lock()
         .map_err(|e| e.to_string())?
@@ -1369,6 +1448,7 @@ mod tests {
             agent_dir,
             Arc::new(crate::ssh::SshManager::new(store)),
             String::new(),
+            None, // 测试构造不注入云会话
         )
     }
 
