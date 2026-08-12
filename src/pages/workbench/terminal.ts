@@ -592,8 +592,9 @@ class TermSession {
 
   /* ---------- 重连:旧通道关闭(吞掉其 term:exit),同 id 重建后端会话 ---------- */
   private async reconnect(): Promise<void> {
-    if (this.failed) return; // 启动失败态由 init 报错路径兜底,不在此重试
-    dbg(`${this.sid} fe-reconnect`);
+    // 失败态也允许重连（原实现 `if (this.failed) return` 导致密码错误等建连失败后
+    // 右键重连失效）：establish 会重置失败态并重建会话，再次失败仍走 handleConnectError 兜底
+    dbg(`${this.sid} fe-reconnect${this.failed ? '(failed 态重试)' : ''}`);
     this.ignoreExit = true;
     setTimeout(() => { this.ignoreExit = false; }, 8000);
     try { await termClose(this.tab.id); } catch { /* 已关闭忽略 */ }
