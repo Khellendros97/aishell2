@@ -123,6 +123,12 @@ export interface MemoryCard {
   dept: string;
   /** manual = 主动提交（原文保存）；auto = 对话流量 AI 自动沉淀 */
   source: 'manual' | 'auto' | string;
+  /** shared（团队共享）/ personal（仅本人可见）；存量旧卡片可能为空，按共享处理 */
+  scope: 'shared' | 'personal' | string | null;
+  /** 自动沉淀卡片元数据（手动卡片通常无） */
+  projectName: string | null;
+  sessionId: string | null;
+  date: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -136,6 +142,9 @@ export interface MemoryEvent {
   note: string;
 }
 
+/** 记忆卡片作用域：shared（团队共享）/ personal（仅本人可见） */
+export type MemoryScope = 'all' | 'shared' | 'personal';
+
 /** 语义检索命中（§7.2）：卡片 + 相关度（数组按相关度降序） */
 export interface MemoryHit {
   id: string;
@@ -146,6 +155,10 @@ export interface MemoryHit {
   creatorName: string;
   dept: string;
   source: string;
+  scope: 'shared' | 'personal' | string | null;
+  projectName: string | null;
+  sessionId: string | null;
+  date: string | null;
   createdAt: string;
   updatedAt: string;
   score: number;

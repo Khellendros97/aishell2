@@ -6,7 +6,7 @@
  * 本地回环回调（127.0.0.1:38901）收 code → 后端换令牌/拉资料 → cloud:changed 驱动刷新。
  * 服务端协议以 docs/AIShell云服务-OAuth2接入文档.md、开放API文档.md、记忆卡片API文档.md 为准。
  */
-import type { CloudStatus, MemoryCard, UsageReport } from '../types';
+import type { CloudStatus, MemoryCard, MemoryScope, UsageReport } from '../types';
 import {
   cloudBeginLogin,
   cloudCancelLogin,
@@ -18,6 +18,7 @@ import {
   memoryCreate,
   memoryDelete,
   memoryHistory,
+  memoryPromote,
   memorySearch,
   memoryUpdate,
   onCloudChanged,
@@ -32,7 +33,7 @@ import './account.css';
 const LOGIN_WAIT_MS = 120_000;
 
 /** 记忆卡片建议固定分类（记忆卡片 API 文档 §2.1） */
-const MEMORY_CATEGORIES = ['编码规范', '排障经验', '提示词技巧', '工具配置', '业务流程', '其他'];
+const MEMORY_CATEGORIES = ['编码规范', '排障经验', '提示词技巧', '工具配置', '业务流程', '其他', '个人记忆'];
 
 /** 用量报表天数选项 */
 const USAGE_DAYS = [7, 14, 30, 90];
@@ -53,6 +54,8 @@ export const renderAccount: PageRender = (root) => {
   let usageModel = '';
   /** 记忆搜索词（空 = 全量列表） */
   let memQuery = '';
+  /** 记忆列表/检索作用域：all = 共享 + 我的个人（默认）；shared / personal 过滤 */
+  let memScope: MemoryScope = 'all';
   let memDebounce: ReturnType<typeof setTimeout> | null = null;
 
   root.insertAdjacentHTML('beforeend', `
@@ -393,7 +396,7 @@ export const renderAccount: PageRender = (root) => {
     const seq = ++memoriesSeq;
     content.innerHTML = `<div class="loading-row">${icon('loader')} 加载记忆卡片…</div>`;
     try {
-      const cards = await memoriesList();
+      const cards = await memoriesList(memScope);
       if (seq !== memoriesSeq) return;
       renderMemories(cards, null);
     } catch (e) {
@@ -413,7 +416,7 @@ export const renderAccount: PageRender = (root) => {
     if (!guardCloud(content)) return;
     const seq = ++memoriesSeq;
     try {
-      const hits = await memorySearch(query, 20);
+      const hits = await memorySearch(query, 20, memScope);
       if (seq !== memoriesSeq) return;
       renderMemories(hits.map((h) => ({ ...h, _score: h.score })), query);
     } catch (e) {
@@ -428,17 +431,21 @@ export const renderAccount: PageRender = (root) => {
     const selfId = lastStatus?.user?.id ?? null;
     const list = cards.length > 0 ? cards.map((c) => {
       const mine = selfId != null && c.creatorId === selfId;
+      const personal = c.scope === 'personal';
       const cat = c.category?.trim() ? escapeHtml(c.category) : '<span class="mem-cat muted">未分类</span>';
       const tags = (c.tags ?? []).filter((t) => t.trim()).map((t) =>
         `<span class="mem-tag">${escapeHtml(t)}</span>`).join('');
       const source = c.source === 'auto'
         ? '<span class="mem-source mem-source-auto" title="对话流量 AI 自动沉淀">自动</span>'
         : '<span class="mem-source" title="用户主动提交，原文保存">手动</span>';
+      const scopeBadge = personal
+        ? '<span class="mem-scope mem-scope-personal" title="仅本人可见">个人</span>'
+        : '<span class="mem-scope" title="团队全员可见">共享</span>';
       const score = c._score != null ? `<span class="mem-score" title="相关度（值越小越相关）">相关度 ${c._score.toFixed(3)}</span>` : '';
       return `
       <div class="mem-card" data-id="${escapeHtml(c.id)}">
         <div class="mem-card-head">
-          ${cat}${source}
+          ${cat}${source}${scopeBadge}
           <span class="mem-time" title="创建 / 最后更新">${escapeHtml(c.createdAt)}</span>
         </div>
         <div class="mem-content">${escapeHtml(c.content)}</div>
@@ -447,6 +454,8 @@ export const renderAccount: PageRender = (root) => {
           <span class="mem-creator">${escapeHtml(c.creatorName || '未知')}${c.dept ? ` · ${escapeHtml(c.dept)}` : ''}</span>
           ${score}
           <span class="mem-actions">
+            ${mine && personal ? `
+              <button class="icon-btn" data-act="promote" title="提升为共享" aria-label="提升为共享">${icon('upload')}</button>` : ''}
             <button class="icon-btn" data-act="history" title="变更历史" aria-label="变更历史">${icon('history')}</button>
             ${mine ? `
               <button class="icon-btn" data-act="edit" title="编辑" aria-label="编辑">${icon('pencil')}</button>
@@ -470,9 +479,14 @@ export const renderAccount: PageRender = (root) => {
         <div class="mem-search-wrap">
           ${icon('search')}
           <input id="mem-search" class="input" type="text" spellcheck="false"
-                 placeholder="语义检索共享记忆，回车搜索，清空回到列表…">
+                 placeholder="语义检索记忆，回车搜索，清空回到列表…">
         </div>
         <button class="btn primary small" data-mem-add>${icon('plus')} 新增记忆</button>
+      </div>
+      <div class="mem-scope-tabs" id="mem-scope-tabs">
+        <button class="mem-scope-tab active" data-scope="all" title="共享卡片 + 我的个人卡片">全部</button>
+        <button class="mem-scope-tab" data-scope="shared" title="团队全员可见的共享卡片">共享</button>
+        <button class="mem-scope-tab" data-scope="personal" title="仅本人可见的个人卡片">我的个人</button>
       </div>
       <div id="memories-content"></div>`;
     const search = memoriesBody.querySelector('#mem-search') as HTMLInputElement;
@@ -491,6 +505,16 @@ export const renderAccount: PageRender = (root) => {
         if (memDebounce) clearTimeout(memDebounce);
         run();
       }
+    });
+    // 作用域过滤：切换后保留当前搜索词（有词走检索、无词走列表）
+    memoriesBody.querySelectorAll<HTMLElement>('#mem-scope-tabs .mem-scope-tab').forEach((tab) => {
+      tab.addEventListener('click', () => {
+        memScope = (tab.dataset.scope ?? 'all') as MemoryScope;
+        memoriesBody.querySelectorAll<HTMLElement>('#mem-scope-tabs .mem-scope-tab').forEach((t) => {
+          t.classList.toggle('active', t === tab);
+        });
+        run();
+      });
     });
     memoriesBody.querySelector('[data-mem-add]')!.addEventListener('click', () => openMemoryModal(null));
     void loadMemories();
@@ -516,6 +540,18 @@ export const renderAccount: PageRender = (root) => {
           <div class="field">
             <label>分类<span class="req">*</span></label>
             <select id="mem-category" class="select">${catOpts}</select>
+          </div>
+          <div class="field">
+            <label>可见范围</label>
+            <div class="mem-scope-radio">
+              <label class="mode-option active">
+                <input type="radio" name="mem-scope" value="shared" checked> 团队共享（全员可见）
+              </label>
+              <label class="mode-option">
+                <input type="radio" name="mem-scope" value="personal"
+                       title="仅本人可见；之后可在列表中提升为共享"> 仅自己可见
+              </label>
+            </div>
           </div>
           <div class="field">
             <label>标签（逗号分隔，可选）</label>
@@ -553,8 +589,9 @@ export const renderAccount: PageRender = (root) => {
       errEl.hidden = true;
       try {
         if (isNew) {
-          await memoryCreate(content, category, tags);
-          toast('记忆已提交，全员可见', 'success');
+          const scope = (mask.querySelector('input[name="mem-scope"]:checked') as HTMLInputElement | null)?.value ?? 'shared';
+          await memoryCreate(content, category, tags, scope as MemoryScope);
+          toast('记忆已提交', 'success');
         } else {
           const note = (mask.querySelector('#mem-note') as HTMLInputElement | null)?.value.trim() ?? '';
           await memoryUpdate(card.id, content, category, tags, note);
@@ -619,6 +656,24 @@ export const renderAccount: PageRender = (root) => {
       if (card) void openHistoryModal(card);
       return;
     }
+    if (act === 'promote') {
+      void (async () => {
+        const ok = await confirmDialog({
+          title: '提升为共享',
+          message: '确定将这条个人记忆提升为团队共享吗？\n提升后全员可见，原个人卡片将被共享卡片替换（内容不变），操作写入审计日志。',
+          okText: '提升',
+        });
+        if (!ok) return;
+        try {
+          const newId = await memoryPromote(id);
+          toast(`已提升为共享（新卡片 ${newId.slice(0, 8)}…）`, 'success');
+          void (memQuery ? searchMemories(memQuery) : loadMemories());
+        } catch (err) {
+          toast(`提升失败: ${String(err)}`, 'error');
+        }
+      })();
+      return;
+    }
     if (act === 'edit') {
       const card = memoryCardFromDom(cardEl);
       if (card) openMemoryModal(card);
@@ -663,6 +718,10 @@ export const renderAccount: PageRender = (root) => {
       creatorName: creatorName ?? '',
       dept: dept ?? '',
       source: el.querySelector('.mem-source-auto') ? 'auto' : 'manual',
+      scope: el.querySelector('.mem-scope-personal') ? 'personal' : 'shared',
+      projectName: null,
+      sessionId: null,
+      date: null,
       createdAt: el.querySelector('.mem-time')?.textContent ?? '',
       updatedAt: '',
     };

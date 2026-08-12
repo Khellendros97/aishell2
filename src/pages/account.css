@@ -299,6 +299,14 @@
   color: var(--text-2);
 }
 .account-page .mem-source-auto { color: var(--warn); }
+.account-page .mem-scope {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+.account-page .mem-scope-personal { background: var(--bg-3); color: var(--text-2); }
 .account-page .mem-time {
   margin-left: auto;
   font-size: 11px;
@@ -328,6 +336,33 @@
 }
 .account-page .mem-score { color: var(--text-2); }
 .account-page .mem-actions { margin-left: auto; display: flex; gap: 2px; }
+
+/* 记忆作用域过滤 tabs */
+.account-page .mem-scope-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.account-page .mem-scope-tab {
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 6px 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.account-page .mem-scope-tab:hover { color: var(--text-1); }
+.account-page .mem-scope-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+/* 新增记忆弹窗：可见范围单选 */
+.account-page .mem-scope-radio { display: flex; gap: 10px; margin-top: 6px; }
 
 /* 变更历史时间线 */
 .account-page .mem-history { display: flex; flex-direction: column; gap: 12px; }

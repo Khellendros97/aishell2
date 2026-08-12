@@ -272,6 +272,11 @@ impl AiManager {
         };
         // 托管模式（CR-3.1）：provider 指向公司服务器代理端点，apiKey 用 $AISHELL_CLOUD_TOKEN
         // （spawn 时注入当前 access_token）；个人模式维持现状（本地 baseUrl + $DEEPSEEK_API_KEY）。
+        // 已知限制：开放 API 文档 §2.1/§6.6 建议 LLM 请求体顶层携带 sessionId/projectName 以便
+        // 服务端按会话聚合自动沉淀记忆，但 pi 的 provider 配置不支持注入任意请求体字段
+        // （仅 baseUrl/apiKey/headers，session-affinity 走请求头与 prompt_cache_key，非 body 顶层）。
+        // memoryScope 服务端可推断，客户端不传。待云服务端新增「对话历史」专用接口后另行对接
+        // （届时由 ai.rs 按 key 的 sessionId 维度上报，见服务端变更）。
         let hosted = self.store.cloud_mode() == CloudMode::Hosted;
         let (base_url, api_key_env) = if hosted {
             let server = crate::cloud::server_url()

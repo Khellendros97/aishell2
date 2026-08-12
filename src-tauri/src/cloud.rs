@@ -695,6 +695,7 @@ pub struct UsageModel {
 }
 
 /// 记忆卡片（记忆卡片 API 文档 §1.2）；creatorId 为创建时快照的数字 id。
+/// scope：shared（团队共享）/ personal（仅本人可见）；存量旧卡片字段缺失按共享处理。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MemoryCard {
@@ -706,6 +707,12 @@ pub struct MemoryCard {
     pub creator_name: String,
     pub dept: String,
     pub source: String,
+    /// shared / personal；旧卡片可能缺失（按共享处理）
+    pub scope: Option<String>,
+    /// 自动沉淀卡片元数据（手动卡片通常无，客户端仅透传展示）
+    pub project_name: Option<String>,
+    pub session_id: Option<String>,
+    pub date: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -865,18 +872,26 @@ pub async fn cloud_usage(
 
 // ---------------------------------------------------------------- 记忆卡片（文档：记忆卡片 API）
 
-/// 拉取全部共享记忆卡片（GET /api/memories，不分页）。
+/// 拉取记忆卡片（GET /api/memories，不分页）。
+/// `scope`：缺省/空 = all（共享 + 当前用户个人，按更新时间倒序合并）；`shared` 仅共享；
+/// `personal` 仅当前用户个人卡片（他人的个人卡片任何 scope 下都不出现）。
 #[tauri::command]
 pub async fn memories_list(
     cloud: State<'_, Arc<CloudManager>>,
     store: State<'_, Arc<Store>>,
+    scope: Option<String>,
 ) -> Result<Vec<MemoryCard>, String> {
-    let v = cloud_api_request(&cloud, &store, reqwest::Method::GET, "/api/memories", &[], None).await?;
+    let q: Vec<(&str, String)> = match scope {
+        Some(s) if !s.trim().is_empty() && s != "all" => vec![("scope", s.trim().to_string())],
+        _ => Vec::new(),
+    };
+    let v = cloud_api_request(&cloud, &store, reqwest::Method::GET, "/api/memories", &q, None).await?;
     let cards = v.get("memories").cloned().unwrap_or_else(|| serde_json::json!([]));
     serde_json::from_value(cards).map_err(|e| format!("解析记忆卡片列表失败: {e}"))
 }
 
-/// 主动提交一条记忆（POST /api/memories）：内容原文保存，不被 AI 改写，提交后全员可见。
+/// 主动提交一条记忆（POST /api/memories）：内容原文保存，不被 AI 改写。
+/// `scope`：shared（默认）/ personal；共享入口提交 shared，个人工作记录/偏好提交 personal。
 #[tauri::command]
 pub async fn memory_create(
     cloud: State<'_, Arc<CloudManager>>,
@@ -884,10 +899,16 @@ pub async fn memory_create(
     content: String,
     category: String,
     tags: Option<Vec<String>>,
+    scope: Option<String>,
 ) -> Result<MemoryCard, String> {
     let mut body = serde_json::json!({ "content": content, "category": category });
     if let Some(t) = tags {
         body["tags"] = serde_json::json!(t);
+    }
+    if let Some(s) = scope {
+        if !s.trim().is_empty() {
+            body["scope"] = serde_json::json!(s.trim());
+        }
     }
     let v = cloud_api_request(&cloud, &store, reqwest::Method::POST, "/api/memories", &[], Some(body)).await?;
     serde_json::from_value(v).map_err(|e| format!("解析记忆卡片失败: {e}"))
@@ -965,17 +986,24 @@ pub async fn memory_history(
     serde_json::from_value(events).map_err(|e| format!("解析记忆历史失败: {e}"))
 }
 
-/// 语义检索共享记忆（POST /api/memories/search）：topK 默认 10、clamp 1–20。
+/// 语义检索记忆（POST /api/memories/search）：topK 默认 10、clamp 1–20；
+/// `scope` 缺省 = all（共享 + 当前用户个人；个人检索失败不阻断共享结果）。
 #[tauri::command]
 pub async fn memory_search(
     cloud: State<'_, Arc<CloudManager>>,
     store: State<'_, Arc<Store>>,
     query: String,
     top_k: Option<u32>,
+    scope: Option<String>,
 ) -> Result<Vec<MemoryHit>, String> {
     let mut body = serde_json::json!({ "query": query });
     if let Some(k) = top_k {
         body["topK"] = serde_json::json!(k);
+    }
+    if let Some(s) = scope {
+        if !s.trim().is_empty() {
+            body["scope"] = serde_json::json!(s.trim());
+        }
     }
     let v = cloud_api_request(
         &cloud,
@@ -988,6 +1016,32 @@ pub async fn memory_search(
     .await?;
     let hits = v.get("results").cloned().unwrap_or_else(|| serde_json::json!([]));
     serde_json::from_value(hits).map_err(|e| format!("解析记忆检索结果失败: {e}"))
+}
+
+/// 个人卡片提升为共享（POST /api/memories/{id}/promote）：仅创建者本人可调；
+/// 原文保留不被改写，原个人卡片消失、共享空间出现新 id 的共享卡片（服务端写审计）。
+/// 返回新的共享卡片 id。
+#[tauri::command]
+pub async fn memory_promote(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<String, String> {
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::POST,
+        &format!("/api/memories/{id}/promote"),
+        &[],
+        None,
+    )
+    .await?;
+    let new_id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "提升响应缺少新卡片 id".to_string())?
+        .to_string();
+    Ok(new_id)
 }
 
 /// 极简 URL 编码（授权 URL 参数；redirect_uri 只含 `:/-_` 无需全量编码，保守处理特殊字符）。
@@ -1088,6 +1142,10 @@ mod tests {
           "creatorName": "张三",
           "dept": "研发部",
           "source": "manual",
+          "scope": "shared",
+          "projectName": "aishell-cloud",
+          "sessionId": "chat-2026-08-12-0001",
+          "date": "2026-08-12",
           "createdAt": "2026-08-12 11:46",
           "updatedAt": "2026-08-12 11:46"
         }"#;
@@ -1098,7 +1156,20 @@ mod tests {
         assert_eq!(c.creator_id, Some(7));
         assert_eq!(c.creator_name, "张三");
         assert_eq!(c.source, "manual");
+        assert_eq!(c.scope.as_deref(), Some("shared"));
+        assert_eq!(c.project_name.as_deref(), Some("aishell-cloud"));
+        assert_eq!(c.session_id.as_deref(), Some("chat-2026-08-12-0001"));
+        assert_eq!(c.date.as_deref(), Some("2026-08-12"));
         assert_eq!(c.created_at, "2026-08-12 11:46");
+    }
+
+    #[test]
+    fn memory_card_personal_scope_parses() {
+        let c: MemoryCard = serde_json::from_str(
+            r#"{"id":"p1","content":"个人工作笔记","scope":"personal"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.scope.as_deref(), Some("personal"));
     }
 
     #[test]
