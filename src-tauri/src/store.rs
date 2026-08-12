@@ -527,6 +527,10 @@ pub struct AppState {
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
     pub db_connections: HashMap<String, Vec<DbConnection>>,
+    /// 已完成内置技能播种的 workspace（规范化路径）；旧配置无此字段按空列表。
+    /// 用户删除/修改内置技能后不会被同一 workspace 的重启/保存设置流程复活。
+    #[serde(default)]
+    pub seeded_skill_workspaces: Vec<String>,
 }
 
 /// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
@@ -666,6 +670,25 @@ pub struct Store {
 
 const STATE_FILE: &str = "aishell.json";
 
+/// 规范化 workspace 路径用于播种记录去重：目录存在时 canonicalize，否则原样（写入前会创建）。
+/// Windows canonicalize 的 `\\?\` verbatim 前缀统一剥掉，避免落盘记录形态不一致。
+fn normalize_ws(ws: &str) -> String {
+    let p = PathBuf::from(ws.trim());
+    let p = std::fs::canonicalize(&p).unwrap_or(p);
+    #[cfg(windows)]
+    let p = {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{rest}"))
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            PathBuf::from(rest)
+        } else {
+            p
+        }
+    };
+    p.to_string_lossy().into_owned()
+}
+
 /// 会话内全部自由文本脱敏（消息正文/快照/文件引用/动作摘要与意图），返回是否有变更。幂等：
 /// 已脱敏内容再次处理字符串不变，不会误报 changed。
 /// 先做会话级值收集（跨消息共享同一凭据的 KV 值），再逐字段替换——
@@ -751,6 +774,16 @@ impl Store {
             let guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
             store.persist_locked(&guard)?;
         }
+        // 内置技能一次性播种：workspace 已配置且从未播种时创建全局 skill-management；
+        // 失败阻止启动（不以不完整状态运行）。
+        if let Some(ws) = store
+            .settings()
+            .workspace_dir
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            store.seed_builtin_skill(ws)?;
+        }
         Ok(store)
     }
 
@@ -794,7 +827,9 @@ impl Store {
     }
 
     /// 保存设置；api_key / brave_key 为 Some 时写入 keyring（空串也写，视为覆盖），None 保持原值。
-    fn save_settings(
+    /// workspace 切换/首配时在同一事务内播种内置技能：播种失败整体回滚（旧 settings 与播种记录保留）。
+    /// pub(crate)：skills.rs 等模块的测试需要构造带 workspace 的 Store。
+    pub(crate) fn save_settings(
         &self,
         settings: Settings,
         api_key: Option<&str>,
@@ -807,7 +842,41 @@ impl Store {
             self.secrets.set(KEYRING_ACCOUNT_BRAVE, key)?;
         }
         self.with_state(|s| {
-            s.settings = settings;
+            // 先播种（失败 → 闭包返回 Err，s.settings 与播种记录均未变更，整体回滚）
+            if let Some(ws) = settings
+                .workspace_dir
+                .as_deref()
+                .filter(|w| !w.trim().is_empty())
+            {
+                let ws = normalize_ws(ws);
+                if !s.seeded_skill_workspaces.contains(&ws) {
+                    crate::skills::seed_builtin_skill_files(&ws)?;
+                    s.seeded_skill_workspaces.push(ws);
+                }
+            }
+            s.settings = settings.clone();
+            Ok(())
+        })
+    }
+
+    /// 内置技能播种：workspace 非空且未记录时创建 `<workspace>/.aishell/skills/skill-management/SKILL.md`；
+    /// 目标已存在则保留用户文件不覆盖；只有文件已存在或成功创建后才记录 workspace 并原子落盘。
+    fn seed_builtin_skill(&self, workspace: &str) -> Result<(), String> {
+        let ws = normalize_ws(workspace);
+        if ws.is_empty() {
+            return Ok(());
+        }
+        {
+            let guard = self.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            if guard.seeded_skill_workspaces.contains(&ws) {
+                return Ok(());
+            }
+        }
+        crate::skills::seed_builtin_skill_files(&ws)?;
+        self.with_state(|s| {
+            if !s.seeded_skill_workspaces.contains(&ws) {
+                s.seeded_skill_workspaces.push(ws);
+            }
             Ok(())
         })
     }
@@ -1854,6 +1923,8 @@ mod tests {
             sftp_history: HashMap::new(),
             sftp_favorites: HashMap::new(),
             db_connections: HashMap::new(),
+            // 与 settings.workspace_dir 一致：reload 时视为已播种（不创建 D:\AIShellWorkspace，不破坏往返相等）
+            seeded_skill_workspaces: vec!["D:\\AIShellWorkspace".to_string()],
         }
     }
 
@@ -1883,6 +1954,7 @@ mod tests {
             "\"serverRefs\"",
             "\"autoSwitchAiWorkdir\"",
             "\"projectView\"",
+            "\"seededSkillWorkspaces\"",
         ] {
             assert!(json.contains(key), "序列化 JSON 缺少字段 {key}: {json}");
         }
@@ -1933,12 +2005,13 @@ mod tests {
     #[test]
     fn is_config_complete_reflects_workspace_dir() {
         let dir = temp_config_dir("complete");
+        let ws = temp_config_dir("complete-ws");
         let store = test_store(dir);
         assert!(!store.is_config_complete());
         store
             .save_settings(
                 Settings {
-                    workspace_dir: Some("C:\\ws".to_string()),
+                    workspace_dir: Some(ws.to_string_lossy().into_owned()),
                     ..Default::default()
                 },
                 None,
@@ -3381,11 +3454,12 @@ mod tests {
     #[test]
     fn downstream_accessors() {
         let dir = temp_config_dir("accessors");
+        let ws = temp_config_dir("accessors-ws");
         let store = test_store(dir);
         store
             .save_settings(
                 Settings {
-                    workspace_dir: Some("C:\\ws".to_string()),
+                    workspace_dir: Some(ws.to_string_lossy().into_owned()),
                     llm: LlmConfig {
                         model_id: "deepseek-reasoner".to_string(),
                         base_url: "https://api.deepseek.com/v1".to_string(),
@@ -3898,7 +3972,11 @@ mod tests {
         store
             .save_settings(
                 Settings {
-                    workspace_dir: Some("C:\\ws".into()),
+                    workspace_dir: Some(
+                        temp_config_dir("cfg-complete-hosted-ws")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                     ..Default::default()
                 },
                 None,
@@ -3924,10 +4002,229 @@ mod tests {
         assert_eq!(store.cloud_profile().0, Some(user));
         assert_eq!(store.cloud_tokens(), (None, None), "内存密钥后端跨实例不保留");
         // 旧配置无 cloud 段：serde 默认 personal（构造无 cloud 的 JSON 验证）
-        let legacy = r#"{"settings":{"workspaceDir":"C:\\ws","llm":{"modelId":"m","baseUrl":"b","effort":"low"},"search":{"enabled":false},"theme":"dark","autoSwitchAiWorkdir":true,"projectView":"card","approvalMode":"smart"},"servers":[],"projects":[],"sessions":{}}"#;
+        let legacy = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"b","effort":"low"},"search":{"enabled":false},"theme":"dark","autoSwitchAiWorkdir":true,"projectView":"card","approvalMode":"smart"},"servers":[],"projects":[],"sessions":{}}"#;
         std::fs::write(dir.join("aishell.json"), legacy).unwrap();
         let store2 = test_store(dir.clone());
         assert_eq!(store2.cloud_mode(), CloudMode::Personal, "旧配置按未接入处理");
         assert_eq!(store2.cloud_profile(), (None, None));
+    }
+
+    // ---------------------------------------------------------------- 内置技能播种
+
+    /// 首次保存 workspace 后精确产生 .aishell/skills/skill-management/SKILL.md。
+    #[test]
+    fn first_save_seeds_skill_management() {
+        let dir = temp_config_dir("seed-first");
+        let ws = temp_config_dir("seed-first-ws");
+        let store = test_store(dir.clone());
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
+        assert!(file.is_file(), "首次保存未播种内置技能");
+        let content = fs::read_to_string(&file).unwrap();
+        // 内容含两个目录、目录结构、scope/enabled 语义
+        assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {content}");
+        assert!(content.contains("<name>/SKILL.md"), "缺少目录结构: {content}");
+        assert!(content.contains("## scope 语义"), "缺少 scope 语义: {content}");
+        assert!(content.contains("enabled") && content.contains("scope"), "缺少字段 schema");
+        // 播种记录已落盘（记录的是 normalize_ws 规范化路径：canonicalize + 剥 verbatim 前缀）
+        let state: AppState =
+            serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
+        let expected_ws = normalize_ws(&ws.to_string_lossy());
+        assert_eq!(
+            state.seeded_skill_workspaces,
+            vec![expected_ws],
+            "播种记录不符: {:?}",
+            state.seeded_skill_workspaces
+        );
+    }
+
+    /// 目标已存在不覆盖；用户删除后同 workspace 重启/再次保存不复活。
+    #[test]
+    fn seed_never_overwrites_or_resurrects() {
+        let dir = temp_config_dir("seed-keep");
+        let ws = temp_config_dir("seed-keep-ws");
+        let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
+        // 预置用户文件 → 保存设置不覆盖
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "用户自建的内容").unwrap();
+        let store = test_store(dir.clone());
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "用户自建的内容", "已存在文件被覆盖");
+        // 用户删除后：重启（重新加载）不复活
+        fs::remove_dir_all(ws.join(".aishell")).unwrap();
+        let _store2 = test_store(dir.clone());
+        assert!(!file.exists(), "重启不应复活已删除的内置技能");
+        // 再次保存设置同样不复活
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!file.exists(), "再次保存不应复活已删除的内置技能");
+    }
+
+    /// 切换到从未播种的新 workspace 会播种；旧 workspace 记录保留。
+    #[test]
+    fn switching_workspace_seeds_new_one() {
+        let dir = temp_config_dir("seed-switch");
+        let ws1 = temp_config_dir("seed-switch-ws1");
+        let ws2 = temp_config_dir("seed-switch-ws2");
+        let store = test_store(dir.clone());
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws1.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws2.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(ws1.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
+        assert!(ws2.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
+        let state: AppState =
+            serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
+        assert_eq!(state.seeded_skill_workspaces.len(), 2);
+        // 再切回 ws1：已播种 → 不再创建（幂等）
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws1.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(state.seeded_skill_workspaces.len(), 2);
+    }
+
+    /// 播种写失败：save_settings 保持旧 workspace 与旧播种记录（整体回滚）。
+    #[test]
+    fn seed_failure_rolls_back_save_settings() {
+        let dir = temp_config_dir("seed-fail");
+        let ws1 = temp_config_dir("seed-fail-ws1");
+        let ws2 = temp_config_dir("seed-fail-ws2");
+        let store = test_store(dir.clone());
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws1.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        // 让新 workspace 播种必然失败：把 .aishell 预置为「文件」占位
+        fs::write(ws2.join(".aishell"), "占位文件").unwrap();
+        let err = store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(ws2.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("创建内置技能目录失败") || err.contains("创建技能根失败"), "错误串不符: {err}");
+        // 设置与播种记录保持旧值（ws1）
+        let settings = store.settings();
+        assert_eq!(
+            settings.workspace_dir.as_deref(),
+            Some(ws1.to_str().unwrap()),
+            "失败后 workspace 被改成新值"
+        );
+        let state: AppState =
+            serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
+        assert_eq!(state.seeded_skill_workspaces.len(), 1, "失败后播种记录被污染");
+        assert!(state.seeded_skill_workspaces[0].contains("seed-fail-ws1"));
+    }
+
+    /// 播种写失败：首次加载（with_secrets）返回错误，阻止以不完整状态启动。
+    #[test]
+    fn seed_failure_blocks_first_load() {
+        let dir = temp_config_dir("seed-load-fail");
+        let ws = temp_config_dir("seed-load-fail-ws");
+        // 预置一个「已配置 workspace 但未播种」的 aishell.json
+        let state = AppState {
+            settings: Settings {
+                workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            seeded_skill_workspaces: Vec::new(),
+            ..Default::default()
+        };
+        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        // 让播种失败：.aishell 被文件占位
+        fs::write(ws.join(".aishell"), "占位文件").unwrap();
+        let res = Store::with_secrets(dir.clone(), std::sync::Arc::new(MemorySecrets::default()));
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("播种失败场景不应加载成功"),
+        };
+        assert!(err.contains("内置技能"), "错误串不符: {err}");
+        // 修复后加载成功
+        fs::remove_file(ws.join(".aishell")).unwrap();
+        let store = Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
+        assert!(store.settings().workspace_dir.is_some());
+    }
+
+    /// 旧 aishell.json 无 seededSkillWorkspaces 可正常反序列化为空，且不触发播种。
+    #[test]
+    fn legacy_state_without_seed_field_parses_empty() {
+        let dir = temp_config_dir("seed-legacy");
+        let ws = temp_config_dir("seed-legacy-ws");
+        // workspace 未配置 → 旧配置加载不播种
+        let old = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark"},"servers":[],"projects":[],"sessions":{},"projectFolders":[],"commandFolders":[],"uiExpanded":{},"sftpHistory":{},"sftpFavorites":{},"dbConnections":{}}"#;
+        fs::write(dir.join("aishell.json"), old).unwrap();
+        let store = test_store(dir.clone());
+        assert!(store.state.lock().unwrap().seeded_skill_workspaces.is_empty());
+        // workspace 已配置但旧配置无播种字段 → 加载时播种一次并记录
+        let state = AppState {
+            settings: Settings {
+                workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        let store = test_store(dir);
+        assert!(ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
+        assert_eq!(store.state.lock().unwrap().seeded_skill_workspaces.len(), 1);
     }
 }

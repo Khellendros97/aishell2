@@ -31,7 +31,7 @@
 //!
 //! 与计划唯一偏差：`procs` 字段为 `Arc<Mutex<HashMap<...>>>`（计划给的是裸 `Mutex`）——
 //! 因为 stdout 读取线程必须在进程退出/管道破裂时「从 map 摘除」条目，裸 Mutex 无法被线程共享。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -43,6 +43,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ai_actions::AiActions;
+use crate::skills::{SkillOrigin, SkillSummary};
 use crate::store::{AiMode, ApprovalMode, CloudMode, Store};
 
 /// suggest 模式的系统提示（保持现状：无 bash，写仅 .aishell/）。
@@ -130,6 +131,9 @@ pub struct AiProc {
     killed: Arc<AtomicBool>,
     /// 待处理审批：extension_ui_request id -> toolCallId（ai_respond_approval 校验用）。
     approvals: Arc<Mutex<HashMap<String, String>>>,
+    /// 启动时技能快照指纹（origin|name|enabled|scope|正文 稳定序列化）；ai_chat 发现
+    /// 该项目指纹变化时 kill/wait/摘除后按同一 session 文件重生，下一条消息即生效。
+    skill_fingerprint: String,
 }
 
 /// AI 进程管理器：每 key 一个长驻 pi 进程，进程生命周随工作台（ai_kill_project / Drop）结束。
@@ -142,6 +146,73 @@ pub struct AiManager {
     pub pi_debug: String,
     pub procs: Arc<Mutex<HashMap<String, AiProc>>>,
     actions: Arc<AiActions>,
+    /// 最近一次 load_skills 中被项目同名技能覆盖的全局技能（name + 路径），ai_debug_info 输出用。
+    covered_skills: Mutex<Vec<String>>,
+}
+
+/// 最终启用技能集合：先分别过滤 enabled=true，再按「项目技能在前、全局技能在后；各组按 name 排序」。
+/// 同名时项目技能覆盖全局技能（被覆盖的全局项返回给调用方写入 AI 诊断，避免 pi 的
+/// 「同名保留第一个」行为依赖未声明的扫描顺序）；项目同名项被禁用时不参与候选，全局启用项恢复加载。
+fn select_enabled_skills(
+    global: Vec<SkillSummary>,
+    project: Vec<SkillSummary>,
+) -> (Vec<SkillSummary>, Vec<SkillSummary>) {
+    let mut global_enabled: Vec<SkillSummary> = global.into_iter().filter(|s| s.enabled).collect();
+    let mut project_enabled: Vec<SkillSummary> = project.into_iter().filter(|s| s.enabled).collect();
+    global_enabled.sort_by(|a, b| a.name.cmp(&b.name));
+    project_enabled.sort_by(|a, b| a.name.cmp(&b.name));
+    let project_names: HashSet<&str> = project_enabled.iter().map(|s| s.name.as_str()).collect();
+    let (covered, rest): (Vec<_>, Vec<_>) = global_enabled
+        .into_iter()
+        .partition(|s| project_names.contains(s.name.as_str()));
+    let mut final_list = project_enabled;
+    final_list.extend(rest);
+    (final_list, covered)
+}
+
+/// 稳定「Skill 作用域提示」区：追加在系统提示尾部。scope 只提示何时优先使用，不是权限或加载过滤；
+/// 所有启用技能始终传给 pi，切换本地/远程工作区域不得重建或增删 --skill 参数（本区与指纹均不含
+/// 工作区域）。scope 摘要不得包含技能正文或任意密钥值。
+fn scope_prompt(skills: &[SkillSummary]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\n[Skill 作用域提示]\n以下为当前项目已启用的 AIShell Skill（name => scope）。scope 仅提示何时优先使用，不是权限或加载过滤：local 对应当前工作区域为本地，remote:<主机名称> 对应当前工作区域服务器的 Server.name，all 始终适用。所有已启用 Skill 均已加载，切换本地/远程工作区域不会改变本列表：\n",
+    );
+    for s in skills {
+        out.push_str(&format!("- {} => {}\n", s.name, s.scope.join(", ")));
+    }
+    out
+}
+
+/// 技能快照指纹：最终加载项按固定顺序（列表序）拼接 origin|name|enabled|scope|SKILL.md 正文。
+/// 直接比较稳定序列化字节即可，不新增散列依赖；工作区域变化不参与指纹。
+fn skill_fingerprint(skills: &[SkillSummary], contents: &[String]) -> String {
+    let mut out = String::new();
+    for (s, c) in skills.iter().zip(contents) {
+        out.push_str(s.origin.as_str());
+        out.push('|');
+        out.push_str(&s.name);
+        out.push('|');
+        out.push_str(if s.enabled { "1" } else { "0" });
+        out.push('|');
+        out.push_str(&s.scope.join(","));
+        out.push('|');
+        out.push_str(c);
+        out.push('\n');
+    }
+    out
+}
+
+/// 一次技能装载结果（spawn / ai_chat 指纹共用）。
+struct LoadedSkills {
+    /// 最终传给 pi 的启用技能（项目在前、全局在后）。
+    final_list: Vec<SkillSummary>,
+    /// 稳定指纹（技能集合 + 正文）。
+    fingerprint: String,
+    /// 全局技能根（AISHELL_GLOBAL_SKILLS_DIR）。
+    global_root: PathBuf,
 }
 
 /// 托管模式 LLM 代理端点：{serverUrl}/api/proxy/llm/v1（开放 API 文档 §2）。
@@ -160,10 +231,37 @@ impl AiManager {
             pi_debug,
             procs: Arc::new(Mutex::new(HashMap::new())),
             actions,
+            covered_skills: Mutex::new(Vec::new()),
         }
     }
 
-/// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
+    /// 读取并校验本项目技能集合：任何 SKILL.md 解析失败都返回含路径的中文错误，
+    /// 阻止 spawn（不能退化为无技能启动）。
+    fn load_skills(&self, project_id: &str) -> Result<LoadedSkills, String> {
+        let all = crate::skills::list_skills(&self.store, project_id)?;
+        let (global, project): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|s| s.origin == SkillOrigin::Global);
+        let (final_list, covered) = select_enabled_skills(global, project);
+        let mut contents = Vec::with_capacity(final_list.len());
+        for s in &final_list {
+            let c = std::fs::read_to_string(&s.path)
+                .map_err(|e| format!("SKILL.md 读取失败（{}）: {e}", s.path))?;
+            contents.push(c);
+        }
+        let fingerprint = skill_fingerprint(&final_list, &contents);
+        let global_root = crate::skills::global_skills_root(&self.store)?;
+        *self
+            .covered_skills
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = covered
+            .iter()
+            .map(|s| format!("{}（{}）", s.name, s.path))
+            .collect();
+        Ok(LoadedSkills { final_list, fingerprint, global_root })
+    }
+
+    /// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
     fn write_models_json(&self) -> Result<(), String> {
         let cfg = self.store.llm_config();
         let model_id = &cfg.model_id;
@@ -253,14 +351,17 @@ impl AiManager {
             .trim_matches('"')
             .to_string();
         let mode = self.store.ai_mode(project_id).unwrap_or_default();
+        // 技能装载（失败阻止 spawn，含损坏路径的中文错误；正文不拼入系统提示，由 pi 按需 read）
+        let loaded = self.load_skills(project_id)?;
         // 本地终端环境说明注入提示词：让模型用对 shell 语法（Windows 是 Git Bash，不是 cmd/PowerShell）
         let system_prompt = format!(
-            "{}\n{}",
+            "{}\n{}{}",
             local_env_note(),
             match mode {
                 AiMode::Suggest => SYSTEM_PROMPT_SUGGEST,
                 AiMode::Agent | AiMode::Yolo => SYSTEM_PROMPT_AGENT,
-            }
+            },
+            scope_prompt(&loaded.final_list)
         );
         let cwd = self
             .store
@@ -329,8 +430,29 @@ impl AiManager {
             "--append-system-prompt",
             &system_prompt,
         ])
-        .env("PI_CODING_AGENT_DIR", &self.agent_dir)
-        .env("AISHELL_AI_MODE", mode.as_str());
+        // 阻断 ~/.pi/agent/skills、~/.agents/skills 等非 AIShell 技能泄漏；只挂载本项目启用技能
+        .args(["--no-skills"]);
+        for s in &loaded.final_list {
+            cmd.args(["--skill"]).arg(&s.path);
+        }
+        // AI 读写技能所需目录（JSON 数组编码，guard 严格解析，失败 fail-closed 只保留项目根）：
+        // 只读允许根 = 最终启用技能目录清单；write/edit/delete 额外允许全局技能根
+        let skill_dirs: Vec<String> = loaded
+            .final_list
+            .iter()
+            .map(|s| {
+                Path::new(&s.path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| s.path.clone())
+            })
+            .collect();
+        let global_skills = vec![loaded.global_root.to_string_lossy().into_owned()];
+        let enc = |v: &[String]| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
+        cmd.env("PI_CODING_AGENT_DIR", &self.agent_dir)
+            .env("AISHELL_AI_MODE", mode.as_str())
+            .env("AISHELL_SKILL_DIRS", enc(&skill_dirs))
+            .env("AISHELL_GLOBAL_SKILLS_DIR", enc(&global_skills));
         if hosted {
             // 托管模式（CR-3.1 / CR-4.1）：models.json 引用 $AISHELL_CLOUD_TOKEN；
             // 搜索扩展读 $AISHELL_SEARCH_URL + $AISHELL_SEARCH_TOKEN 走公司服务器代理
@@ -641,7 +763,14 @@ impl AiManager {
             .unwrap_or_else(|p| p.into_inner())
             .insert(
                 key.to_string(),
-                AiProc { child, stdin, busy, killed, approvals },
+                AiProc {
+                    child,
+                    stdin,
+                    busy,
+                    killed,
+                    approvals,
+                    skill_fingerprint: loaded.fingerprint,
+                },
             );
         Ok(())
     }
@@ -1025,6 +1154,43 @@ pub async fn ai_chat(
         };
         mgr.spawn(&app, &key, &project_id, cloud_token)?;
     }
+    // 进程就绪与技能快照指纹判断：guard 收进块内，await（token 续期/spawn）前全部释放
+    // （MutexGuard 非 Send，不能跨 await 持有）。指纹：UI/AI 修改、启停、增删技能后
+    // 下一条消息即生效；工作区域切换不影响指纹。
+    let needs_restart = {
+        let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        // 旧进程已死但读取线程尚未摘除时，先清理再重起
+        if let Some(p) = procs.get_mut(&key) {
+            if let Ok(Some(_)) = p.child.try_wait() {
+                procs.remove(&key);
+            }
+        }
+        // 锁外计算指纹（文件 I/O），锁内仅比较
+        let fingerprint = mgr.load_skills(&project_id)?.fingerprint;
+        match procs.get(&key) {
+            None => true,
+            Some(p) => p.skill_fingerprint != fingerprint,
+        }
+    };
+    if needs_restart {
+        // 沿用 kill_keys 的取消审批 + kill/wait + 摘除流程；随后按同一 session 文件 spawn
+        {
+            let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+            if let Some(mut old) = procs.remove(&key) {
+                cancel_approvals(&mut old);
+                old.killed.store(true, Ordering::SeqCst);
+                let _ = old.child.kill();
+                let _ = old.child.wait();
+            }
+        }
+        // 托管模式：spawn 前同样确保 access_token 有效（与首次 spawn 同语义）
+        let cloud_token = if mgr.store.cloud_mode() == crate::store::CloudMode::Hosted {
+            Some(cloud.valid_access_token(&mgr.store).await?)
+        } else {
+            None
+        };
+        mgr.spawn(&app, &key, &project_id, cloud_token)?;
+    }
     let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     let Some(proc) = procs.get_mut(&key) else {
         return Err("pi 进程未就绪".to_string());
@@ -1061,9 +1227,18 @@ pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(),
 }
 
 /// pi 运行时诊断信息：前端控制台输出，用于排查安装版资源布局问题。
+/// 附带最近一次技能装载中被项目同名技能覆盖的全局技能（避免 pi「同名保留第一个」依赖未声明顺序）。
 #[tauri::command]
 pub async fn ai_debug_info(mgr: State<'_, Arc<AiManager>>) -> Result<String, String> {
-    Ok(mgr.pi_debug.clone())
+    let covered = mgr
+        .covered_skills
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut out = mgr.pi_debug.clone();
+    if !covered.is_empty() {
+        out.push_str(&format!("\n被项目同名技能覆盖的全局技能: {}\n", covered.join(", ")));
+    }
+    Ok(out)
 }
 
 /// 工作台卸载/切换项目时调用：杀掉该项目全部 pi 进程。
@@ -1261,5 +1436,98 @@ mod tests {
         let store = Arc::new(test_store(temp_dir("smoke")));
         store.cloud_set_mode(crate::store::CloudMode::Hosted).unwrap();
         let _ = manager(store, "smoke");
+    }
+
+    // ---------------------------------------------------------------- 技能纯函数测试
+
+    fn summary(name: &str, enabled: bool, scope: &[&str], origin: SkillOrigin) -> SkillSummary {
+        SkillSummary {
+            id: format!("{}:{name}", origin.as_str()),
+            name: name.to_string(),
+            description: format!("描述 {name}"),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            enabled,
+            origin,
+            path: format!("C:/skills/{name}/SKILL.md"),
+        }
+    }
+
+    #[test]
+    fn skill_selection_filters_enabled_and_orders() {
+        let global = vec![
+            summary("z-global", true, &["all"], SkillOrigin::Global),
+            summary("a-disabled", false, &["all"], SkillOrigin::Global),
+            summary("a-global", true, &["local"], SkillOrigin::Global),
+        ];
+        let project = vec![
+            summary("b-proj", true, &["all"], SkillOrigin::Project),
+            summary("a-disabled-proj", false, &["all"], SkillOrigin::Project),
+        ];
+        let (final_list, covered) = select_enabled_skills(global, project);
+        let names: Vec<&str> = final_list.iter().map(|s| s.name.as_str()).collect();
+        // 项目在前、全局在后，各组按 name 排序；禁用项不进候选
+        assert_eq!(names, vec!["b-proj", "a-global", "z-global"], "顺序/过滤不符: {names:?}");
+        assert!(covered.is_empty(), "不应有覆盖");
+    }
+
+    #[test]
+    fn project_overrides_global_and_disabled_project_restores_global() {
+        let global = vec![summary("dup", true, &["all"], SkillOrigin::Global)];
+        let project = vec![summary("dup", true, &["local"], SkillOrigin::Project)];
+        let (final_list, covered) = select_enabled_skills(global.clone(), project.clone());
+        // 同名：项目覆盖全局，只传最终项
+        assert_eq!(final_list.len(), 1);
+        assert_eq!(final_list[0].origin, SkillOrigin::Project);
+        assert_eq!(final_list[0].scope, vec!["local"]);
+        assert_eq!(covered.len(), 1);
+        assert_eq!(covered[0].name, "dup");
+        // 项目同名项被禁用 → 全局启用项恢复加载
+        let project_disabled = vec![summary("dup", false, &["local"], SkillOrigin::Project)];
+        let (final_list, covered) = select_enabled_skills(global, project_disabled);
+        assert_eq!(final_list.len(), 1);
+        assert_eq!(final_list[0].origin, SkillOrigin::Global);
+        assert!(covered.is_empty(), "禁用项目项不应覆盖全局");
+    }
+
+    #[test]
+    fn scope_prompt_lists_names_only() {
+        assert_eq!(scope_prompt(&[]), "", "空集合不应产生提示区");
+        let skills = vec![
+            summary("skill-a", true, &["local", "all"], SkillOrigin::Global),
+            summary("skill-b", true, &["remote:生产-Web-01"], SkillOrigin::Project),
+        ];
+        let prompt = scope_prompt(&skills);
+        assert!(prompt.contains("skill-a => local, all"), "缺少 skill-a: {prompt}");
+        assert!(prompt.contains("skill-b => remote:生产-Web-01"), "缺少 skill-b: {prompt}");
+        assert!(prompt.contains("不是权限或加载过滤"), "缺少语义说明");
+        assert!(prompt.contains("Server.name"), "缺少 remote 语义");
+        // 不得包含技能正文或任意密钥值
+        assert!(!prompt.contains("SKILL.md"));
+        assert!(!prompt.contains("apiKey") && !prompt.contains("描述"), "提示区泄漏了摘要外内容: {prompt}");
+    }
+
+    #[test]
+    fn fingerprint_changes_on_scope_or_content_but_not_workdir() {
+        let skills = vec![summary("a", true, &["all"], SkillOrigin::Global)];
+        let fp1 = skill_fingerprint(&skills, &["正文1".to_string()]);
+        // 稳定：同输入同指纹
+        assert_eq!(fp1, skill_fingerprint(&skills, &["正文1".to_string()]));
+        // scope 改动改变指纹
+        let skills_scope = vec![summary("a", true, &["local"], SkillOrigin::Global)];
+        assert_ne!(fp1, skill_fingerprint(&skills_scope, &["正文1".to_string()]));
+        // 正文改动改变指纹
+        assert_ne!(fp1, skill_fingerprint(&skills, &["正文2".to_string()]));
+        // enabled 改动改变指纹
+        let skills_off = vec![summary("a", false, &["all"], SkillOrigin::Global)];
+        assert_ne!(fp1, skill_fingerprint(&skills_off, &["正文1".to_string()]));
+        // 指纹不含工作区域：无任何路径/工作区输入（构造已证明）；追加技能改变指纹
+        let skills2 = vec![
+            summary("a", true, &["all"], SkillOrigin::Global),
+            summary("b", true, &["all"], SkillOrigin::Project),
+        ];
+        assert_ne!(fp1, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
+        // 同 list 序稳定（skill_fingerprint 固定字段顺序，不依赖 hash 随机性）
+        let fp_repeated = skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]);
+        assert_eq!(fp_repeated, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
     }
 }

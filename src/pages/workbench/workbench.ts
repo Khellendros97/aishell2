@@ -1,7 +1,7 @@
 /**
  * 工作台页面：三栏布局（activity-bar / sidebar / center / ai-panel）。
  * 结构照 .proto/workbench.html，面板切换行为照 .proto/workbench-sidebar.js：
- * - activity-bar 三个面板按钮（explorer / servers / commands）+ 底部 AI 面板开关；
+ * - activity-bar 四个面板按钮（explorer / servers / commands / skills）+ 底部 AI 面板开关；
  * - commands 准入：仅当活跃标签为终端，否则 toast「请先激活一个终端标签页」；
  * - 正在显示 commands 时活跃标签变为非终端 → 自动切回 explorer。
  *
@@ -20,6 +20,7 @@ import { wbLifecycle } from './lifecycle';
 import { mountExplorerPanel, explorerHead } from './sidebar/explorer';
 import { mountServersPanel, serversHead } from './sidebar/servers';
 import { mountCommandsPanel, commandsHead } from './sidebar/commands';
+import { mountSkillsPanel, skillsHead } from './sidebar/skills';
 import { mountAiPanel } from './ai';
 import './terminal'; // import 即注册渲染器（模块级副作用）
 import './editor';
@@ -30,6 +31,7 @@ const PANELS: Record<string, string> = {
   explorer: '文件资源管理器',
   servers: '服务器列表',
   commands: '命令收藏',
+  skills: 'Skill',
 };
 
 export async function renderWorkbench(root: HTMLElement, params: URLSearchParams): Promise<(() => void) | void> {
@@ -38,11 +40,12 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
 
   root.insertAdjacentHTML('beforeend', `
     <div id="workbench">
-      <!-- 契约：activity-bar 的图标由本模块绑定事件；data-panel 取值为 explorer | servers | commands -->
+      <!-- 契约：activity-bar 的图标由本模块绑定事件；data-panel 取值为 explorer | servers | commands | skills | ai -->
       <div id="activity-bar">
         <div class="activity-icon active" data-panel="explorer" title="文件资源管理器">${icon('folder')}</div>
         <div class="activity-icon" data-panel="servers" title="服务器列表">${icon('monitor')}</div>
         <div class="activity-icon" data-panel="commands" title="命令收藏">${icon('star')}</div>
+        <div class="activity-icon" data-panel="skills" title="Skill">${icon('sparkles')}</div>
         <!-- 云账号入口（CR-1.1b）：置于 AI 开关上方；未接入云服务时隐藏 -->
         <div class="activity-icon avatar-entry" data-nav-account title="账号" hidden>${icon('user')}</div>
         <div class="activity-icon ai-toggle" data-panel="ai" title="AI 助手">${icon('bot')}</div>
@@ -145,6 +148,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     explorer: explorerHead,
     servers: serversHead,
     commands: commandsHead,
+    skills: skillsHead,
   };
   const sidebarActions = root.querySelector('#sidebar-actions') as HTMLElement;
   /* 面板契约：mount(panelRoot) 返回 cleanup（反注册监听 / 停定时器 / 作废闭包）。
@@ -154,6 +158,7 @@ export async function renderWorkbench(root: HTMLElement, params: URLSearchParams
     explorer: mountExplorerPanel,
     servers: mountServersPanel,
     commands: mountCommandsPanel,
+    skills: mountSkillsPanel,
   };
   let currentPanel = 'explorer';
   let aiMounted = false;

@@ -39,6 +39,8 @@ reqwest = { version = "0.12", features = ["json"] }
 regex = "1"
 # 云服务 OAuth2 授权 state（CSRF 防注入）用密码学随机
 getrandom = "0.3"
+# Skill 系统 frontmatter 解析（serde_yaml 已归档，采用维护中的 serde_yaml_ng）
+serde_yaml_ng = "0.9.36"
 
 # WebView2 设置（禁用浏览器快捷键，避免劫持终端 Ctrl+Shift+C/V）；版本与 wry 对齐
 [target.'cfg(windows)'.dependencies]

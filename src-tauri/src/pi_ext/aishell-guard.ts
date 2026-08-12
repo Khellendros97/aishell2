@@ -1,12 +1,19 @@
 /**
  * AIShell pi 门控扩展 —— 由 src-tauri/src/ai.rs 在每次 spawn 时重写进 agent_dir 并以 -e 加载。
  * 单一权限事实源（禁止另起第二套前端授权规则），三档模式：
- * - suggest：保持现状 —— 读限项目根，write/edit 仅 <项目>/.aishell/，不提供删除/命令/SFTP 工具；
+ * - suggest：保持现状 —— 读限项目根（+ AISHELL_SKILL_DIRS 技能目录），write/edit 仅
+ *   <项目>/.aishell/ 与全局技能根（AISHELL_GLOBAL_SKILLS_DIR），不提供删除/命令/SFTP 工具；
  *   另提供 request_agent_mode 工具（经 `AISHELL_MODE_REQUEST:` confirm 由前端确认后切到工作模式）；
- * - agent  /yolo：读写均限项目根，启用 delete_path/run_command/sftp_upload/sftp_download；
+ * - agent  /yolo：读写均限项目根（+ 技能目录），启用 delete_path/run_command/sftp_upload/sftp_download；
  *   模式变化经 RPC prompt `/aishell-mode <suggest|agent|yolo>` 热切换（非法值保持原模式并抛错）。
  *   注意：RPC 模式下 setActiveTools 不影响模型请求的 tools（spawn 时 --tools 固定），
  *   agent ↔ yolo 热推即可；suggest 边界切换由 Rust set_ai_mode 重启进程完成（会话经 --session 恢复）。
+ * 技能权限：两个环境变量均为 JSON 数组（AISHELL_SKILL_DIRS = 本次最终启用技能目录清单；
+ * AISHELL_GLOBAL_SKILLS_DIR = 全局技能根），解析失败 fail-closed 只保留项目根权限。
+ * read/grep/find/ls 允许项目根 + AISHELL_SKILL_DIRS；write/edit 只额外允许全局技能根
+ * （项目技能本就在 <项目>/.aishell/skills 范围内），suggest 下全局技能根内写沿用「.aishell 内
+ * 可写且无需受控审批」语义；delete_path 仅 agent/yolo 激活并允许全局技能根。绝不因项目技能
+ * 覆盖而扩大到其它路径。
  * 审批：agent 对受控工具（write/edit/delete_path/run_command/sftp_upload/sftp_download）
  * 每次调用单独 ctx.ui.confirm（title 固定 `AISHELL_APPROVAL:<toolCallId>`，message 为
  * `{action,intent,summary}`）；yolo 跳过；suggest 即使异常收到变更工具调用也直接阻止。
@@ -58,6 +65,36 @@ export default function (pi: ExtensionAPI) {
 
 	const inside = (dirLower: string, targetLower: string): boolean =>
 		targetLower === dirLower || targetLower.startsWith(dirLower + path.sep);
+
+	/** 剥掉 Windows verbatim 前缀（`\\?\C:\` → `C:\`、`\\?\UNC\srv\` → `\\srv\`），
+	 *  与 path.resolve 的常规输出对齐，避免 Rust canonicalize 的 `\\?\` 形式导致前缀失配误拒。 */
+	function stripVerbatim(p: string): string {
+		const lower = p.toLowerCase();
+		if (lower.startsWith("\\\\?\\unc\\")) return p.slice(8);
+		if (lower.startsWith("\\\\?\\")) return p.slice(4);
+		return p;
+	}
+
+	/** JSON 数组编码的环境变量目录清单（spawn 时由 ai.rs 注入）；解析失败 fail-closed → 空（只保留项目根权限） */
+	function envDirs(name: string): string[] {
+		try {
+			const raw = process.env[name];
+			if (!raw) return [];
+			const parsed = JSON.parse(raw);
+			if (!Array.isArray(parsed)) return [];
+			return parsed
+				.filter((x): x is string => typeof x === "string" && x.length > 0)
+				.map((x) => stripVerbatim(path.resolve(x)).toLowerCase());
+		} catch {
+			return [];
+		}
+	}
+	/** 全局技能根（write/edit/delete 额外允许；suggest 沿用 .aishell 内可写且无需受控审批的语义） */
+	const globalSkillsDir = envDirs("AISHELL_GLOBAL_SKILLS_DIR");
+	/** 本次最终加载的启用技能目录清单（read/grep/find/ls 额外允许根，含全局技能目录） */
+	const skillDirs = envDirs("AISHELL_SKILL_DIRS");
+	const insideAny = (dirs: string[], targetLower: string): boolean =>
+		dirs.some((d) => inside(d, targetLower));
 
 	let mode: AiMode = VALID_MODES.includes((process.env.AISHELL_AI_MODE || "") as AiMode)
 		? (process.env.AISHELL_AI_MODE as AiMode)
@@ -150,7 +187,9 @@ export default function (pi: ExtensionAPI) {
 			case "ls": {
 				const raw = rawPath();
 				const p = path.resolve(cwd, raw);
-				if (!inside(root, p.toLowerCase())) {
+				const lower = p.toLowerCase();
+				// 项目根 + 最终启用技能目录（含全局技能目录；技能正文按绝对 SKILL.md 路径 read）
+				if (!inside(root, lower) && !insideAny(skillDirs, lower)) {
 					return { block: true, reason: `AIShell 权限边界:只能读项目目录内的文件(拒绝:${raw})。` };
 				}
 				return undefined;
@@ -159,14 +198,17 @@ export default function (pi: ExtensionAPI) {
 			case "edit": {
 				const raw = rawPath();
 				const p = path.resolve(cwd, raw);
+				const lower = p.toLowerCase();
 				const limit = mode === "suggest" ? writableRoot : root;
-				if (!inside(limit, p.toLowerCase())) {
+				// 全局技能根内 write/edit 在 suggest 沿用「.aishell 内可写且无需受控审批」语义；
+				// agent/yolo 照常由 CONTROLLED_TOOLS 触发审批
+				if (!inside(limit, lower) && !insideAny(globalSkillsDir, lower)) {
 					return {
 						block: true,
 						reason:
 							mode === "suggest"
-								? `AIShell 权限边界:只能写项目 .aishell/ 目录下的文件(拒绝:${raw})。修改项目文件请改为在回复中输出命令卡,让用户在终端执行。`
-								: `AIShell 权限边界:只能写项目目录内的文件(拒绝:${raw})。`,
+								? `AIShell 权限边界:只能写项目 .aishell/ 或全局技能目录下的文件(拒绝:${raw})。修改项目文件请改为在回复中输出命令卡,让用户在终端执行。`
+								: `AIShell 权限边界:只能写项目目录或全局技能目录内的文件(拒绝:${raw})。`,
 					};
 				}
 				return undefined;
@@ -174,8 +216,10 @@ export default function (pi: ExtensionAPI) {
 			case "delete_path": {
 				const raw = rawPath();
 				const p = path.resolve(cwd, raw);
-				if (!inside(root, p.toLowerCase())) {
-					return { block: true, reason: `AIShell 权限边界:只能删除项目目录内的文件或目录(拒绝:${raw})。` };
+				const lower = p.toLowerCase();
+				// 项目根 + 全局技能根（仅 agent/yolo 激活 delete_path；suggest 无删除工具）
+				if (!inside(root, lower) && !insideAny(globalSkillsDir, lower)) {
+					return { block: true, reason: `AIShell 权限边界:只能删除项目目录或全局技能目录内的文件或目录(拒绝:${raw})。` };
 				}
 				return undefined;
 			}
@@ -309,7 +353,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "delete_path",
 		label: "Delete Path",
-		description: "删除项目目录内的文件或目录（递归）。仅限当前项目目录内，越界会被拒绝。",
+		description: "删除项目目录或全局技能目录内的文件或目录（递归）。仅限当前项目目录与全局技能根内，越界会被拒绝。",
 		promptSnippet: "删除项目内文件",
 		promptGuidelines: [
 			"使用 delete_path 删除项目内文件或目录时，必须先在回复中说明删除目标与原因。",
@@ -320,8 +364,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params) {
 			const raw = String(params.path || "").trim();
 			const p = path.resolve(cwd, raw);
-			if (!inside(root, p.toLowerCase())) {
-				throw new Error(`AIShell 权限边界:只能删除项目目录内的文件或目录(拒绝:${raw})。`);
+			const lower = p.toLowerCase();
+			if (!inside(root, lower) && !insideAny(globalSkillsDir, lower)) {
+				throw new Error(`AIShell 权限边界:只能删除项目目录或全局技能目录内的文件或目录(拒绝:${raw})。`);
 			}
 			try {
 				await fs.rm(p, { recursive: true, force: false });

@@ -7,6 +7,7 @@ pub mod smart_approval;
 pub mod gitinstall;
 pub mod fsops;
 pub mod sftp;
+pub mod skills;
 pub mod ssh;
 pub mod store;
 pub mod term;
@@ -193,6 +194,11 @@ pub fn run() {
             sftp::sftp_unique_name,
             sftp::sftp_create,
             ssh::ssh_exec,
+            skills::skills_list,
+            skills::skill_read,
+            skills::skill_save,
+            skills::skill_delete,
+            skills::skill_set_enabled,
             ai::ai_chat,
             ai::ai_abort,
             ai::ai_debug_info,

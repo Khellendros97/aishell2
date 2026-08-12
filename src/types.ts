@@ -197,6 +197,8 @@ export interface AppState {
   sftpFavorites: Record<string, SftpFavorite[]>;
   /** 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表；旧配置无此字段为空对象 */
   dbConnections: Record<string, DbConnection[]>;
+  /** 已完成内置技能播种的 workspace（规范化路径）；旧配置无此字段为空数组 */
+  seededSkillWorkspaces: string[];
 }
 
 export interface FsEntry {
@@ -271,4 +273,29 @@ export interface XshellImportResult {
   needsAttention: number;
   /** 本次导入新建的项目数（按会话目录自动建项目；同名项目复用不计） */
   projectsCreated: number;
+}
+
+/* ---------------- Skill（与 store.rs skills 模块 serde camelCase 对齐） ---------------- */
+
+/** Skill 来源：global = <workspace_dir>/.aishell/skills；project = <项目目录>/.aishell/skills
+ *  —— 与 store.rs SkillOrigin serde lowercase 对齐 */
+export type SkillOrigin = 'global' | 'project';
+
+/** Skill 摘要 —— 与 store.rs SkillSummary serde camelCase 对齐。
+ *  id 固定为 global:<name> 或 project:<projectId>:<name>；path 为 SKILL.md 规范化绝对路径。
+ *  scope 缺失/空数组时后端已规范化为 ["all"]；enabled 缺失按 true。 */
+export interface SkillSummary {
+  id: string;
+  name: string;
+  description: string;
+  scope: string[];
+  enabled: boolean;
+  origin: SkillOrigin;
+  path: string;
+}
+
+/** 完整 Skill 文档：content 为完整 SKILL.md 原文（编辑时原样回传，后端只重写顶层 scope） */
+export interface SkillDocument {
+  summary: SkillSummary;
+  content: string;
 }

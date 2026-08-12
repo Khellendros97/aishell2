@@ -294,6 +294,18 @@ struct Pi {
 
 impl Pi {
     fn spawn(project_dir: &Path, agent_dir: &Path, mock_url: &str, mode: &str) -> Option<Pi> {
+        Self::spawn_full(project_dir, agent_dir, mock_url, mode, &[], &[])
+    }
+
+    /// 技能探针用：额外追加 pi 参数（--no-skills / --skill）与环境变量（AISHELL_*_DIRS）。
+    fn spawn_full(
+        project_dir: &Path,
+        agent_dir: &Path,
+        mock_url: &str,
+        mode: &str,
+        extra_args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Option<Pi> {
         if !Path::new(PI_EXE).is_file() {
             eprintln!("跳过：pi.exe 不存在（{}），先运行 scripts/fetch-pi.sh", PI_EXE);
             return None;
@@ -344,8 +356,12 @@ impl Pi {
         .args(["--no-approve", "--no-session", "--no-context-files"])
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .env("DEEPSEEK_API_KEY", "test-key")
-        .env("AISHELL_AI_MODE", mode)
-        .current_dir(project_dir)
+        .env("AISHELL_AI_MODE", mode);
+        cmd.args(extra_args);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.current_dir(project_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -651,4 +667,233 @@ async fn mode_hot_switch_via_command() {
     pi.wait_settled();
     assert!(env.project_dir.join("second.txt").is_file());
     assert_eq!(pi.confirm_count(), 2, "非法模式不应改变当前模式");
+}
+
+// ---------------------------------------------------------------- 技能权限探针
+
+fn skill_doc(name: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: 探针技能\ndisabled: 未知字段\nenabled: true\n---\n\n# {name}\n正文 {name}。\n"
+    )
+}
+
+/// 建技能目录并启动 pi（带 --no-skills/--skill 与 AISHELL_*_DIRS 环境变量）。
+/// invalid_env=true 时注入非法 JSON（fail-closed 验证）。返回全局技能根供断言。
+#[allow(clippy::type_complexity)]
+async fn setup_skills(
+    mode: &str,
+    script: &[&str],
+    invalid_env: bool,
+) -> (Env, Option<Pi>, PathBuf) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("绑定 mock 端口失败");
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(MockState::default());
+    *state.script.lock().unwrap() = script.iter().map(|s| s.to_string()).collect();
+    let st = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let st = Arc::clone(&st);
+                    tokio::spawn(async move {
+                        let _ = handle_conn(stream, st).await;
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[mock] accept error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
+    static SEQ2: AtomicUsize = AtomicUsize::new(0);
+    let base = std::env::temp_dir().join(format!(
+        "aishell-pi-skills-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        SEQ2.fetch_add(1, Ordering::SeqCst),
+    ));
+    let project_dir = base.join("proj");
+    let agent_dir = base.join("agent");
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(project_dir.join(".aishell")).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    // 全局技能：skill-management（加载中）+ to-delete（yolo 删除目标）+ 伪前缀目录
+    let global_root = workspace.join(".aishell").join("skills");
+    for name in ["skill-management", "to-delete"] {
+        let dir = global_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), skill_doc(name)).unwrap();
+    }
+    std::fs::create_dir_all(global_root.join("skill-managementX")).unwrap();
+    std::fs::write(global_root.join("skill-managementX").join("SKILL.md"), skill_doc("x")).unwrap();
+    // 项目技能
+    let proj_skills = project_dir.join(".aishell").join("skills");
+    std::fs::create_dir_all(proj_skills.join("proj-skill")).unwrap();
+    std::fs::write(proj_skills.join("proj-skill").join("SKILL.md"), skill_doc("proj-skill")).unwrap();
+    // workspace 相邻文件（越界目标）
+    std::fs::write(workspace.join("neighbor.txt"), "n").unwrap();
+
+    // 只把「加载中的技能目录」放入 AISHELL_SKILL_DIRS（伪前缀目录不在其中 → 前缀越界拒绝）
+    let skill_dirs: Vec<String> = [
+        proj_skills.join("proj-skill"),
+        global_root.join("skill-management"),
+    ]
+    .iter()
+    .map(|p| p.to_string_lossy().into_owned())
+    .collect();
+    let skill_files: Vec<String> = skill_dirs
+        .iter()
+        .map(|d| Path::new(d).join("SKILL.md").to_string_lossy().into_owned())
+        .collect();
+    let mut extra_args: Vec<&str> = vec!["--no-skills"];
+    for f in &skill_files {
+        extra_args.extend(["--skill", f.as_str()]);
+    }
+    let global_root_str = global_root.to_string_lossy().into_owned();
+    let mut extra_env: Vec<(&str, &str)> = Vec::new();
+    if invalid_env {
+        extra_env.push(("AISHELL_SKILL_DIRS", "{非法 JSON"));
+        extra_env.push(("AISHELL_GLOBAL_SKILLS_DIR", "也不是数组"));
+    } else {
+        extra_env.push((
+            "AISHELL_SKILL_DIRS",
+            Box::leak(serde_json::to_string(&skill_dirs).unwrap().into_boxed_str()),
+        ));
+        extra_env.push((
+            "AISHELL_GLOBAL_SKILLS_DIR",
+            Box::leak(serde_json::to_string(&[&global_root_str]).unwrap().into_boxed_str()),
+        ));
+    }
+
+    let pi = Pi::spawn_full(
+        &project_dir,
+        &agent_dir,
+        &format!("http://127.0.0.1:{}", addr.port()),
+        mode,
+        &extra_args,
+        &extra_env,
+    );
+    let env = Env { mock_state: state, project_dir, _agent_dir: agent_dir };
+    (env, pi, global_root)
+}
+
+fn read_abs(path: &str) -> String {
+    format!(r#"{{"name":"read","arguments":"{{\"path\":\"{path}\"}}"}}"#)
+}
+fn write_abs(path: &str) -> String {
+    format!(r#"{{"name":"write","arguments":"{{\"path\":\"{path}\",\"content\":\"w\"}}"}}"#)
+}
+fn delete_abs(path: &str) -> String {
+    format!(r#"{{"name":"delete_path","arguments":"{{\"path\":\"{path}\"}}"}}"#)
+}
+
+/// suggest + 技能：技能目录可读、全局技能根内写放行且无需审批、workspace 相邻文件/伪前缀拒绝。
+#[tokio::test(flavor = "multi_thread")]
+async fn suggest_skills_read_write_allowed_neighbors_rejected() {
+    let (env, pi, global_root) = setup_skills("suggest", &[], false).await;
+    let Some(mut pi) = pi else { return };
+    let skill_file = global_root.join("skill-management").join("SKILL.md");
+    let neighbor = env.project_dir.parent().unwrap().join("workspace").join("neighbor.txt");
+    let prefix_file = global_root.join("skill-managementX").join("SKILL.md");
+    let write_target = global_root.join("skill-management").join("notes.md");
+    let p = |path: &PathBuf| path.to_string_lossy().replace('\\', "/");
+    let script = [
+        read_abs(&p(&skill_file)),
+        read_abs(&p(&prefix_file)),
+        read_abs(&p(&neighbor)),
+        write_abs(&p(&write_target)),
+    ];
+    // 重设脚本（setup_skills 用空脚本启动；mock 每次请求消费一条，一回合一条工具调用）
+    {
+        let mut s = env.mock_state.script.lock().unwrap();
+        *s = script.iter().map(|x| x.to_string()).collect();
+    }
+    pi.prompt("读取全局技能");
+    pi.wait_settled();
+    pi.prompt("读取伪前缀目录");
+    pi.wait_settled();
+    pi.prompt("读取邻居文件");
+    pi.wait_settled();
+    pi.prompt("写全局技能 notes.md");
+    pi.wait_settled();
+
+    assert!(write_target.is_file(), "suggest 写全局技能根应放行");
+    assert_eq!(pi.confirm_count(), 0, "suggest 全局技能根内写无需审批");
+    assert_tool_error(&env, "权限边界"); // 伪前缀 + 邻居至少一次被拒
+    // 伪前缀目录不在 AISHELL_SKILL_DIRS 内 → 读被拒（路径原文出现在拒绝理由里）
+    assert_tool_error(&env, "skill-managementX");
+    assert_tool_error(&env, "neighbor.txt");
+}
+
+/// agent + 技能：全局技能根内写仍走逐调用审批，批准才落盘。
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_global_skill_write_needs_approval() {
+    let (env, pi, global_root) = setup_skills("agent", &[], false).await;
+    let Some(mut pi) = pi else { return };
+    let write_target = global_root.join("skill-management").join("notes.md");
+    let script = [write_abs(&write_target.to_string_lossy().replace('\\', "/"))];
+    {
+        let mut s = env.mock_state.script.lock().unwrap();
+        *s = script.iter().map(|x| x.to_string()).collect();
+    }
+    pi.prompt("写全局技能 notes.md");
+    let req = pi.wait_confirm_request();
+    pi.respond_confirm(req["id"].as_str().unwrap(), true);
+    pi.wait_settled();
+    assert!(write_target.is_file(), "agent 批准后应写入全局技能根");
+    assert_eq!(pi.confirm_count(), 1, "agent 全局技能根写应触发一次审批");
+}
+
+/// yolo + 技能：全局技能根内删除放行（无审批）、`../` 逃逸仍拒绝。
+#[tokio::test(flavor = "multi_thread")]
+async fn yolo_delete_global_skill_allowed_escape_rejected() {
+    let (env, pi, global_root) = setup_skills("yolo", &[], false).await;
+    let Some(mut pi) = pi else { return };
+    let delete_dir = global_root.join("to-delete");
+    let escape = env.project_dir.parent().unwrap().join("workspace").join("neighbor.txt");
+    let script = [
+        delete_abs(&delete_dir.to_string_lossy().replace('\\', "/")),
+        delete_abs(&escape.to_string_lossy().replace('\\', "/")),
+    ];
+    {
+        let mut s = env.mock_state.script.lock().unwrap();
+        *s = script.iter().map(|x| x.to_string()).collect();
+    }
+    pi.prompt("删除全局技能 to-delete");
+    pi.wait_settled();
+    assert!(!delete_dir.exists(), "yolo 删除全局技能目录应放行");
+    assert!(!env.project_dir.join("to-delete").exists());
+    pi.prompt("删除 workspace 邻居文件");
+    pi.wait_settled();
+    assert!(escape.exists(), "workspace 邻居文件越界必须保留");
+    assert_tool_error(&env, "权限边界");
+    assert_eq!(pi.confirm_count(), 0, "yolo 不应产生审批");
+}
+
+/// 非法环境变量（fail-closed）：技能目录读被拒，只保留项目根权限。
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_skill_env_fails_closed() {
+    let (env, pi, global_root) = setup_skills("yolo", &[], true).await;
+    let Some(mut pi) = pi else { return };
+    let skill_file = global_root.join("skill-management").join("SKILL.md");
+    let project_note = env.project_dir.join(".aishell").join("note.md");
+    let script = [
+        read_abs(&skill_file.to_string_lossy().replace('\\', "/")),
+        write_abs(&project_note.to_string_lossy().replace('\\', "/")),
+    ];
+    {
+        let mut s = env.mock_state.script.lock().unwrap();
+        *s = script.iter().map(|x| x.to_string()).collect();
+    }
+    pi.prompt("读全局技能");
+    pi.wait_settled();
+    pi.prompt("写项目 .aishell/note.md");
+    pi.wait_settled();
+    // 技能目录读被拒（env 解析失败 fail-closed）
+    assert_tool_error(&env, "权限边界");
+    // 项目根内权限不受影响（.aishell 写放行）
+    assert!(project_note.is_file(), "env 解析失败不应影响项目根权限");
 }

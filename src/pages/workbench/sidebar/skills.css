@@ -1,0 +1,58 @@
+/* Skill 面板样式 —— 分组卡片视觉复制 commands.css（.wbs-content 共享规则自声明），
+   启用开关复制 servers.css 的 .db-switch。 */
+.wbs-content { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.wbs-skills-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+/* 搜索行（持久元素，不随列表重建，避免输入焦点丢失） */
+.wbs-skills-search { display: flex; align-items: center; gap: 6px; }
+.wbs-skills-search .input { flex: 1; min-width: 0; }
+
+/* 分组标题行（点击展开/收起；与 commands 分组交互一致） */
+.wbs-skills-group-title {
+  display: flex; align-items: center; gap: 6px;
+  margin: 4px 2px 6px; font-size: 11px; font-weight: 600; color: var(--text-2);
+  cursor: pointer; user-select: none; border-radius: 6px; padding: 1px 4px;
+}
+.wbs-skills-group-title:hover { background: var(--bg-hover); }
+.wbs-skills-group-title .wbs-skills-group-ic { display: inline-flex; flex: none; color: var(--text-2); }
+.wbs-skills-group-title .wbs-skills-group-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wbs-skills-group-title .tag { margin-left: auto; font-weight: 400; }
+.wbs-skills-group-list { display: flex; flex-direction: column; gap: 8px; }
+.wbs-skills-group-list.hidden { display: none; }
+
+/* 技能卡片：名称 + 来源徽标、两行截断描述、scope 标签、启停滑块 + 编辑/删除 */
+.wbs-skills-card { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.wbs-skills-head { display: flex; align-items: center; gap: 6px; }
+.wbs-skills-name { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; }
+.wbs-skills-origin { flex: none; }
+.wbs-skills-desc {
+  font-size: 11.5px; color: var(--text-2); line-height: 1.5; word-break: break-all;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.wbs-skills-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.wbs-skills-scope-tag { font-size: 10.5px; }
+.wbs-skills-actions { display: flex; align-items: center; gap: 4px; }
+.wbs-skills-actions .db-switch { margin-right: auto; }
+.wbs-skills-actions .icon-btn { width: 24px; height: 24px; font-size: 13px; }
+.wbs-skills-actions .icon-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 错误态 / 空态 */
+.wbs-skills-error { font-size: 12px; color: var(--danger, #e5534b); white-space: pre-wrap; word-break: break-all; max-width: 100%; }
+.wbs-skills-error + .btn { margin-top: 8px; }
+
+/* 模态：scope 编辑区 */
+.wbs-skills-scope-opts { display: flex; gap: 16px; margin-bottom: 8px; }
+.wbs-skills-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.wbs-skills-remote-search { margin-bottom: 6px; }
+.wbs-skills-remote-list { display: flex; flex-direction: column; gap: 6px; max-height: 150px; overflow-y: auto; margin-bottom: 10px; }
+.wbs-skills-remote-card { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 12px; }
+.wbs-skills-remote-card.selected { border-color: var(--accent, #4a9eff); }
+.wbs-skills-extra-row { display: flex; gap: 6px; margin-bottom: 6px; }
+.wbs-skills-extra-row .input { flex: 1; min-width: 0; }
+.wbs-skills-extra-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.wbs-skills-extra-chip { display: inline-flex; align-items: center; gap: 4px; }
+.wbs-skills-extra-chip .icon-btn { width: 14px; height: 14px; font-size: 10px; color: inherit; }
+.wbs-skills-parse-error {
+  font-size: 12px; color: var(--danger, #e5534b); white-space: pre-wrap; word-break: break-all;
+  margin-top: 6px;
+}
