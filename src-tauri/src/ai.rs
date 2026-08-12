@@ -1391,6 +1391,7 @@ mod tests {
         store
             .cloud_login_info(
                 CloudUser {
+                    id: None,
                     name: "张三".into(),
                     avatar: None,
                     dept: None,

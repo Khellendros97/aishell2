@@ -101,6 +101,8 @@ pub enum CloudMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudUser {
+    #[serde(default)]
+    pub id: Option<i64>,
     pub name: String,
     #[serde(default)]
     pub avatar: Option<String>,
@@ -3894,6 +3896,7 @@ mod tests {
         let store = test_store(temp_config_dir("cloud-login"));
         assert_eq!(store.cloud_mode(), CloudMode::Personal, "默认个人模式");
         let user = CloudUser {
+            id: Some(7),
             name: "张三".into(),
             avatar: Some("https://example.com/a.png".into()),
             dept: Some("研发部".into()),
@@ -3932,7 +3935,7 @@ mod tests {
         store.cloud_set_tokens("acc", "ref").unwrap();
         store
             .cloud_login_info(
-                CloudUser { name: "旧名".into(), avatar: None, dept: None },
+                CloudUser { id: None, name: "旧名".into(), avatar: None, dept: None },
                 CloudCapabilities::default(),
             )
             .unwrap();
@@ -3941,7 +3944,7 @@ mod tests {
         // 启动刷新：更新资料与能力，模式保持 personal
         store
             .cloud_update_profile(
-                CloudUser { name: "张三".into(), avatar: None, dept: None },
+                CloudUser { id: Some(7), name: "张三".into(), avatar: None, dept: None },
                 CloudCapabilities {
                     models: vec!["gpt-4o".into()],
                     search: true,
@@ -3989,7 +3992,7 @@ mod tests {
     #[test]
     fn cloud_config_survives_reload_and_legacy_json_defaults() {
         let dir = temp_config_dir("cloud-reload");
-        let user = CloudUser { name: "李四".into(), avatar: None, dept: None };
+        let user = CloudUser { id: Some(7), name: "李四".into(), avatar: None, dept: None };
         {
             let store = test_store(dir.clone());
             store.cloud_login_info(user.clone(), CloudCapabilities::default()).unwrap();

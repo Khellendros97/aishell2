@@ -34,6 +34,8 @@ export type CloudMode = 'hosted' | 'personal';
 
 /** 登录用户展示资料（token 永不进 JSON、永不返回前端） */
 export interface CloudUser {
+  /** 平台用户数字 id（/api/auth/me 带回；记忆卡片权限判断用） */
+  id: number | null;
   name: string;
   avatar: string | null;
   dept: string | null;
@@ -62,6 +64,91 @@ export interface CloudStatus {
   /** 构建期注入的服务器地址；null = 未接入云服务（一切云功能隐藏） */
   serverUrl: string | null;
   mode: CloudMode;
+}
+
+/* ---------- 用量报表（GET /api/usage，开放 API 文档 §4.1） ---------- */
+
+/** 汇总指标（summary 段） */
+export interface UsageSummary {
+  requests: number;
+  llmRequests: number;
+  searchRequests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  averageLatencyMs: number;
+  errorCount: number;
+}
+
+/** 单日统计（daily 段，按查询天数补齐连续日期） */
+export interface UsageDaily {
+  date: string;
+  requests: number;
+  llmRequests: number;
+  searchRequests: number;
+  promptTokens: number;
+  completionTokens: number;
+  errorCount: number;
+}
+
+/** 单模型统计（models 段，仅 LLM） */
+export interface UsageModel {
+  model: string;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/** cloud_usage 返回值（与 Rust cloud.rs UsageReport serde camelCase 对齐） */
+export interface UsageReport {
+  from: string;
+  to: string;
+  timezone: string;
+  summary: UsageSummary;
+  daily: UsageDaily[];
+  models: UsageModel[];
+}
+
+/* ---------- 记忆卡片（记忆卡片 API 文档 §1.2） ---------- */
+
+/** 共享记忆卡片对象 */
+export interface MemoryCard {
+  id: string;
+  content: string;
+  category: string;
+  tags: string[];
+  creatorId: number | null;
+  creatorName: string;
+  dept: string;
+  /** manual = 主动提交（原文保存）；auto = 对话流量 AI 自动沉淀 */
+  source: 'manual' | 'auto' | string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 卡片变更历史事件（§6）：event = ADD / UPDATE */
+export interface MemoryEvent {
+  event: string;
+  value: string;
+  ts: string;
+  actor: string;
+  note: string;
+}
+
+/** 语义检索命中（§7.2）：卡片 + 相关度（数组按相关度降序） */
+export interface MemoryHit {
+  id: string;
+  content: string;
+  category: string;
+  tags: string[];
+  creatorId: number | null;
+  creatorName: string;
+  dept: string;
+  source: string;
+  createdAt: string;
+  updatedAt: string;
+  score: number;
 }
 
 /** 与 store.rs Theme serde lowercase 对齐 */

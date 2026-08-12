@@ -211,6 +211,13 @@ pub fn run() {
             cloud::cloud_logout,
             cloud::cloud_status,
             cloud::cloud_set_mode,
+            cloud::cloud_usage,
+            cloud::memories_list,
+            cloud::memory_create,
+            cloud::memory_update,
+            cloud::memory_delete,
+            cloud::memory_history,
+            cloud::memory_search,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

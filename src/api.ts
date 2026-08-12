@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, FsEntry, FsStat, MemoryCard, MemoryEvent, MemoryHit, Project, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, SshExecResult, Theme, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -220,6 +220,26 @@ export const cloudSetMode = (mode: CloudMode) => call<void>('cloud_set_mode', { 
 /** 登录/登出/登录失效/模式切换后广播（载荷 = CloudStatus） */
 export const onCloudChanged = (cb: (s: CloudStatus) => void): Promise<UnlistenFn> =>
   listen<CloudStatus>('cloud:changed', (e) => cb(e.payload));
+
+/* ---------------- 用量报表 / 记忆卡片（token 全程留在 Rust 端，前端只收结构化数据） ---------------- */
+/** 个人用量报表（GET /api/usage）；days 1–90 默认 14；kind llm|search；model 仅 LLM 过滤 */
+export const cloudUsage = (days?: number, kind?: string, model?: string) =>
+  call<UsageReport>('cloud_usage', { days: days ?? null, kind: kind ?? '', model: model ?? '' });
+/** 全部共享记忆卡片（GET /api/memories） */
+export const memoriesList = () => call<MemoryCard[]>('memories_list');
+/** 主动提交记忆（POST /api/memories，原文保存） */
+export const memoryCreate = (content: string, category: string, tags: string[]) =>
+  call<MemoryCard>('memory_create', { content, category, tags });
+/** 编辑/纠正卡片（PUT /api/memories/{id}）；note 可选纠正说明 */
+export const memoryUpdate = (id: string, content: string, category: string, tags: string[], note?: string) =>
+  call<void>('memory_update', { id, content, category, tags, note: note ?? '' });
+/** 删除卡片（DELETE /api/memories/{id}，不可恢复） */
+export const memoryDelete = (id: string) => call<void>('memory_delete', { id });
+/** 单卡变更历史（GET /api/memories/{id}/history） */
+export const memoryHistory = (id: string) => call<MemoryEvent[]>('memory_history', { id });
+/** 语义检索共享记忆（POST /api/memories/search）；topK 默认 10 */
+export const memorySearch = (query: string, topK?: number) =>
+  call<MemoryHit[]>('memory_search', { query, topK: topK ?? null });
 /* ---------------- skills ---------------- */
 /** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
 export const skillsList = (projectId: string) => call<SkillSummary[]>('skills_list', { projectId });

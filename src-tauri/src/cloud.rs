@@ -17,6 +17,7 @@
 //! 登出（CR-1.7）：尽力调 `{server}/api/auth/logout` 吊销 refresh_token，失败忽略，
 //! 本地一律清 keyring + cloud 段；个人模式配置（llm/search）不受影响。
 
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -452,6 +453,16 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
             .map(String::from)
     };
     let user = CloudUser {
+        // 用户 id：记忆卡片权限判断（creatorId === 当前用户 id）依赖该字段
+        id: user_obj
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                user_obj
+                    .get("userId")
+                    .or_else(|| user_obj.get("uid"))
+                    .and_then(|v| v.as_i64())
+            }),
         name: str_field(
             user_obj,
             &["name", "username", "nickname", "display_name", "displayName"],
@@ -574,6 +585,152 @@ pub async fn refresh_on_startup(
     }
 }
 
+// ---------------------------------------------------------------- 开放 API（用量 / 记忆卡片）
+
+/// 带 Bearer 的 JSON 请求；成功返回解析后的 JSON（204 等无体响应返回 Null）。
+/// token 由 `valid_access_token` 在请求前续期（CR-1.6）；仍 401 = refresh 失效/账号禁用，
+/// 统一按服务端错误文本透传（协议见 docs/AIShell云服务-开放API文档.md 与 记忆卡片API文档.md）。
+async fn cloud_api_request(
+    cloud: &Arc<CloudManager>,
+    store: &Arc<Store>,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let (server, ..) = credentials()?;
+    let token = cloud.valid_access_token(store).await?;
+    let url = format!("{server}{path}");
+    let client = reqwest::Client::new();
+    let mut req = client.request(method, &url).bearer_auth(&token);
+    if !query.is_empty() {
+        req = req.query(query);
+    }
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("连接云平台失败: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取云平台响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(api_error_text(status.as_u16(), &text));
+    }
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(t).map_err(|e| format!("解析云平台响应失败: {e}"))
+}
+
+/// 非 2xx 响应的中文错误提取：统一格式 {"error": "中文可读信息"}，
+/// 兼容 error_description/msg 兜底；无 JSON 结构时原样截取响应文本。
+fn api_error_text(status: u16, text: &str) -> String {
+    let err = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .or_else(|| v.get("error_description"))
+                .or_else(|| v.get("msg"))
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| {
+            let t = text.trim();
+            if t.is_empty() { "无响应内容".to_string() } else { t.to_string() }
+        });
+    format!("{err}（HTTP {status}）")
+}
+
+/// GET /api/usage 响应（开放 API 文档 §4.1）；字段缺失按默认兜底（防御服务端结构微调）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsageReport {
+    pub from: String,
+    pub to: String,
+    pub timezone: String,
+    pub summary: UsageSummary,
+    pub daily: Vec<UsageDaily>,
+    pub models: Vec<UsageModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsageSummary {
+    pub requests: u64,
+    pub llm_requests: u64,
+    pub search_requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub average_latency_ms: f64,
+    pub error_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsageDaily {
+    pub date: String,
+    pub requests: u64,
+    pub llm_requests: u64,
+    pub search_requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub error_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsageModel {
+    pub model: String,
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// 记忆卡片（记忆卡片 API 文档 §1.2）；creatorId 为创建时快照的数字 id。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryCard {
+    pub id: String,
+    pub content: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub creator_id: Option<i64>,
+    pub creator_name: String,
+    pub dept: String,
+    pub source: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 卡片变更历史事件（§6）：event = ADD / UPDATE。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryEvent {
+    pub event: String,
+    pub value: String,
+    pub ts: String,
+    pub actor: String,
+    pub note: String,
+}
+
+/// 语义检索命中（§7.2）：卡片字段平铺 + 相关度 score。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MemoryHit {
+    #[serde(flatten)]
+    pub card: MemoryCard,
+    pub score: f64,
+}
+
+
 // ---------------------------------------------------------------- Tauri commands
 
 /// 发起登录：生成 state、启动本地回调监听，返回授权 URL（前端 openUrl 打开系统浏览器）。
@@ -674,6 +831,165 @@ pub async fn cloud_set_mode(
     Ok(())
 }
 
+// ---------------------------------------------------------------- 用量报表（GET /api/usage，文档 §4.1）
+
+/// 个人用量报表：仅统计当前令牌用户本人（服务端强制忽略 userId 参数）。
+/// `days` 1–90（默认 14）；`kind` llm|search；`model` 模型名过滤（仅 LLM）。
+#[tauri::command]
+pub async fn cloud_usage(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    days: Option<u32>,
+    kind: Option<String>,
+    model: Option<String>,
+) -> Result<UsageReport, String> {
+    let mut q: Vec<(&str, String)> = Vec::new();
+    if let Some(d) = days {
+        if (1..=90).contains(&d) {
+            q.push(("days", d.to_string()));
+        }
+    }
+    if let Some(k) = kind {
+        if !k.is_empty() {
+            q.push(("kind", k));
+        }
+    }
+    if let Some(m) = model {
+        if !m.is_empty() {
+            q.push(("model", m));
+        }
+    }
+    let v = cloud_api_request(&cloud, &store, reqwest::Method::GET, "/api/usage", &q, None).await?;
+    serde_json::from_value(v).map_err(|e| format!("解析用量报表失败: {e}"))
+}
+
+// ---------------------------------------------------------------- 记忆卡片（文档：记忆卡片 API）
+
+/// 拉取全部共享记忆卡片（GET /api/memories，不分页）。
+#[tauri::command]
+pub async fn memories_list(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<MemoryCard>, String> {
+    let v = cloud_api_request(&cloud, &store, reqwest::Method::GET, "/api/memories", &[], None).await?;
+    let cards = v.get("memories").cloned().unwrap_or_else(|| serde_json::json!([]));
+    serde_json::from_value(cards).map_err(|e| format!("解析记忆卡片列表失败: {e}"))
+}
+
+/// 主动提交一条记忆（POST /api/memories）：内容原文保存，不被 AI 改写，提交后全员可见。
+#[tauri::command]
+pub async fn memory_create(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    content: String,
+    category: String,
+    tags: Option<Vec<String>>,
+) -> Result<MemoryCard, String> {
+    let mut body = serde_json::json!({ "content": content, "category": category });
+    if let Some(t) = tags {
+        body["tags"] = serde_json::json!(t);
+    }
+    let v = cloud_api_request(&cloud, &store, reqwest::Method::POST, "/api/memories", &[], Some(body)).await?;
+    serde_json::from_value(v).map_err(|e| format!("解析记忆卡片失败: {e}"))
+}
+
+/// 编辑/纠正卡片（PUT /api/memories/{id}）：仅创建者本人或管理员；可附纠正说明留痕。
+#[tauri::command]
+pub async fn memory_update(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    id: String,
+    content: String,
+    category: String,
+    tags: Option<Vec<String>>,
+    note: Option<String>,
+) -> Result<(), String> {
+    let mut body = serde_json::json!({ "content": content, "category": category });
+    if let Some(t) = tags {
+        body["tags"] = serde_json::json!(t);
+    }
+    if let Some(n) = note {
+        if !n.trim().is_empty() {
+            body["note"] = serde_json::json!(n);
+        }
+    }
+    let _ = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::PUT,
+        &format!("/api/memories/{id}"),
+        &[],
+        Some(body),
+    )
+    .await?;
+    Ok(())
+}
+
+/// 删除卡片（DELETE /api/memories/{id}）：全员不可见、历史一并清除、不可恢复；
+/// 前端已二次确认。非创建者/管理员由服务端 403 拒绝。
+#[tauri::command]
+pub async fn memory_delete(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<(), String> {
+    let _ = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::DELETE,
+        &format!("/api/memories/{id}"),
+        &[],
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// 单卡变更历史时间线（GET /api/memories/{id}/history）。
+#[tauri::command]
+pub async fn memory_history(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<Vec<MemoryEvent>, String> {
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::GET,
+        &format!("/api/memories/{id}/history"),
+        &[],
+        None,
+    )
+    .await?;
+    let events = v.get("history").cloned().unwrap_or_else(|| serde_json::json!([]));
+    serde_json::from_value(events).map_err(|e| format!("解析记忆历史失败: {e}"))
+}
+
+/// 语义检索共享记忆（POST /api/memories/search）：topK 默认 10、clamp 1–20。
+#[tauri::command]
+pub async fn memory_search(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    query: String,
+    top_k: Option<u32>,
+) -> Result<Vec<MemoryHit>, String> {
+    let mut body = serde_json::json!({ "query": query });
+    if let Some(k) = top_k {
+        body["topK"] = serde_json::json!(k);
+    }
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::POST,
+        "/api/memories/search",
+        &[],
+        Some(body),
+    )
+    .await?;
+    let hits = v.get("results").cloned().unwrap_or_else(|| serde_json::json!([]));
+    serde_json::from_value(hits).map_err(|e| format!("解析记忆检索结果失败: {e}"))
+}
+
 /// 极简 URL 编码（授权 URL 参数；redirect_uri 只含 `:/-_` 无需全量编码，保守处理特殊字符）。
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -720,5 +1036,136 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert_ne!(a, b, "两次生成的 state 不应相同");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ---------------------------------------------------------------- 开放 API 解析
+
+    #[test]
+    fn usage_report_parses_full_document_sample() {
+        let json = r#"{
+          "from": "2026-07-29", "to": "2026-08-11", "timezone": "UTC",
+          "summary": { "requests": 128, "llmRequests": 100, "searchRequests": 28,
+                       "promptTokens": 123456, "completionTokens": 54321, "totalTokens": 177777,
+                       "averageLatencyMs": 214.5, "errorCount": 2 },
+          "daily": [ { "date": "2026-08-11", "requests": 12, "llmRequests": 9, "searchRequests": 3,
+                       "promptTokens": 0, "completionTokens": 0, "errorCount": 0 } ],
+          "models": [ { "model": "gpt-4o", "requests": 80, "promptTokens": 0,
+                        "completionTokens": 0, "totalTokens": 0 } ]
+        }"#;
+        let r: UsageReport = serde_json::from_str(json).unwrap();
+        assert_eq!(r.from, "2026-07-29");
+        assert_eq!(r.summary.requests, 128);
+        assert_eq!(r.summary.llm_requests, 100);
+        assert_eq!(r.summary.total_tokens, 177777);
+        assert!((r.summary.average_latency_ms - 214.5).abs() < 1e-9);
+        assert_eq!(r.summary.error_count, 2);
+        assert_eq!(r.daily.len(), 1);
+        assert_eq!(r.daily[0].date, "2026-08-11");
+        assert_eq!(r.daily[0].search_requests, 3);
+        assert_eq!(r.models.len(), 1);
+        assert_eq!(r.models[0].model, "gpt-4o");
+        assert_eq!(r.models[0].requests, 80);
+    }
+
+    #[test]
+    fn usage_report_tolerates_missing_fields() {
+        // 服务端旧版本/字段缺失：按默认值兜底，不整卡失败
+        let r: UsageReport = serde_json::from_str(r#"{"from":"2026-08-01","to":"2026-08-11"}"#).unwrap();
+        assert_eq!(r.timezone, "");
+        assert_eq!(r.summary.requests, 0);
+        assert!(r.daily.is_empty());
+        assert!(r.models.is_empty());
+    }
+
+    #[test]
+    fn memory_card_parses_document_sample() {
+        let json = r#"{
+          "id": "83d6beb5-2cdb-4c45-8c8a-123e8282813e",
+          "content": "生产发布前必须冻结主干分支",
+          "category": "编码规范",
+          "tags": ["发布", "分支"],
+          "creatorId": 7,
+          "creatorName": "张三",
+          "dept": "研发部",
+          "source": "manual",
+          "createdAt": "2026-08-12 11:46",
+          "updatedAt": "2026-08-12 11:46"
+        }"#;
+        let c: MemoryCard = serde_json::from_str(json).unwrap();
+        assert_eq!(c.id, "83d6beb5-2cdb-4c45-8c8a-123e8282813e");
+        assert_eq!(c.category, "编码规范");
+        assert_eq!(c.tags, vec!["发布", "分支"]);
+        assert_eq!(c.creator_id, Some(7));
+        assert_eq!(c.creator_name, "张三");
+        assert_eq!(c.source, "manual");
+        assert_eq!(c.created_at, "2026-08-12 11:46");
+    }
+
+    #[test]
+    fn memory_card_tolerates_missing_optional_fields() {
+        // 自动沉淀卡片 category 为空、creatorId 缺失 → 默认兜底
+        let c: MemoryCard = serde_json::from_str(r#"{"id":"x","content":"事实"}"#).unwrap();
+        assert_eq!(c.category, "");
+        assert!(c.tags.is_empty());
+        assert_eq!(c.creator_id, None);
+        assert_eq!(c.source, "");
+    }
+
+    #[test]
+    fn memory_hit_flattens_card_and_score() {
+        let json = r#"{
+          "id": "b583edb2", "content": "Redis 密码在配置中心", "category": "",
+          "tags": [], "creatorId": 7, "creatorName": "张三", "dept": "研发部",
+          "source": "auto", "createdAt": "2026-08-12 11:47", "updatedAt": "2026-08-12 11:47",
+          "score": 0.334
+        }"#;
+        let h: MemoryHit = serde_json::from_str(json).unwrap();
+        assert_eq!(h.card.id, "b583edb2");
+        assert_eq!(h.card.content, "Redis 密码在配置中心");
+        assert_eq!(h.card.source, "auto");
+        assert!((h.score - 0.334).abs() < 1e-9);
+    }
+
+    #[test]
+    fn memory_history_parses_events() {
+        let json = r#"{"history": [
+          { "event": "ADD", "value": "v1", "ts": "2026-08-12 11:46", "actor": "张三", "note": "" },
+          { "event": "UPDATE", "value": "v2", "ts": "2026-08-12 12:03", "actor": "李四(管理员代编辑)", "note": "补充说明" }
+        ]}"#;
+        let events: Vec<MemoryEvent> = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(json)
+                .unwrap()
+                .get("history")
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "ADD");
+        assert_eq!(events[1].event, "UPDATE");
+        assert_eq!(events[1].note, "补充说明");
+        assert_eq!(events[1].actor, "李四(管理员代编辑)");
+    }
+
+    #[test]
+    fn api_error_text_extracts_service_chinese_error() {
+        // 统一 {"error": "中文"} 格式
+        assert_eq!(
+            api_error_text(503, r#"{"error":"记忆服务未配置"}"#),
+            "记忆服务未配置（HTTP 503）"
+        );
+        // 兼容 error_description / msg 兜底
+        assert_eq!(
+            api_error_text(429, r#"{"error_description":"个人配额已用完"}"#),
+            "个人配额已用完（HTTP 429）"
+        );
+        assert_eq!(
+            api_error_text(403, r#"{"msg":"只能编辑自己上传的记忆卡片"}"#),
+            "只能编辑自己上传的记忆卡片（HTTP 403）"
+        );
+        // 非 JSON：原样截取
+        assert_eq!(api_error_text(502, "Bad Gateway"), "Bad Gateway（HTTP 502）");
+        // 空体
+        assert_eq!(api_error_text(204, ""), "无响应内容（HTTP 204）");
     }
 }
