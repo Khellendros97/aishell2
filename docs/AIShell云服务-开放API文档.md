@@ -27,6 +27,8 @@ OpenAI 兼容格式，请求体**原样透传**到模型上游（仅注入服务
     { "role": "system", "content": "你是企业助手" },
     { "role": "user", "content": "介绍 AIShell" }
   ],
+  "sessionId": "chat-2026-08-12-0001",
+  "projectName": "aishell-cloud",
   "stream": false,
   "temperature": 0.7
 }
@@ -37,7 +39,14 @@ OpenAI 兼容格式，请求体**原样透传**到模型上游（仅注入服务
 | `model` | 必填，非空；未配置 → `400 请求的模型未配置`；已停用 → `503 请求的模型已停用` |
 | 请求体大小 | ≤ 10 MB |
 | `stream: true` | 上游 SSE 流式透传：`Content-Type: text/event-stream`，`X-Accel-Buffering: no`，边收边发 |
+| `sessionId` / `projectName` | **选填**，字符串：服务端记忆沉淀的会话/项目元数据（见下方「记忆元数据」说明） |
 | 其余字段 | 透传，不校验（遵循所选上游模型实际支持） |
+
+> **记忆元数据（选填）**：请求体顶层可带 `sessionId`（会话标识）、`projectName`（项目名），及可选 `memoryScope`（`shared`/`personal` 提示，服务端仅作参考，最终可见范围以服务端 AI 分类为准）。服务端据此**按会话聚合自动沉淀**（同一会话累计 8 条消息或 2000 字、或闲置 5 分钟触发一次沉淀）并写入卡片元数据追溯。**不携带 `sessionId` 的请求不触发自动沉淀**（旧客户端兼容：不产生无项目/会话标签的碎片卡片）。这些字段随 body 原样透传上游（OpenAI 兼容服务通常忽略未知字段），不影响对话。
+>
+> **无法修改请求体时**：若客户端（如 pi coding agent 封装）无法在 LLM 请求中携带上述字段，可在对话结束后调用 `POST /api/memories/sediment` 显式上报对话历史（见《记忆卡片 API 文档》§10），走完全相同的自动沉淀管线。
+
+> **召回注入**：管理端开启「对话召回注入」时，服务端会在 `messages` 头部插入一条 `system` 消息（检索命中的**共享记忆 + 当前用户个人记忆**，可能与当前问题无关）；无命中或检索失败时不注入。客户端无需感知，但上游回答可能受注入内容影响。
 
 ### 2.2 响应
 
@@ -192,7 +201,8 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 2. **搜索注入**（CR-4.1）：`AISHELL_SEARCH_URL=<serverUrl>/api/proxy/search`，token 同样经 env 注入；
 3. **失败语义**（CR-3.2）：401/403 → 上浮服务端中文错误并触发登录失效处理；429 → 原样展示中文；502/503 → 提示上游暂时不可用，可提示稍后重试；
 4. **请求前续期**：spawn/发起请求前按 CR-1.6 用 refresh_token 确保 access_token 未过期，避免请求中途 401；
-5. 所有代理接口的 `model`/`q` 参数校验均在服务端完成，客户端无需预检。
+5. 所有代理接口的 `model`/`q` 参数校验均在服务端完成，客户端无需预检；
+6. **记忆沉淀元数据**：LLM 请求顶层传 `sessionId`（会话标识）与 `projectName`（项目名），服务端据此按会话聚合自动沉淀记忆（8 条/2000 字/闲置 5 分钟触发），并写入卡片标签与元数据便于追溯；**不带 `sessionId` 的请求不触发自动沉淀**。若客户端无法修改 LLM 请求体（pi coding agent 等封装）或希望对话结束立即沉淀，调用 `POST /api/memories/sediment` 上报对话历史（详见《记忆卡片 API 文档》§10）。
 
 ## 7. 快速验证（curl）
 
