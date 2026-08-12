@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpFavorite, SftpWriteResult, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -203,6 +203,27 @@ export const aiRespondApproval = (key: string, requestId: string, confirmed: boo
   call<void>('ai_respond_approval', { key, requestId, confirmed });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
+
+/* ---------------- skills ---------------- */
+/** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
+export const skillsList = (projectId: string) => call<SkillSummary[]>('skills_list', { projectId });
+/** 读取单个技能完整文档（content 为 SKILL.md 原文） */
+export const skillRead = (projectId: string, origin: SkillOrigin, name: string) =>
+  call<SkillDocument>('skill_read', { projectId, origin, name });
+/** 保存技能：scope 为管理 UI 的显式值（后端只重写 frontmatter 顶层 scope，其余字节不变）；
+ *  originalName 传 null = 新增；编辑改名时后端整体迁移技能目录（保留附属资源） */
+export const skillSave = (
+  projectId: string,
+  origin: SkillOrigin,
+  originalName: string | null,
+  content: string,
+  scope: string[],
+) => call<SkillSummary>('skill_save', { projectId, origin, originalName, content, scope });
+export const skillDelete = (projectId: string, origin: SkillOrigin, name: string) =>
+  call<void>('skill_delete', { projectId, origin, name });
+/** 启停（只改 frontmatter 顶层 enabled 标量） */
+export const skillSetEnabled = (projectId: string, origin: SkillOrigin, name: string, enabled: boolean) =>
+  call<SkillSummary>('skill_set_enabled', { projectId, origin, name, enabled });
 
 /* ---------------- misc ---------------- */
 export { open as openDialog } from '@tauri-apps/plugin-dialog';
