@@ -1,8 +1,10 @@
 pub mod ai;
 pub mod ai_actions;
+pub mod ai_impact;
 pub mod cloud;
 pub mod redact;
 pub mod smart_approval;
+pub mod staging;
 #[cfg(windows)]
 pub mod gitinstall;
 pub mod fsops;
@@ -35,6 +37,12 @@ pub fn run() {
                     .map_err(std::io::Error::other)?,
             );
             let ssh = Arc::new(ssh::SshManager::new(store.clone()));
+            // 会话级远程文件暂存（自动备份）：config_dir/remote-staging
+            let staging = Arc::new(staging::RemoteStaging::new(
+                config_dir.join("remote-staging"),
+                Arc::clone(&ssh),
+                Arc::clone(&store),
+            ));
             let terms = Arc::new(term::TermManager::new(ssh.clone()));
             // pi 运行时目录：Windows 安装版把 bundle.resources 装到 exe 旁 resources/ 子目录，
             // macOS 装到 AIShell.app/Contents/Resources/resources/ 子目录；resource_dir() 在各
@@ -84,6 +92,7 @@ pub fn run() {
                 pi_dir,
                 config_dir.join("pi-agent"),
                 ssh.clone(),
+                staging.clone(),
                 pi_debug,
                 Some(cloud_mgr.clone()),
             ));
@@ -91,6 +100,7 @@ pub fn run() {
             app.manage(ssh);
             app.manage(terms);
             app.manage(ai.clone());
+            app.manage(staging);
             // 云服务 OAuth2 会话（登录 state + 令牌内存缓存；令牌权威存储在 keyring）
             app.manage(cloud_mgr);
             // 启动异步刷新：已登录则重拉 me（用户资料/能力清单），服务端配置变更无需重登
@@ -221,6 +231,12 @@ pub fn run() {
             cloud::memory_history,
             cloud::memory_search,
             cloud::memory_promote,
+            staging::staging_list,
+            staging::staging_snapshot_read,
+            staging::staging_current_read,
+            staging::staging_accept,
+            staging::staging_restore,
+            staging::staging_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -20,6 +20,9 @@
  * 动作执行：delete_path 在扩展内用 Node fs 执行（同一项目根校验）；run_command / sftp_upload /
  * sftp_download 经 `ctx.ui.input('AISHELL_ACTION:<toolCallId>', JSON.stringify(payload))`
  * 走 RPC extension UI 子协议交给 Rust 的 ai_actions（唯一执行入口，另有后端硬边界）。
+ * 会话级文件暂存（staging_list / staging_diff / staging_restore）：只读列表/diff + 还原
+ * （agent 下还原逐调用审批），**不接受/清除暂存条目**（staging_accept 只在前端面板，绝不注册为
+ * AI 工具）；project/session 不接受任意参数——后端从当前 pi 进程 key 推导，扩展仅携带会话身份环境变量。
  * 路径处理：path.resolve 归一（相对路径、`..`、绝对路径）后统一小写做前缀比较
  * （Windows 大小写不敏感）；8.3 短文件名等无法归一的形式会因前缀失配被拒（安全方向）。
  */
@@ -33,9 +36,10 @@ const VALID_MODES = ["suggest", "agent", "yolo"] as const;
 type AiMode = (typeof VALID_MODES)[number];
 
 /** 仅 agent/yolo 提供的变更工具（suggest 一律拒绝） */
-const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query"];
-/** agent 模式逐调用审批的受控工具 */
-const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download"];
+const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore"];
+/** agent 模式逐调用审批的受控工具：staging_restore 为远程写操作需审批；
+ *  staging_list / staging_diff 只读不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
+const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore"];
 
 /** db_query 只读首词（union 表，与 Rust ai_actions::is_db_read_only 语义一致，见 store.rs DbKind::default_read_commands）。
  *  guard 侧无法感知连接类型，故用并集静态分类：命中 → 读（放行）；未命中 → 写（agent 模式人工审批）。
@@ -169,6 +173,20 @@ export default function (pi: ExtensionAPI) {
 					intent: `数据库写操作（连接 ${String(input.connectionId || "")}，服务器 ${String(input.serverId || "")}）`,
 					summary: `db_query：${typeof input.command === "string" ? input.command : ""}`,
 				};
+			case "staging_list":
+				return { action: "staging_list", intent: "查看当前会话文件暂存列表", summary: "staging_list：只读查看暂存区" };
+			case "staging_diff":
+				return {
+					action: "staging_diff",
+					intent: `查看暂存条目 diff（${String(input.entryId || "")}）`,
+					summary: `staging_diff：查看快照与当前内容差异（entryId=${String(input.entryId || "")}）`,
+				};
+			case "staging_restore":
+				return {
+					action: "staging_restore",
+					intent: `还原暂存条目（${String(input.entryId || "")}）`,
+					summary: `staging_restore：把远程文件还原到首次修改前的内容（entryId=${String(input.entryId || "")}）`,
+				};
 			default:
 				return { action: tool, intent: "执行操作", summary: "" };
 		}
@@ -285,6 +303,30 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (!(typeof input.command === "string" && input.command.trim())) {
 					return { block: true, reason: "db_query: command 不能为空。" };
+				}
+				return undefined;
+			}
+			case "staging_list":
+				// 只读：当前 pi 会话的暂存区（project/session 由后端从进程 key 推导，不接受任意参数）
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不提供远程文件暂存工具。" };
+				}
+				return undefined;
+			case "staging_diff": {
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不提供远程文件暂存工具。" };
+				}
+				if (!(typeof input.entryId === "string" && input.entryId.trim())) {
+					return { block: true, reason: "staging_diff: 缺少 entryId。" };
+				}
+				return undefined;
+			}
+			case "staging_restore": {
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不提供远程文件暂存工具。" };
+				}
+				if (!(typeof input.entryId === "string" && input.entryId.trim())) {
+					return { block: true, reason: "staging_restore: 缺少 entryId。" };
 				}
 				return undefined;
 			}
@@ -422,6 +464,7 @@ export default function (pi: ExtensionAPI) {
 				intent: params.intent,
 				command: params.command,
 				target: params.target,
+				sessionId: process.env.AISHELL_SESSION_ID || "",
 			};
 			if (params.serverId) payload.serverId = params.serverId;
 			if (params.timeoutSeconds !== undefined) payload.timeoutSeconds = params.timeoutSeconds;
@@ -536,6 +579,80 @@ export default function (pi: ExtensionAPI) {
 				serverId: params.serverId,
 				remotePath: params.remotePath,
 				localDir: params.localDir,
+			});
+		},
+	});
+
+	/* ---------- 会话级远程文件暂存（只读列表/diff + 还原；接受只在前端面板，绝不提供给 AI） ----------
+	   project/session 不接受任意参数：后端从当前 pi 进程的 key（<projectId>:<sessionId>）推导，
+	   本扩展只把会话身份环境变量一并带上供后端一致性校验。 */
+	const sessionCtx = {
+		projectId: process.env.AISHELL_PROJECT_ID || "",
+		sessionId: process.env.AISHELL_SESSION_ID || "",
+	};
+
+	pi.registerTool({
+		name: "staging_list",
+		label: "查看文件暂存区",
+		description:
+			"查看当前会话的远程文件暂存列表（自动备份开启时，AI 修改远程文件前已保存原始快照）。返回每个条目的 entryId、服务器、远程路径、原始/当前状态与首次快照时间。",
+		promptSnippet: "查看当前会话的文件暂存区",
+		promptGuidelines: [
+			"远程文件修改（run_command 写入 / sftp_upload 覆盖）前系统会自动暂存原始快照；需要向用户展示改过哪些文件或确认还原目标时调用本工具。",
+			"staging_list / staging_diff / staging_restore 都只能作用于当前 AI 会话的暂存区，不接受任意 project/session 参数。",
+		],
+		parameters: Type.Object({}),
+		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, {
+				action: "staging_list",
+				projectId: sessionCtx.projectId,
+				sessionId: sessionCtx.sessionId,
+			});
+		},
+	});
+
+	pi.registerTool({
+		name: "staging_diff",
+		label: "查看暂存 diff",
+		description:
+			"查看某条暂存条目「首次快照 vs 当前内容」的差异（entryId 来自 staging_list）。文本文件返回行级 diff（上=快照，下=当前）；二进制或超大文件返回 hash/size/mtime 元数据。",
+		promptSnippet: "查看某个暂存条目的 diff",
+		promptGuidelines: [
+			"diff 内容已由系统脱敏；还原前建议先 diff 确认影响，并向用户说明差异。",
+		],
+		parameters: Type.Object({
+			entryId: Type.String({ description: "暂存条目 ID（staging_list 返回的 entryId）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, {
+				action: "staging_diff",
+				entryId: params.entryId,
+				projectId: sessionCtx.projectId,
+				sessionId: sessionCtx.sessionId,
+			});
+		},
+	});
+
+	pi.registerTool({
+		name: "staging_restore",
+		label: "还原暂存文件",
+		description:
+			"把某条暂存条目对应的远程文件还原到首次修改前的内容（entryId 来自 staging_list）。仅限用户明确要求的还原；外部修改冲突时如实报告冲突，不静默覆盖。不能接受（清除）暂存条目。",
+		promptSnippet: "还原某个暂存条目",
+		promptGuidelines: [
+			"还原是远程写操作，Agent 模式需用户审批；仅当用户明确要求还原某文件时才调用。",
+			"还原遇到「远程文件已被外部修改」冲突时如实报告，不得声称已还原。",
+			"你只能查看、diff、还原暂存条目；接受（清除）暂存由用户在文件暂存区面板操作，调用会被拒绝。",
+		],
+		parameters: Type.Object({
+			entryId: Type.String({ description: "暂存条目 ID（staging_list 返回的 entryId）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, {
+				action: "staging_restore",
+				entryId: params.entryId,
+				projectId: sessionCtx.projectId,
+				sessionId: sessionCtx.sessionId,
 			});
 		},
 	});

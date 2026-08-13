@@ -14,12 +14,12 @@ import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, L
 import { icon } from '../../icons';
 import {
   aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiSetThinking, getState, onAiEvent, saveSettings,
-  sessionUpsert, sessionsGet, setAiMode,
+  sessionUpsert, sessionsGet, setAiMode, stagingList,
   type AiEvent,
 } from '../../api';
-import { Workbench, activateTab, bus, getActiveTab, getActiveTerminalApi, getTabs, type Tab, type TerminalApi } from './core';
+import { Workbench, activateTab, bus, getActiveTab, getActiveTerminalApi, getTabs, openTab, type Tab, type TerminalApi } from './core';
 import { addQuickCommandModal } from './quickcommand';
-import { confirmDialog, copyText, toast, uid } from '../../ui';
+import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../ui';
 
 /* ---------- 面板样式（原型 workbench-ai.js 注入的样式 + 错误气泡红边） ---------- */
 const STYLE = `
@@ -93,6 +93,9 @@ const STYLE = `
 }
 .ai-action-group-toggle svg { width: 12px; height: 12px; }
 .ai-action-card .ai-action-detail { display: flex; flex-direction: column; gap: 5px; }
+.ai-action-impact-warn { color: var(--yellow); display: inline-flex; align-items: flex-start; gap: 4px; }
+.ai-action-impact-warn svg { flex: none; width: 12px; height: 12px; margin-top: 2px; }
+.ai-action-impact-ok { color: var(--green); }
 #ai-chat {
   flex: 1; overflow-y: auto; padding: 12px 10px;
   display: flex; flex-direction: column; gap: 10px;
@@ -251,6 +254,8 @@ interface ActionCard {
   requestId?: string;
   /** 智能审批自动放行：status='smart' 时展示判定理由 */
   smartReason?: string;
+  /** 影响计划（自动备份开启时审批事件携带）：unbounded 卡片展示「不保证完整备份」 */
+  impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string };
   status: 'approving' | 'approved' | 'rejected' | 'running' | 'succeeded' | 'failed' | 'smart';
   /** actionEnd 的截断结果 */
   result?: string;
@@ -275,6 +280,9 @@ const ACTION_NAMES: Record<string, string> = {
   run_command: '执行命令',
   sftp_upload: '上传文件',
   sftp_download: '下载文件',
+  staging_list: '查看暂存列表',
+  staging_diff: '查看暂存 diff',
+  staging_restore: '还原暂存文件',
 };
 
 const ACTION_STATUS: Record<ActionCard['status'], string> = {
@@ -302,6 +310,12 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `上传 ${String(args.localPath ?? '')} 到 ${String(args.remoteDir ?? '')}${args.overwrite ? '（覆盖同名）' : ''}`;
     case 'sftp_download':
       return `下载 ${String(args.remotePath ?? '')} 到 ${String(args.localDir ?? '')}`;
+    case 'staging_list':
+      return '查看当前会话文件暂存列表';
+    case 'staging_diff':
+      return `查看暂存条目 diff（${String(args.entryId ?? '')}）`;
+    case 'staging_restore':
+      return `还原暂存条目（${String(args.entryId ?? '')}）`;
     default:
       return '';
   }
@@ -643,6 +657,7 @@ function handleEvent(key: string, ev: AiEvent): void {
         ? timeoutArg
         : existing?.timeoutSeconds ?? 10,
       requestId: existing?.requestId,
+      impact: existing?.impact,
       status: project?.aiMode === 'agent' ? 'approving' : 'running',
       textLen: existing?.textLen ?? p.text.length,
     });
@@ -664,6 +679,7 @@ function handleEvent(key: string, ev: AiEvent): void {
         summary: ev.summary || existing?.summary || '',
         command: existing?.command,
         timeoutSeconds: existing?.timeoutSeconds,
+        impact: ev.impact,
         status: 'smart',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
@@ -682,6 +698,7 @@ function handleEvent(key: string, ev: AiEvent): void {
         command: existing?.command,
         timeoutSeconds: existing?.timeoutSeconds,
         requestId: ev.requestId,
+        impact: ev.impact,
         status: existing?.status === 'running' ? 'running' : 'approving',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
@@ -698,6 +715,10 @@ function handleEvent(key: string, ev: AiEvent): void {
       existing.result = ev.result ? ev.result.slice(0, 2000) : undefined;
     }
     pendingBy.set(sid, p);
+    /* 暂存工具完成 → 广播刷新暂存面板/diff 标签 */
+    if (ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff') {
+      bus.emit('staging-changed');
+    }
   } else if (ev.type === 'segment') {
     /* 新一轮 assistant 消息分段（工具来回时），仅流式中有文本才分段 */
     const cur = pendingBy.get(sid) ?? null;
@@ -840,6 +861,13 @@ function renderActionCard(a: ActionCard): string {
   const smartHtml = a.smartReason
     ? `<div class="ai-action-intent ai-action-smart">${a.status === 'approving' ? '智能审批拦截（转人工确认）' : '智能判定'}：${escapeHtml(a.smartReason)}</div>`
     : '';
+  const impactHtml = a.impact
+    ? a.impact.effect === 'unbounded'
+      ? `<div class="ai-action-intent ai-action-impact-warn">${icon('alert')} 影响范围无法完整确定，不保证完整备份：${escapeHtml(a.impact.reason)}</div>`
+      : a.impact.effect === 'bounded'
+        ? `<div class="ai-action-intent ai-action-impact-ok">将自动备份 ${a.impact.changes.length} 个文件</div>`
+        : ''
+    : '';
   const timeoutHtml = isCmd
     ? `<div class="ai-action-intent">超时：${a.timeoutSeconds ?? 10} 秒</div>`
     : '';
@@ -854,6 +882,7 @@ function renderActionCard(a: ActionCard): string {
         ? `<code class="ai-action-cmd">${escapeHtml(a.command)}</code>`
         : a.summary ? `<div class="ai-action-intent ai-action-summary">${escapeHtml(a.summary)}</div>` : ''}
       ${timeoutHtml}
+      ${impactHtml}
       ${smartHtml}
       ${buttons}
       ${resultHtml}
@@ -1555,6 +1584,33 @@ function bindEvents(): void {
     void subscribe(currentKey());
   };
   chat.addEventListener('click', onChatClick);
+  /* AI 对话容器右键菜单：打开当前会话文件暂存区（数量实时查询；只作用于当前 project+session） */
+  chat.addEventListener('contextmenu', (e) => {
+    const pid = project?.id;
+    const sid = activeSessionId;
+    if (!pid || !sid) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const openStaging = (): void => {
+      openTab({
+        id: `staging:${pid}:${sid}`,
+        type: 'remote-staging',
+        title: '文件暂存区',
+        data: { projectId: pid, sessionId: sid },
+      });
+    };
+    void stagingList(pid, sid)
+      .then((entries) => {
+        showContextMenu(e.clientX, e.clientY, [
+          { label: `打开文件暂存区（${entries.length}）`, iconName: 'history', action: openStaging },
+        ]);
+      })
+      .catch(() => {
+        showContextMenu(e.clientX, e.clientY, [
+          { label: '打开文件暂存区', iconName: 'history', action: openStaging },
+        ]);
+      });
+  });
   chipRow.addEventListener('click', onChipRowClick);
   input.addEventListener('input', autoGrow);
   input.addEventListener('keydown', (e: KeyboardEvent) => {

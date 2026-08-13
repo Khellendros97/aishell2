@@ -222,6 +222,7 @@ export const renderWelcome: PageRender = (root) => {
       projectView: 'card',
       approvalMode: 'smart',
       cloud: { mode: 'personal', user: null, capabilities: null },
+      autoBackupRemoteFiles: true,
     },
     servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, seededSkillWorkspaces: [],
   };

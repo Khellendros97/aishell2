@@ -341,7 +341,7 @@ impl Pi {
         let tools = if mode == "suggest" {
             "read,write,edit,ls,find,grep".to_string()
         } else {
-            "read,write,edit,ls,find,grep,delete_path,run_command,sftp_upload,sftp_download,list_servers".to_string()
+            "read,write,edit,ls,find,grep,delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore".to_string()
         };
         cmd.args([
             "--mode", "rpc",
@@ -896,4 +896,16 @@ async fn invalid_skill_env_fails_closed() {
     assert_tool_error(&env, "权限边界");
     // 项目根内权限不受影响（.aishell 写放行）
     assert!(project_note.is_file(), "env 解析失败不应影响项目根权限");
+}
+
+/// 探针（无需 pi 二进制即可运行）：guard 注册了会话暂存工具（只读列表/diff + 还原），
+/// 但绝无 staging_accept——接受只在前端面板，绝不进 AI 工具/动作桥。
+#[test]
+fn guard_registers_staging_tools_but_never_accept() {
+    assert!(GUARD_EXT.contains("staging_list"), "guard 应注册 staging_list");
+    assert!(GUARD_EXT.contains("staging_diff"), "guard 应注册 staging_diff");
+    assert!(GUARD_EXT.contains("staging_restore"), "guard 应注册 staging_restore");
+    // 引号形态 = 工具/列表注册；注释里的裸词说明不算
+    assert!(!GUARD_EXT.contains("\"staging_accept\""), "guard 绝不可注册 staging_accept");
+    assert!(!GUARD_EXT.contains("name: \"staging_accept\""), "guard 绝不可定义 staging_accept 工具");
 }

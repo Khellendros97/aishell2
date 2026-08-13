@@ -55,10 +55,10 @@ export interface AiHandle {
 
 /** fn(container, tab) 返回可选 tabApi 对象（供其他模块调用） */
 export type RendererFn = (container: HTMLElement, tab: Tab) => unknown;
-export type BusEvent = 'tab-activated' | 'tab-closed' | 'project-changed';
+export type BusEvent = 'tab-activated' | 'tab-closed' | 'project-changed' | 'staging-changed';
 type BusCallback = (arg: Tab | null) => void;
 
-const TYPE_ICONS: Record<string, string> = { editor: icon('file'), sftp: icon('globe'), terminal: icon('terminal') };
+const TYPE_ICONS: Record<string, string> = { editor: icon('file'), sftp: icon('globe'), terminal: icon('terminal'), 'remote-staging': icon('history'), 'staging-diff': icon('diff') };
 
 /* ---------- 事件总线 ----------
    'tab-activated'   (tab|null)      激活标签变化（关闭最后一个标签时发 null）

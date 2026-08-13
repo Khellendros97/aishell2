@@ -63,6 +63,24 @@ const cmThemeExt = (): Extension => currentTheme() === 'dark'
   ? [oneDarkTheme, syntaxHighlighting(darkHighlightStyle)]
   : syntaxHighlighting(lightHighlightStyle);
 
+/** 只读 CodeMirror 视图（staging diff 等只读展示用）：复用编辑器主题与基础扩展，不可编辑。
+ *  diff.ts 等只读面板调用；主题随全局切换自动跟随（cmTheme compartment 全局共享）。 */
+export function createReadonlyView(parent: HTMLElement, doc: string): EditorView {
+  return new EditorView({
+    state: EditorState.create({
+      doc,
+      extensions: [
+        lineNumbers(),
+        EditorState.readOnly.of(true),
+        EditorView.editable.of(false),
+        cmTheme.of(cmThemeExt()),
+        keymap.of([...defaultKeymap]),
+      ],
+    }),
+    parent,
+  });
+}
+
 /** 单个编辑器标签的运行状态 */
 interface EditorEntry {
   tab: Tab;

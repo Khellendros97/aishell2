@@ -25,6 +25,8 @@ import { mountAiPanel } from './ai';
 import './terminal'; // import 即注册渲染器（模块级副作用）
 import './editor';
 import './sftp';
+import './staging';
+import './diff';
 import './workbench.css';
 
 const PANELS: Record<string, string> = {

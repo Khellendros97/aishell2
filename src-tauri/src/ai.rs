@@ -40,9 +40,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ai_actions::AiActions;
+use crate::ai_impact::{analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan};
 use crate::skills::{SkillOrigin, SkillSummary};
 use crate::store::{AiMode, ApprovalMode, CloudMode, Store};
 
@@ -69,6 +71,7 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
+- 远程文件暂存（staging_list / staging_diff / staging_restore）：自动备份开启时，AI 修改远程文件（run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff、按用户要求把远程文件还原到首次修改前的内容；**不能接受（清除）暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
 - 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
 凭据纪律（硬性，优先级高于任务效率）：
@@ -102,15 +105,89 @@ const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 const BASE_TOOLS: &str = "read,grep,find,ls,write,edit";
 
-/// 需要动作卡 / 审批的受控工具（与 aishell-guard.ts 的 CONTROLLED_TOOLS 保持一致）。
-const CONTROLLED_TOOLS: [&str; 6] = [
+/// 需要动作卡 / 审批的受控工具。
+/// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
+/// staging_list / staging_diff 只读不入审批（guard 侧不在 CONTROLLED_TOOLS），但执行时
+/// 仍经动作桥并在 ai.rs 侧渲染小字活动行；staging_restore 两侧都要（审批 + 卡片）。
+const CONTROLLED_TOOLS: [&str; 7] = [
     "write",
     "edit",
     "delete_path",
     "run_command",
     "sftp_upload",
     "sftp_download",
+    "staging_restore",
 ];
+
+/// 影响计划跟踪条目（tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费）。
+/// 存于单个 pi 进程的 stdout 读取线程（审批与动作桥在同一线程按序处理，无需跨线程锁）。
+#[derive(Clone)]
+struct ImpactEntry {
+    /// run_command | sftp_upload
+    tool: String,
+    /// 登记时的结构化 args（执行时语义比对防篡改）
+    payload: serde_json::Value,
+    /// 审批阶段解析的远程工作目录（执行时复用，保证分析与 exec 环境一致）
+    cwd: Option<String>,
+    /// 审批绑定指纹 sha256(command+target+serverId+cwd)；无审批（yolo）为 None
+    fingerprint: Option<String>,
+    /// 审批后确定的计划（确定性 或 确定性+LLM 合并）；None = 执行时现算
+    plan: Option<ImpactPlan>,
+}
+
+/// 审批与执行的绑定指纹：sha256(command+target+serverId+cwd)，payload 不一致直接拒绝。
+fn impact_fingerprint(command: &str, target: &str, server_id: &str, cwd: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(command.as_bytes());
+    h.update([0u8]);
+    h.update(target.as_bytes());
+    h.update([0u8]);
+    h.update(server_id.as_bytes());
+    h.update([0u8]);
+    h.update(cwd.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// 动作参数语义指纹：只比较影响执行的字段——guard 的动作桥会在 payload 上附加
+/// `action` / `sessionId` 等桥字段（tool_execution_start 的 args 里没有），直接整体比较
+/// 必然误报。run_command / sftp_upload 取关键字段；其余动作按全量序列化（serde_json 的
+/// Map 为 BTreeMap，对象键序无关）。
+fn payload_fingerprint(p: &serde_json::Value) -> String {
+    let get = |k: &str| p.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let core = if p.get("command").is_some() && p.get("target").is_some() {
+        // run_command：命令/目标/服务器/超时
+        format!(
+            "run_command|{}|{}|{}|{}",
+            get("command"),
+            get("target"),
+            get("serverId"),
+            p.get("timeoutSeconds").map(|v| v.to_string()).unwrap_or_default()
+        )
+    } else if p.get("localPath").is_some() && p.get("remoteDir").is_some() {
+        // sftp_upload：服务器/本地源/远端目录/覆盖开关
+        format!(
+            "sftp_upload|{}|{}|{}|{}",
+            get("serverId"),
+            get("localPath"),
+            get("remoteDir"),
+            p.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        )
+    } else {
+        p.to_string()
+    };
+    let mut h = Sha256::new();
+    h.update(core.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// 影响计划 → 前端审批事件透传 JSON（effect / changes / reason）。
+fn impact_event_json(plan: &ImpactPlan) -> serde_json::Value {
+    json!({
+        "effect": plan.effect,
+        "changes": plan.changes,
+        "reason": plan.reason,
+    })
+}
 
 /// pi 二进制名：Windows 发行版是 pi.exe，macOS/Linux 无扩展名。
 /// lib.rs 的资源目录探测与本模块 spawn 共用（与 scripts/fetch-pi.mjs 的 TARGETS 对应）。
@@ -231,19 +308,20 @@ impl AiManager {
         pi_dir: PathBuf,
         agent_dir: PathBuf,
         ssh: Arc<crate::ssh::SshManager>,
+        staging: Arc<crate::staging::RemoteStaging>,
         pi_debug: String,
         cloud: Option<Arc<crate::cloud::CloudManager>>,
     ) -> Self {
-        let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh));
+        let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh, staging));
         AiManager {
             store,
             pi_dir,
             agent_dir,
             pi_debug,
+            cloud,
             procs: Arc::new(Mutex::new(HashMap::new())),
             actions,
             covered_skills: Mutex::new(Vec::new()),
-            cloud,
         }
     }
 
@@ -410,7 +488,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -452,6 +530,13 @@ impl AiManager {
         for s in &loaded.final_list {
             cmd.args(["--skill"]).arg(&s.path);
         }
+        cmd.env("PI_CODING_AGENT_DIR", &self.agent_dir)
+            .env("DEEPSEEK_API_KEY", &api_key)
+            .env("AISHELL_AI_MODE", mode.as_str())
+            // 会话身份注入 guard：staging / run_command 动作桥据此携带当前会话（guard 工具不暴露
+            // 任意 project/session 参数，后端动作桥以 key 推导为准、payload 仅作一致性参考）
+            .env("AISHELL_PROJECT_ID", project_id)
+            .env("AISHELL_SESSION_ID", session_id);
         // AI 读写技能所需目录（JSON 数组编码，guard 严格解析，失败 fail-closed 只保留项目根）：
         // 只读允许根 = 最终启用技能目录清单；write/edit/delete 额外允许全局技能根
         let skill_dirs: Vec<String> = loaded
@@ -515,10 +600,13 @@ impl AiManager {
         let approvals2 = Arc::clone(&approvals);
         let actions = Arc::clone(&self.actions);
         let project_id2 = project_id.to_string();
+        let session_id2 = session_id.to_string();
         let store2 = Arc::clone(&self.store);
         let cloud2 = self.cloud.clone();
         let last_prompt2 = Arc::clone(&last_prompt);
         thread::spawn(move || {
+            // 影响计划跟踪：tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费
+            let mut impact_tracker: HashMap<String, ImpactEntry> = HashMap::new();
             // 已开始执行的 write/edit 工具 → 规范化绝对路径（end 成功时据此发 fs:changed）
             let mut pending_paths: HashMap<String, String> = HashMap::new();
             // 是否已收到过终止性事件（done/error）：正常收尾后退出不再报「异常退出」
@@ -627,6 +715,26 @@ impl AiManager {
                             let mut args = ev.get("args").cloned().unwrap_or_else(|| json!({}));
                             if let Some(obj) = args.as_object_mut() {
                                 obj.remove("content");
+                            }
+                            // 影响计划登记（yolo 也走：执行时按确定性计划快照/拒绝 unbounded）：
+                            // run_command（仅远程）与 sftp_upload 在 AISHELL_ACTION 前需要
+                            // 会话级暂存信息；其余受控工具不涉及远程文件。
+                            let target = args
+                                .get("target")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let is_remote_cmd = tool == "run_command" && target == "remote";
+                            if is_remote_cmd || tool == "sftp_upload" {
+                                impact_tracker.insert(
+                                    tool_call_id.clone(),
+                                    ImpactEntry {
+                                        tool: tool.to_string(),
+                                        payload: args.clone(),
+                                        cwd: None,
+                                        fingerprint: None,
+                                        plan: None,
+                                    },
+                                );
                             }
                             let _ = app2.emit(
                                 &event,
@@ -759,6 +867,8 @@ impl AiManager {
                             &actions,
                             &store2,
                             &project_id2,
+                            &session_id2,
+                            &mut impact_tracker,
                             &mut rt,
                         );
                     }
@@ -853,6 +963,8 @@ fn handle_extension_ui_request(
     actions: &Arc<AiActions>,
     store2: &Arc<Store>,
     project_id: &str,
+    session_id: &str,
+    impact_tracker: &mut HashMap<String, ImpactEntry>,
     rt: &mut Option<tokio::runtime::Runtime>,
 ) {
     let Some(id) = ev.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
@@ -864,6 +976,7 @@ fn handle_extension_ui_request(
     if method == "input" && title.starts_with("AISHELL_ACTION:") {
         // 内部动作：执行并回写结果（不透传前端）。
         // ctx.ui.input(title, placeholder) → extension_ui_request 的默认值在 placeholder 字段
+        let tool_call_id = title["AISHELL_ACTION:".len()..].to_string();
         let payload: serde_json::Value = ev
             .get("placeholder")
             .and_then(serde_json::Value::as_str)
@@ -875,7 +988,15 @@ fn handle_extension_ui_request(
                 .build()
                 .expect("创建动作执行 runtime 失败")
         });
-        let result = runtime.block_on(run_internal_action(actions, store2, project_id, &payload));
+        let result = runtime.block_on(run_internal_action(
+            actions,
+            store2,
+            project_id,
+            session_id,
+            &tool_call_id,
+            impact_tracker,
+            &payload,
+        ));
         write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}));
     } else if method == "confirm" && title.starts_with("AISHELL_MODE_REQUEST:") {
         // AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：
@@ -916,8 +1037,56 @@ fn handle_extension_ui_request(
         let intent = info.get("intent").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let summary = info.get("summary").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
 
+        // 自动备份开关（决定是否做影响分析与快照）
+        let auto_backup = store2.settings().auto_backup_remote_files;
+        // 确定性影响计划（审批阶段计算；agent+all 直接采用，agent+smart 与 LLM 合并）
+        let mut deterministic_plan: Option<ImpactPlan> = None;
         // 智能审批判定为危险的拦截理由（人工审批卡展示「为何被拦」）
         let mut flagged_reason: Option<String> = None;
+
+        if auto_backup {
+            let entry = impact_tracker.get(&tool_call_id).cloned();
+            if let Some(entry) = &entry {
+                if matches!(entry.tool.as_str(), "run_command" | "sftp_upload") {
+                    let runtime = rt.get_or_insert_with(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("创建影响分析 runtime 失败")
+                    });
+                    let (plan, cwd) = compute_approval_impact(actions, entry, project_id, runtime);
+                    if let (Some(_p), Some(c)) = (&plan, &cwd) {
+                        if entry.tool == "run_command" {
+                            if let Some(e) = impact_tracker.get_mut(&tool_call_id) {
+                                e.cwd = Some(c.clone());
+                                // 审批/执行绑定指纹（含 cwd）：执行时 payload 不一致直接拒绝
+                                let command = e
+                                    .payload
+                                    .get("command")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                let target = e
+                                    .payload
+                                    .get("target")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                let sid = e
+                                    .payload
+                                    .get("serverId")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                e.fingerprint = Some(impact_fingerprint(command, target, sid, c));
+                            }
+                        }
+                    }
+                    if let Some(p) = plan {
+                        deterministic_plan = Some(p);
+                    }
+                }
+            }
+        }
+
+        // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）
         if store2.approval_mode() == ApprovalMode::Smart {
             let runtime = rt.get_or_insert_with(|| {
                 tokio::runtime::Builder::new_current_thread()
@@ -926,22 +1095,34 @@ fn handle_extension_ui_request(
                     .expect("创建智能审批 runtime 失败")
             });
             let cloud_mgr = app2.state::<Arc<crate::cloud::CloudManager>>();
-            match runtime.block_on(crate::smart_approval::judge(
-                store2,
-                &cloud_mgr,
-                &action,
-                &intent,
-                &summary,
-            )) {
-                // 非危险：直接放行，并向前端发带 smart 标记的 approval 事件（渲染「已智能放行」卡）
-                Ok((false, reason)) => {
-                    write_stdin_json(
-                        stdin2,
-                        &json!({"type": "extension_ui_response", "id": id, "confirmed": true}),
-                    );
-                    let _ = app2.emit(
-                        event,
-                        json!({
+            let (command, target, server_id, cwd) = approval_context(impact_tracker.get(&tool_call_id), &action);
+            let judge_result = runtime.block_on(crate::smart_approval::judge(
+                store2, &cloud_mgr, &action, &intent, &summary, &command, &target, &server_id, &cwd,
+            ));
+            match judge_result {
+                Ok(out) => {
+                    // LLM 补充的路径分析：格式非法按 unbounded（绝不降级为 none）
+                    let effective_plan = match &deterministic_plan {
+                        Some(det) => {
+                            let llm_plan = match validate_impact_plan(&out.to_plan()) {
+                                Ok(p) => p,
+                                Err(e) => ImpactPlan::unbounded(&e),
+                            };
+                            Some(merge_plans(det, &llm_plan))
+                        }
+                        None => deterministic_plan.clone(),
+                    };
+                    let merged_unbounded = effective_plan
+                        .as_ref()
+                        .map(|p| p.effect == Effect::Unbounded)
+                        .unwrap_or(false);
+                    // 非危险且影响可控（或未启用影响分析）：直接放行
+                    if !out.dangerous && !merged_unbounded {
+                        write_stdin_json(
+                            stdin2,
+                            &json!({"type": "extension_ui_response", "id": id, "confirmed": true}),
+                        );
+                        let mut ev_json = json!({
                             "type": "approval",
                             "requestId": id,
                             "toolCallId": tool_call_id,
@@ -949,44 +1130,163 @@ fn handle_extension_ui_request(
                             "intent": intent,
                             "summary": summary,
                             "smart": true,
-                            "smartReason": reason,
-                        }),
-                    );
-                    return;
+                            "smartReason": out.reason,
+                        });
+                        if let Some(p) = &effective_plan {
+                            ev_json["impact"] = impact_event_json(p);
+                            if let Some(e) = impact_tracker.get_mut(&tool_call_id) {
+                                e.plan = Some(p.clone());
+                            }
+                        }
+                        let _ = app2.emit(event, ev_json);
+                        return;
+                    }
+                    // 危险 / 影响 unbounded（无法保证完整备份）：照常人工审批
+                    if out.dangerous {
+                        flagged_reason = Some(out.reason);
+                    } else if merged_unbounded {
+                        flagged_reason = Some(
+                            effective_plan
+                                .as_ref()
+                                .map(|p| p.reason.clone())
+                                .unwrap_or_else(|| "命令影响范围无法完整确定，不保证完整备份".to_string()),
+                        );
+                    }
+                    // 落盘计划（人工确认后执行时消费；unbounded 由用户确认后放行）
+                    if let Some(p) = &effective_plan {
+                        if let Some(e) = impact_tracker.get_mut(&tool_call_id) {
+                            e.plan = Some(p.clone());
+                        }
+                    }
                 }
-                // 危险：照常人工审批，判定理由随事件透传（卡片展示拦截原因）
-                Ok((true, reason)) => {
-                    flagged_reason = Some(reason);
+                // 判定失败：回退人工审批（危险方向保守；失败原因透传前端卡片便于排查）
+                Err(e) => {
+                    flagged_reason = Some(format!("智能审批判定失败，已转人工（{e}）"));
+                    // 确定性计划照常落盘（人工确认后执行时消费）
+                    if let Some(p) = &deterministic_plan {
+                        if let Some(e) = impact_tracker.get_mut(&tool_call_id) {
+                            e.plan = Some(p.clone());
+                        }
+                    }
                 }
-                // 判定失败：回退人工审批（危险方向保守）
-                Err(_) => {}
+            }
+        } else {
+            // agent + 全部审批：确定性计划直接落盘（卡片展示影响，执行时消费）
+            if let Some(p) = &deterministic_plan {
+                if let Some(e) = impact_tracker.get_mut(&tool_call_id) {
+                    e.plan = Some(p.clone());
+                }
             }
         }
 
         if let Ok(mut map) = approvals2.lock() {
             map.insert(id.clone(), tool_call_id.clone());
         }
-        let _ = app2.emit(
-            event,
-            json!({
-                "type": "approval",
-                "requestId": id,
-                "toolCallId": tool_call_id,
-                "action": action,
-                "intent": intent,
-                "summary": summary,
-                "smartReason": flagged_reason,
-            }),
-        );
+        let mut ev_json = json!({
+            "type": "approval",
+            "requestId": id,
+            "toolCallId": tool_call_id,
+            "action": action,
+            "intent": intent,
+            "summary": summary,
+            "smartReason": flagged_reason,
+        });
+        if let Some(p) = &deterministic_plan {
+            ev_json["impact"] = impact_event_json(p);
+        }
+        let _ = app2.emit(event, ev_json);
     }
     // 其余 UI 请求（notify/setStatus 等）不转发也不响应（fire-and-forget）
 }
 
+/// 审批上下文：run_command 取命令/目标/服务器/工作目录（LLM 判定输入）；其余动作空串。
+fn approval_context(
+    entry: Option<&ImpactEntry>,
+    action: &str,
+) -> (String, String, String, String) {
+    if action == "run_command" {
+        if let Some(e) = entry {
+            let strf = |k: &str| {
+                e.payload
+                    .get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            return (strf("command"), strf("target"), strf("serverId"), e.cwd.clone().unwrap_or_default());
+        }
+    }
+    (String::new(), String::new(), String::new(), String::new())
+}
+
+/// 审批阶段确定性影响计划（run_command 远程 / sftp_upload）：解析远程 cwd 并返回
+/// (plan, cwd)。cwd 解析失败返回 (None, None)（执行时再解析、影响不随审批事件展示）。
+fn compute_approval_impact(
+    actions: &Arc<AiActions>,
+    entry: &ImpactEntry,
+    project_id: &str,
+    runtime: &tokio::runtime::Runtime,
+) -> (Option<ImpactPlan>, Option<String>) {
+    let strf = |k: &str| {
+        entry
+            .payload
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    match entry.tool.as_str() {
+        "run_command" => {
+            let command = strf("command");
+            let server_id = strf("serverId");
+            let cwd = match &entry.cwd {
+                Some(c) => Some(c.clone()),
+                None => runtime
+                    .block_on(actions.remote_home(&server_id))
+                    .ok()
+                    .filter(|c| !c.is_empty()),
+            };
+            match &cwd {
+                Some(c) => (Some(analyze_remote_command(&command, c)), cwd),
+                None => (None, None),
+            }
+        }
+        "sftp_upload" => {
+            let server_id = strf("serverId");
+            let local_path = strf("localPath");
+            let remote_dir = strf("remoteDir");
+            let overwrite = entry
+                .payload
+                .get("overwrite")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let plan = runtime.block_on(actions.upload_impact(
+                project_id,
+                &server_id,
+                &local_path,
+                &remote_dir,
+                overwrite,
+            ));
+            match plan {
+                Ok(p) => (Some(p), None),
+                Err(e) => (Some(ImpactPlan::unbounded(&format!("无法枚举上传覆盖范围：{e}"))), None),
+            }
+        }
+        _ => (None, None),
+    }
+}
+
 /// 执行扩展内部动作请求，返回回写扩展的结果 JSON（{ok:true,text}|{ok:false,error}）。
+/// 会话级暂存动作（staging_*）与 run_command/sftp_upload 的自动备份都以 key 推导的
+/// session_id 为准（guard 不暴露任意 project/session 参数）。
+#[allow(clippy::too_many_arguments)]
 async fn run_internal_action(
     actions: &Arc<AiActions>,
     store: &Arc<Store>,
     project_id: &str,
+    session_id: &str,
+    tool_call_id: &str,
+    impact_tracker: &mut HashMap<String, ImpactEntry>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let action = payload.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -997,6 +1297,14 @@ async fn run_internal_action(
             .unwrap_or("")
             .to_string()
     };
+    // 消费登记的计划（tool_execution_start 登记的结构化 args 语义比对；不一致直接拒绝）
+    let entry = impact_tracker.remove(tool_call_id);
+    if let Some(entry) = &entry {
+        if payload_fingerprint(&entry.payload) != payload_fingerprint(payload) {
+            return json!({"ok": false, "error": "动作参数与审批不一致，已拒绝执行"});
+        }
+    }
+    let auto_backup = store.settings().auto_backup_remote_files;
     let result = match action {
         "list_servers" => actions
             .list_servers(project_id)
@@ -1022,14 +1330,41 @@ async fn run_internal_action(
                     }
                 },
             };
+            // 执行环境：复用审批阶段解析的工作目录（保证分析与 exec 一致）；无登记时现取
+            let (cwd, plan) = resolve_exec_plan(actions, &entry, &command, &target, &server_id, session_id, auto_backup).await;
+            let (cwd, plan) = match (cwd, plan) {
+                (Ok(c), Ok(p)) => (c, p),
+                (Err(e), _) | (_, Err(e)) => {
+                    return json!({"ok": false, "error": e});
+                }
+            };
+            // 审批/执行绑定：sha256(command+target+serverId+cwd)（仅审批过的条目）
+            if let Some(e) = &entry {
+                if let Some(fp) = &e.fingerprint {
+                    let sid = server_id.as_deref().unwrap_or("");
+                    if impact_fingerprint(&command, &target, sid, &cwd) != *fp {
+                        return json!({"ok": false, "error": "命令参数与审批不一致，已拒绝执行"});
+                    }
+                }
+            }
+            // yolo + 自动备份 + unbounded：直接拒绝，避免绕过保护（agent 已在审批卡确认放行）
+            if auto_backup && plan.effect == Effect::Unbounded && store.ai_mode(project_id) == Some(AiMode::Yolo) {
+                return json!({
+                    "ok": false,
+                    "error": "该命令的影响范围无法完整确定（不保证完整备份），已拒绝自动执行。请改用受管文件操作（sftp_upload 等），或切换到工作模式由用户确认后执行"
+                });
+            }
             actions
                 .run_command(
                     project_id,
+                    session_id,
                     intent,
                     command,
                     target,
                     server_id,
                     timeout_seconds,
+                    Some(cwd),
+                    Some(plan),
                 )
                 .await
                 .map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
@@ -1051,13 +1386,16 @@ async fn run_internal_action(
                 .get("overwrite")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            let plan = entry.as_ref().and_then(|e| e.plan.clone());
             actions
                 .sftp_upload(
                     project_id,
+                    session_id,
                     server_id.clone(),
                     local_path.clone(),
                     remote_dir.clone(),
                     overwrite,
+                    plan,
                 )
                 .await
                 .map(|text| json!({"ok": true, "text": text}))
@@ -1073,11 +1411,80 @@ async fn run_internal_action(
                     json!({"ok": true, "text": format!("下载完成：{remote_path} → {local_dir}（服务器 {server_id}）")})
                 })
         }
+        // AI 暂存工具：只读列表/diff + 还原（force 恒 false）；接受绝不提供
+        "staging_list" => actions
+            .staging_list(project_id, session_id)
+            .await
+            .map(|text| json!({"ok": true, "text": text})),
+        "staging_diff" => {
+            let entry_id = str_field("entryId");
+            actions
+                .staging_diff(project_id, session_id, &entry_id)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "staging_restore" => {
+            let entry_id = str_field("entryId");
+            actions
+                .staging_restore(project_id, session_id, &entry_id)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
         other => Err(format!("未知动作：{other}")),
     };
     match result {
         Ok(v) => v,
         Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+/// 执行前的 (cwd, plan) 解析：复用审批阶段解析的 cwd / 计划；无则现取现算（yolo 路径）。
+async fn resolve_exec_plan(
+    actions: &Arc<AiActions>,
+    entry: &Option<ImpactEntry>,
+    command: &str,
+    target: &str,
+    server_id: &Option<String>,
+    _session_id: &str,
+    _auto_backup: bool,
+) -> (Result<String, String>, Result<ImpactPlan, String>) {
+    if target != "remote" {
+        // 本地命令：无远程工作目录/影响分析（run_command 本地分支不使用）
+        return (Ok(String::new()), Ok(ImpactPlan::none("本地命令")));
+    }
+    let sid = match server_id {
+        Some(s) => s.clone(),
+        None => return (Err("远程目标必须提供 serverId".to_string()), Err("远程目标必须提供 serverId".to_string())),
+    };
+    match entry {
+        Some(e) if e.tool == "run_command" => {
+            let cwd = match &e.cwd {
+                Some(c) => Ok(c.clone()),
+                None => actions.remote_home(&sid).await,
+            };
+            match cwd {
+                Ok(c) => {
+                    let plan = e.plan.clone().unwrap_or_else(|| analyze_remote_command(command, &c));
+                    (Ok(c), Ok(plan))
+                }
+                Err(err) => {
+                    let e2 = err.clone();
+                    (Err(err), Err(e2))
+                }
+            }
+        }
+        _ => {
+            match actions.remote_home(&sid).await {
+                Ok(c) => {
+                    let plan = analyze_remote_command(command, &c);
+                    (Ok(c), Ok(plan))
+                }
+                Err(err) => {
+                    let e2 = err.clone();
+                    (Err(err), Err(e2))
+                }
+            }
+        }
     }
 }
 
@@ -1442,11 +1849,17 @@ mod tests {
 
     fn manager(store: Arc<Store>, tag: &str) -> AiManager {
         let agent_dir = temp_dir(tag);
+        let staging = Arc::new(crate::staging::RemoteStaging::new(
+            temp_dir(&format!("staging-{tag}")),
+            Arc::new(crate::ssh::SshManager::new(Arc::clone(&store))),
+            Arc::clone(&store),
+        ));
         AiManager::new(
             store.clone(),
             PathBuf::from("pi-unused"),
             agent_dir,
             Arc::new(crate::ssh::SshManager::new(store)),
+            staging,
             String::new(),
             None, // 测试构造不注入云会话
         )
@@ -1615,5 +2028,53 @@ mod tests {
         // 同 list 序稳定（skill_fingerprint 固定字段顺序，不依赖 hash 随机性）
         let fp_repeated = skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]);
         assert_eq!(fp_repeated, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
+    }
+
+    #[test]
+    fn impact_fingerprint_is_stable_and_input_sensitive() {
+        let fp1 = impact_fingerprint("echo x > f", "remote", "srv-a", "/root");
+        // 稳定：同输入同指纹
+        assert_eq!(fp1, impact_fingerprint("echo x > f", "remote", "srv-a", "/root"));
+        // 任一维度变化 → 指纹变化（审批/执行绑定）
+        assert_ne!(fp1, impact_fingerprint("echo x > g", "remote", "srv-a", "/root"));
+        assert_ne!(fp1, impact_fingerprint("echo x > f", "local", "srv-a", "/root"));
+        assert_ne!(fp1, impact_fingerprint("echo x > f", "remote", "srv-b", "/root"));
+        assert_ne!(fp1, impact_fingerprint("echo x > f", "remote", "srv-a", "/var/www"));
+    }
+
+    #[test]
+    fn guard_extension_has_staging_tools_but_never_accept() {
+        // 探针：AI 工具清单有 staging_list/diff/restore，绝无 staging_accept（接受只在前端面板）
+        assert!(GUARD_EXT.contains("staging_list"), "guard 应注册 staging_list");
+        assert!(GUARD_EXT.contains("staging_diff"), "guard 应注册 staging_diff");
+        assert!(GUARD_EXT.contains("staging_restore"), "guard 应注册 staging_restore");
+        // 探针核心：AI 工具清单/受控列表绝无 staging_accept（引号形态 = 工具/列表注册；
+        // 注释里的裸词说明文字不算注册）
+        assert!(!GUARD_EXT.contains("\"staging_accept\""), "guard 绝不可注册 staging_accept");
+        assert!(!GUARD_EXT.contains("staging_accept\"}"), "guard 绝不可出现 staging_accept 工具定义");
+        // 还原属受控工具（逐调用审批）；只读列表/diff 不入审批
+        assert!(GUARD_EXT.contains("\"staging_restore\""), "staging_restore 应受控审批");
+        // suggest 模式不提供受控远程工具（工具集变量中无 staging_*）
+        let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
+        assert!(!tools_suggest.contains("staging_"), "suggest 工具集不应含暂存工具");
+        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore");
+        assert!(tools_agent.contains("staging_list"));
+        assert!(tools_agent.contains("staging_restore"));
+        // ai.rs 侧动作卡列表：staging_restore 有卡片，但接受类动作绝不入列
+        assert!(CONTROLLED_TOOLS.contains(&"staging_restore"));
+        assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("staging_accept")));
+    }
+
+    #[test]
+    fn session_key_derives_project_and_session() {
+        // key = "<projectId>:<sessionId>"：会话级暂存以进程 key 为准（guard 不接受任意参数）
+        let key = "proj-1:sess_abc";
+        let (p, s) = key.split_once(':').unwrap();
+        assert_eq!(p, "proj-1");
+        assert_eq!(s, "sess_abc");
+        // 空 key / 无冒号 → 默认会话（spawn 兜底），但正常路径恒带冒号
+        let key2 = "proj-1";
+        let s2 = key2.split_once(':').map(|(_, s)| s).unwrap_or("default");
+        assert_eq!(s2, "default");
     }
 }

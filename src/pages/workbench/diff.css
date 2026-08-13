@@ -1,0 +1,111 @@
+/* 暂存 diff 标签（staging-diff） */
+.sd-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.sd-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.sd-title {
+  font-weight: 600;
+  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sd-title svg { flex: none; }
+.sd-meta {
+  flex: none;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.sd-path { font-weight: 600; color: var(--text-0); font-family: var(--font-mono); }
+.sd-badge {
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 10.5px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+}
+.sd-badge-del { color: var(--red); border-color: var(--red); }
+.sd-body {
+  flex: 1;
+  overflow: auto;
+  padding: 10px 12px;
+}
+.sd-loading { color: var(--text-2); font-size: 12px; padding: 20px 4px; }
+.sd-loading.error { color: var(--red); white-space: pre-wrap; }
+.sd-binary-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+.sd-meta-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11.5px;
+}
+.sd-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+}
+.sd-meta-row .sd-meta-label { font-family: var(--font-ui); color: var(--text-1); }
+.sd-meta-row code { color: var(--text-0); }
+.sd-sides {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  height: 100%;
+}
+.sd-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-2);
+}
+.sd-side-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 8px;
+  font-size: 11px;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-3);
+}
+.sd-side-head svg { width: 12px; height: 12px; flex: none; }
+.sd-side-editor { flex: 1; overflow: auto; min-height: 0; }
+.sd-side-editor .cm-editor { height: 100%; }
+.sd-side-editor .cm-scroller { font-family: var(--font-mono); font-size: 12px; }
+/* diff 行高亮：删除（左）/ 新增（右） */
+.sd-side-editor .cm-line.sd-line-del { background: rgba(220, 60, 60, 0.16); }
+.sd-side-editor .cm-line.sd-line-add { background: rgba(60, 180, 100, 0.16); }

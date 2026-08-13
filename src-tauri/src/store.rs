@@ -138,7 +138,7 @@ pub struct CloudConfig {
     pub capabilities: Option<CloudCapabilities>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub workspace_dir: Option<String>,
@@ -162,6 +162,31 @@ pub struct Settings {
     /// 云服务接入（公司服务器托管）；旧配置无此字段按未接入处理
     #[serde(default)]
     pub cloud: CloudConfig,
+    /// 自动备份远程文件：开启后 AI 会话第一次修改某远程文件前保存原始快照（会话级暂存区）；
+    /// 旧配置无此字段时按开启处理（默认开启）
+    #[serde(default = "default_true")]
+    pub auto_backup_remote_files: bool,
+}
+
+/// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            workspace_dir: None,
+            llm: LlmConfig::default(),
+            search: SearchConfig::default(),
+            theme: Theme::default(),
+            auto_switch_ai_workdir: true,
+            project_view: ProjectView::default(),
+            approval_mode: ApprovalMode::default(),
+            cloud: CloudConfig {
+                mode: CloudMode::default(),
+                user: None,
+                capabilities: None,
+            },
+            auto_backup_remote_files: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1829,7 +1854,12 @@ mod tests {
                 auto_switch_ai_workdir: true,
                 project_view: ProjectView::Card,
                 approval_mode: ApprovalMode::Smart,
-                cloud: CloudConfig::default(),
+                cloud: CloudConfig {
+                    mode: CloudMode::default(),
+                    user: None,
+                    capabilities: None,
+                },
+                auto_backup_remote_files: true,
             },
             servers: vec![
                 Server {
@@ -3472,7 +3502,12 @@ mod tests {
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::Card,
                     approval_mode: ApprovalMode::Smart,
-                    cloud: CloudConfig::default(),
+                    cloud: CloudConfig {
+                        mode: CloudMode::default(),
+                        user: None,
+                        capabilities: None,
+                    },
+                    auto_backup_remote_files: true,
                 },
                 Some("sk-test-key"),
                 None,
@@ -3647,7 +3682,12 @@ mod tests {
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::List,
                     approval_mode: ApprovalMode::Smart,
-                    cloud: CloudConfig::default(),
+                    cloud: CloudConfig {
+                        mode: CloudMode::default(),
+                        user: None,
+                        capabilities: None,
+                    },
+                    auto_backup_remote_files: true,
                 },
                 None,
                 Some("bsk-1"),

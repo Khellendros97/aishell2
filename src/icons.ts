@@ -99,6 +99,8 @@ const PATHS = {
     '<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>',
   chart:
     '<path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>',
+  diff:
+    '<path d="M12 3v10"/><path d="M12 9h4a2 2 0 0 1 0 4h-4"/><path d="M12 19H8a2 2 0 0 1 0-4h4"/><path d="M12 15v4"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

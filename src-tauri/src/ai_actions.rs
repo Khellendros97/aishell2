@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::ai_impact::{analyze_remote_command, Effect, ImpactPlan};
 use crate::ssh::SshManager;
+use crate::staging::{RemoteStaging, StagedState};
 use crate::store::{DbKind, Store};
 
 const DEFAULT_RUN_COMMAND_TIMEOUT_SECS: u64 = 10;
@@ -36,27 +38,42 @@ pub struct CommandResult {
     pub timed_out: bool,
 }
 
-/// AI 动作执行器（由 AiManager 持有并复用 Store + SshManager）。
+/// AI 动作执行器（由 AiManager 持有并复用 Store + SshManager + RemoteStaging）。
 pub struct AiActions {
     store: Arc<Store>,
     ssh: Arc<SshManager>,
+    staging: Arc<RemoteStaging>,
 }
 
 impl AiActions {
-    pub fn new(store: Arc<Store>, ssh: Arc<SshManager>) -> Self {
-        AiActions { store, ssh }
+    pub fn new(store: Arc<Store>, ssh: Arc<SshManager>, staging: Arc<RemoteStaging>) -> Self {
+        AiActions { store, ssh, staging }
     }
 
     /// 执行命令：target=local 走本地 shell（项目根 cwd），target=remote 走 SshManager。
     /// 空命令 / 空 intent / 非法超时在建进程或网络前拒绝；未传超时默认 10 秒。
+    ///
+    /// 远程分支（自动备份流程）：
+    /// - `working_directory` 为后端解析的远程工作目录（绝对路径；None 时经 SFTP canonicalize(".") 现取）；
+    ///   实际 exec 用同一绝对 cwd 以 `cd <cwd> && <command>` 包装（前一次独立调用的 cd 不保留），
+    ///   cwd 解析失败或 `cd` 失败不得执行原命令。
+    /// - `impact` 为审批阶段确定的影响计划（None = 执行时按 command+cwd 现算，yolo 路径）。
+    ///
+    /// 自动备份开启时：bounded → 执行前逐项 ensure_snapshot（全部成功才执行，失败阻止写入）；
+    /// 执行后逐项刷新 current 状态。none/unbounded 不在此处拦截（unbounded 的拒绝/人工确认在
+    /// 审批与动作桥层处理）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_command(
         &self,
         project_id: &str,
+        session_id: &str,
         intent: String,
         command: String,
         target: String,
         server_id: Option<String>,
         timeout_seconds: Option<u64>,
+        working_directory: Option<String>,
+        impact: Option<ImpactPlan>,
     ) -> Result<CommandResult, String> {
         let command = command.trim().to_string();
         if command.is_empty() {
@@ -78,12 +95,59 @@ impl AiActions {
                 let sid =
                     server_id.ok_or_else(|| "远程目标必须提供 serverId".to_string())?;
                 self.ensure_ai_allowed(&sid)?;
-                let result = self.ssh.exec_with_timeout(&sid, &command, timeout).await?;
+                // 有效工作目录：调用方解析结果优先（与审批分析同源），否则现取
+                let effective_cwd = match &working_directory {
+                    Some(c) if c.starts_with('/') => c.clone(),
+                    Some(_) => return Err("工作目录必须是绝对路径".to_string()),
+                    None => self.remote_home(&sid).await?,
+                };
+                let auto_backup = self.staging.auto_backup_enabled();
+                let plan = match impact {
+                    Some(p) => p,
+                    None => analyze_remote_command(&command, &effective_cwd),
+                };
+                // 自动备份：bounded → 执行前逐文件快照（任一失败即阻止执行）
+                if auto_backup && plan.effect == Effect::Bounded {
+                    let mut paths: Vec<&str> = Vec::new();
+                    for c in &plan.changes {
+                        if !paths.contains(&c.path.as_str()) {
+                            paths.push(c.path.as_str());
+                        }
+                        if let Some(d) = &c.destination {
+                            if !paths.contains(&d.as_str()) {
+                                paths.push(d.as_str());
+                            }
+                        }
+                    }
+                    for p in &paths {
+                        self.staging
+                            .ensure_snapshot(project_id, session_id, &sid, p)
+                            .await?;
+                    }
+                }
+                // 用同一绝对 cwd 包装命令（保证分析路径与实际执行环境一致）
+                let wrapped = format!("cd {} && {}", shell_quote(&effective_cwd), command);
+                let result = self.ssh.exec_with_timeout(&sid, &wrapped, timeout).await?;
                 if result.timed_out {
                     return Err(format!(
                         "命令执行超时（{} 秒），已尝试终止远端命令",
                         timeout.as_secs()
                     ));
+                }
+                // 执行后刷新 current 状态（best-effort：刷新失败不掩盖命令结果）
+                if auto_backup && plan.effect == Effect::Bounded {
+                    for c in &plan.changes {
+                        let _ = self
+                            .staging
+                            .refresh_current(project_id, session_id, &sid, &c.path)
+                            .await;
+                        if let Some(d) = &c.destination {
+                            let _ = self
+                                .staging
+                                .refresh_current(project_id, session_id, &sid, d)
+                                .await;
+                        }
+                    }
                 }
                 Ok(result)
             }
@@ -94,13 +158,21 @@ impl AiActions {
     /// SFTP 上传：本地源必须在项目根内且已存在（文件或目录），远端目录必填。
     /// overwrite=true 时远端同名直接覆盖；false 时重名自动创建副本。
     /// 返回给模型的落地说明：明确远端文件名，创建副本时显式提示。
+    ///
+    /// 自动备份：overwrite=true 时在 `upload_one` 前快照最终远程目标；目录覆盖时枚举本地
+    /// 每个文件逐一快照，无法枚举（权限等）返回错误拒绝（已获「不保证完整备份」人工确认的
+    /// agent 场景除外——`impact` 为审批阶段 unbounded 计划时按用户确认放行）。overwrite=false
+    /// 创建新副本，不备份原同名文件。
+    #[allow(clippy::too_many_arguments)]
     pub async fn sftp_upload(
         &self,
         project_id: &str,
+        session_id: &str,
         server_id: String,
         local_path: String,
         remote_dir: String,
         overwrite: bool,
+        impact: Option<ImpactPlan>,
     ) -> Result<String, String> {
         if local_path.trim().is_empty() {
             return Err("本地路径不能为空".to_string());
@@ -115,6 +187,31 @@ impl AiActions {
             .map_err(|e| format!("读取本地 {} 失败：{e}", local.display()))?;
         if !md.is_file() && !md.is_dir() {
             return Err(format!("上传源既不是文件也不是目录：{}", local.display()));
+        }
+        // 自动备份：覆盖前快照最终远程目标
+        if self.staging.auto_backup_enabled() && overwrite {
+            match self.upload_targets(&local, &remote_dir, &server_id).await {
+                Ok(targets) => {
+                    for t in &targets {
+                        self.staging
+                            .ensure_snapshot(project_id, session_id, &server_id, t)
+                            .await?;
+                    }
+                }
+                Err(reason) => {
+                    // 审批阶段已确认「不保证完整备份」（agent 人工确认）→ 放行；
+                    // 否则（yolo / 未经过审批）拒绝，避免绕过保护
+                    let approved_unbounded = matches!(
+                        impact.as_ref().map(|p| p.effect),
+                        Some(Effect::Unbounded)
+                    );
+                    if !approved_unbounded {
+                        return Err(format!(
+                            "{reason}，已拒绝覆盖上传；请改用受管文件操作（如上传到新目录）或手动 SFTP"
+                        ));
+                    }
+                }
+            }
         }
         let sftp = self.ssh.open_sftp(&server_id).await?;
         let landed = crate::sftp::upload_one(&sftp, &local, &remote_dir, overwrite).await?;
@@ -136,6 +233,50 @@ impl AiActions {
         } else {
             Ok(format!("上传完成：{full}（服务器 {server_id}）"))
         }
+    }
+
+    /// 覆盖上传的最终远程目标清单：文件 → 单一目标；目录 → 递归枚举本地文件映射远端相对路径。
+    /// 枚举失败返回 Err（调用方按 unbounded/拒绝处理）。
+    async fn upload_targets(&self, local: &Path, remote_dir: &str, server_id: &str) -> Result<Vec<String>, String> {
+        let md = std::fs::metadata(local)
+            .map_err(|e| format!("读取本地 {} 失败: {e}", local.display()))?;
+        if !md.is_file() && !md.is_dir() {
+            return Err(format!("上传源既不是文件也不是目录：{}", local.display()));
+        }
+        // 远端目录解析为绝对形态（快照要求绝对路径；相对目录相对 home 解析）
+        let base = if remote_dir.starts_with('/') {
+            remote_dir.trim_end_matches('/').to_string()
+        } else {
+            let home = self.remote_home(server_id).await?;
+            format!("{}/{}", home.trim_end_matches('/'), remote_dir.trim_end_matches('/'))
+        };
+        if md.is_file() {
+            let name = local
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| "无法确定本地文件名".to_string())?;
+            return Ok(vec![format!("{}/{}", base.trim_end_matches('/'), name)]);
+        }
+        // 目录：递归枚举
+        let mut out: Vec<String> = Vec::new();
+        let mut stack: Vec<(PathBuf, String)> = vec![(local.to_path_buf(), base.clone())];
+        while let Some((dir, remote_dir_cur)) = stack.pop() {
+            let rd = std::fs::read_dir(&dir)
+                .map_err(|e| format!("枚举本地目录 {} 失败: {e}", dir.display()))?;
+            for ent in rd {
+                let ent = ent.map_err(|e| format!("枚举本地目录 {} 失败: {e}", dir.display()))?;
+                let path = ent.path();
+                let name = ent.file_name().to_string_lossy().into_owned();
+                let remote = format!("{}/{}", remote_dir_cur, name);
+                if path.is_dir() {
+                    stack.push((path, remote));
+                } else {
+                    out.push(remote);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// SFTP 下载：本地目标目录必须在项目根内且**已存在**（AI 不自动创建目录）。
@@ -164,6 +305,167 @@ impl AiActions {
         crate::sftp::download_one(&sftp, &remote_path, &dir)
             .await
             .map(|_| ())
+    }
+
+    /// 解析远端 home（canonicalize(".")）：审批/执行两阶段共用的远程工作目录事实源。
+    /// 供 ai.rs 审批流（影响分析、LLM 上下文）与 run_command 包装使用。
+    pub async fn remote_home(&self, server_id: &str) -> Result<String, String> {
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        sftp.canonicalize(".")
+            .await
+            .map_err(|e| format!("解析远程工作目录失败: {e}"))
+    }
+
+    /// 覆盖上传的影响计划（审批阶段计算，供合并/展示/执行确认）：
+    /// overwrite=false → none；文件覆盖 → bounded 单目标；目录覆盖 → bounded 枚举目标；
+    /// 枚举失败 → unbounded。
+    pub async fn upload_impact(
+        &self,
+        project_id: &str,
+        server_id: &str,
+        local_path: &str,
+        remote_dir: &str,
+        overwrite: bool,
+    ) -> Result<ImpactPlan, String> {
+        if !overwrite {
+            return Ok(ImpactPlan::none("创建新副本，不覆盖已有文件"));
+        }
+        let root = self.project_root(project_id)?;
+        let local = self.resolve_inside(&root, Path::new(local_path))?;
+        let md = std::fs::metadata(&local)
+            .map_err(|e| format!("读取本地 {} 失败：{e}", local.display()))?;
+        if !md.is_file() && !md.is_dir() {
+            return Ok(ImpactPlan::none("上传源既不是文件也不是目录"));
+        }
+        match self.upload_targets(&local, remote_dir, server_id).await {
+            Ok(targets) if !targets.is_empty() => Ok(ImpactPlan::bounded(
+                targets
+                    .into_iter()
+                    .map(|path| crate::ai_impact::FileChange {
+                        operation: crate::ai_impact::Operation::Modify,
+                        path,
+                        destination: None,
+                    })
+                    .collect(),
+                "覆盖上传目标已完整枚举",
+            )),
+            Ok(_) => Ok(ImpactPlan::none("覆盖上传目标为空")),
+            Err(reason) => Ok(ImpactPlan::unbounded(&format!("{reason}；不保证完整备份"))),
+        }
+    }
+
+    /// AI 查看当前会话暂存列表（只读工具；不经前端 Tauri 命令）。
+    pub async fn staging_list(&self, project_id: &str, session_id: &str) -> Result<String, String> {
+        let entries = self.staging.list(project_id, session_id).await?;
+        if entries.is_empty() {
+            return Ok("当前会话暂存区为空（自动备份开启后，AI 修改远程文件前会自动保存原始快照，可在此查看、diff、还原）".to_string());
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for e in &entries {
+            let orig = match e.original_state {
+                StagedState::Existing => "已有文件",
+                StagedState::Absent => "新建文件",
+            };
+            let cur = match e.current_state {
+                StagedState::Existing => "存在",
+                StagedState::Absent => "已不存在",
+            };
+            lines.push(format!(
+                "- entryId={}，服务器={}，路径={}，原始状态={}，当前状态={}，首次快照时间={}",
+                e.entry_id,
+                e.server_id,
+                e.remote_path,
+                orig,
+                cur,
+                format_staged_ts(e.staged_at)
+            ));
+        }
+        Ok(format!("当前会话暂存条目（{} 个）：\n{}", entries.len(), lines.join("\n")))
+    }
+
+    /// AI 查看某条目 diff（只读工具）。
+    pub async fn staging_diff(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        entry_id: &str,
+    ) -> Result<String, String> {
+        let d = self.staging.diff(project_id, session_id, entry_id).await?;
+        if let Some(meta) = &d.meta {
+            let s = &meta.snapshot;
+            let c = &meta.current;
+            let fmt = |sha: &Option<String>, size: &Option<u64>, mtime: &Option<i64>| {
+                format!(
+                    "sha256={} size={} mtime={}",
+                    sha.as_deref().unwrap_or("-"),
+                    size.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+                    mtime.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+                )
+            };
+            return Ok(format!(
+                "暂存条目 {entry_id} 为二进制或超大文件，无法显示文本 diff：\n快照：{}\n当前：{}",
+                fmt(&s.sha256, &s.size, &s.mtime),
+                fmt(&c.sha256, &c.size, &c.mtime)
+            ));
+        }
+        let mut lines = Vec::new();
+        if d.snapshot_absent {
+            lines.push("（原始状态：文件不存在——首次修改前为空）".to_string());
+        }
+        if d.current_absent {
+            lines.push("（当前：远端文件已不存在）".to_string());
+        }
+        for l in &d.left {
+            lines.push(format!("{} {}", if l.kind == "del" { "-" } else { " " }, l.text));
+        }
+        lines.push("─".repeat(40));
+        for l in &d.right {
+            lines.push(format!("{} {}", if l.kind == "add" { "+" } else { " " }, l.text));
+        }
+        Ok(format!("暂存条目 {entry_id} diff（上：首次快照；下：当前）：\n{}", lines.join("\n")))
+    }
+
+    /// AI 还原某条目（force 恒 false：外部修改冲突如实报告，不静默覆盖）。
+    /// 仍执行服务器 AI 锁检查与外部修改冲突检查。
+    pub async fn staging_restore(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        entry_id: &str,
+    ) -> Result<String, String> {
+        // 先定位条目所属服务器（AI 锁检查需要）
+        let entries = self.staging.list(project_id, session_id).await?;
+        let entry = entries
+            .iter()
+            .find(|e| e.entry_id == entry_id)
+            .ok_or_else(|| format!("暂存条目不存在：{entry_id}"))?;
+        self.ensure_ai_allowed(&entry.server_id)?;
+        let out = self
+            .staging
+            .restore(project_id, session_id, entry_id, false)
+            .await?;
+        if out.restored {
+            let e = out.entry.as_ref().unwrap();
+            let verb = match e.original_state {
+                StagedState::Existing => "已把远程文件还原到首次修改前的内容",
+                StagedState::Absent => "已删除当前远程文件（原始状态为不存在）",
+            };
+            Ok(format!("还原完成：{verb}（{}）", e.remote_path))
+        } else if let Some(c) = out.conflict {
+            Err(format!(
+                "还原冲突：远程文件已被外部修改（size={}，mtime={}，sha256={}），未执行还原。\
+                 如需强制还原请用户在暂存面板确认",
+                c.current_size.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+                c.current_mtime.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+                c.current_sha256.as_deref().unwrap_or("-")
+            ))
+        } else {
+            Err("还原失败：暂存状态异常".to_string())
+        }
     }
 
     /// 查询项目绑定的可操作服务器列表（只读；供 LLM 在远程动作前确认 serverId）。
@@ -396,6 +698,22 @@ fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
+/// 单引号 shell 引用（`'` → `'\''`）：远程 cwd 含空格/特殊字符时安全包装 exec 命令。
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 暂存时间展示（本地时间 HH:MM:SS）。
+fn format_staged_ts(ts: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = ts.max(0) as u64;
+    let base = UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    match SystemTime::now().duration_since(base) {
+        Ok(d) => format!("{} 秒前", d.as_secs()),
+        Err(_) => "-".to_string(),
+    }
+}
+
 /// run_command 超时：未传使用 10 秒，避免命令无界挂起；显式值限制为 1–3600 秒。
 fn command_timeout(timeout_seconds: Option<u64>) -> Result<Duration, String> {
     let seconds = timeout_seconds.unwrap_or(DEFAULT_RUN_COMMAND_TIMEOUT_SECS);
@@ -523,6 +841,18 @@ pub fn is_db_read_only(kind: DbKind, command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用 AiActions：临时暂存根 + test_store（不碰真实 keyring / Store::new）。
+    fn test_actions(store: Arc<Store>) -> AiActions {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-ai-actions-staging-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ssh = Arc::new(SshManager::new(Arc::clone(&store)));
+        let staging = Arc::new(RemoteStaging::new(dir, Arc::clone(&ssh), Arc::clone(&store)));
+        AiActions::new(store, ssh, staging)
+    }
 
     #[test]
     fn normalize_collapses_dots_and_parents() {
@@ -655,7 +985,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let actions = AiActions::new(Arc::clone(&store), Arc::new(crate::ssh::SshManager::new(Arc::clone(&store))));
+        let actions = test_actions(Arc::clone(&store));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -786,12 +1116,7 @@ mod tests {
             .unwrap();
 
         let store = Arc::new(store);
-        let actions = AiActions::new(Arc::clone(&store), Arc::new(SshManager::new(Arc::new(
-            crate::store::test_store(std::env::temp_dir().join(format!(
-                "aishell-ai-actions-ssh-{}",
-                std::process::id()
-            ))),
-        ))));
+        let actions = test_actions(Arc::clone(&store));
         let text = actions.list_servers("proj-x").unwrap();
         assert!(text.contains("serverId=srv-a"), "应列出绑定服务器: {text}");
         assert!(text.contains("生产机"));

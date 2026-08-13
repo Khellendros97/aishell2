@@ -15,10 +15,32 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::json;
 
+use crate::ai_impact::{Effect, FileChange, ImpactPlan, Operation};
 use crate::store::{CloudMode, Store};
 
 /// 判定超时：超时视为判定失败（回退人工审批）。
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 智能审批判定结果：危险判定 + LLM 补充的文件系统影响（格式未经校验，调用方按 unbounded 兜底）。
+#[derive(Debug, Clone)]
+pub struct JudgeOutput {
+    /// true = 需人工审批；false = 直接放行
+    pub dangerous: bool,
+    pub reason: String,
+    pub effect: Effect,
+    pub changes: Vec<FileChange>,
+}
+
+impl JudgeOutput {
+    /// 组装为 ImpactPlan（供 merge_plans / 校验使用）。
+    pub fn to_plan(&self) -> ImpactPlan {
+        ImpactPlan {
+            effect: self.effect,
+            changes: self.changes.clone(),
+            reason: format!("LLM 判定：{}", self.reason),
+        }
+    }
+}
 
 /// 凭据文件（basename 形态）：命中即人工审批。普通 *.conf 读取不拦，避免审批疲劳——
 /// 配置内容里的密码由 redact 在输出侧脱敏兜底。
@@ -91,21 +113,39 @@ const SYSTEM_PROMPT: &str = r#"你是 AIShell 的 AI 助手操作安全审查器
 - 启动/停止项目内普通开发进程（如 dev server）、查看进程/端口、网络探测类只读命令。
 
 只输出一个 JSON 对象，不要输出任何其他内容，格式：
-{"dangerous": true 或 false, "reason": "一句中文理由"}"#;
+{"dangerous": true 或 false, "reason": "一句中文理由", "filesystemEffect": "none|bounded|unbounded", "changes": [{"operation": "create|modify|delete|rename", "path": "/绝对/路径", "destination": "/rename/目标(仅 rename 需要)"}]}
 
-/// 判定一次受控工具调用是否危险。
-/// 返回 `Ok((dangerous, reason))`：dangerous=true 需人工审批，false 直接放行；
-/// `Err` 表示判定失败（网络/状态码/解析），调用方按人工审批处理。
+filesystemEffect 判定要求（决定远程文件自动备份范围）：
+- 命令会写入哪些远程文件必须全部列出为绝对路径；例如 `cd /var/www/app && : > config.json` 应输出
+  {"filesystemEffect":"bounded","changes":[{"operation":"modify","path":"/var/www/app/config.json"}]}；
+  相对路径必须基于命令中的静态 cd 或给定的工作目录解析为绝对路径。
+- 无任何文件写入 → "none" 且 changes 为空数组。
+- 影响范围无法完整确定（变量路径、命令替换、脚本、循环、递归目录、通配符等）→ "unbounded" 且 changes 为空数组。
+- 绝对路径必须以 / 开头；rename 必须带 destination（绝对路径）。"#;
+
+/// 判定一次受控工具调用是否危险（并补充文件系统影响分析）。
+/// 返回 `Ok(JudgeOutput)`：dangerous=true 需人工审批，false 直接放行；
+/// `Err` 表示判定失败（网络/状态码/解析），调用方按人工审批处理（文件影响按 unbounded 兜底）。
+#[allow(clippy::too_many_arguments)]
 pub async fn judge(
     store: &Arc<Store>,
     cloud: &Arc<crate::cloud::CloudManager>,
     action: &str,
     intent: &str,
     summary: &str,
-) -> Result<(bool, String), String> {
+    command: &str,
+    target: &str,
+    server_id: &str,
+    working_directory: &str,
+) -> Result<JudgeOutput, String> {
     // 凭据前置规则：确定性命中即转人工，不消耗 LLM 判定请求（offline、零误放行）。
     if let Some(reason) = precheck_credential_access(summary) {
-        return Ok((true, reason));
+        return Ok(JudgeOutput {
+            dangerous: true,
+            reason,
+            effect: Effect::Unbounded,
+            changes: Vec::new(),
+        });
     }
     let cfg = store.llm_config();
     // 托管模式（CR-3.3）：判定请求改发公司服务器代理 + Bearer access_token（请求前续期）；
@@ -132,11 +172,11 @@ pub async fn judge(
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": format!(
-                "工具调用信息：\n工具：{action}\n意图：{intent}\n详情：{summary}"
+                "工具调用信息：\n工具：{action}\n意图：{intent}\n详情：{summary}\n完整命令：{command}\n执行目标：{target}\n服务器：{server_id}\n工作目录：{working_directory}"
             )},
         ],
         "temperature": 0,
-        "max_tokens": 300,
+        "max_tokens": 400,
         "reasoning_effort": "low",
     });
     let client = reqwest::Client::builder()
@@ -164,8 +204,9 @@ pub async fn judge(
 }
 
 /// 从模型输出中提取判定 JSON：宽松提取首个 `{` 到最后一个 `}`（容忍围栏/前后说明文字）。
-/// 单独成函数便于单测。
-pub fn parse_judgement(text: &str) -> Result<(bool, String), String> {
+/// 输出 `JudgeOutput`；filesystemEffect / changes 缺字段或非法（operation 非枚举、路径非绝对等）
+/// 一律 Err → 调用方按 unbounded 处理（绝不降级为 none）。单独成函数便于单测。
+pub fn parse_judgement(text: &str) -> Result<JudgeOutput, String> {
     let start = text.find('{').ok_or("判定结果缺少 JSON")?;
     let end = text.rfind('}').ok_or("判定结果缺少 JSON")?;
     let v: serde_json::Value = serde_json::from_str(&text[start..=end])
@@ -179,12 +220,46 @@ pub fn parse_judgement(text: &str) -> Result<(bool, String), String> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
-    Ok((dangerous, reason))
+    let effect: Effect = v
+        .get("filesystemEffect")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("判定结果缺少 filesystemEffect 字段")?
+        .parse()
+        .map_err(|_| "filesystemEffect 必须是 none|bounded|unbounded".to_string())?;
+    let changes: Vec<FileChange> = v
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("判定结果缺少 changes 数组")?
+        .iter()
+        .map(|c| {
+            let operation: Operation = c
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("changes 项缺少 operation")?
+                .parse()
+                .map_err(|_| "operation 必须是 create|modify|delete|rename".to_string())?;
+            let path = c
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("changes 项缺少 path")?
+                .to_string();
+            let destination = c
+                .get("destination")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            Ok(FileChange { operation, path, destination })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // 格式校验：非绝对路径 / bounded 无 changes / none 携带 changes → Err（调用方按 unbounded）
+    let plan = ImpactPlan { effect, changes: changes.clone(), reason: reason.clone() };
+    crate::ai_impact::validate_impact_plan(&plan)?;
+    Ok(JudgeOutput { dangerous, reason, effect, changes })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{parse_judgement, precheck_credential_access};
+    use crate::ai_impact::{Effect, Operation};
 
     #[test]
     fn precheck_flags_qa01_real_command() {
@@ -244,30 +319,65 @@ mod tests {
 
     #[test]
     fn parse_plain_json() {
-        assert_eq!(
-            parse_judgement(r#"{"dangerous": false, "reason": "常规查询"}"#).unwrap(),
-            (false, "常规查询".to_string())
-        );
-        assert_eq!(
-            parse_judgement(r#"{"dangerous": true, "reason": "删除文件"}"#).unwrap(),
-            (true, "删除文件".to_string())
-        );
+        let out = parse_judgement(
+            r#"{"dangerous": false, "reason": "常规查询", "filesystemEffect": "none", "changes": []}"#,
+        )
+        .unwrap();
+        assert!(!out.dangerous);
+        assert_eq!(out.reason, "常规查询");
+        assert_eq!(out.effect, Effect::None);
+        assert!(out.changes.is_empty());
+
+        let out = parse_judgement(
+            r#"{"dangerous": true, "reason": "删除文件", "filesystemEffect": "bounded", "changes": [{"operation": "delete", "path": "/var/log/a.log"}]}"#,
+        )
+        .unwrap();
+        assert!(out.dangerous);
+        assert_eq!(out.changes.len(), 1);
+        assert_eq!(out.changes[0].path, "/var/log/a.log");
+    }
+
+    #[test]
+    fn parse_cd_absolute_path_example() {
+        // 需求验收：模型应把 cd 后的相对路径解析为绝对路径（示例输出）
+        let out = parse_judgement(
+            r#"{"dangerous": false, "reason": "清空配置", "filesystemEffect": "bounded", "changes": [{"operation": "modify", "path": "/var/www/app/config.json"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(out.effect, Effect::Bounded);
+        assert_eq!(out.changes[0].path, "/var/www/app/config.json");
+        assert_eq!(out.changes[0].operation, Operation::Modify);
     }
 
     #[test]
     fn parse_with_surrounding_text() {
         // 模型偶发在 JSON 前后附加说明：宽松提取首个 { 到最后一个 }
-        let text = "好的，分析如下：\n```json\n{\"dangerous\": true, \"reason\": \"rm -rf 删除目录\"}\n```\n结论如上。";
-        assert_eq!(
-            parse_judgement(text).unwrap(),
-            (true, "rm -rf 删除目录".to_string())
-        );
+        let text = "好的，分析如下：\n```json\n{\"dangerous\": true, \"reason\": \"rm -rf 删除目录\", \"filesystemEffect\": \"unbounded\", \"changes\": []}\n```\n结论如上。";
+        let out = parse_judgement(text).unwrap();
+        assert!(out.dangerous);
+        assert_eq!(out.reason, "rm -rf 删除目录");
+        assert_eq!(out.effect, Effect::Unbounded);
     }
 
     #[test]
-    fn parse_missing_fields() {
-        assert!(parse_judgement(r#"{"dangerous": "yes"}"#).is_err());
-        assert!(parse_judgement(r#"{"reason": "无判定字段"}"#).is_err());
+    fn parse_missing_or_invalid_fields() {
+        // 缺 dangerous
+        assert!(parse_judgement(r#"{"reason": "x", "filesystemEffect": "none", "changes": []}"#).is_err());
+        // dangerous 非布尔
+        assert!(parse_judgement(r#"{"dangerous": "yes", "filesystemEffect": "none", "changes": []}"#).is_err());
+        // 缺 filesystemEffect
+        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "changes": []}"#).is_err());
+        // filesystemEffect 非法
+        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "partial", "changes": []}"#).is_err());
+        // operation 非法
+        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "bounded", "changes": [{"operation": "truncate", "path": "/a"}]}"#).is_err());
+        // 非绝对路径 → Err（不降级为 none）
+        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "bounded", "changes": [{"operation": "modify", "path": "config.json"}]}"#).is_err());
+        // bounded 无 changes → Err
+        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "bounded", "changes": []}"#).is_err());
+        // none 携带 changes → Err
+        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "none", "changes": [{"operation": "modify", "path": "/a"}]}"#).is_err());
+        // 无 JSON
         assert!(parse_judgement("没有任何 JSON").is_err());
     }
 }
