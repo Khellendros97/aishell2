@@ -103,6 +103,14 @@ export const renderSettings: PageRender = (root, params) => {
               <div class="hint">智能审批：AI 操作先由大模型判定，非危险操作（常规读写、查询、构建等）自动放行并展示「已智能放行」；删除、服务启停、格式化等危险操作仍需人工确认。全部审批：每次操作都需人工确认</div>
             </div>
           </fieldset>
+          <fieldset class="llm-group">
+            <legend>远程文件备份</legend>
+            <div class="field">
+              <label>自动备份远程文件</label>
+              <input id="f-auto-backup" type="checkbox">
+              <div class="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
+            </div>
+          </fieldset>
           <div class="form-actions">
             <button id="btn-save-system" class="btn primary">保存</button>
           </div>
@@ -123,10 +131,11 @@ export const renderSettings: PageRender = (root, params) => {
   const fBraveKey = root.querySelector('#f-brave-key') as HTMLInputElement;
   const fAiWorkdir = root.querySelector('#f-ai-workdir') as HTMLInputElement;
   const fApprovalMode = root.querySelector('#f-approval-mode') as HTMLSelectElement;
+  const fAutoBackup = root.querySelector('#f-auto-backup') as HTMLInputElement;
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
-    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: true, projectView: 'card', approvalMode: 'smart' },
+    settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: true, projectView: 'card', approvalMode: 'smart', autoBackupRemoteFiles: true },
     servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, seededSkillWorkspaces: [],
   };
 
@@ -149,6 +158,7 @@ export const renderSettings: PageRender = (root, params) => {
     fBraveKey.value = ''; // 同上：Brave key 永不回传
     fAiWorkdir.checked = s.autoSwitchAiWorkdir ?? true;
     fApprovalMode.value = s.approvalMode ?? 'smart';
+    fAutoBackup.checked = s.autoBackupRemoteFiles ?? true;
   }
 
   // Workspace 浏览…：真实目录选择
@@ -216,6 +226,7 @@ export const renderSettings: PageRender = (root, params) => {
       workspaceDir, llm, search: { enabled: fSearchEnabled.checked }, theme: currentTheme(),
       autoSwitchAiWorkdir: fAiWorkdir.checked, projectView: db.settings.projectView ?? 'card',
       approvalMode: fApprovalMode.value as Settings['approvalMode'],
+      autoBackupRemoteFiles: fAutoBackup.checked,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);

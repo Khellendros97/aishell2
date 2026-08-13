@@ -37,6 +37,9 @@ base64 = "0.22"
 reqwest = { version = "0.12", features = ["json"] }
 # 输出脱敏与凭据提取前置规则（redact / smart_approval）
 regex = "1"
+# 远程文件暂存 blob 内容寻址（staging.rs）
+sha2 = "0.10"
+hex = "0.4"
 # Skill 系统 frontmatter 解析（serde_yaml 已归档，采用维护中的 serde_yaml_ng）
 serde_yaml_ng = "0.9.36"
 

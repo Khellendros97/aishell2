@@ -25,6 +25,8 @@ export interface Settings {
   projectView: 'card' | 'list';
   /** 审批模式（智能审批/全部审批）；旧配置无此字段按智能审批 */
   approvalMode: 'smart' | 'all';
+  /** 自动备份远程文件：开启后 AI 会话第一次修改某远程文件前保存原始快照（会话级暂存区）；旧配置无此字段按开启 */
+  autoBackupRemoteFiles: boolean;
 }
 
 /** 与 store.rs Theme serde lowercase 对齐 */
@@ -261,4 +263,78 @@ export interface SkillSummary {
 export interface SkillDocument {
   summary: SkillSummary;
   content: string;
+}
+
+/* ---------------- 会话级远程文件暂存（与 staging.rs serde camelCase 对齐） ---------------- */
+
+/** 原始/当前存在状态 —— 与 staging.rs StagedState serde lowercase 对齐 */
+export type StagedState = 'existing' | 'absent';
+
+/** 暂存条目 —— 与 staging.rs StagedFile serde camelCase 对齐 */
+export interface StagedFile {
+  entryId: string;
+  serverId: string;
+  remotePath: string;
+  /** 首次快照时远程状态 */
+  originalState: StagedState;
+  /** 快照 blob 的 sha256（原始状态为 absent 时为 null） */
+  blobRef: string | null;
+  size: number | null;
+  mtime: number | null;
+  sha256: string | null;
+  stagedAt: number;
+  /** 最近一次刷新时的远程状态 */
+  currentState: StagedState;
+  currentSize: number | null;
+  currentMtime: number | null;
+  currentSha256: string | null;
+}
+
+/** 文件元数据（二进制/超大文件的展示与冲突校验用） */
+export interface StagingMeta {
+  sha256: string | null;
+  size: number | null;
+  mtime: number | null;
+}
+
+/** 单侧内容读取结果：text 为可编辑文本（已脱敏）；meta 为二进制/超大元数据；absent 表示该侧不存在 */
+export interface StagingContent {
+  text: string | null;
+  meta: StagingMeta | null;
+  absent: boolean;
+}
+
+/** diff 单侧行（kind：del/add/ctx） */
+export interface DiffLine {
+  kind: 'del' | 'add' | 'ctx';
+  text: string;
+}
+
+/** diff 元数据对比（二进制/超大时） */
+export interface DiffMeta {
+  snapshot: StagingMeta;
+  current: StagingMeta;
+}
+
+/** staging_diff 结果：行级 diff（文本）或元数据对比（二进制/超大） */
+export interface StagingDiff {
+  left: DiffLine[];
+  right: DiffLine[];
+  meta: DiffMeta | null;
+  snapshotAbsent: boolean;
+  currentAbsent: boolean;
+}
+
+/** restore 冲突详情（结构化返回，前端据此弹「仍要强制还原？」） */
+export interface RestoreConflict {
+  currentSize: number | null;
+  currentMtime: number | null;
+  currentSha256: string | null;
+}
+
+/** restore 结果：restored=true 时 entry 为更新后的条目；conflict 非空表示冲突且未还原 */
+export interface RestoreOutcome {
+  restored: boolean;
+  conflict: RestoreConflict | null;
+  entry: StagedFile | null;
 }

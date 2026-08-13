@@ -214,6 +214,7 @@ export const renderWelcome: PageRender = (root) => {
       autoSwitchAiWorkdir: true,
       projectView: 'card',
       approvalMode: 'smart',
+      autoBackupRemoteFiles: true,
     },
     servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, seededSkillWorkspaces: [],
   };

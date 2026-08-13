@@ -1,7 +1,9 @@
 pub mod ai;
 pub mod ai_actions;
+pub mod ai_impact;
 pub mod redact;
 pub mod smart_approval;
+pub mod staging;
 #[cfg(windows)]
 pub mod gitinstall;
 pub mod fsops;
@@ -34,6 +36,12 @@ pub fn run() {
                     .map_err(std::io::Error::other)?,
             );
             let ssh = Arc::new(ssh::SshManager::new(store.clone()));
+            // 会话级远程文件暂存（自动备份）：config_dir/remote-staging
+            let staging = Arc::new(staging::RemoteStaging::new(
+                config_dir.join("remote-staging"),
+                Arc::clone(&ssh),
+                Arc::clone(&store),
+            ));
             let terms = Arc::new(term::TermManager::new(ssh.clone()));
             // pi 运行时目录：Windows 安装版把 bundle.resources 装到 exe 旁 resources/ 子目录，
             // macOS 装到 AIShell.app/Contents/Resources/resources/ 子目录；resource_dir() 在各
@@ -82,12 +90,14 @@ pub fn run() {
                 pi_dir,
                 config_dir.join("pi-agent"),
                 ssh.clone(),
+                staging.clone(),
                 pi_debug,
             ));
             app.manage(store);
             app.manage(ssh);
             app.manage(terms);
             app.manage(ai.clone());
+            app.manage(staging);
             term::set_debug_app(app.handle().clone());
             // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
             // 捆绑安装器。放后台线程并延迟触发：等主事件循环泵消息、主窗口显示后再弹框
@@ -196,6 +206,12 @@ pub fn run() {
             ai::ai_set_thinking,
             ai::set_ai_mode,
             ai::ai_respond_approval,
+            staging::staging_list,
+            staging::staging_snapshot_read,
+            staging::staging_current_read,
+            staging::staging_accept,
+            staging::staging_restore,
+            staging::staging_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

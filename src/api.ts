@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -184,7 +184,9 @@ export type AiEvent =
   | { type: 'error'; message: string }
   | { type: 'approval'; requestId: string; toolCallId: string; action: string; intent: string; summary: string;
       /** 智能审批自动放行：true 时卡片直接展示「已智能放行」（后端已回 confirmed，无需再回复） */
-      smart?: boolean; smartReason?: string }
+      smart?: boolean; smartReason?: string;
+      /** 影响计划（自动备份开启时）：effect 为 none|bounded|unbounded，unbounded 卡片展示「不保证完整备份」 */
+      impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string } }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
@@ -203,6 +205,28 @@ export const aiRespondApproval = (key: string, requestId: string, confirmed: boo
   call<void>('ai_respond_approval', { key, requestId, confirmed });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
+
+/* ---------------- staging（会话级远程文件暂存，自动备份） ----------------
+   快照在 AI 修改远程文件前自动创建；本组命令供「文件暂存区」面板 / diff 标签使用。
+   staging_accept 只注册为前端命令，绝不加入 pi 工具 / guard 工具集 / 动作桥。 */
+export const stagingList = (projectId: string, sessionId: string) =>
+  call<StagedFile[]>('staging_list', { projectId, sessionId });
+/** 读取快照侧内容：text 为已脱敏文本；二进制/超大只返回 hash/size/mtime 元数据 */
+export const stagingSnapshotRead = (projectId: string, sessionId: string, entryId: string) =>
+  call<StagingContent>('staging_snapshot_read', { projectId, sessionId, entryId });
+/** 读取当前侧内容（实时从远端读取） */
+export const stagingCurrentRead = (projectId: string, sessionId: string, entryId: string) =>
+  call<StagingContent>('staging_current_read', { projectId, sessionId, entryId });
+/** 接受暂存：只删除本地条目，不改远程内容 */
+export const stagingAccept = (projectId: string, sessionId: string, entryId: string) =>
+  call<StagedFile>('staging_accept', { projectId, sessionId, entryId });
+/** 还原：先比较暂存记录的 current hash/size/mtime，冲突时返回结构化冲突；
+ *  force=true 只由用户前端命令传入（AI 工具恒 false） */
+export const stagingRestore = (projectId: string, sessionId: string, entryId: string, force: boolean) =>
+  call<RestoreOutcome>('staging_restore', { projectId, sessionId, entryId, force });
+/** 行级 diff（文本）或元数据对比（二进制/超大） */
+export const stagingDiff = (projectId: string, sessionId: string, entryId: string) =>
+  call<StagingDiff>('staging_diff', { projectId, sessionId, entryId });
 
 /* ---------------- skills ---------------- */
 /** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
