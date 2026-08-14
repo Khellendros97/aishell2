@@ -31,15 +31,17 @@ npm run tauri build        # 打包安装包
 
 构建期注入公司云平台配置后,客户端启用 OAuth2 登录与托管模式:员工登录公司账号即可使用服务器统一管理的模型 / 搜索转发,无需自配 API Key;本地「个人模式」保留可切换。
 
-云配置为**构建期常量**(`build.rs` 注入),客户端无修改入口;取值顺序为**环境变量 → 项目根 `release.env`(gitignore 本地文件)**:
+云配置为**构建期常量**(`build.rs` 注入),客户端无修改入口;取值顺序为**环境变量 → 项目根按构建档位选择 env 文件**(debug 构建读 `dev.env`,release 构建读 `release.env`,均为 gitignore 本地文件):
 
 ```bash
-# 方式一:环境变量(一次性注入)
+# 方式一:环境变量(一次性注入,优先级最高)
 export AISHELL_SERVER_URL=https://cloud.example.com/           # 云平台服务器地址
 export AISHELL_CLIENT_ID=xxxxxxxx                              # OAuth 应用 client_id
 export AISHELL_CLIENT_SECRET=xxxxxxxx                          # OAuth 应用 client_secret
 
-# 方式二:项目根 release.env(gitignore 不入库,VS Code 集成终端等读不到环境变量时兜底)
+# 方式二:项目根 env 文件(gitignore 不入库,VS Code 集成终端等读不到环境变量时兜底)
+#   dev 环境 → dev.env(tauri dev 自动读取)
+#   release 环境 → release.env(scripts/build-release.mjs 自动读取)
 # AISHELL_SERVER_URL=https://cloud.example.com/
 # AISHELL_CLIENT_ID=xxxxxxxx
 # AISHELL_CLIENT_SECRET=xxxxxxxx
@@ -50,10 +52,10 @@ export AISHELL_CLIENT_SECRET=xxxxxxxx                          # OAuth 应用 cl
 ```bash
 node scripts/build-release.mjs --check   # 校验云配置是否完整
 node scripts/build-release.mjs           # release 打包(等价 npm run tauri build)
-npm run tauri dev                        # 开发模式(自动读 release.env,无需手动注入)
+npm run tauri dev                        # 开发模式(自动读 dev.env,无需手动注入)
 ```
 
-> 凭据纪律:client_secret 属于敏感凭据,只存在于环境变量 / release.env(不入库);回调地址白名单在云平台后台登记 `http://127.0.0.1:38901/auth/callback`(客户端本地回环监听,端口固定)。
+> 凭据纪律:client_secret 属于敏感凭据,只存在于环境变量 / dev.env / release.env(不入库);回调地址白名单在云平台后台登记 `http://127.0.0.1:38901/auth/callback`(客户端本地回环监听,端口固定)。
 
 ## 数据与密钥
 

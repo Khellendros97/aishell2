@@ -29,5 +29,6 @@ src-tauri/resources/pi/
 src-tauri/resources/git/
 src-tauri/target
 tmp/
-# 本地 release 构建云配置（含 client_secret，绝不入库；scripts/build-release.mjs 读取）
+# 本地云配置文件（含 client_secret，绝不入库；debug 构建读 dev.env，release 构建读 release.env）
+dev.env
 release.env
