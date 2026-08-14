@@ -231,6 +231,11 @@ impl RemoteStaging {
         map.entry(key.to_string()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
     }
 
+    /// 同一会话的 manifest 是单文件读改写事务；所有写操作必须持有此锁，避免并发丢失更新。
+    fn manifest_lock(&self, project_id: &str, session_id: &str) -> Arc<AsyncMutex<()>> {
+        self.lock_for(&format!("manifest:{project_id}:{session_id}"))
+    }
+
     /// 保存快照：按唯一键查 manifest，已有条目直接返回（同一会话后续修改不覆盖原始快照）；
     /// 无条目时经 SFTP 读远程元数据与完整原始字节写 blob（文件不存在记录 Absent），再原子写 manifest。
     /// 快照失败返回中文错误（调用方应阻止远程修改）。
@@ -246,6 +251,8 @@ impl RemoteStaging {
         let lock_key = format!("{project_id}:{session_id}:{server_id}:{remote_path}");
         let lock = self.lock_for(&lock_key);
         let _guard = lock.lock().await;
+        let manifest_lock = self.manifest_lock(project_id, session_id);
+        let _manifest_guard = manifest_lock.lock().await;
 
         let mut entries = self.read_manifest(project_id, session_id)?;
         if let Some(existing) = entries.iter().find(|e| e.server_id == server_id && e.remote_path == remote_path) {
@@ -380,6 +387,8 @@ impl RemoteStaging {
     ) -> Result<StagedFile, String> {
         validate_id(project_id, "项目 ID")?;
         validate_id(session_id, "会话 ID")?;
+        let manifest_lock = self.manifest_lock(project_id, session_id);
+        let _manifest_guard = manifest_lock.lock().await;
         let mut entries = self.read_manifest(project_id, session_id)?;
         let idx = entries
             .iter()
@@ -402,6 +411,8 @@ impl RemoteStaging {
     ) -> Result<RestoreOutcome, String> {
         validate_id(project_id, "项目 ID")?;
         validate_id(session_id, "会话 ID")?;
+        let manifest_lock = self.manifest_lock(project_id, session_id);
+        let _manifest_guard = manifest_lock.lock().await;
         let mut entries = self.read_manifest(project_id, session_id)?;
         let entry = self.find_entry(&entries, entry_id)?;
         let sftp = self
@@ -558,6 +569,8 @@ impl RemoteStaging {
     ) -> Result<StagedFile, String> {
         self.validate_session(project_id, session_id, server_id)?;
         let remote_path = canonical_remote_path(remote_path)?;
+        let manifest_lock = self.manifest_lock(project_id, session_id);
+        let _manifest_guard = manifest_lock.lock().await;
         let mut entries = self.read_manifest(project_id, session_id)?;
         let Some(entry) = entries.iter_mut().find(|e| e.server_id == server_id && e.remote_path == remote_path) else {
             return Ok(StagedFile {
@@ -892,6 +905,20 @@ fn lcs_diff(a: &[String], b: &[String]) -> (Vec<DiffLine>, Vec<DiffLine>) {
 
 /* ---------------- Tauri 命令（前端工作台调用；AI 侧经 ai_actions 动作桥） ---------------- */
 
+/// 用户从 SFTP / 远程编辑器主动暂存文件；复用 ensure_snapshot 的会话隔离、去重和目录拒绝语义。
+#[tauri::command]
+pub async fn staging_add(
+    staging: State<'_, Arc<RemoteStaging>>,
+    project_id: String,
+    session_id: String,
+    server_id: String,
+    remote_path: String,
+) -> Result<StagedFile, String> {
+    staging
+        .ensure_snapshot(&project_id, &session_id, &server_id, &remote_path)
+        .await
+}
+
 #[tauri::command]
 pub async fn staging_list(
     staging: State<'_, Arc<RemoteStaging>>,
@@ -1068,6 +1095,45 @@ mod tests {
             .block_on(staging.accept("p1", "s1", "e1"))
             .unwrap_err();
         assert!(err.contains("暂存条目不存在"), "实际: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_accepts_do_not_lose_manifest_updates() {
+        let root = test_root("accept-concurrent");
+        let store = Arc::new(crate::store::test_store(root.join("store")));
+        let staging = Arc::new(RemoteStaging::new(
+            root.clone(),
+            Arc::new(SshManager::new(Arc::clone(&store))),
+            Arc::clone(&store),
+        ));
+        let entries: Vec<StagedFile> = (1..=3)
+            .map(|n| StagedFile {
+                entry_id: format!("e{n}"),
+                server_id: "srv-a".to_string(),
+                remote_path: format!("/tmp/{n}.txt"),
+                original_state: StagedState::Existing,
+                blob_ref: Some(format!("hash{n}")),
+                size: Some(1),
+                mtime: Some(1),
+                sha256: Some(format!("hash{n}")),
+                staged_at: n,
+                current_state: StagedState::Existing,
+                current_size: Some(1),
+                current_mtime: Some(1),
+                current_sha256: Some(format!("hash{n}")),
+            })
+            .collect();
+        staging.write_manifest("p1", "s1", &entries).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (a, b, c) = tokio::join!(
+                staging.accept("p1", "s1", "e1"),
+                staging.accept("p1", "s1", "e2"),
+                staging.accept("p1", "s1", "e3"),
+            );
+            assert!(a.is_ok() && b.is_ok() && c.is_ok());
+        });
+        assert!(staging.read_manifest("p1", "s1").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

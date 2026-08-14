@@ -209,6 +209,9 @@ export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<Unlis
 /* ---------------- staging（会话级远程文件暂存，自动备份） ----------------
    快照在 AI 修改远程文件前自动创建；本组命令供「文件暂存区」面板 / diff 标签使用。
    staging_accept 只注册为前端命令，绝不加入 pi 工具 / guard 工具集 / 动作桥。 */
+/** 用户主动暂存远程文件；同一会话已暂存时直接返回既有条目，不覆盖首次快照。 */
+export const stagingAdd = (projectId: string, sessionId: string, serverId: string, remotePath: string) =>
+  call<StagedFile>('staging_add', { projectId, sessionId, serverId, remotePath });
 export const stagingList = (projectId: string, sessionId: string) =>
   call<StagedFile[]>('staging_list', { projectId, sessionId });
 /** 读取快照侧内容：text 为已脱敏文本；二进制/超大只返回 hash/size/mtime 元数据 */

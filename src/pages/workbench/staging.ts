@@ -40,41 +40,73 @@ registerRenderer('remote-staging', (container, tab) => {
   let servers: Array<{ id: string; name: string }> = [];
   let entries: StagedFile[] = [];
   let loading = false;
+  const selected = new Set<string>();
+  let bulkRunning = false;
 
   const serverName = (id: string): string => servers.find((s) => s.id === id)?.name ?? id;
 
   container.innerHTML = `
     <div class="staging-panel">
       <div class="staging-head">
-        <span class="staging-title">${icon('history')} 文件暂存区</span>
+        <span class="staging-title">${icon('history')} 文件暂存区 <span class="staging-count" data-staging-count>0</span></span>
         <button class="btn small" data-staging-refresh title="刷新列表">${icon('refresh')} 刷新</button>
       </div>
       <div class="staging-hint">自动备份开启后，AI 会话第一次修改远程文件前自动保存原始快照，同一会话后续修改不覆盖。接受 = 确认本次修改并清除暂存条目（不改远程内容）；还原 = 把远程文件恢复到首次修改前的内容。</div>
+      <div class="staging-toolbar" data-staging-toolbar hidden>
+        <span class="staging-selected" data-staging-selected>已选择 0 项</span>
+        <span class="staging-toolbar-spacer"></span>
+        <button class="btn small primary" data-staging-bulk-accept disabled>批量接受</button>
+        <button class="btn small" data-staging-bulk-restore disabled>${icon('restore')} 批量还原</button>
+      </div>
       <div class="staging-body"><div class="staging-empty">加载中…</div></div>
     </div>
   `;
 
   const bodyEl = container.querySelector('.staging-body') as HTMLElement;
+  const countEl = container.querySelector('[data-staging-count]') as HTMLElement;
+  const toolbarEl = container.querySelector('[data-staging-toolbar]') as HTMLElement;
+  const selectedEl = container.querySelector('[data-staging-selected]') as HTMLElement;
+  const bulkAcceptBtn = container.querySelector('[data-staging-bulk-accept]') as HTMLButtonElement;
+  const bulkRestoreBtn = container.querySelector('[data-staging-bulk-restore]') as HTMLButtonElement;
+
+  function updateSelectionUi(): void {
+    const count = selected.size;
+    countEl.textContent = String(entries.length);
+    toolbarEl.hidden = entries.length === 0;
+    selectedEl.textContent = count ? `已选择 ${count} 项` : '选择文件后可批量操作';
+    bulkAcceptBtn.disabled = count === 0 || bulkRunning;
+    bulkRestoreBtn.disabled = count === 0 || bulkRunning;
+    const all = bodyEl.querySelector<HTMLInputElement>('[data-staging-select-all]');
+    if (all) {
+      all.checked = entries.length > 0 && count === entries.length;
+      all.indeterminate = count > 0 && count < entries.length;
+    }
+  }
 
   function render(): void {
+    for (const id of selected) {
+      if (!entries.some((entry) => entry.entryId === id)) selected.delete(id);
+    }
     if (!entries.length) {
       bodyEl.innerHTML = `<div class="staging-empty">当前会话暂无暂存条目。AI 修改远程文件（run_command 写入 / sftp_upload 覆盖）前会自动保存原始快照。</div>`;
+      updateSelectionUi();
       return;
     }
-    const rows = entries.map((e) => {
-      const orig = STATE_LABEL[e.originalState] ?? e.originalState;
-      const cur = STATE_LABEL[e.currentState] ?? e.currentState;
-      const curCls = e.currentState === 'absent' ? ' st-absent' : '';
-      const name = e.remotePath.split('/').filter(Boolean).pop() || e.remotePath;
+    const rows = entries.map((entry) => {
+      const orig = STATE_LABEL[entry.originalState] ?? entry.originalState;
+      const cur = STATE_LABEL[entry.currentState] ?? entry.currentState;
+      const curCls = entry.currentState === 'absent' ? ' st-absent' : '';
+      const name = entry.remotePath.split('/').filter(Boolean).pop() || entry.remotePath;
       return `
-        <tr data-entry-id="${escapeHtml(e.entryId)}">
-          <td class="st-server">${escapeHtml(serverName(e.serverId))}</td>
-          <td class="st-path" title="${escapeHtml(e.remotePath)}">${escapeHtml(name)}<span class="st-path-full">${escapeHtml(e.remotePath)}</span></td>
-          <td class="st-time">${fmtTime(e.stagedAt)}</td>
-          <td class="st-orig">${orig}${e.size != null ? ` · ${fmtSize(e.size)}` : ''}</td>
+        <tr data-entry-id="${escapeHtml(entry.entryId)}" class="${selected.has(entry.entryId) ? 'selected' : ''}">
+          <td class="st-select"><input type="checkbox" data-staging-select aria-label="选择 ${escapeHtml(entry.remotePath)}" ${selected.has(entry.entryId) ? 'checked' : ''}></td>
+          <td class="st-server">${escapeHtml(serverName(entry.serverId))}</td>
+          <td class="st-path" title="${escapeHtml(entry.remotePath)}">${escapeHtml(name)}<span class="st-path-full">${escapeHtml(entry.remotePath)}</span></td>
+          <td class="st-time">${fmtTime(entry.stagedAt)}</td>
+          <td class="st-orig">${orig}${entry.size != null ? ` · ${fmtSize(entry.size)}` : ''}</td>
           <td class="st-cur${curCls}">${cur}</td>
           <td class="st-actions">
-            <button class="btn small" data-staging-diff title="查看首次快照与当前内容差异">${icon('diff')} Diff</button>
+            <button class="btn small" data-staging-diff title="查看首次快照与当前内容差异">${icon('diff')} 比较差异</button>
             <button class="btn small primary" data-staging-accept title="确认本次修改，清除暂存条目（不改远程内容）">接受</button>
             <button class="btn small" data-staging-restore title="把远程文件还原到首次修改前的内容">还原</button>
           </td>
@@ -82,9 +114,10 @@ registerRenderer('remote-staging', (container, tab) => {
     }).join('');
     bodyEl.innerHTML = `
       <table class="staging-table">
-        <thead><tr><th>服务器</th><th>远程路径</th><th>首次快照</th><th>原始状态</th><th>当前状态</th><th>操作</th></tr></thead>
+        <thead><tr><th class="st-select"><input type="checkbox" data-staging-select-all aria-label="全选暂存文件"></th><th>服务器</th><th>远程路径</th><th>首次快照</th><th>原始状态</th><th>当前状态</th><th>操作</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
+    updateSelectionUi();
   }
 
   function findRow(target: HTMLElement): HTMLElement | null {
@@ -147,6 +180,65 @@ registerRenderer('remote-staging', (container, tab) => {
       toast(String(err), 'error');
     }
   }
+  async function doBulkAccept(): Promise<void> {
+    const targets = entries.filter((entry) => selected.has(entry.entryId));
+    if (!targets.length || bulkRunning) return;
+    const ok = await confirmDialog({
+      title: '批量接受暂存',
+      message: `确认接受选中的 ${targets.length} 个文件修改？\n这只会清除本地暂存记录，不会修改远程文件。`,
+      okText: `接受 ${targets.length} 项`,
+    });
+    if (!ok) return;
+    bulkRunning = true;
+    updateSelectionUi();
+    let accepted = 0;
+    for (const entry of targets) {
+      try {
+        await stagingAccept(data.projectId, data.sessionId, entry.entryId);
+        accepted++;
+      } catch { /* 继续处理其余条目，结束后统一报告 */ }
+    }
+    bulkRunning = false;
+    const failed = targets.length - accepted;
+    if (failed) toast(`已接受 ${accepted} 项，${failed} 项失败`, 'error');
+    else toast(`已接受 ${accepted} 项暂存修改`, 'success');
+    selected.clear();
+    bus.emit('staging-changed');
+    void refresh();
+  }
+
+  async function doBulkRestore(): Promise<void> {
+    const targets = entries.filter((entry) => selected.has(entry.entryId));
+    if (!targets.length || bulkRunning) return;
+    const ok = await confirmDialog({
+      title: '批量还原暂存',
+      message: `把选中的 ${targets.length} 个远程文件还原到首次修改前？\n当前修改将丢失；检测到外部修改的文件会跳过，不会强制覆盖。`,
+      danger: true,
+      okText: `还原 ${targets.length} 项`,
+    });
+    if (!ok) return;
+    bulkRunning = true;
+    updateSelectionUi();
+    let restored = 0;
+    let conflicts = 0;
+    let failed = 0;
+    for (const entry of targets) {
+      try {
+        const result = await stagingRestore(data.projectId, data.sessionId, entry.entryId, false);
+        if (result.restored) restored++;
+        else if (result.conflict) conflicts++;
+        else failed++;
+      } catch {
+        failed++;
+      }
+    }
+    bulkRunning = false;
+    if (conflicts || failed) toast(`已还原 ${restored} 项；${conflicts} 项冲突、${failed} 项失败`, 'error');
+    else toast(`已还原 ${restored} 个远程文件`, 'success');
+    selected.clear();
+    bus.emit('staging-changed');
+    void refresh();
+  }
 
   bodyEl.addEventListener('click', (e) => {
     const btn = (e.target as HTMLElement).closest('button');
@@ -172,8 +264,27 @@ registerRenderer('remote-staging', (container, tab) => {
       }).then((ok) => { if (ok) void doRestore(entry, false); });
     }
   });
+  bodyEl.addEventListener('change', (e) => {
+    const input = (e.target as HTMLElement).closest<HTMLInputElement>('input[type="checkbox"]');
+    if (!input) return;
+    if (input.hasAttribute('data-staging-select-all')) {
+      selected.clear();
+      if (input.checked) entries.forEach((entry) => selected.add(entry.entryId));
+      render();
+      return;
+    }
+    if (!input.hasAttribute('data-staging-select')) return;
+    const row = findRow(input);
+    if (!row?.dataset.entryId) return;
+    if (input.checked) selected.add(row.dataset.entryId);
+    else selected.delete(row.dataset.entryId);
+    row.classList.toggle('selected', input.checked);
+    updateSelectionUi();
+  });
 
   container.querySelector('[data-staging-refresh]')!.addEventListener('click', () => void refresh());
+  bulkAcceptBtn.addEventListener('click', () => void doBulkAccept());
+  bulkRestoreBtn.addEventListener('click', () => void doBulkRestore());
   // 双击行打开 diff
   bodyEl.addEventListener('dblclick', (e) => {
     const row = findRow(e.target as HTMLElement);

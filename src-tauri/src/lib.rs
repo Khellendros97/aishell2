@@ -206,6 +206,7 @@ pub fn run() {
             ai::ai_set_thinking,
             ai::set_ai_mode,
             ai::ai_respond_approval,
+            staging::staging_add,
             staging::staging_list,
             staging::staging_snapshot_read,
             staging::staging_current_read,

@@ -17,7 +17,7 @@ import { tags } from '@lezer/highlight';
 import { oneDarkTheme } from '@codemirror/theme-one-dark';
 import { search, SearchQuery, getSearchQuery, openSearchPanel, closeSearchPanel, searchPanelOpen, setSearchQuery, findNext, findPrevious, replaceNext, replaceAll } from '@codemirror/search';
 import type { Panel, ViewUpdate } from '@codemirror/view';
-import { fsRead, fsWrite, onFsChanged, sftpRead, sftpStat, sftpWrite } from '../../api';
+import { fsRead, fsWrite, onFsChanged, sftpRead, sftpStat, sftpWrite, stagingAdd, stagingList } from '../../api';
 import { copyText, showContextMenu, toast, uid } from '../../ui';
 import { icon } from '../../icons';
 import type { IconName } from '../../icons';
@@ -101,6 +101,10 @@ interface EditorEntry {
   conflict: boolean;
   /** 冲突弹窗防重入 */
   conflictDialogOpen: boolean;
+  /** 远程文件是否已加入当前 AI 会话暂存；本地文件不使用。 */
+  staged: boolean;
+  /** 远程文件未暂存警告条。 */
+  stagingWarning?: HTMLElement;
 }
 
 const entries = new Map<string, EditorEntry>();
@@ -294,22 +298,61 @@ async function loadFile(entry: EditorEntry, skipIfSame = false): Promise<void> {
   }
 }
 
+async function refreshRemoteStaging(entry: EditorEntry): Promise<void> {
+  const sftp = entry.tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
+  const projectId = Workbench.state.project?.id;
+  const sessionId = Workbench.ai?.currentSessionId?.();
+  if (!sftp?.serverId || !sftp.remotePath || !projectId || !sessionId) {
+    entry.staged = false;
+    entry.stagingWarning?.classList.remove('hidden');
+    return;
+  }
+  try {
+    const entries = await stagingList(projectId, sessionId);
+    entry.staged = entries.some((item) => item.serverId === sftp.serverId && item.remotePath === sftp.remotePath);
+  } catch {
+    entry.staged = false;
+  }
+  entry.stagingWarning?.classList.toggle('hidden', entry.staged);
+}
+
+async function stageEditorFile(entry: EditorEntry): Promise<void> {
+  const sftp = entry.tab.data.sftp as { serverId?: string; remotePath?: string } | undefined;
+  const projectId = Workbench.state.project?.id;
+  const sessionId = Workbench.ai?.currentSessionId?.();
+  if (!sftp?.serverId || !sftp.remotePath) return;
+  if (!projectId || !sessionId) {
+    toast('AI 会话尚未加载，无法暂存文件', 'error');
+    return;
+  }
+  try {
+    await stagingAdd(projectId, sessionId, sftp.serverId, sftp.remotePath);
+    entry.staged = true;
+    entry.stagingWarning?.classList.add('hidden');
+    toast(`已暂存：${entry.baseTitle}`, 'success');
+    bus.emit('staging-changed');
+  } catch (err) {
+    toast(String(err), 'error');
+  }
+}
+
 /* ---------- 编辑器右键菜单：全选 / 复制 / 剪切 / 粘贴 / 添加到chat ---------- */
 function showEditorMenu(x: number, y: number, entry: EditorEntry, path: string): void {
   const view = entry.view;
   const { from, to, empty } = view.state.selection.main;
   const hasSel = !empty && from !== to;
   const selText = hasSel ? view.state.sliceDoc(from, to) : '';
+  const remote = Boolean((entry.tab.data.sftp as { serverId?: string; remotePath?: string } | undefined)?.serverId);
 
-  showContextMenu(x, y, [
-    { label: '全选', iconName: 'square', action: () => { view.focus(); selectAll(view); } },
-    'sep',
+  const items = [
+    { label: '全选', iconName: 'square' as const, action: () => { view.focus(); selectAll(view); } },
+    'sep' as const,
     {
-      label: '复制', iconName: 'copy', disabled: !hasSel, disabledTip: '请先框选一段文字',
+      label: '复制', iconName: 'copy' as const, disabled: !hasSel, disabledTip: '请先框选一段文字',
       action: () => { void copyText(selText).then(() => toast('已复制', 'success')); },
     },
     {
-      label: '剪切', iconName: 'scissors', disabled: !hasSel, disabledTip: '请先框选一段文字',
+      label: '剪切', iconName: 'scissors' as const, disabled: !hasSel, disabledTip: '请先框选一段文字',
       action: () => {
         void copyText(selText).then(() => {
           view.dispatch({ changes: { from, to } });
@@ -318,27 +361,30 @@ function showEditorMenu(x: number, y: number, entry: EditorEntry, path: string):
       },
     },
     {
-      label: '删除', iconName: 'trash', danger: true, disabled: !hasSel, disabledTip: '请先框选一段文字',
+      label: '删除', iconName: 'trash' as const, danger: true, disabled: !hasSel, disabledTip: '请先框选一段文字',
       action: () => { view.dispatch({ changes: { from, to } }); },
     },
     {
-      label: '粘贴', iconName: 'clipboard',
+      label: '粘贴', iconName: 'clipboard' as const,
       action: () => {
         void navigator.clipboard.readText().then((text) => {
           const pos = view.state.selection.main.from;
-          view.dispatch({
-            changes: { from: pos, insert: text },
-            selection: { anchor: pos + text.length },
-          });
+          view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length } });
         }).catch(() => toast('读取剪贴板失败', 'error'));
       },
     },
-    'sep',
+    'sep' as const,
+    ...(remote ? [{
+      label: entry.staged ? '已暂存' : '暂存', iconName: 'history' as const, disabled: entry.staged,
+      disabledTip: entry.staged ? '当前文件已在本会话暂存' : undefined,
+      action: () => void stageEditorFile(entry),
+    }, 'sep' as const] : []),
     {
-      label: '添加到chat', iconName: 'chatPlus', disabled: !hasSel, disabledTip: '请先框选一段文字',
+      label: '添加到chat', iconName: 'chatPlus' as const, disabled: !hasSel, disabledTip: '请先框选一段文字',
       action: () => addCurrentSelectionToAI(view, path),
     },
-  ]);
+  ];
+  showContextMenu(x, y, items);
 }
 
 /** 取当前选区（菜单/Ctrl+L 共用入口）：无选区时提示 */
@@ -600,11 +646,9 @@ class FindBar implements Panel {
     const view = this.view;
     if (view.state.readOnly) return;
     if (!this.query.valid) { toast('请先输入查找内容', 'info'); return; }
-    // 先按与 replaceAll 相同的口径（仅精确匹配）统计数量，再执行
     let count = 0;
     const cursor = this.query.getCursor(view.state);
     for (let it = cursor.next(); !it.done; it = cursor.next()) {
-      // @codemirror/search 的 d.ts 对 value 只声明 from/to，运行时恒带 precise 标志
       const v = it.value as { from: number; to: number; precise: boolean };
       if (v.precise) count++;
     }
@@ -613,7 +657,6 @@ class FindBar implements Panel {
     toast(`已替换 ${count} 处`, 'success');
   }
 
-  /** 只读态（本编辑器暂不启用）时禁用替换按钮 */
   private syncReplaceButtons(): void {
     const ro = this.view.state.readOnly;
     this.replaceBtn.disabled = ro;
@@ -624,11 +667,18 @@ class FindBar implements Panel {
 /* ---------- 渲染器 ---------- */
 registerRenderer('editor', (container, tab) => {
   const sftp = tab.data.sftp as { serverId?: string; remotePath?: string; stat?: { size: number; mtime: number } } | undefined;
-  // 远端文件无本地 path：用远端路径承担文件名/语言/选区引用展示
   const path = String(tab.data.path ?? '') || (sftp?.remotePath ?? '');
   const name = path.split(/[\\/]/).pop() ?? '';
   const baseTitle = tab.title || name || '未命名';
 
+  const remote = Boolean(sftp?.serverId && sftp.remotePath);
+  let stagingWarning: HTMLElement | undefined;
+  if (remote) {
+    stagingWarning = document.createElement('div');
+    stagingWarning.className = 'ed-staging-warning';
+    stagingWarning.innerHTML = `${icon('alert')} <span>该远程文件尚未暂存，请在修改前右键暂存</span>`;
+    container.appendChild(stagingWarning);
+  }
   const root = document.createElement('div');
   root.className = 'ed-root';
   container.appendChild(root);
@@ -638,11 +688,13 @@ registerRenderer('editor', (container, tab) => {
     dirty: false, version: 0, timer: undefined,
     chain: Promise.resolve(), loading: false,
     view: undefined as unknown as EditorView,
-    // 打开时快照：远端外部修改冲突检测基线（无快照 = 不检测）
     remoteStat: sftp?.stat ?? null,
     conflict: false,
     conflictDialogOpen: false,
+    staged: false,
+    stagingWarning,
   };
+
 
   entry.view = new EditorView({
     state: EditorState.create({
@@ -657,23 +709,19 @@ registerRenderer('editor', (container, tab) => {
         // Ctrl+F/Ctrl+H：查找 / 替换（keymap 仅编辑器聚焦时生效，不干扰终端等全局快捷键）；Esc 关闭查找栏
         Prec.highest(keymap.of([
           {
-            key: 'Mod-s',
-            preventDefault: true,
+            key: 'Mod-s', preventDefault: true,
             run: () => { void queueSave(entry, false, true); return true; },
           },
           {
-            key: 'Mod-l',
-            preventDefault: true,
+            key: 'Mod-l', preventDefault: true,
             run: () => addCurrentSelectionToAI(entry.view, path),
           },
           {
-            key: 'Mod-f',
-            preventDefault: true,
+            key: 'Mod-f', preventDefault: true,
             run: () => { openFind(entry.view, false); return true; },
           },
           {
-            key: 'Mod-h',
-            preventDefault: true,
+            key: 'Mod-h', preventDefault: true,
             run: () => { openFind(entry.view, true); return true; },
           },
           {
@@ -687,7 +735,6 @@ registerRenderer('editor', (container, tab) => {
         ])),
         keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
         cmTheme.of(cmThemeExt()),
-        // 查找/替换面板：top 浮层 + 中文面板（FindBar）；查询状态/高亮/跳转/替换复用 @codemirror/search
         search({ top: true, createPanel: (view) => new FindBar(view) }),
         EditorView.updateListener.of((update) => { if (update.docChanged) markDirty(entry); }),
       ],
@@ -703,6 +750,10 @@ registerRenderer('editor', (container, tab) => {
     showEditorMenu(e.clientX, e.clientY, entry, path);
   });
 
+  const offStaging = bus.on('staging-changed', () => {
+    if (remote && container.isConnected) void refreshRemoteStaging(entry);
+  });
+
   // 链式保留打开方传入的 onClose：先静默落盘未保存缓冲，再放行（原型语义）
   const originalOnClose = tab.onClose;
   tab.onClose = (t: Tab): void => {
@@ -713,11 +764,13 @@ registerRenderer('editor', (container, tab) => {
         // 远端已被外部修改且未处理：不覆盖外部修改，也不弹窗打断关闭流程
         toast(`「${entry.baseTitle}」远端已被外部修改，更改未保存`, 'info');
       }
+      offStaging();
       originalOnClose?.(t);
     })();
   };
 
   void loadFile(entry);
+  if (remote) void refreshRemoteStaging(entry);
 
   return {
     getPath: () => path,

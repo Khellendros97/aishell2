@@ -40,6 +40,26 @@ const STYLE = `
 }
 #ai-effort-bar .ai-mode-label { display: inline-flex; align-items: center; gap: 4px; }
 #ai-mode-select { width: 74px; }
+#ai-staging-notice {
+  min-height: 30px;
+  margin: 0 10px 8px;
+  padding: 5px 9px;
+  display: none;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color .12s, background .12s, color .12s;
+}
+#ai-staging-notice.visible { display: flex; }
+#ai-staging-notice:hover { border-color: var(--accent); background: var(--accent-dim); color: var(--text-0); }
+#ai-staging-notice .ic { flex: none; color: var(--accent); }
+#ai-staging-notice .ai-staging-link { margin-left: auto; color: var(--accent); }
 /* 动作卡（Agent 审批卡 / YOLO 自动执行卡 / 历史只读审计卡） */
 .ai-action-card {
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
@@ -344,6 +364,9 @@ let observer: MutationObserver | null = null;
 let unmounted = false;
 /** AI 面板根容器（Ctrl+C 键盘策略监听用，卸载时移除） */
 let panelRoot: HTMLElement | null = null;
+let stagingNotice: HTMLButtonElement;
+let offStagingChanged: (() => void) | null = null;
+let stagingRefreshVersion = 0;
 
 let chat: HTMLElement;
 let sessionSelect: HTMLSelectElement;
@@ -432,6 +455,9 @@ export function mountAiPanel(container: HTMLElement): void {
       <button id="ai-new-session" class="icon-btn" title="新建会话">${icon('plus')}</button>
     </div>
     <div id="ai-chat"></div>
+    <button id="ai-staging-notice" type="button">
+      ${icon('diff')} <span data-ai-staging-text>已暂存 0 个文件修改，点击查看</span><span class="ai-staging-link">${icon('chevronRight')}</span>
+    </button>
     <div id="ai-input-area">
       <div id="ai-effort-bar">
         <span class="ai-mode-label">${icon('bot')} AI 模式</span>
@@ -463,6 +489,7 @@ export function mountAiPanel(container: HTMLElement): void {
   chipRow = el('chip-row');
   effortSelect = el('effort-select') as HTMLSelectElement;
   modeSelect = el('mode-select') as HTMLSelectElement;
+  stagingNotice = el('staging-notice') as HTMLButtonElement;
   modeSelect.value = project?.aiMode ?? 'suggest';
 
   /* 容器被移除（工作台页面卸载）→ 取消订阅、置空 Workbench.ai、杀掉本项目 pi 进程 */
@@ -480,6 +507,10 @@ export function mountAiPanel(container: HTMLElement): void {
     if (autoSwitchAiWorkdir) updateWorkareaFromTab(t);
   });
 
+  offStagingChanged = bus.on('staging-changed', () => {
+    if (!unmounted && container.isConnected) void refreshStagingNotice();
+  });
+
   // pi 运行时诊断输出到控制台（F12 可查），便于排查安装版「pi 运行时不存在」
   void aiDebugInfo().then((info) => console.log('[AI] pi 运行时诊断:\n' + info));
 
@@ -488,6 +519,7 @@ export function mountAiPanel(container: HTMLElement): void {
   container.addEventListener('keydown', onPanelKeydown, true);
   void loadSessions();
   void loadEffort();
+  void refreshStagingNotice();
 }
 
 function cleanup(): void {
@@ -496,6 +528,7 @@ function cleanup(): void {
   if (panelRoot) { panelRoot.removeEventListener('keydown', onPanelKeydown, true); panelRoot = null; }
   if (unlisten) { unlisten(); unlisten = null; }
   if (observer) { observer.disconnect(); observer = null; }
+  if (offStagingChanged) { offStagingChanged(); offStagingChanged = null; }
   if (Workbench.ai === aiHandle) Workbench.ai = null;
   if (project) void aiKillProject(project.id).catch(() => { /* 进程清理失败可忽略 */ });
 }
@@ -537,6 +570,9 @@ const aiHandle = {
     pathRefs.set(ref.path, ref);
     addPathRefChip(ref);
   },
+  currentSessionId(): string | null {
+    return activeSessionId || null;
+  },
 };
 
 /* ---------- 会话管理 ---------- */
@@ -548,6 +584,36 @@ function newSession(): ChatSession {
 
 function currentKey(): string {
   return project && activeSessionId ? `${project.id}:${activeSessionId}` : '';
+}
+function openCurrentStaging(): void {
+  const pid = project?.id;
+  const sid = activeSessionId;
+  if (!pid || !sid) return;
+  openTab({
+    id: `staging:${pid}:${sid}`,
+    type: 'remote-staging',
+    title: '文件暂存区',
+    data: { projectId: pid, sessionId: sid },
+  });
+}
+
+async function refreshStagingNotice(): Promise<void> {
+  const pid = project?.id;
+  const sid = activeSessionId;
+  const version = ++stagingRefreshVersion;
+  if (!pid || !sid) {
+    stagingNotice.classList.remove('visible');
+    return;
+  }
+  try {
+    const entries = await stagingList(pid, sid);
+    if (version !== stagingRefreshVersion || sid !== activeSessionId) return;
+    const text = stagingNotice.querySelector('[data-ai-staging-text]') as HTMLElement;
+    text.textContent = `已暂存 ${entries.length} 个文件修改，点击查看`;
+    stagingNotice.classList.toggle('visible', entries.length > 0);
+  } catch {
+    if (version === stagingRefreshVersion) stagingNotice.classList.remove('visible');
+  }
 }
 
 async function loadSessions(): Promise<void> {
@@ -570,6 +636,7 @@ async function loadSessions(): Promise<void> {
   renderSessionBar();
   renderHistory();
   updateSendBtn();
+  void refreshStagingNotice();
 }
 
 async function subscribe(key: string): Promise<void> {
@@ -715,8 +782,9 @@ function handleEvent(key: string, ev: AiEvent): void {
       existing.result = ev.result ? ev.result.slice(0, 2000) : undefined;
     }
     pendingBy.set(sid, p);
-    /* 暂存工具完成 → 广播刷新暂存面板/diff 标签 */
-    if (ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff') {
+    /* 远程写入与暂存工具完成 → 广播刷新暂存面板、diff 标签和输入区计数。 */
+    if (ev.tool === 'run_command' || ev.tool === 'sftp_upload'
+      || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff') {
       bus.emit('staging-changed');
     }
   } else if (ev.type === 'segment') {
@@ -1534,15 +1602,15 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
   return text
     + snaps.map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`).join('')
     + refs.map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`).join('')
-    + prefs.map((p) => `\n\n[${p.isDir ? '引用目录' : '引用文件'}: ${p.path}]`).join('')
+    + prefs.map((r) => `\n\n[${r.isDir ? '目录路径' : '文件路径'}: ${r.path}]`).join('')
     + refText;
 }
 
 /* ---------- 事件绑定 ---------- */
 /** AI 面板 Ctrl+C 策略（capture 阶段）：
  *  1) 输入框有选区 → 不拦截，交给浏览器默认复制；
- *  2) 消息区有选中文本 → 显式复制（WebView 对非编辑区选中文本的默认复制不可靠，走 copyText 封装）；
- *  3) 输入框为空且当前标签为终端 → 转发 ^C 给终端（中断正在运行的程序），避免误吞 Ctrl+C。 */
+ *  2) 消息区有选中文本 → 显式复制；
+ *  3) 输入框为空且当前标签为终端 → 转发 ^C 给终端。 */
 function onPanelKeydown(e: KeyboardEvent): void {
   if (e.key !== 'c' && e.key !== 'C') return;
   if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
@@ -1574,6 +1642,7 @@ function bindEvents(): void {
     void subscribe(currentKey());
     renderHistory();
     updateSendBtn();
+    void refreshStagingNotice();
   };
   newSessionBtn.onclick = () => {
     leaveSession(activeSessionId);
@@ -1582,6 +1651,7 @@ function bindEvents(): void {
     renderHistory();
     updateSendBtn();
     void subscribe(currentKey());
+    void refreshStagingNotice();
   };
   chat.addEventListener('click', onChatClick);
   /* AI 对话容器右键菜单：打开当前会话文件暂存区（数量实时查询；只作用于当前 project+session） */
@@ -1591,14 +1661,7 @@ function bindEvents(): void {
     if (!pid || !sid) return;
     e.preventDefault();
     e.stopPropagation();
-    const openStaging = (): void => {
-      openTab({
-        id: `staging:${pid}:${sid}`,
-        type: 'remote-staging',
-        title: '文件暂存区',
-        data: { projectId: pid, sessionId: sid },
-      });
-    };
+    const openStaging = openCurrentStaging;
     void stagingList(pid, sid)
       .then((entries) => {
         showContextMenu(e.clientX, e.clientY, [
@@ -1611,6 +1674,7 @@ function bindEvents(): void {
         ]);
       });
   });
+  stagingNotice.addEventListener('click', openCurrentStaging);
   chipRow.addEventListener('click', onChipRowClick);
   input.addEventListener('input', autoGrow);
   input.addEventListener('keydown', (e: KeyboardEvent) => {

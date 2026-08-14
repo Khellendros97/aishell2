@@ -51,6 +51,8 @@ export interface AiHandle {
   addServerRef?(ref: ServerRef): void;
   /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容） */
   addPathRef?(ref: PathRef): void;
+  /** 当前 AI 会话 ID；会话尚未加载时返回 null。 */
+  currentSessionId?(): string | null;
 }
 
 /** fn(container, tab) 返回可选 tabApi 对象（供其他模块调用） */

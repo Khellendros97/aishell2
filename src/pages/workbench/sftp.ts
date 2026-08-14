@@ -19,7 +19,7 @@ import './sftp.css';
 import type { FsEntry, FsStat, SftpFavorite, SshExecResult } from '../../types';
 import {
   fsDelete, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
-  sftpHome, sftpList, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec,
+  sftpHome, sftpList, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec, stagingAdd,
 } from '../../api';
 import { confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../ui';
 import { bus, getActiveTab, openTab, registerRenderer, Workbench, type Tab } from './core';
@@ -881,6 +881,21 @@ function startRemoteRename(st: SftpTabState, it: RemoteEntry, row: HTMLElement):
   input.addEventListener('blur', () => finish(true));
   input.addEventListener('click', (e) => e.stopPropagation());
 }
+async function stageRemoteFile(st: SftpTabState, entry: RemoteEntry): Promise<void> {
+  const projectId = Workbench.state.project?.id;
+  const sessionId = Workbench.ai?.currentSessionId?.();
+  if (!projectId || !sessionId) {
+    toast('AI 会话尚未加载，无法暂存文件', 'error');
+    return;
+  }
+  try {
+    await stagingAdd(projectId, sessionId, st.serverId, entry.path);
+    toast(`已暂存：${entry.name}`, 'success');
+    bus.emit('staging-changed');
+  } catch (err) {
+    toast(String(err), 'error');
+  }
+}
 
 /** 单选/多选共用的条目菜单：右键的条目不在选中集时先单选它，再按选中集提供操作 */
 function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, row: HTMLElement): void {
@@ -901,6 +916,11 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
       action: () => { if (first.isDir) goTo(st, first.path, true); else openRemoteFile(st, first); },
     },
     'sep',
+    {
+      label: '暂存', iconName: 'history', disabled: multi || first.isDir,
+      disabledTip: multi ? '暂存仅支持单个文件' : (first.isDir ? '目录无法暂存' : undefined),
+      action: () => void stageRemoteFile(st, first),
+    },
     {
       label: '复制', iconName: 'copy',
       action: () => {

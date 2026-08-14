@@ -96,7 +96,7 @@ const PATHS = {
   sparkles:
     '<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>',
   diff:
-    '<path d="M12 3v10"/><path d="M12 9h4a2 2 0 0 1 0 4h-4"/><path d="M12 19H8a2 2 0 0 1 0-4h4"/><path d="M12 15v4"/>',
+    '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/><path d="M6.5 9h3"/><path d="M8 7.5v3"/><path d="M14.5 15h3"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;
