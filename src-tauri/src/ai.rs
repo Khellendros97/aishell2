@@ -1,7 +1,8 @@
 //! AI 助手（pi 子进程 RPC 嵌入）。
 //! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)` /
 //! `ai_set_thinking(project_id, level)` / `set_ai_mode(project_id, mode)` /
-//! `ai_respond_approval(key, request_id, confirmed)`；
+//! `ai_respond_approval(key, request_id, confirmed)` /
+//! `ai_respond_db_request(key, request_id, response)`；
 //! 事件 `ai:event:<key>` payload：
 //!   - `{type:"delta",text}` / `{type:"tool",tool,label}` / `{type:"segment"}`
 //!   - `{type:"done"}` / `{type:"error",message}`
@@ -25,6 +26,12 @@
 //! 会话历史经 `--session <agent_dir>/sessions/<projectId>__<sessionId>.jsonl` 恢复。
 //! AI 主动申请切到工作模式：suggest 下工具 request_agent_mode 发 `AISHELL_MODE_REQUEST:`
 //! confirm，经 approval 事件转发前端确认框，同意后前端走 set_ai_mode 实时切换路径。
+//! AI 主动申请数据库连接：agent/yolo 下工具 request_db_connection 发 `AISHELL_DB_REQUEST:`
+//! input（消息为 `{action,intent,summary,connection}`，connection 为 AI 填写的连接信息），
+//! 经 approval 事件（带 connection 字段）转发前端审批对话框；前端把用户填写的密码经
+//! save_db_connection 落 keyring 后，用 ai_respond_db_request 以 `{approved,connectionId}`
+//! JSON 串回执（extension_ui_response value），工具结果直接携带 connectionId 供 db_query。
+//! 该通道独立于 AISHELL_APPROVAL，永不参与智能审批自动放行——授予凭据必须人工填密码。
 //!
 //! 动作执行经内部协议 `AISHELL_ACTION:` input 交给 ai_actions.rs（唯一后端入口：项目根校验 +
 //! 服务器 AI 锁检查，锁只拦 AI，不影响用户手动 SSH/SFTP）。
@@ -78,6 +85,7 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
 - 远程文件读写：read/grep/find/ls/write/edit/delete_path 都支持可选 serverId 参数（先用 list_servers 确认 serverId；不传则操作本地项目目录）。远程文件的内容查看/修改**优先用这些工具**，不要用 run_command 的 cat/sed/echo/tee 等命令读写远程文件内容——基础工具的远程写入/删除会自动进入会话暂存（自动备份原始快照，可 diff/还原）；run_command 用于服务管理、进程、包管理等非文件内容操作。远程路径可用绝对路径（/ 开头）或相对服务器登录目录的相对路径；不支持盘符形态。
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
+- request_db_connection：当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时，调用该工具申请添加连接。把已知的连接信息填进参数（serverId 取自 list_servers；名称、类型、主机、端口、用户名、默认库），主机相对该服务器（数据库在服务器本机填 127.0.0.1）；申请理由（reason）用一句中文说明用途。用户会在审批对话框里补密码并勾选查询权限，批准后工具结果会直接返回 connectionId，用它继续 db_query；被拒绝时不要反复重试，向用户说明需要哪些信息或请其在「服务器设置-数据库连接」中手动配置。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
 - 远程文件暂存（staging_list / staging_diff / staging_restore）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff、按用户要求把远程文件还原到首次修改前的内容；**不能接受（清除）暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
@@ -435,7 +443,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,request_db_connection")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -673,6 +681,7 @@ impl AiManager {
                                         .or_else(|| a.get("pattern"))
                                         .or_else(|| a.get("command"))
                                         .or_else(|| a.get("query"))
+                                        .or_else(|| a.get("name"))
                                 })
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("");
@@ -945,6 +954,49 @@ fn handle_extension_ui_request(
                 "action": "request_agent_mode",
                 "intent": "AI 申请切换到工作模式",
                 "summary": reason,
+            }),
+        );
+    } else if method == "input" && title.starts_with("AISHELL_DB_REQUEST:") {
+        // AI 申请数据库连接（agent/yolo 的 request_db_connection 工具）：
+        // 经 approval 事件（带 connection 字段）转发前端审批对话框；前端把用户填写的
+        // 密码落 keyring 后经 ai_respond_db_request 回执 extension_ui_response(value)。
+        // 独立于 AISHELL_APPROVAL 通道：不参与智能审批，授予凭据必须人工填密码。
+        let tool_call_id = title["AISHELL_DB_REQUEST:".len()..].to_string();
+        if let Ok(mut map) = approvals2.lock() {
+            map.insert(id.clone(), tool_call_id.clone());
+        }
+        // input 方法的请求正文在 placeholder 字段（与 AISHELL_ACTION 动作桥同协议）
+        let info: serde_json::Value = ev
+            .get("placeholder")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| json!({}));
+        let action = info
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("request_db_connection")
+            .to_string();
+        let intent = info
+            .get("intent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let summary = info
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let connection = info.get("connection").cloned().unwrap_or_else(|| json!({}));
+        let _ = app2.emit(
+            event,
+            json!({
+                "type": "approval",
+                "requestId": id,
+                "toolCallId": tool_call_id,
+                "action": action,
+                "intent": intent,
+                "summary": summary,
+                "connection": connection,
             }),
         );
     } else if method == "confirm" && title.starts_with("AISHELL_APPROVAL:") {
@@ -1778,6 +1830,37 @@ pub async fn ai_respond_approval(
         "type": "extension_ui_response",
         "id": request_id,
         "confirmed": confirmed,
+    }))
+    .map_err(|e| e.to_string())?;
+    buf.push(b'\n');
+    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    Ok(())
+}
+
+/// 回复数据库连接申请（request_db_connection 工具）：与 ai_respond_approval 同校验，
+/// 但按 input 子协议回写 value（JSON 串 `{approved, connectionId?}`，guard 解析后
+/// 作为工具结果返回给模型；approved=false 时工具返回「用户拒绝了该申请」文案）。
+#[tauri::command]
+pub async fn ai_respond_db_request(
+    mgr: State<'_, Arc<AiManager>>,
+    key: String,
+    request_id: String,
+    response: String,
+) -> Result<(), String> {
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+    let Some(proc) = procs.get_mut(&key) else {
+        return Err("pi 进程不存在".to_string());
+    };
+    let mut approvals = proc.approvals.lock().map_err(|e| e.to_string())?;
+    let Some(_tool_call_id) = approvals.remove(&request_id) else {
+        return Err("审批请求已过期或不存在".to_string());
+    };
+    drop(approvals);
+    let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+    let mut buf = serde_json::to_vec(&json!({
+        "type": "extension_ui_response",
+        "id": request_id,
+        "value": response,
     }))
     .map_err(|e| e.to_string())?;
     buf.push(b'\n');

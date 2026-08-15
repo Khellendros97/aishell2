@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -201,7 +201,9 @@ export type AiEvent =
       /** 智能审批自动放行：true 时卡片直接展示「已智能放行」（后端已回 confirmed，无需再回复） */
       smart?: boolean; smartReason?: string;
       /** 影响计划（自动备份开启时）：effect 为 none|bounded|unbounded，unbounded 卡片展示「不保证完整备份」 */
-      impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string } }
+      impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string };
+      /** 数据库连接申请（request_db_connection 工具）：AI 填写的连接信息，审批对话框只读展示 */
+      connection?: { serverId: string; name: string; kind: DbKind; host: string; port?: number; user?: string; database?: string } }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
@@ -218,6 +220,10 @@ export const aiSetThinking = (projectId: string, level: string) =>
  *  重复或过期回复返回中文错误。 */
 export const aiRespondApproval = (key: string, requestId: string, confirmed: boolean) =>
   call<void>('ai_respond_approval', { key, requestId, confirmed });
+/** 回复数据库连接申请（request_db_connection 工具）：approved=true 时 connectionId 为前端
+ *  已保存连接的 id（工具结果直接携带，AI 据此 db_query）；false 为拒绝。校验语义同 aiRespondApproval。 */
+export const aiRespondDbRequest = (key: string, requestId: string, response: { approved: boolean; connectionId?: string }) =>
+  call<void>('ai_respond_db_request', { key, requestId, response: JSON.stringify(response) });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 

@@ -5,6 +5,10 @@
  * 基础工具远程化：actionStart 的 args 携带 serverId 表示远程 write/edit/delete_path（guard 覆盖版
  * 工具经动作桥执行，见 aishell-guard.ts）；这类动作完成后额外广播 staging-changed（远程写入/删除
  * 已进会话暂存自动备份），且不发 fs:changed（后端已按 serverId 跳过）。
+ * 数据库连接申请（request_db_connection，新交互无 .proto 对照）：approval 事件携带 connection
+ * 字段 → 插入审批卡片（只读展示 AI 填写的连接信息）→ 点【审批】打开审批对话框
+ * （ai-db-approval.ts，用户只填密码 + 勾查询权限）→ 通过先 saveDbConnection 落库再
+ * aiRespondDbRequest 回执 connectionId；关闭对话框不回执，卡片可重开。
  * 输入区 chip 四类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端引用
  * @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名（发送时展开为说明文本拼进 prompt）；
  * Settings.autoSwitchAiWorkdir
@@ -16,13 +20,15 @@ import MarkdownIt from 'markdown-it';
 import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, TermSnapshot } from '../../types';
 import { icon } from '../../icons';
 import {
-  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiSetThinking, getState, onAiEvent, saveSettings,
+  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, onAiEvent, saveDbConnection, saveSettings,
   sessionUpsert, sessionsGet, setAiMode, stagingList,
   type AiEvent,
 } from '../../api';
 import { Workbench, activateTab, bus, getActiveTab, getActiveTerminalApi, getTabs, openTab, type Tab, type TerminalApi } from './core';
 import { addQuickCommandModal } from './quickcommand';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../ui';
+import { openAiDbApprovalModal, type DbRequestDetail } from './ai-db-approval';
+import { DB_DEFAULT_PORTS, DB_KIND_LABEL } from './db';
 
 /* ---------- 面板样式（原型 workbench-ai.js 注入的样式 + 错误气泡红边） ---------- */
 const STYLE = `
@@ -245,6 +251,19 @@ const STYLE = `
   font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text-0);
   white-space: pre-wrap; word-break: break-all;
 }
+/* 数据库连接申请审批对话框（ai-db-approval.ts） */
+.db-approval-tip {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 12px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-2); color: var(--text-0); font-size: 12.5px;
+}
+.db-approval-tip svg { flex: none; color: var(--accent); }
+.db-approval-warn {
+  display: flex; align-items: flex-start; gap: 6px;
+  margin-top: 10px; font-size: 11.5px; color: var(--yellow); line-height: 1.5;
+}
+.db-approval-warn svg { flex: none; width: 12px; height: 12px; margin-top: 2px; }
 `;
 
 /* ---------- Markdown 渲染（AI 回复正文；html:false 转义原始 HTML 防 XSS，breaks 保留单换行） ---------- */
@@ -277,6 +296,8 @@ interface ActionCard {
   serverId?: string;
   /** 审批事件携带的 requestId（批准/拒绝回执用） */
   requestId?: string;
+  /** 数据库连接申请（request_db_connection）：AI 填写的连接信息，卡片只读展示、审批对话框复用 */
+  dbRequest?: DbRequestDetail;
   /** 智能审批自动放行：status='smart' 时展示判定理由 */
   smartReason?: string;
   /** 影响计划（自动备份开启时审批事件携带）：unbounded 卡片展示「不保证完整备份」 */
@@ -308,6 +329,7 @@ const ACTION_NAMES: Record<string, string> = {
   staging_list: '查看暂存列表',
   staging_diff: '查看暂存 diff',
   staging_restore: '还原暂存文件',
+  request_db_connection: '申请数据库连接',
 };
 
 const ACTION_STATUS: Record<ActionCard['status'], string> = {
@@ -743,6 +765,23 @@ function handleEvent(key: string, ev: AiEvent): void {
        不进动作卡；其余仍为 Agent 逐调用审批卡 */
     if (ev.action === 'request_agent_mode') {
       void handleModeRequest(sid, ev);
+    } else if (ev.action === 'request_db_connection') {
+      /* AI 申请数据库连接：插入审批卡片（带 AI 填写的连接信息，只读展示），
+         点【审批】打开审批对话框（见 openDbApproval）；关闭对话框不回执、可重开 */
+      const cur = pendingBy.get(sid) ?? null;
+      const p = cur ?? emptyPending();
+      const existing = p.actions.get(ev.toolCallId);
+      p.actions.set(ev.toolCallId, {
+        toolCallId: ev.toolCallId,
+        tool: 'request_db_connection',
+        intent: ev.intent || existing?.intent || '',
+        summary: ev.summary || existing?.summary || '',
+        dbRequest: ev.connection,
+        requestId: ev.requestId,
+        status: 'approving',
+        textLen: existing?.textLen ?? p.text.length,
+      });
+      pendingBy.set(sid, p);
     } else if (ev.smart) {
       /* 智能审批自动放行：后端已判定非危险并直接回 confirmed，卡片进入「已智能放行」态 */
       const cur = pendingBy.get(sid) ?? null;
@@ -920,6 +959,7 @@ function renderHistory(): void {
 /** 动作卡渲染：Agent 审批态带批准/拒绝按钮；执行中/终态/历史只读无按钮。
  *  历史一串动作卡的折叠由 renderActionGroup 整组负责，单卡不再单独折叠。 */
 function renderActionCard(a: ActionCard): string {
+  if (a.dbRequest) return renderDbRequestCard(a);
   const isCmd = a.tool === 'run_command';
   // actionStart 后：YOLO/人工批准为 running；智能审批自动放行暂存 smart，二者都仍在执行中。
   const isCmdRunning = isCmd && (a.status === 'running' || a.status === 'smart');
@@ -966,6 +1006,38 @@ function renderActionCard(a: ActionCard): string {
       ${impactHtml}
       ${smartHtml}
       ${buttons}
+      ${resultHtml}
+    </div>
+  </div>`;
+}
+
+/** 数据库连接申请卡（request_db_connection）：AI 提交连接信息，approving 时显示【审批】按钮
+ *  打开审批对话框（openDbApproval）；关闭对话框不回执，卡片保持待批可重开。 */
+function renderDbRequestCard(a: ActionCard): string {
+  const d = a.dbRequest!;
+  const dbName = d.database || d.name || '未知数据库';
+  const port = d.port ?? DB_DEFAULT_PORTS[d.kind];
+  const kindLabel = DB_KIND_LABEL[d.kind] ?? d.kind;
+  const statusText = ACTION_STATUS[a.status] ?? a.status;
+  const cls = a.status === 'succeeded' || a.status === 'failed' || a.status === 'rejected' ? a.status : '';
+  const approveBtn = a.status === 'approving' && a.requestId
+    ? `<div class="ai-action-actions">
+        <button class="btn small primary" type="button" data-act-db-approve="${escapeHtml(a.toolCallId)}">审批</button>
+      </div>`
+    : '';
+  const resultHtml = a.result && a.status === 'succeeded'
+    ? `<div class="ai-action-result">${escapeHtml(a.result)}</div>`
+    : '';
+  return `<div class="ai-action-card ${cls}">
+    <div class="ai-action-head">
+      <span class="ai-action-name">${icon('database')} ${ACTION_NAMES[a.tool] ?? a.tool}</span>
+      <span class="ai-action-status">${statusText}</span>
+    </div>
+    <div class="ai-action-detail">
+      <div class="ai-action-intent">AI 助手想要申请访问数据库 <b>${escapeHtml(dbName)}</b> 的权限</div>
+      <div class="ai-action-intent ai-action-summary">${kindLabel} · ${escapeHtml(d.host || '')}:${port}${d.user ? ' · 用户 ' + escapeHtml(d.user) : ''} · 服务器 ${escapeHtml(d.serverId || '')}</div>
+      ${a.summary ? `<div class="ai-action-intent">申请理由：${escapeHtml(a.summary)}</div>` : ''}
+      ${approveBtn}
       ${resultHtml}
     </div>
   </div>`;
@@ -1204,6 +1276,75 @@ function autoResumeAfterModeSwitch(sid: string): void {
   });
 }
 
+/** 数据库连接申请审批（request_db_connection）：从最新 state 解析目标服务器名称/锁定态，
+ *  打开审批对话框。通过 → 保存连接（密码进 keyring，永不回显）后回执 connectionId，
+ *  工具结果直接携带 connectionId，AI 立即可 db_query；拒绝 → 回执 approved:false。
+ *  关闭对话框（X/遮罩/Esc）不产生任何回执——卡片保持「等待批准」，可再次点【审批】重开。 */
+async function openDbApproval(sid: string, toolCallId: string): Promise<void> {
+  if (!project) return;
+  const p = pendingBy.get(sid) ?? null;
+  const card = p?.actions.get(toolCallId);
+  if (!p || !card || !card.requestId || !card.dbRequest) {
+    toast('审批请求已过期', 'error');
+    return;
+  }
+  const d = card.dbRequest;
+  let serverName = d.serverId;
+  let serverLocked = false;
+  try {
+    const st = await getState();
+    const sv = st.servers.find((s) => s.id === d.serverId);
+    if (sv) {
+      serverName = sv.name;
+      serverLocked = !!sv.locked;
+    }
+  } catch { /* 服务器信息读取失败时回退显示 serverId */ }
+  const requestId = card.requestId;
+  const key = `${project.id}:${sid}`;
+  openAiDbApprovalModal({
+    serverName,
+    serverLocked,
+    detail: d,
+    onApprove: async (connection, password) => {
+      // 先落库（配置 + keyring 密码），成功再回执 pi；失败弹窗保留可重试
+      try {
+        await saveDbConnection(d.serverId, connection, password);
+      } catch (err) {
+        toast(`保存数据库连接失败：${String(err)}`, 'error');
+        return false;
+      }
+      try {
+        await aiRespondDbRequest(key, requestId, { approved: true, connectionId: connection.id });
+      } catch (err) {
+        toast(`回复 AI 审批失败：${String(err)}`, 'error');
+        return false;
+      }
+      card.status = 'succeeded';
+      card.requestId = undefined;
+      card.result = `已批准并保存数据库连接「${connection.name}」（connectionId=${connection.id}）`;
+      if (sid === activeSessionId) {
+        renderHistory();
+        updateSendBtn();
+      }
+      toast(`已批准数据库连接「${connection.name}」，AI 可立即查询`, 'success');
+      return true;
+    },
+    onReject: () => {
+      aiRespondDbRequest(key, requestId, { approved: false })
+        .then(() => {
+          card.status = 'rejected';
+          card.requestId = undefined;
+          if (sid === activeSessionId) {
+            renderHistory();
+            updateSendBtn();
+          }
+          toast('已拒绝数据库连接申请', 'info');
+        })
+        .catch((err: unknown) => toast(`回复 AI 审批失败：${String(err)}`, 'error'));
+    },
+  });
+}
+
 /** 回复 Agent 审批：批准 → 执行中；拒绝 → 已拒绝（后端只接受当前待处理 requestId） */
 async function respondApproval(sid: string, toolCallId: string, confirmed: boolean): Promise<void> {
   if (!project) return;
@@ -1231,6 +1372,12 @@ async function respondApproval(sid: string, toolCallId: string, confirmed: boole
 /* ---------- 建议卡片 / 动作审批 / 快照 chip 点击（事件委托） ---------- */
 function onChatClick(e: MouseEvent): void {
   const target = e.target as HTMLElement;
+  /* 数据库连接申请卡【审批】按钮：打开审批对话框（关闭不回执，卡片保持待批） */
+  const dbApproveBtn = target.closest('[data-act-db-approve]') as HTMLElement | null;
+  if (dbApproveBtn) {
+    void openDbApproval(activeSessionId, dbApproveBtn.dataset.actDbApprove ?? '');
+    return;
+  }
   /* 动作卡审批按钮：优先于卡片其他动作 */
   const approveBtn = target.closest('[data-act-approve]') as HTMLElement | null;
   if (approveBtn) {

@@ -23,6 +23,10 @@
  * 审批：agent 对受控工具（write/edit/delete_path/run_command/sftp_upload/sftp_download）
  * 每次调用单独 ctx.ui.confirm（title 固定 `AISHELL_APPROVAL:<toolCallId>`，message 为
  * `{action,intent,summary}`）；yolo 跳过；suggest 即使异常收到变更工具调用也直接阻止。
+ * 申请数据库连接（request_db_connection）：工具 execute 内自带 ctx.ui.input
+ * （`AISHELL_DB_REQUEST:<toolCallId>`，消息为 `{action,intent,summary,connection}`），
+ * 经 Rust 转发前端审批对话框，用户补密码并授权后回执 `{approved,connectionId}`；
+ * 不参与逐调用审批/智能审批（授予凭据必须人工填密码），suggest 不提供。
  * 动作执行：delete_path 在扩展内用 Node fs 执行（同一项目根校验）；run_command / sftp_upload /
  * sftp_download 及远程文件工具（remote_*）经 `ctx.ui.input('AISHELL_ACTION:<toolCallId>',
  * JSON.stringify(payload))` 走 RPC extension UI 子协议交给 Rust 的 ai_actions（唯一执行入口，
@@ -56,7 +60,7 @@ const VALID_MODES = ["suggest", "agent", "yolo"] as const;
 type AiMode = (typeof VALID_MODES)[number];
 
 /** 仅 agent/yolo 提供的变更工具（suggest 一律拒绝） */
-const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore"];
+const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "request_db_connection"];
 /** agent 模式逐调用审批的受控工具：staging_restore 为远程写操作需审批；
  *  staging_list / staging_diff 只读不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
 const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore"];
@@ -456,6 +460,30 @@ export default function (pi: ExtensionAPI) {
 					return { block: true, reason: "AIShell 权限边界:仅建议模式下才可申请切换工作模式。" };
 				}
 				return undefined;
+			case "request_db_connection": {
+				// 申请数据库连接：用户需人工补密码并授权（工具 execute 内自带交互，
+				// 不参与逐调用审批 / 智能审批）；suggest 无此工具（与 db_query 同边界）
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不能申请数据库连接，请先调用 request_agent_mode 申请切换到工作模式。" };
+				}
+				if (!(typeof input.serverId === "string" && input.serverId.trim())) {
+					return { block: true, reason: "request_db_connection: 缺少 serverId（先调用 list_servers 获取）。" };
+				}
+				if (!(typeof input.name === "string" && input.name.trim())) {
+					return { block: true, reason: "request_db_connection: 缺少连接名称（name）。" };
+				}
+				if (!(typeof input.kind === "string" && input.kind.trim())) {
+					return { block: true, reason: "request_db_connection: 缺少数据库类型（kind）。" };
+				}
+				if (!(typeof input.host === "string" && input.host.trim())) {
+					return { block: true, reason: "request_db_connection: 缺少主机（host，相对服务器，本机库填 127.0.0.1）。" };
+				}
+				if (input.port !== undefined
+					&& !(Number.isInteger(input.port) && Number(input.port) >= 1 && Number(input.port) <= 65535)) {
+					return { block: true, reason: "request_db_connection: port 必须是 1–65535 之间的整数。" };
+				}
+				return undefined;
+			}
 			default:
 				return { block: true, reason: `AIShell 权限边界:工具 ${tool} 不可用。` };
 		}
@@ -899,6 +927,73 @@ export default function (pi: ExtensionAPI) {
 				return okResult("用户拒绝了切换到工作模式的申请，请继续以建议方式提供帮助。");
 			}
 			return okResult("用户已同意切换到工作模式。");
+		},
+	});
+
+	pi.registerTool({
+		name: "request_db_connection",
+		label: "申请数据库连接",
+		description:
+			"向用户申请添加一条受管数据库连接（mysql/clickhouse/postgres/redis）。当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时调用：把已知的连接信息填进参数（serverId 取自 list_servers），用户会在审批对话框中补充密码并勾选查询权限，批准后连接永久保存，工具结果直接返回 connectionId，随后用 db_query 查询。",
+		promptSnippet: "申请数据库连接",
+		promptGuidelines: [
+			"查询数据库前先调用 list_servers 确认目标服务器的 serverId 与既有连接，避免重复申请同一数据库。",
+			"主机（host）相对目标服务器：数据库在服务器本机填 127.0.0.1；redis 可不填用户名与默认库。",
+			"申请理由（reason）用一句中文说明用途，会展示给用户；被拒绝时不要反复重试，向用户说明需要哪些信息，或请其在「服务器设置-数据库连接」中手动配置。",
+			"凭据由系统代管，禁止用 run_command 自行连接数据库、读取配置文件或提取密码。",
+		],
+		parameters: Type.Object({
+			serverId: Type.String({ description: "目标服务器 ID（先调用 list_servers 获取；db_query 经该服务器 SSH 执行客户端）" }),
+			name: Type.String({ description: "连接名称（中文，如：计费库）" }),
+			kind: StringEnum(["mysql", "clickhouse", "redis", "postgres"] as const),
+			host: Type.String({ description: "数据库主机（相对目标服务器；数据库在服务器本机填 127.0.0.1）" }),
+			port: Type.Optional(Type.Integer({ minimum: 1, maximum: 65535, description: "端口，缺省按类型默认（mysql 3306 / clickhouse 9000 / redis 6379 / postgres 5432）" })),
+			user: Type.Optional(Type.String({ description: "用户名（redis 可省略）" })),
+			database: Type.Optional(Type.String({ description: "默认库（mysql/clickhouse/postgres 用；redis 忽略）" })),
+			reason: Type.String({ description: "申请理由（中文，展示给用户确认）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			const connection: Record<string, unknown> = {
+				serverId: params.serverId,
+				name: params.name,
+				kind: params.kind,
+				host: params.host,
+				port: typeof params.port === "number" ? params.port : undefined,
+				user: typeof params.user === "string" && params.user.trim() ? params.user.trim() : "",
+				database: typeof params.database === "string" && params.database.trim() ? params.database.trim() : "",
+			};
+			// 与审批同通道（input 子协议）转发前端审批对话框；回执为
+			// {approved, connectionId?} JSON 串（见 ai.rs ai_respond_db_request）
+			let raw: string | undefined;
+			try {
+				raw = await ctx.ui.input(
+					"AISHELL_DB_REQUEST:" + toolCallId,
+					JSON.stringify({
+						action: "request_db_connection",
+						intent: `申请连接数据库 ${params.database || params.name}`,
+						summary: String(params.reason || ""),
+						connection,
+					}),
+				);
+			} catch {
+				// 中止/窗口卸载/客户端取消（cancelled:true）统一按拒绝
+				raw = undefined;
+			}
+			if (raw === undefined) {
+				return okResult("用户取消了数据库连接申请，请向用户说明需要哪些信息，或请其在「服务器设置-数据库连接」中手动配置。");
+			}
+			let result: { approved?: boolean; connectionId?: string };
+			try {
+				result = JSON.parse(raw);
+			} catch {
+				return okResult("用户拒绝了数据库连接申请，请向用户说明需要哪些信息，或请其在「服务器设置-数据库连接」中手动配置。");
+			}
+			if (result.approved && typeof result.connectionId === "string" && result.connectionId) {
+				return okResult(
+					`用户已批准数据库连接申请（connectionId=${result.connectionId}，名称=${String(params.name)}）。请直接用 db_query 查询（serverId=${String(params.serverId)}）。`,
+				);
+			}
+			return okResult("用户拒绝了数据库连接申请，请向用户说明需要哪些信息，或请其在「服务器设置-数据库连接」中手动配置。");
 		},
 	});
 

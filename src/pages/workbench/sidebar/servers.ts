@@ -15,6 +15,7 @@ import { bus, openTab, Workbench } from '../core';
 import { confirmDialog, showContextMenu, toast, uid } from '../../../ui';
 import { createServerForm } from '../../server-form';
 import { openMcpModal } from './mcp-modal';
+import { DB_COMMAND_GROUPS, DB_DEFAULT_COMMANDS, DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
 import './servers.css';
 
 export const serversHead = { title: '服务器列表' };
@@ -692,60 +693,8 @@ export function mountServersPanel(container: HTMLElement): () => void {
   };
 }
 
-/* ---------- 数据库连接配置弹窗（AI 受管查询通道） ---------- */
-
-const DB_KIND_LABEL: Record<DbKind, string> = {
-  mysql: 'MySQL',
-  clickhouse: 'ClickHouse',
-  redis: 'Redis',
-  postgres: 'PostgreSQL',
-};
-
-/** 各类型默认端口：新建连接按类型预填，切换类型时若端口仍为旧默认则联动更新 */
-const DB_DEFAULT_PORTS: Record<DbKind, number> = {
-  mysql: 3306,
-  clickhouse: 9000,
-  redis: 6379,
-  postgres: 5432,
-};
-
-/** 各类型 AI 可用命令清单（表单勾选区用）：只读组与后端 store.rs DbKind::default_read_commands 严格一致；
- *  写组为常用写操作（勾选后保存进白名单，AI 执行前 guard 分类转人工审批）。 */
-const DB_COMMAND_GROUPS: Record<DbKind, { title: string; write: boolean; commands: string[] }[]> = {
-  mysql: [
-    { title: '只读命令（AI 可直接执行）', write: false, commands: ['SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'EXPLAIN'] },
-    { title: '写命令（勾选后 AI 执行前需人工审批）', write: true, commands: ['INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'] },
-  ],
-  clickhouse: [
-    { title: '只读命令（AI 可直接执行）', write: false, commands: ['SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'EXPLAIN'] },
-    { title: '写命令（勾选后 AI 执行前需人工审批）', write: true, commands: ['INSERT', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'OPTIMIZE', 'RENAME'] },
-  ],
-  postgres: [
-    { title: '只读命令（AI 可直接执行）', write: false, commands: ['SELECT', 'SHOW', 'DESC', 'DESCRIBE', 'EXPLAIN'] },
-    { title: '写命令（勾选后 AI 执行前需人工审批）', write: true, commands: ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'GRANT', 'REVOKE', 'VACUUM', 'ANALYZE'] },
-  ],
-  redis: [
-    { title: '只读命令（AI 可直接执行）', write: false, commands: [
-      'GET', 'MGET', 'KEYS', 'SCAN', 'TYPE', 'TTL', 'PTTL', 'EXISTS', 'DBSIZE',
-      'INFO', 'PING', 'STRLEN', 'LLEN', 'SCARD', 'ZCARD', 'HLEN', 'HGET',
-      'HGETALL', 'HKEYS', 'HVALS', 'SMEMBERS', 'LRANGE', 'ZRANGE', 'SISMEMBER',
-      'HEXISTS', 'SRANDMEMBER', 'RANDOMKEY', 'ZSCORE', 'HSTRLEN', 'GETRANGE',
-    ] },
-    { title: '写命令（勾选后 AI 执行前需人工审批）', write: true, commands: [
-      'SET', 'MSET', 'SETEX', 'DEL', 'EXPIRE', 'PERSIST', 'HSET', 'HDEL',
-      'LPUSH', 'RPUSH', 'LPOP', 'RPOP', 'SADD', 'SREM', 'ZADD', 'ZREM',
-      'RENAME', 'FLUSHDB', 'FLUSHALL',
-    ] },
-  ],
-};
-
-/** 各类型默认只读命令集（取命令清单的只读组） */
-const DB_DEFAULT_COMMANDS: Record<DbKind, string[]> = {
-  mysql: DB_COMMAND_GROUPS.mysql[0].commands,
-  clickhouse: DB_COMMAND_GROUPS.clickhouse[0].commands,
-  redis: DB_COMMAND_GROUPS.redis[0].commands,
-  postgres: DB_COMMAND_GROUPS.postgres[0].commands,
-};
+/* ---------- 数据库连接配置弹窗（AI 受管查询通道） ----------
+   类型/端口/命令清单等共享常量见 ../db.ts（与 AI 审批对话框同源，勿在此重复定义）。 */
 
 /** 数据库连接配置弹窗：列表视图 ↔ 表单视图（新增/编辑），密码永不回显。 */
 function openDbConnectionsModal(server: Server): void {
