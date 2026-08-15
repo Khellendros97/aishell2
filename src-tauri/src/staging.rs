@@ -147,7 +147,8 @@ fn validate_id(id: &str, what: &str) -> Result<(), String> {
 }
 
 /// 词法规范化绝对路径（折叠 `.` `..` 与重复 `/`；不触碰磁盘）。
-fn canonical_remote_path(path: &str) -> Result<String, String> {
+/// pub(crate)：ai_actions 的 remote_* 动作族复用同一套路径归一（保证暂存键一致）。
+pub(crate) fn canonical_remote_path(path: &str) -> Result<String, String> {
     let path = path.trim();
     if path.is_empty() {
         return Err("远程路径不能为空".to_string());

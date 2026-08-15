@@ -2,6 +2,9 @@
  * AI 助手面板 —— 照 .proto/workbench-ai.js 移植全部交互，mock 回复换成 pi 子进程流式事件
  * （ai:event:<key> 订阅，见 src/api.ts）。挂载时设置 Workbench.ai = { addSnapshot, addFileRef, addServerRef, addPathRef }，
  * 容器被移除时置 null 并 aiKillProject 清理该项目的 pi 进程。
+ * 基础工具远程化：actionStart 的 args 携带 serverId 表示远程 write/edit/delete_path（guard 覆盖版
+ * 工具经动作桥执行，见 aishell-guard.ts）；这类动作完成后额外广播 staging-changed（远程写入/删除
+ * 已进会话暂存自动备份），且不发 fs:changed（后端已按 serverId 跳过）。
  * 输入区 chip 四类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端引用
  * @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名（发送时展开为说明文本拼进 prompt）；
  * Settings.autoSwitchAiWorkdir
@@ -270,6 +273,8 @@ interface ActionCard {
   command?: string;
   /** run_command 整体超时秒数（未传时后端默认 10 秒） */
   timeoutSeconds?: number;
+  /** 远程操作（基础工具 serverId 模式）：携带目标服务器 id；actionEnd 据此广播 staging-changed */
+  serverId?: string;
   /** 审批事件携带的 requestId（批准/拒绝回执用） */
   requestId?: string;
   /** 智能审批自动放行：status='smart' 时展示判定理由 */
@@ -315,15 +320,18 @@ const ACTION_STATUS: Record<ActionCard['status'], string> = {
   rejected: '已拒绝',
 };
 
-/** 由 actionStart 的 args 计算动作意图（审批事件到达前占位；审批事件会覆盖） */
+/** 由 actionStart 的 args 计算动作意图（审批事件到达前占位；审批事件会覆盖）。
+ *  基础工具远程化：args.serverId 存在时标注「远程/服务器」文案。 */
 function argsIntent(tool: string, args: Record<string, unknown>): string {
+  const server = typeof args.serverId === 'string' && args.serverId ? `（服务器 ${args.serverId}）` : '';
+  const remote = args.serverId ? '远程' : '';
   switch (tool) {
     case 'write':
-      return `写文件 ${String(args.path ?? '')}`;
+      return `写${remote}文件 ${String(args.path ?? '')}${server}`;
     case 'edit':
-      return `编辑文件 ${String(args.path ?? '')}`;
+      return `编辑${remote}文件 ${String(args.path ?? '')}${server}`;
     case 'delete_path':
-      return `删除 ${String(args.path ?? '')}`;
+      return `删除${remote} ${String(args.path ?? '')}${server}`;
     case 'run_command':
       return String(args.intent ?? '');
     case 'sftp_upload':
@@ -723,6 +731,7 @@ function handleEvent(key: string, ev: AiEvent): void {
       timeoutSeconds: typeof timeoutArg === 'number' && Number.isInteger(timeoutArg)
         ? timeoutArg
         : existing?.timeoutSeconds ?? 10,
+      serverId: typeof ev.args.serverId === 'string' && ev.args.serverId ? ev.args.serverId : existing?.serverId,
       requestId: existing?.requestId,
       impact: existing?.impact,
       status: project?.aiMode === 'agent' ? 'approving' : 'running',
@@ -782,9 +791,13 @@ function handleEvent(key: string, ev: AiEvent): void {
       existing.result = ev.result ? ev.result.slice(0, 2000) : undefined;
     }
     pendingBy.set(sid, p);
-    /* 远程写入与暂存工具完成 → 广播刷新暂存面板、diff 标签和输入区计数。 */
+    /* 远程写入与暂存工具完成 → 广播刷新暂存面板、diff 标签和输入区计数。
+       本地 write/edit 不改远程文件，不触发（后端对远程 write/edit 不发 fs:changed，
+       本地文件刷新走 fs:changed 事件，见 editor.ts）。 */
+    const isRemoteFileOp = ['write', 'edit', 'delete_path'].includes(ev.tool) && !!existing?.serverId;
     if (ev.tool === 'run_command' || ev.tool === 'sftp_upload'
-      || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff') {
+      || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff'
+      || isRemoteFileOp) {
       bus.emit('staging-changed');
     }
   } else if (ev.type === 'segment') {
