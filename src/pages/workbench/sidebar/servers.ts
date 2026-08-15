@@ -8,12 +8,13 @@
  * 侧栏框架契约：导出 head 描述符（title）；mountServersPanel(panelRoot) 只渲染内容区
  * （panelRoot = 每次切换新建的独立容器，卸载即弃），返回 cleanup 反注册全部监听。
  */
-import type { DbConnection, DbKind, Server } from '../../../types';
+import type { DbConnection, DbKind, McpDeviceConfig, Server } from '../../../types';
 import { icon } from '../../../icons';
 import { deleteDbConnection, deleteServer, getState, saveDbConnection, setServerLocked, upsertProject, upsertServer } from '../../../api';
 import { bus, openTab, Workbench } from '../core';
 import { confirmDialog, showContextMenu, toast, uid } from '../../../ui';
 import { createServerForm } from '../../server-form';
+import { openMcpModal } from './mcp-modal';
 import './servers.css';
 
 export const serversHead = { title: '服务器列表' };
@@ -474,9 +475,11 @@ export function mountServersPanel(container: HTMLElement): () => void {
 
   const render = async (): Promise<void> => {
     let servers: Server[] = [];
+    let mcpDevices: Record<string, McpDeviceConfig> = {};
     try {
       const state = await getState();
       servers = state.servers;
+      mcpDevices = state.mcpDevices ?? {};
     } catch {
       /* 后端未就绪时按空列表渲染 */
     }
@@ -585,6 +588,10 @@ export function mountServersPanel(container: HTMLElement): () => void {
         : s.bastionId
           ? '<span class="tag purple">' + icon('link') + ' 堡垒机:' + esc(byId.get(s.bastionId)?.name ?? '已删除') + '</span>'
           : '';
+      // MCP 标签：设备已启用时展示（点击卡片 MCP 入口可配置）
+      const mcpTag = mcpDevices[s.id]?.enabled
+        ? '<span class="tag green">' + icon('plug') + ' MCP</span>'
+        : '';
       card.innerHTML =
         '<div class="wbs-server-top">' +
           '<span class="wbs-server-icon">' + icon('server') + '</span>' +
@@ -599,10 +606,11 @@ export function mountServersPanel(container: HTMLElement): () => void {
             icon(s.locked ? 'lock' : 'unlock') +
           '</button>' +
         '</div>' +
-        // 认证 / 堡垒机标签独立一行，避免与右上角按钮挤在一起
+        // 认证 / 堡垒机 / MCP 标签独立一行，避免与右上角按钮挤在一起
         '<div class="wbs-server-tags">' +
           '<span class="tag">' + (s.authType === 'key' ? icon('key') + ' 密钥' : '密码') + '</span>' +
           bastionTags +
+          mcpTag +
         '</div>' +
         '<div class="wbs-server-actions">' +
           '<button class="icon-btn wbs-chat" title="添加到对话" aria-label="添加到对话">' + icon('chatPlus') + '</button>' +
@@ -649,10 +657,12 @@ export function mountServersPanel(container: HTMLElement): () => void {
           data: { serverId: s.id },
         });
       };
-      /* 「更多」下拉菜单：数据库连接 / SSH跳转设置（非常用操作收纳进下拉，避免卡片操作区拥挤） */
+      /* 「更多」下拉菜单：MCP 接入 / 数据库连接 / SSH跳转设置（非常用操作收纳进下拉，避免卡片操作区拥挤）。
+         服务器已锁定（不允许 AI 访问）时 MCP 入口禁用（后端亦强制拒绝）。 */
       (card.querySelector('.wbs-more') as HTMLButtonElement).onclick = (e) => {
         e.stopPropagation();
         showContextMenu(e.clientX, e.clientY, [
+          { label: 'MCP', iconName: 'plug', disabled: s.locked, disabledTip: '服务器已锁定（不允许 AI 访问），MCP 不可用', action: () => openMcpModal(s) },
           { label: '数据库连接', iconName: 'database', action: () => openDbConnectionsModal(s) },
           { label: 'SSH跳转设置', iconName: 'link', action: () => void openJumpEdit(s) },
         ]);

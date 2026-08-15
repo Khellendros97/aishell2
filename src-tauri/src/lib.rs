@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod ai_actions;
 pub mod ai_impact;
+pub mod mcp;
 pub mod redact;
 pub mod smart_approval;
 pub mod staging;
@@ -93,11 +94,22 @@ pub fn run() {
                 staging.clone(),
                 pi_debug,
             ));
+            // MCP 服务端：按已启用设备自动监听 127.0.0.1:<port>/mcp（见 mcp.rs）
+            let mcp = Arc::new(mcp::McpService::new(
+                store.clone(),
+                ssh.clone(),
+                staging.clone(),
+            ));
             app.manage(store);
             app.manage(ssh);
             app.manage(terms);
             app.manage(ai.clone());
             app.manage(staging);
+            app.manage(mcp.clone());
+            // 启动时按持久化配置同步监听（有已启用设备则自动拉起）
+            tauri::async_runtime::spawn(async move {
+                mcp.sync().await;
+            });
             term::set_debug_app(app.handle().clone());
             // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
             // 捆绑安装器。放后台线程并延迟触发：等主事件循环泵消息、主窗口显示后再弹框
@@ -152,6 +164,11 @@ pub fn run() {
             store::set_server_locked,
             store::save_db_connection,
             store::delete_db_connection,
+            mcp::mcp_set_device,
+            mcp::mcp_set_port,
+            mcp::mcp_status,
+            mcp::mcp_ensure_token,
+            mcp::mcp_reset_token,
             store::create_project_folder,
             store::rename_project_folder,
             store::delete_project_folder,

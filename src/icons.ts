@@ -32,6 +32,9 @@ const PATHS = {
   database:
     '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
   zap: '<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',
+  // 插头（MCP 接入）
+  plug:
+    '<path d="M9 7V3"/><path d="M15 7V3"/><path d="M6 7h12v4a6 6 0 0 1-12 0V7z"/><path d="M12 17v4"/>',
   bot: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="13" r="0.5"/><circle cx="15" cy="13" r="0.5"/><path d="M9 17h6"/>',
   terminal: '<path d="M4 17l6-5-6-5"/><path d="M12 19h8"/>',
   minus: '<path d="M5 12h14"/>',

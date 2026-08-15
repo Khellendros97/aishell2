@@ -29,6 +29,53 @@ export interface Settings {
   autoBackupRemoteFiles: boolean;
 }
 
+/** MCP 服务全局配置（AppState 顶层字段）—— 与 store.rs McpServiceConfig serde camelCase 对齐。
+ *  port 为回环监听端口（仅 127.0.0.1，不做局域网暴露）；旧配置无此字段按默认 8945。 */
+export interface McpServiceConfig {
+  port: number;
+}
+
+/** MCP 单项功能开关（每服务器独立；默认全关，不扩大权限）—— 与 store.rs McpFeatures serde camelCase 对齐。
+ *  服务器 locked 时无论开关如何，所有 MCP 工具调用一律拒绝（与 AI 锁同语义）。 */
+export interface McpFeatures {
+  /** SFTP 目录查询（sftp_list 工具） */
+  sftpList: boolean;
+  /** SFTP 上传（sftp_upload 工具，本地源限于 MCP 传输目录） */
+  sftpUpload: boolean;
+  /** SFTP 下载（sftp_download 工具，落地限于 MCP 传输目录） */
+  sftpDownload: boolean;
+  /** SFTP 重命名/移动（sftp_rename 工具） */
+  sftpRename: boolean;
+  /** SFTP 删除（sftp_delete 工具，目录递归删除） */
+  sftpDelete: boolean;
+  /** 远程文件读取（read_file 工具，>5MB/二进制拒绝） */
+  fileRead: boolean;
+  /** 远程文件写入（write_file 工具，整体覆写，支持冲突检测） */
+  fileWrite: boolean;
+  /** 远程文件编辑（edit_file 工具，oldText→newText 精确替换） */
+  fileEdit: boolean;
+  /** 执行远程命令（exec_command 工具，不经 AI 审批） */
+  exec: boolean;
+  /** 数据库管道查询（db_query 工具，白名单与 AI 通道一致，仅暴露启用中的连接） */
+  dbQuery: boolean;
+}
+
+/** MCP 设备配置（每服务器独立）—— 与 store.rs McpDeviceConfig serde camelCase 对齐。
+ *  enabled = 加入 MCP 可发现设备列表；features 为单项功能开关。 */
+export interface McpDeviceConfig {
+  enabled: boolean;
+  features: McpFeatures;
+}
+
+/** mcp_status 返回 —— 与 mcp.rs McpStatus serde camelCase 对齐。 */
+export interface McpStatus {
+  running: boolean;
+  port: number;
+  boundPort: number | null;
+  error: string | null;
+  deviceCount: number;
+}
+
 /** 与 store.rs Theme serde lowercase 对齐 */
 export type Theme = 'dark' | 'light';
 
@@ -162,6 +209,10 @@ export interface AppState {
   sftpFavorites: Record<string, SftpFavorite[]>;
   /** 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表；旧配置无此字段为空对象 */
   dbConnections: Record<string, DbConnection[]>;
+  /** MCP 服务全局配置（回环监听端口）；旧配置无此字段按默认 8945 */
+  mcp: McpServiceConfig;
+  /** MCP 设备配置：serverId → 配置（enabled = 加入 MCP 可发现设备列表 + 功能开关）；旧配置无此字段为空对象 */
+  mcpDevices: Record<string, McpDeviceConfig>;
   /** 已完成内置技能播种的 workspace（规范化路径）；旧配置无此字段为空数组 */
   seededSkillWorkspaces: string[];
 }

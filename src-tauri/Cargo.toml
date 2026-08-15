@@ -42,9 +42,19 @@ sha2 = "0.10"
 hex = "0.4"
 # Skill 系统 frontmatter 解析（serde_yaml 已归档，采用维护中的 serde_yaml_ng）
 serde_yaml_ng = "0.9.36"
+# MCP 服务端（Streamable HTTP，仅绑定 127.0.0.1）：hyper 1 已在依赖树（reqwest 带入），
+# 加为直接依赖复用既有版本，无新增编译产物
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+http-body-util = "0.1"
 
 # WebView2 设置（禁用浏览器快捷键，避免劫持终端 Ctrl+Shift+C/V）；版本与 wry 对齐
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows = { version = "0.61", features = ["Win32_Foundation"] }
+
+# 离线 vendor：hyper 的 server feature 依赖 crates.io 的 httpdate，构建环境无外网时
+# 无法下载，以 vendor/httpdate（本仓库自写的最小实现，API 兼容）本地替换。
+[patch.crates-io]
+httpdate = { path = "vendor/httpdate" }
 

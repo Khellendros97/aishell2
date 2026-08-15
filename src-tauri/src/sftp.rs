@@ -41,20 +41,14 @@ pub async fn sftp_home(
         .map_err(|e| format!("解析远端 home 失败: {e}"))
 }
 
-/// 列出远端目录。path 为 "." 或空串时先 canonicalize(".") 取远端 home。
-#[tauri::command]
-pub async fn sftp_list(
-    ssh: State<'_, Arc<SshManager>>,
-    server_id: String,
-    path: String,
-) -> Result<Vec<FsEntry>, String> {
-    let sftp = ssh.inner().open_sftp(&server_id).await?;
+/// 列出远端目录（sftp_list 命令与 MCP 工具共用）。path 为 "." 或空串时先 canonicalize(".") 取远端 home。
+pub(crate) async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FsEntry>, String> {
     let dir = if path.is_empty() || path == "." {
         sftp.canonicalize(".")
             .await
             .map_err(|e| format!("解析远端 home 失败: {e}"))?
     } else {
-        path
+        path.to_string()
     };
     let mut entries: Vec<FsEntry> = Vec::new();
     let rd = sftp
@@ -77,6 +71,17 @@ pub async fn sftp_list(
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(entries)
+}
+
+/// 列出远端目录。path 为 "." 或空串时先 canonicalize(".") 取远端 home。
+#[tauri::command]
+pub async fn sftp_list(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+    path: String,
+) -> Result<Vec<FsEntry>, String> {
+    let sftp = ssh.inner().open_sftp(&server_id).await?;
+    list_dir(&sftp, &path).await
 }
 
 /// 读取远端单项属性（右键「属性」对话框用）：lstat 不跟随符号链接（链接显示为链接自身，
@@ -333,20 +338,14 @@ fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
-/// 读取远端文本文件：>5MB、前 8KB 含 NUL 或非 UTF-8 → 报错（不可编辑）。
-/// 与 fsops::fs_read 同一套编辑约束，供编辑器打开远端文件。
-#[tauri::command]
-pub async fn sftp_read(
-    ssh: State<'_, Arc<SshManager>>,
-    server_id: String,
-    remote_path: String,
-) -> Result<String, String> {
+/// 读取远端文本文件（sftp_read 命令与 MCP read_file 共用）：>5MB、前 8KB 含 NUL 或非 UTF-8 → 报错（不可编辑）。
+/// 与 fsops::fs_read 同一套编辑约束。
+pub(crate) async fn read_text(sftp: &SftpSession, remote_path: &str) -> Result<String, String> {
     if remote_path.trim().is_empty() {
         return Err("远端路径不能为空".to_string());
     }
-    let sftp = ssh.inner().open_sftp(&server_id).await?;
     let md = sftp
-        .metadata(&remote_path)
+        .metadata(remote_path)
         .await
         .map_err(|e| format!("读取远端 {remote_path} 失败: {e}"))?;
     if md.is_dir() {
@@ -356,7 +355,7 @@ pub async fn sftp_read(
         return Err("文件过大或为二进制，无法编辑".to_string());
     }
     let mut f = sftp
-        .open(&remote_path)
+        .open(remote_path)
         .await
         .map_err(|e| format!("打开远端 {remote_path} 失败: {e}"))?;
     let mut bytes: Vec<u8> = Vec::new();
@@ -382,26 +381,35 @@ pub async fn sftp_read(
     String::from_utf8(bytes).map_err(|_| "文件过大或为二进制，无法编辑".to_string())
 }
 
-/// 覆写远端文本文件（保存场景允许覆盖；目录目标报错）。
-/// 可选 `expected_size` / `expected_mtime`（编辑器打开时的 stat 快照）：
-/// 远端当前属性与快照不一致时**不写入**，返回 conflict=true + 实际属性，
-/// 由前端弹「外部修改」确认（覆盖/重新加载）；无快照时直接覆写。
-/// 写入成功后重新 stat 并随结果返回（作为下次保存的基线）。
+/// 读取远端文本文件：>5MB、前 8KB 含 NUL 或非 UTF-8 → 报错（不可编辑）。
+/// 与 fsops::fs_read 同一套编辑约束，供编辑器打开远端文件。
 #[tauri::command]
-pub async fn sftp_write(
+pub async fn sftp_read(
     ssh: State<'_, Arc<SshManager>>,
     server_id: String,
     remote_path: String,
-    content: String,
+) -> Result<String, String> {
+    let sftp = ssh.inner().open_sftp(&server_id).await?;
+    read_text(&sftp, &remote_path).await
+}
+
+/// 覆写远端文本文件（sftp_write 命令与 MCP write_file 共用；保存场景允许覆盖；目录目标报错）。
+/// 可选 `expected_size` / `expected_mtime`（打开时的 stat 快照）：
+/// 远端当前属性与快照不一致时**不写入**，返回 conflict=true + 实际属性，
+/// 由调用方弹「外部修改」确认（覆盖/重新加载）；无快照时直接覆写。
+/// 写入成功后重新 stat 并随结果返回（作为下次保存的基线）。
+pub(crate) async fn write_text(
+    sftp: &SftpSession,
+    remote_path: &str,
+    content: &str,
     expected_size: Option<u64>,
     expected_mtime: Option<i64>,
 ) -> Result<SftpWriteResult, String> {
     if remote_path.trim().is_empty() {
         return Err("远端路径不能为空".to_string());
     }
-    let sftp = ssh.inner().open_sftp(&server_id).await?;
     let md = sftp
-        .metadata(&remote_path)
+        .metadata(remote_path)
         .await
         .map_err(|e| format!("读取远端 {remote_path} 失败: {e}"))?;
     if md.is_dir() {
@@ -417,7 +425,7 @@ pub async fn sftp_write(
         });
     }
     let mut f = sftp
-        .create(&remote_path)
+        .create(remote_path)
         .await
         .map_err(|e| format!("创建远端文件 {remote_path} 失败: {e}"))?;
     f.write_all(content.as_bytes())
@@ -428,7 +436,7 @@ pub async fn sftp_write(
         .map_err(|e| format!("关闭远端文件 {remote_path} 失败: {e}"))?;
     // 落盘后重新 stat：mtime/size 以服务器实际值为准（前端以此重建基线）
     let (after_size, after_mtime) = sftp
-        .metadata(&remote_path)
+        .metadata(remote_path)
         .await
         .ok()
         .map(|md| (md.size.unwrap_or(0), md.mtime.unwrap_or(0) as i64))
@@ -438,6 +446,24 @@ pub async fn sftp_write(
         actual_size: Some(after_size),
         actual_mtime: Some(after_mtime),
     })
+}
+
+/// 覆写远端文本文件（保存场景允许覆盖；目录目标报错）。
+/// 可选 `expected_size` / `expected_mtime`（编辑器打开时的 stat 快照）：
+/// 远端当前属性与快照不一致时**不写入**，返回 conflict=true + 实际属性，
+/// 由前端弹「外部修改」确认（覆盖/重新加载）；无快照时直接覆写。
+/// 写入成功后重新 stat 并随结果返回（作为下次保存的基线）。
+#[tauri::command]
+pub async fn sftp_write(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+    remote_path: String,
+    content: String,
+    expected_size: Option<u64>,
+    expected_mtime: Option<i64>,
+) -> Result<SftpWriteResult, String> {
+    let sftp = ssh.inner().open_sftp(&server_id).await?;
+    write_text(&sftp, &remote_path, &content, expected_size, expected_mtime).await
 }
 
 /// 校验预期快照与远端当前属性是否一致（编辑器「外部修改冲突」检测）。
@@ -486,6 +512,24 @@ mod tests {
     }
 }
 
+/// 远端移动/重命名（sftp_rename 命令与 MCP sftp_rename 共用）：to 为完整目标路径；目标已存在报错（防误覆盖）。
+pub(crate) async fn rename_one(sftp: &SftpSession, from: &str, to: &str) -> Result<(), String> {
+    if from.trim().is_empty() || to.trim().is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    if sftp
+        .try_exists(to)
+        .await
+        .map_err(|e| format!("检查远端 {to} 失败: {e}"))?
+    {
+        return Err(format!("目标已存在：{to}"));
+    }
+    sftp.rename(from, to)
+        .await
+        .map_err(|e| format!("重命名远端 {from} → {to} 失败: {e}"))?;
+    Ok(())
+}
+
 /// 远端移动/重命名：to 为完整目标路径；目标已存在报错（防误覆盖，与 fs_move 语义一致）。
 #[tauri::command]
 pub async fn sftp_rename(
@@ -494,20 +538,8 @@ pub async fn sftp_rename(
     from: String,
     to: String,
 ) -> Result<(), String> {
-    if from.trim().is_empty() || to.trim().is_empty() {
-        return Err("路径不能为空".to_string());
-    }
     let sftp = ssh.inner().open_sftp(&server_id).await?;
-    if sftp
-        .try_exists(&to)
-        .await
-        .map_err(|e| format!("检查远端 {to} 失败: {e}"))?
-    {
-        return Err(format!("目标已存在：{to}"));
-    }
-    sftp.rename(&from, &to)
-        .await
-        .map_err(|e| format!("重命名 {from} → {to} 失败: {e}"))
+    rename_one(&sftp, &from, &to).await
 }
 
 /// 复制远端文件/目录到远端目录（递归）：目标目录内重名自动 `name (1).ext`；返回落地名称。
@@ -594,7 +626,8 @@ pub async fn sftp_delete(
 }
 
 /// 递归删除一个远端文件或目录（async 递归需装箱，见 inner）。
-async fn delete_one(sftp: &SftpSession, path: &str) -> Result<(), String> {
+/// pub(crate)：MCP sftp_delete 工具复用（不改变手动 sftp_delete 语义）。
+pub(crate) async fn delete_one(sftp: &SftpSession, path: &str) -> Result<(), String> {
     async fn inner(sftp: &SftpSession, path: &str) -> Result<(), String> {
         let md = sftp
             .metadata(path)

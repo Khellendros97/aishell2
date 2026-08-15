@@ -1,0 +1,9 @@
+[package]
+name = "httpdate"
+version = "1.0.3"
+edition = "2021"
+description = "HTTP-date 时间格式（RFC 7231）最小本地实现 —— 离线 vendor，替代 crates.io 同名 crate"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"

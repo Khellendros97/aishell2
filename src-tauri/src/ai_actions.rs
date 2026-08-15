@@ -1074,7 +1074,8 @@ impl AiActions {
 }
 
 /// 词法归一：折叠 `.` 与 `..`（不触碰磁盘，纯路径计算）。
-fn normalize_path(p: &Path) -> PathBuf {
+/// pub(crate)：mcp.rs 传输目录边界校验复用。
+pub(crate) fn normalize_path(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
         match comp {
@@ -1116,7 +1117,8 @@ fn command_timeout(timeout_seconds: Option<u64>) -> Result<Duration, String> {
 }
 
 /// 项目根内判断：统一小写前缀比较（Windows 大小写不敏感）。
-fn ensure_inside(root: &Path, target: &Path) -> Result<(), String> {
+/// pub(crate)：mcp.rs 传输目录边界校验复用。
+pub(crate) fn ensure_inside(root: &Path, target: &Path) -> Result<(), String> {
     let root_l = root.to_string_lossy().to_lowercase();
     let target_l = target.to_string_lossy().to_lowercase();
     let sep = std::path::MAIN_SEPARATOR;

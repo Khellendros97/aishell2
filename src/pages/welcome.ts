@@ -216,7 +216,7 @@ export const renderWelcome: PageRender = (root) => {
       approvalMode: 'smart',
       autoBackupRemoteFiles: true,
     },
-    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, seededSkillWorkspaces: [],
+    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {}, seededSkillWorkspaces: [],
   };
   let editingId: string | null = null;       // null = 新建；否则为正在编辑的项目 id
   let selectedServerIds: string[] = [];      // 模态框中多选的服务器 id

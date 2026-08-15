@@ -7,7 +7,7 @@
  * 项目-服务器单维度重构移除；xshell 导入已移至欢迎页按目录自动建项目，服务器在项目语义下管理。
  */
 import type { AppState, LlmConfig, Settings, Theme } from '../types';
-import { getState, openDialog, saveSettings, setTheme } from '../api';
+import { getMcpStatus, getState, openDialog, saveSettings, setMcpPort, setTheme } from '../api';
 import { toast } from '../ui';
 import { icon } from '../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -111,6 +111,18 @@ export const renderSettings: PageRender = (root, params) => {
               <div class="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
             </div>
           </fieldset>
+          <fieldset class="llm-group">
+            <legend>MCP 服务（外部 agent 工具接入）</legend>
+            <div class="field">
+              <label>监听端口</label>
+              <input id="f-mcp-port" class="input mono" type="number" min="1024" max="65535" placeholder="8945">
+              <div class="hint">仅监听本机回环 127.0.0.1，不对外网开放。每台服务器可在「服务器卡片 → 更多 → MCP」中单独启用并配置功能开关；启用后外部工具经 http://127.0.0.1:端口/mcp 接入（Bearer 令牌在服务器 MCP 设置中查看）</div>
+            </div>
+            <div class="field">
+              <label>服务状态</label>
+              <div id="mcp-status-line" class="mcp-status-line">加载中…</div>
+            </div>
+          </fieldset>
           <div class="form-actions">
             <button id="btn-save-system" class="btn primary">保存</button>
           </div>
@@ -132,11 +144,33 @@ export const renderSettings: PageRender = (root, params) => {
   const fAiWorkdir = root.querySelector('#f-ai-workdir') as HTMLInputElement;
   const fApprovalMode = root.querySelector('#f-approval-mode') as HTMLSelectElement;
   const fAutoBackup = root.querySelector('#f-auto-backup') as HTMLInputElement;
+  const fMcpPort = root.querySelector('#f-mcp-port') as HTMLInputElement;
+  const mcpStatusLine = root.querySelector('#mcp-status-line') as HTMLElement;
+
+  /** MCP 服务状态行：运行中/未运行/端口占用原因（与服务器 MCP 弹窗同源） */
+  async function refreshMcpStatus(): Promise<void> {
+    try {
+      const st = await getMcpStatus();
+      if (st.running) {
+        mcpStatusLine.textContent = `运行中：127.0.0.1:${st.boundPort ?? st.port}（已启用设备 ${st.deviceCount} 台）`;
+        mcpStatusLine.className = 'mcp-status-line ok';
+      } else if (st.error) {
+        mcpStatusLine.textContent = `启动失败：${st.error}`;
+        mcpStatusLine.className = 'mcp-status-line err';
+      } else {
+        mcpStatusLine.textContent = '未运行（当前没有启用 MCP 的服务器；在服务器卡片「更多 → MCP」中启用后自动启动）';
+        mcpStatusLine.className = 'mcp-status-line';
+      }
+    } catch (err) {
+      mcpStatusLine.textContent = `无法获取状态：${String(err)}`;
+      mcpStatusLine.className = 'mcp-status-line err';
+    }
+  }
 
   /* ---------- 状态 ---------- */
   let db: AppState = {
     settings: { workspaceDir: null, llm: { modelId: '', baseUrl: '', effort: 'low' }, search: { enabled: false }, theme: 'dark', autoSwitchAiWorkdir: true, projectView: 'card', approvalMode: 'smart', autoBackupRemoteFiles: true },
-    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, seededSkillWorkspaces: [],
+    servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {}, sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {}, seededSkillWorkspaces: [],
   };
 
   // reason=missing-config：顶部黄色提示条（同 .proto/settings.js）
@@ -159,6 +193,8 @@ export const renderSettings: PageRender = (root, params) => {
     fAiWorkdir.checked = s.autoSwitchAiWorkdir ?? true;
     fApprovalMode.value = s.approvalMode ?? 'smart';
     fAutoBackup.checked = s.autoBackupRemoteFiles ?? true;
+    fMcpPort.value = String(db.mcp?.port ?? 8945);
+    void refreshMcpStatus();
   }
 
   // Workspace 浏览…：真实目录选择
@@ -213,6 +249,14 @@ export const renderSettings: PageRender = (root, params) => {
       fWorkspace.focus();
       return;
     }
+    /* MCP 端口独立保存（AppState.mcp 不在 Settings 里，避免整表单回传覆盖）；
+       校验与后端一致：1024–65535 */
+    const mcpPort = Number(fMcpPort.value);
+    if (!Number.isInteger(mcpPort) || mcpPort < 1024 || mcpPort > 65535) {
+      toast('MCP 端口必须在 1024–65535 之间', 'error');
+      fMcpPort.focus();
+      return;
+    }
     const llm: LlmConfig = {
       modelId: fModelId.value.trim(),
       baseUrl: fBaseUrl.value.trim(),
@@ -230,8 +274,10 @@ export const renderSettings: PageRender = (root, params) => {
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
+      await setMcpPort(mcpPort);
       db.settings = settings;
       toast('设置已保存', 'success');
+      void refreshMcpStatus();
     } catch (err) {
       toast(String(err), 'error');
     }

@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, ChatSession, DbConnection, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -80,6 +80,21 @@ export const saveDbConnection = (serverId: string, connection: DbConnection, pas
   call<void>('save_db_connection', { serverId, connection, password });
 export const deleteDbConnection = (serverId: string, connId: string) =>
   call<void>('delete_db_connection', { serverId, connId });
+
+/* ---------------- MCP 服务（外部 agent 工具接入，Streamable HTTP） ----------------
+   设备配置随 getState 返回（AppState.mcpDevices / mcp.port）；令牌为自签本地配对令牌，
+   仅在本应用 MCP 设置界面展示/复制（这是「密钥永不返回前端」规则的显式例外）。 */
+/** 保存某服务器的 MCP 设备配置（enabled = 加入 MCP 可发现设备列表 + 功能开关）；后端同步监听 */
+export const setMcpDevice = (serverId: string, config: McpDeviceConfig) =>
+  call<void>('mcp_set_device', { serverId, config });
+/** 修改 MCP 监听端口（1024–65535）；后端同步重启监听 */
+export const setMcpPort = (port: number) => call<void>('mcp_set_port', { port });
+/** 服务状态：是否监听、实际端口、启动失败原因、已启用设备数 */
+export const getMcpStatus = () => call<McpStatus>('mcp_status');
+/** 读取（必要时生成）MCP 接入令牌，供设置界面展示/复制 */
+export const mcpEnsureToken = () => call<string>('mcp_ensure_token');
+/** 重置 MCP 接入令牌（旧令牌立即失效） */
+export const mcpResetToken = () => call<string>('mcp_reset_token');
 
 /* ---------------- term ----------------
    id 由前端生成、先订阅事件再调 term_create，避免输出竞态丢失。
