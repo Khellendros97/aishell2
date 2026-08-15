@@ -6,6 +6,7 @@
  */
 import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import type { Window as TauriWindow } from '@tauri-apps/api/window';
 import { getVersion } from '@tauri-apps/api/app';
 import { setTheme } from '../api';
 import { navigate } from '../router';
@@ -15,8 +16,23 @@ import { Icon } from '../shared/Icon';
 
 export type TopbarPage = 'welcome' | 'settings' | null;
 
-const appWin = getCurrentWindow();
 const appLogoUrl = new URL('../assets/logo.svg', import.meta.url).href;
+
+/* 惰性获取窗口句柄:模块级 getCurrentWindow() 在无 Tauri 注入的环境(纯浏览器/jsdom)
+   会直接抛错炸掉整个入口模块 —— 旧版 topbar.ts 即有此问题,迁移时顺手修复。
+   顶栏窗口控制在无句柄环境下降级为无操作,导航/主题等功能不受影响。 */
+let appWin: TauriWindow | null = null;
+function getWindow(): TauriWindow | null {
+  if (appWin) return appWin;
+  try { appWin = getCurrentWindow(); } catch { return null; }
+  return appWin;
+}
+
+/** 容错执行窗口操作(无句柄环境静默跳过) */
+function withWindow(fn: (w: TauriWindow) => void | Promise<unknown>): void {
+  const w = getWindow();
+  if (w) void fn(w);
+}
 
 export function Topbar({ activePage, workbenchProjectId }: {
   activePage: TopbarPage;
@@ -33,9 +49,11 @@ export function Topbar({ activePage, workbenchProjectId }: {
   }, []);
 
   useEffect(() => {
-    // Win+方向键等系统途径触发的最大化也要同步图标
-    const unlistenP = appWin.onResized(() => { void appWin.isMaximized().then(setMaximized); });
-    void appWin.isMaximized().then(setMaximized);
+    // Win+方向键等系统途径触发的最大化也要同步图标(无窗口句柄环境跳过)
+    const w = getWindow();
+    if (!w) return;
+    const unlistenP = w.onResized(() => { void w.isMaximized().then(setMaximized); });
+    void w.isMaximized().then(setMaximized);
     return () => { void unlistenP.then((un) => un()); };
   }, []);
 
@@ -69,9 +87,9 @@ export function Topbar({ activePage, workbenchProjectId }: {
       <button className={`btn small${activePage === 'settings' ? '' : ' ghost'}`} onClick={() => navigate('#/settings')}>设置</button>
       <button className="icon-btn tb-theme" title="切换亮色 / 深色主题" onClick={toggleTheme}><Icon name={theme === 'dark' ? 'sun' : 'moon'} /></button>
       <div className="tb-win-controls">
-        <button className="tb-win-btn tb-win-min" title="最小化" onClick={() => { void appWin.minimize(); }}><Icon name="minus" /></button>
-        <button className="tb-win-btn tb-win-max" title="最大化 / 还原" onClick={() => { void appWin.toggleMaximize(); }}><Icon name={maximized ? 'restore' : 'square'} /></button>
-        <button className="tb-win-btn tb-win-close" title="关闭" onClick={() => { void appWin.close(); }}><Icon name="x" /></button>
+        <button className="tb-win-btn tb-win-min" title="最小化" onClick={() => withWindow((w) => w.minimize())}><Icon name="minus" /></button>
+        <button className="tb-win-btn tb-win-max" title="最大化 / 还原" onClick={() => withWindow((w) => w.toggleMaximize())}><Icon name={maximized ? 'restore' : 'square'} /></button>
+        <button className="tb-win-btn tb-win-close" title="关闭" onClick={() => withWindow((w) => w.close())}><Icon name="x" /></button>
       </div>
     </div>
   );
