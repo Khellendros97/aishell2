@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use regex::Regex;
+use russh_sftp::client::SftpSession;
 use serde::Serialize;
+use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::ai_impact::{analyze_remote_command, Effect, ImpactPlan};
 use crate::ssh::SshManager;
@@ -25,6 +29,20 @@ use crate::store::{DbKind, Store};
 
 const DEFAULT_RUN_COMMAND_TIMEOUT_SECS: u64 = 10;
 const MAX_RUN_COMMAND_TIMEOUT_SECS: u64 = 3600;
+/// 流式拷贝缓冲（与 sftp.rs / staging.rs 一致）。
+const COPY_BUF: usize = 64 * 1024;
+/// 返回给模型的文本上限（与 ai.rs MAX_RESULT_CHARS 一致）。
+const AI_RESULT_CAP: usize = 30_000;
+/// 远程 grep 整体超时（秒）。
+const REMOTE_GREP_TIMEOUT_SECS: u64 = 30;
+/// 远端 glob 递归上限：深度 / 目录扫描数（防失控 walk）。
+const REMOTE_GLOB_MAX_DEPTH: usize = 12;
+const REMOTE_GLOB_MAX_DIRS: usize = 2000;
+
+/// 判断 SFTP 错误是否为「文件不存在」（与 staging.rs 同语义）。
+fn is_no_such_file(e: &russh_sftp::client::error::Error) -> bool {
+    matches!(e, russh_sftp::client::error::Error::Status(s) if s.status_code == russh_sftp::protocol::StatusCode::NoSuchFile)
+}
 
 /// 命令执行结果（serde camelCase：stdout / stderr / exitCode / timedOut）。
 #[derive(Debug, Clone, Serialize)]
@@ -318,6 +336,378 @@ impl AiActions {
         sftp.canonicalize(".")
             .await
             .map_err(|e| format!("解析远程工作目录失败: {e}"))
+    }
+
+    // ---------------------------------------------------------------- 远程文件工具（基础工具 serverId 模式）
+    // 权限契约与 guard 侧一致：仅 agent/yolo 可用（suggest 由 guard validate 阻止）；
+    // 全部入口先过服务器 AI 锁（ensure_ai_allowed）；写操作在自动备份开启时执行前
+    // ensure_snapshot（同一会话首次修改记录原始字节，暂存面板可 diff/还原）。
+
+    /// 解析远程路径为绝对 POSIX 路径：绝对路径词法折叠；相对路径拼远端 home；
+    /// 拒绝 Windows 盘符形态（远程是 POSIX 文件系统）。与暂存键的路径归一保持一致。
+    async fn resolve_remote_path(&self, server_id: &str, path: &str) -> Result<String, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("远程路径不能为空".to_string());
+        }
+        if path.starts_with('\\') || (path.len() >= 2 && path.as_bytes()[1] == b':') {
+            return Err(format!(
+                "远程路径必须是 POSIX 绝对路径（/ 开头）或相对路径，不接受盘符形态：{path}"
+            ));
+        }
+        if path.starts_with('/') {
+            crate::staging::canonical_remote_path(path)
+        } else {
+            let home = self.remote_home(server_id).await?;
+            crate::staging::canonical_remote_path(&format!("{}/{}", home.trim_end_matches('/'), path))
+        }
+    }
+
+    /// 远端单条目属性（ls/read/write 的 exists/stat/access 语义）：
+    /// 返回 JSON `{exists,isDir,size,mtime}`；文件不存在 → exists:false（不报错）。
+    pub async fn remote_stat(&self, server_id: &str, path: &str) -> Result<String, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let resolved = self.resolve_remote_path(server_id, path).await?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        match sftp.metadata(&resolved).await {
+            Ok(md) => Ok(json!({
+                "exists": true,
+                "isDir": md.is_dir(),
+                "size": md.size.unwrap_or(0),
+                "mtime": md.mtime.unwrap_or(0) as i64,
+            })
+            .to_string()),
+            Err(e) if is_no_such_file(&e) => {
+                Ok(json!({"exists": false, "isDir": false, "size": 0, "mtime": 0}).to_string())
+            }
+            Err(e) => Err(format!("读取远端 {resolved} 属性失败: {e}")),
+        }
+    }
+
+    /// 读取远端文本文件字节：>MAX_EDIT_BYTES、前 8KB 含 NUL 或非 UTF-8 → 中文错误
+    /// （远程暂不支持大文件/二进制/图片，与编辑器 sftp_read 同一套约束）。
+    /// 不脱敏：与本地 read 一致，脱敏会破坏 edit 的 oldText 精确匹配。
+    pub async fn remote_read(&self, server_id: &str, path: &str) -> Result<Vec<u8>, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let resolved = self.resolve_remote_path(server_id, path).await?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        let md = sftp
+            .metadata(&resolved)
+            .await
+            .map_err(|e| format!("读取远端 {resolved} 失败: {e}"))?;
+        if md.is_dir() {
+            return Err(format!("远端 {resolved} 是目录，不能读取"));
+        }
+        if md.size.unwrap_or(0) > crate::fsops::MAX_EDIT_BYTES {
+            return Err(format!(
+                "远端 {resolved} 超过 {}MB，无法读取（远程暂不支持大文件/二进制/图片）",
+                crate::fsops::MAX_EDIT_BYTES / 1024 / 1024
+            ));
+        }
+        let mut f = sftp
+            .open(&resolved)
+            .await
+            .map_err(|e| format!("打开远端 {resolved} 失败: {e}"))?;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; COPY_BUF];
+        let mut scanned = 0usize;
+        loop {
+            let n = f
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("读取远端 {resolved} 失败: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            if scanned < crate::fsops::BINARY_SCAN_BYTES {
+                let head = &buf[..n.min(crate::fsops::BINARY_SCAN_BYTES - scanned)];
+                if head.contains(&0) {
+                    return Err(format!("远端 {resolved} 为二进制文件，无法读取（远程暂不支持二进制/图片）"));
+                }
+                scanned += head.len();
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        std::str::from_utf8(&bytes)
+            .map_err(|_| format!("远端 {resolved} 不是有效的 UTF-8 文本，无法读取"))?;
+        Ok(bytes)
+    }
+
+    /// 远端写文件（write/edit 工具的执行体）：
+    /// 目录目标拒绝；自动备份开启时写前 ensure_snapshot（任一失败阻止写入）；
+    /// 父目录不存在自动创建（write 语义）；写后刷新暂存 current 状态。
+    pub async fn remote_write(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        server_id: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<String, String> {
+        self.ensure_ai_allowed(server_id)?;
+        if content.len() > crate::fsops::MAX_EDIT_BYTES as usize {
+            return Err(format!(
+                "写入内容超过 {}MB，请拆分后重试",
+                crate::fsops::MAX_EDIT_BYTES / 1024 / 1024
+            ));
+        }
+        let resolved = self.resolve_remote_path(server_id, path).await?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        // 目录目标拒绝（无论自动备份开关）
+        if let Ok(md) = sftp.metadata(&resolved).await {
+            if md.is_dir() {
+                return Err(format!("远端 {resolved} 是目录，不能写入"));
+            }
+        }
+        let auto_backup = self.staging.auto_backup_enabled();
+        if auto_backup {
+            self.staging
+                .ensure_snapshot(project_id, session_id, server_id, &resolved)
+                .await?;
+        }
+        // 父目录自动创建（write 语义：父目录不存在会自动创建）
+        if let Some(parent) = resolved.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/" } else { p }) {
+            remote_mkdir_impl(&sftp, parent).await?;
+        }
+        let mut f = sftp
+            .create(&resolved)
+            .await
+            .map_err(|e| format!("创建远端文件 {resolved} 失败: {e}"))?;
+        f.write_all(content.as_bytes())
+            .await
+            .map_err(|e| format!("写入远端 {resolved} 失败: {e}"))?;
+        f.shutdown()
+            .await
+            .map_err(|e| format!("关闭远端文件 {resolved} 失败: {e}"))?;
+        if auto_backup {
+            let _ = self
+                .staging
+                .refresh_current(project_id, session_id, server_id, &resolved)
+                .await;
+        }
+        Ok(format!("写入完成：{resolved}（服务器 {server_id}）"))
+    }
+
+    /// 远端目录创建（write 的 mkdir 语义：父目录不存在自动创建；已存在且是目录则跳过）。
+    pub async fn remote_mkdir(&self, server_id: &str, dir: &str) -> Result<(), String> {
+        self.ensure_ai_allowed(server_id)?;
+        let resolved = self.resolve_remote_path(server_id, dir).await?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        remote_mkdir_impl(&sftp, &resolved).await
+    }
+
+    /// 远端目录列表（ls 的 readdir 语义）：返回 JSON 数组
+    /// `[{name,isDir,size,mtime}]`，供扩展侧 stat 缓存，避免逐条目往返。
+    pub async fn remote_listdir(&self, server_id: &str, path: &str) -> Result<String, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let resolved = self.resolve_remote_path(server_id, path).await?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        let rd = sftp
+            .read_dir(&resolved)
+            .await
+            .map_err(|e| format!("读取远端目录 {resolved} 失败: {e}"))?;
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        for entry in rd {
+            let md = entry.metadata();
+            entries.push(json!({
+                "name": entry.file_name(),
+                "isDir": md.is_dir(),
+                "size": md.size.unwrap_or(0),
+                "mtime": md.mtime.unwrap_or(0) as i64,
+            }));
+        }
+        serde_json::to_string(&entries).map_err(|e| format!("序列化远端目录失败: {e}"))
+    }
+
+    /// 远端 glob 搜索（find 工具的 glob 语义）：
+    /// SFTP 递归 walk，glob→regex 匹配「相对 base」的 POSIX 路径（含 '/' 匹配完整相对路径，
+    /// 不含 '/' 只匹配末段）；跳过 ignore 目录（core 默认传 node_modules/.git）；
+    /// 深度/目录数上限防失控；limit 截断。返回相对路径（find core 会相对化展示）。
+    pub async fn remote_glob(
+        &self,
+        server_id: &str,
+        base: &str,
+        pattern: &str,
+        ignore: &[String],
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let base = self.resolve_remote_path(server_id, base).await?;
+        let re = glob_to_regex(pattern)?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        let mut out: Vec<String> = Vec::new();
+        let mut stack: Vec<(String, usize)> = vec![(base.clone(), 0)];
+        let mut scanned = 0usize;
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > REMOTE_GLOB_MAX_DEPTH {
+                continue;
+            }
+            scanned += 1;
+            if scanned > REMOTE_GLOB_MAX_DIRS {
+                break;
+            }
+            let rd = match sftp.read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(_) => continue, // 无权限/已删除目录跳过，不中断整个搜索
+            };
+            for entry in rd {
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+                let name = entry.file_name();
+                let full = format!("{}/{}", dir.trim_end_matches('/'), name);
+                let md = entry.metadata();
+                let rel = full
+                    .strip_prefix(&base)
+                    .unwrap_or(&full)
+                    .trim_start_matches('/')
+                    .to_string();
+                if md.is_dir() {
+                    if ignore.iter().any(|g| ignore_dir_match(g, &name)) {
+                        continue;
+                    }
+                    stack.push((full, depth + 1));
+                    if glob_matches(&re, pattern, &rel) {
+                        out.push(rel);
+                    }
+                } else if glob_matches(&re, pattern, &rel) {
+                    out.push(rel);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 远端 grep（read-only）：服务端固定模板 grep（全参数 shell_quote，无模型自由注入面），
+    /// 30s 超时；退出码 1 = 无匹配；127 = 服务器未装 grep（中文降级指引）；
+    /// 输出脱敏 + 截断（与 run_command 输出同标准）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remote_grep(
+        &self,
+        server_id: &str,
+        pattern: &str,
+        path: &str,
+        glob: Option<&str>,
+        ignore_case: bool,
+        literal: bool,
+        context: Option<u32>,
+    ) -> Result<String, String> {
+        self.ensure_ai_allowed(server_id)?;
+        if pattern.trim().is_empty() {
+            return Err("搜索模式不能为空".to_string());
+        }
+        let resolved = self.resolve_remote_path(server_id, path).await?;
+        let cmd = build_remote_grep_command(pattern, &resolved, glob, ignore_case, literal, context);
+        let result = self
+            .ssh
+            .exec_with_timeout(server_id, &cmd, Duration::from_secs(REMOTE_GREP_TIMEOUT_SECS))
+            .await?;
+        if result.timed_out {
+            return Err(format!(
+                "远程 grep 超时（{REMOTE_GREP_TIMEOUT_SECS} 秒），已终止；可改用 find/read 缩小范围"
+            ));
+        }
+        match result.exit_code {
+            Some(0) => {}
+            Some(1) => return Ok("No matches found".to_string()),
+            Some(127) => {
+                return Err("服务器未安装 grep，无法远程搜索；请改用 read/find/ls 工具".to_string());
+            }
+            Some(2) => {
+                let stderr = result.stderr.trim();
+                return Err(if stderr.is_empty() {
+                    "远程 grep 执行出错（退出码 2），请确认搜索路径存在且可读".to_string()
+                } else {
+                    format!("远程 grep 失败：{stderr}")
+                });
+            }
+            _ => return Err(format!("远程 grep 异常退出（code={:?}）", result.exit_code)),
+        }
+        let mut text = result.stdout;
+        if !result.stderr.is_empty() {
+            text.push_str(&format!("\n{}", result.stderr));
+        }
+        // 输出脱敏（先于截断）：配置里的密码不进 LLM 上下文，也不进 pi 会话落盘
+        let (masked, redacted) = crate::redact::redact_secrets(&text, &self.store.known_secrets());
+        text = masked;
+        if redacted > 0 {
+            text.push_str(&format!("\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"));
+        }
+        if text.len() > AI_RESULT_CAP {
+            text.truncate(AI_RESULT_CAP);
+            text.push_str("\n…(输出已截断)");
+        }
+        if text.trim().is_empty() {
+            return Ok("No matches found".to_string());
+        }
+        Ok(text)
+    }
+
+    /// 远端删除（delete_path 工具的 serverId 模式）：仅文件（目录删除走 run_command，
+    /// 其影响分析会枚举目录内文件并逐一快照）；自动备份开启时删除前快照（可还原）。
+    pub async fn remote_delete(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        server_id: &str,
+        path: &str,
+    ) -> Result<String, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let resolved = self.resolve_remote_path(server_id, path).await?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        let md = sftp
+            .metadata(&resolved)
+            .await
+            .map_err(|e| format!("读取远端 {resolved} 失败: {e}"))?;
+        if md.is_dir() {
+            return Err(format!(
+                "远端 {resolved} 是目录；远程删除工具仅支持文件。删除目录请用 run_command（审批时会展示影响范围并自动备份）"
+            ));
+        }
+        let auto_backup = self.staging.auto_backup_enabled();
+        if auto_backup {
+            self.staging
+                .ensure_snapshot(project_id, session_id, server_id, &resolved)
+                .await?;
+        }
+        sftp.remove_file(&resolved)
+            .await
+            .map_err(|e| format!("删除远端 {resolved} 失败: {e}"))?;
+        if auto_backup {
+            let _ = self
+                .staging
+                .refresh_current(project_id, session_id, server_id, &resolved)
+                .await;
+        }
+        Ok(format!("已删除远程文件：{resolved}（服务器 {server_id}）"))
     }
 
     /// 覆盖上传的影响计划（审批阶段计算，供合并/展示/执行确认）：
@@ -684,7 +1074,8 @@ impl AiActions {
 }
 
 /// 词法归一：折叠 `.` 与 `..`（不触碰磁盘，纯路径计算）。
-fn normalize_path(p: &Path) -> PathBuf {
+/// pub(crate)：mcp.rs 传输目录边界校验复用。
+pub(crate) fn normalize_path(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
         match comp {
@@ -726,7 +1117,8 @@ fn command_timeout(timeout_seconds: Option<u64>) -> Result<Duration, String> {
 }
 
 /// 项目根内判断：统一小写前缀比较（Windows 大小写不敏感）。
-fn ensure_inside(root: &Path, target: &Path) -> Result<(), String> {
+/// pub(crate)：mcp.rs 传输目录边界校验复用。
+pub(crate) fn ensure_inside(root: &Path, target: &Path) -> Result<(), String> {
     let root_l = root.to_string_lossy().to_lowercase();
     let target_l = target.to_string_lossy().to_lowercase();
     let sep = std::path::MAIN_SEPARATOR;
@@ -738,6 +1130,133 @@ fn ensure_inside(root: &Path, target: &Path) -> Result<(), String> {
             target.display()
         ))
     }
+}
+
+// ---------------------------------------------------------------- 远程文件工具辅助
+
+/// 逐级创建远端目录：已存在且是目录 → 跳过；已存在但不是目录 → 错误；
+/// 递归创建父目录后创建自身。纯 SFTP，不依赖 shell。
+/// async 递归需装箱（与 sftp.rs delete_one 同模式）。
+async fn remote_mkdir_impl(sftp: &SftpSession, dir: &str) -> Result<(), String> {
+    async fn inner(sftp: &SftpSession, dir: &str) -> Result<(), String> {
+        match sftp.metadata(dir).await {
+            Ok(md) if md.is_dir() => return Ok(()),
+            Ok(_) => return Err(format!("远端 {dir} 已存在但不是目录")),
+            Err(e) if !is_no_such_file(&e) => return Err(format!("读取远端 {dir} 失败: {e}")),
+            Err(_) => {}
+        }
+        let parent = dir
+            .rsplit_once('/')
+            .map(|(p, _)| if p.is_empty() { "/" } else { p })
+            .unwrap_or("/");
+        if parent != dir {
+            Box::pin(inner(sftp, parent)).await?;
+        }
+        sftp.create_dir(dir)
+            .await
+            .map_err(|e| format!("创建远端目录 {dir} 失败: {e}"))
+    }
+    Box::pin(inner(sftp, dir)).await
+}
+
+/// glob → 正则（find 工具语义）：
+/// `*` → `[^/]*`；`**` → `.*`（`**/` 额外允许零级目录）；`?` → `[^/]`；
+/// `[...]` 字符类原样透传（不嵌套）；其余正则元字符转义。锚定 ^…$。
+fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
+    let mut re = String::from("^");
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    re.push_str(".*");
+                    i += 2;
+                    // `**/`：匹配零或多级目录（`/` 本身可选）
+                    if i < chars.len() && chars[i] == '/' {
+                        re.push_str("/?");
+                        i += 1;
+                    }
+                } else {
+                    re.push_str("[^/]*");
+                    i += 1;
+                }
+            }
+            '?' => {
+                re.push_str("[^/]");
+                i += 1;
+            }
+            '[' => {
+                // 字符类原样透传直到 `]`；无闭合 `]` 按字面处理
+                if let Some(off) = pattern[i + 1..].find(']') {
+                    re.push_str(&pattern[i..=i + 1 + off]);
+                    i += off + 2;
+                } else {
+                    re.push_str("\\[");
+                    i += 1;
+                }
+            }
+            c => {
+                if "\\^$.|+(){}".contains(c) {
+                    re.push('\\');
+                }
+                re.push(c);
+                i += 1;
+            }
+        }
+    }
+    re.push('$');
+    Regex::new(&re).map_err(|e| format!("glob 解析失败（{pattern}）：{e}"))
+}
+
+/// glob 匹配（对齐 rg/find 惯例）：pattern 含 '/' → 匹配相对完整路径；
+/// 不含 '/' → 只匹配末段（basename，任意层级）。
+fn glob_matches(re: &Regex, pattern: &str, rel: &str) -> bool {
+    if pattern.contains('/') {
+        re.is_match(rel)
+    } else {
+        rel.rsplit('/')
+            .next()
+            .map(|b| re.is_match(b))
+            .unwrap_or(false)
+    }
+}
+
+/// ignore 目录判定（core 默认传 `**/node_modules/**`、`**/.git/**`）：
+/// 剥掉 `**/` 前缀与 `/**` 后缀后按名称 glob 匹配。
+fn ignore_dir_match(glob: &str, name: &str) -> bool {
+    let g = glob.trim().trim_start_matches("**/").trim_end_matches("/**");
+    if g.is_empty() || g == "**" || g.contains('/') {
+        return false;
+    }
+    glob_to_regex(g).map(|re| re.is_match(name)).unwrap_or(false)
+}
+
+/// 组装远端 grep 命令：固定模板 + 全参数 shell_quote（模式/路径/glob 无注入面）。
+/// 只读搜索：`grep -rn --color=never [-i] [-F] [-C n] [--include=glob] -e <pattern> -- <path>`
+fn build_remote_grep_command(
+    pattern: &str,
+    resolved: &str,
+    glob: Option<&str>,
+    ignore_case: bool,
+    literal: bool,
+    context: Option<u32>,
+) -> String {
+    let mut cmd = String::from("grep -rn --color=never");
+    if ignore_case {
+        cmd.push_str(" -i");
+    }
+    if literal {
+        cmd.push_str(" -F");
+    }
+    if let Some(c) = context {
+        cmd.push_str(&format!(" -C {c}"));
+    }
+    if let Some(g) = glob {
+        cmd.push_str(&format!(" --include={}", shell_quote(g)));
+    }
+    cmd.push_str(&format!(" -e {} -- {}", shell_quote(pattern), shell_quote(resolved)));
+    cmd
 }
 
 // ---------------------------------------------------------------- 受管数据库查询
@@ -1143,6 +1662,105 @@ mod tests {
             .unwrap();
         let text = actions.list_servers("proj-empty").unwrap();
         assert!(text.contains("项目未绑定任何远程服务器"), "实际: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_to_regex_matches_find_semantics() {
+        // 基本 *：不跨 /
+        let re = glob_to_regex("*.ts").unwrap();
+        assert!(re.is_match("a.ts"));
+        assert!(!re.is_match("a.txt"));
+        assert!(!re.is_match("sub/a.ts"), "无 '/' 的 pattern 由 glob_matches 按 basename 匹配");
+        // ** 跨目录
+        let re = glob_to_regex("**/*.spec.ts").unwrap();
+        assert!(re.is_match("a.spec.ts"));
+        assert!(re.is_match("src/a/b.spec.ts"));
+        // **/ 允许零级目录
+        let re = glob_to_regex("src/**/*.ts").unwrap();
+        assert!(re.is_match("src/a.ts"));
+        assert!(re.is_match("src/sub/b.ts"));
+        assert!(!re.is_match("lib/b.ts"));
+        // ? 单字符
+        let re = glob_to_regex("?.ts").unwrap();
+        assert!(re.is_match("a.ts"));
+        assert!(!re.is_match("ab.ts"));
+        // 正则元字符转义
+        let re = glob_to_regex("a.b").unwrap();
+        assert!(re.is_match("a.b"));
+        assert!(!re.is_match("axb"));
+        // 字符类
+        let re = glob_to_regex("[ab]c.txt").unwrap();
+        assert!(re.is_match("ac.txt"));
+        assert!(re.is_match("bc.txt"));
+        assert!(!re.is_match("cc.txt"));
+        // 未闭合 [ 按字面处理不报错
+        assert!(glob_to_regex("a[b").is_ok());
+    }
+
+    #[test]
+    fn glob_matches_basename_rule_for_slashless_patterns() {
+        let re = glob_to_regex("*.ts").unwrap();
+        assert!(glob_matches(&re, "*.ts", "src/sub/a.ts"), "无 '/' 的 pattern 匹配任意层级 basename");
+        assert!(!glob_matches(&re, "*.ts", "src/a.txt"));
+        let re2 = glob_to_regex("src/**/*.ts").unwrap();
+        assert!(glob_matches(&re2, "src/**/*.ts", "src/sub/b.ts"));
+        assert!(!glob_matches(&re2, "src/**/*.ts", "lib/b.ts"));
+    }
+
+    #[test]
+    fn ignore_dir_match_strips_wrapper_glob() {
+        assert!(ignore_dir_match("**/node_modules/**", "node_modules"));
+        assert!(ignore_dir_match("**/.git/**", ".git"));
+        assert!(!ignore_dir_match("**/node_modules/**", "src"));
+        assert!(!ignore_dir_match("**", "x"));
+        assert!(!ignore_dir_match("**/dist/**", "dist-2"));
+    }
+
+    #[test]
+    fn build_remote_grep_command_quotes_all_params() {
+        let cmd = build_remote_grep_command("foo bar", "/var/www/app", None, false, false, None);
+        assert!(cmd.starts_with("grep -rn --color=never"), "{cmd}");
+        assert!(cmd.contains("-e 'foo bar' -- '/var/www/app'"), "参数必须 shell_quote: {cmd}");
+        // 选项组合
+        let cmd2 = build_remote_grep_command("FIXME", "/etc", Some("*.conf"), true, true, Some(2));
+        assert!(cmd2.contains(" -i"), "{cmd2}");
+        assert!(cmd2.contains(" -F"), "{cmd2}");
+        assert!(cmd2.contains(" -C 2"), "{cmd2}");
+        assert!(cmd2.contains("--include='*.conf'"), "{cmd2}");
+        // 单引号转义
+        let cmd3 = build_remote_grep_command("it's", "/a", None, false, false, None);
+        assert!(cmd3.contains("-e 'it'\\''s'"), "{cmd3}");
+    }
+
+    #[test]
+    fn resolve_remote_path_rejects_drive_forms_and_folds_absolute() {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-ai-actions-resolve-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(crate::store::test_store(dir.clone()));
+        let actions = test_actions(Arc::clone(&store));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // 盘符形态拒绝（不触碰网络）
+        let err = rt.block_on(actions.resolve_remote_path("srv-a", r"C:\etc\hosts"));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("盘符"), "应拒绝盘符形态");
+        let err2 = rt.block_on(actions.resolve_remote_path("srv-a", "C:/x"));
+        assert!(err2.is_err());
+        // 反斜杠开头（UNC 形态）拒绝
+        let err3 = rt.block_on(actions.resolve_remote_path("srv-a", r"\\srv\share"));
+        assert!(err3.is_err());
+        // 绝对路径词法折叠（无网络）
+        let ok = rt.block_on(actions.resolve_remote_path("srv-a", "/var/www/./app/../app2"));
+        assert_eq!(ok.unwrap(), "/var/www/app2");
+        // 空路径
+        let err4 = rt.block_on(actions.resolve_remote_path("srv-a", "  "));
+        assert!(err4.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

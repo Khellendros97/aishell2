@@ -91,13 +91,16 @@ dependencies = [
 
 [[package]]
 name = "aishell"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures",
  "getrandom 0.3.4",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "keyring",
  "portable-pty",
  "regex",
@@ -2389,6 +2392,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2414,6 +2421,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",

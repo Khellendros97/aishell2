@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, FsEntry, FsStat, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -80,6 +80,21 @@ export const saveDbConnection = (serverId: string, connection: DbConnection, pas
   call<void>('save_db_connection', { serverId, connection, password });
 export const deleteDbConnection = (serverId: string, connId: string) =>
   call<void>('delete_db_connection', { serverId, connId });
+
+/* ---------------- MCP 服务（外部 agent 工具接入，Streamable HTTP） ----------------
+   设备配置随 getState 返回（AppState.mcpDevices / mcp.port）；令牌为自签本地配对令牌，
+   仅在本应用 MCP 设置界面展示/复制（这是「密钥永不返回前端」规则的显式例外）。 */
+/** 保存某服务器的 MCP 设备配置（enabled = 加入 MCP 可发现设备列表 + 功能开关）；后端同步监听 */
+export const setMcpDevice = (serverId: string, config: McpDeviceConfig) =>
+  call<void>('mcp_set_device', { serverId, config });
+/** 修改 MCP 监听端口（1024–65535）；后端同步重启监听 */
+export const setMcpPort = (port: number) => call<void>('mcp_set_port', { port });
+/** 服务状态：是否监听、实际端口、启动失败原因、已启用设备数 */
+export const getMcpStatus = () => call<McpStatus>('mcp_status');
+/** 读取（必要时生成）MCP 接入令牌，供设置界面展示/复制 */
+export const mcpEnsureToken = () => call<string>('mcp_ensure_token');
+/** 重置 MCP 接入令牌（旧令牌立即失效） */
+export const mcpResetToken = () => call<string>('mcp_reset_token');
 
 /* ---------------- term ----------------
    id 由前端生成、先订阅事件再调 term_create，避免输出竞态丢失。
@@ -186,7 +201,9 @@ export type AiEvent =
       /** 智能审批自动放行：true 时卡片直接展示「已智能放行」（后端已回 confirmed，无需再回复） */
       smart?: boolean; smartReason?: string;
       /** 影响计划（自动备份开启时）：effect 为 none|bounded|unbounded，unbounded 卡片展示「不保证完整备份」 */
-      impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string } }
+      impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string };
+      /** 数据库连接申请（request_db_connection 工具）：AI 填写的连接信息，审批对话框只读展示 */
+      connection?: { serverId: string; name: string; kind: DbKind; host: string; port?: number; user?: string; database?: string } }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
@@ -203,6 +220,10 @@ export const aiSetThinking = (projectId: string, level: string) =>
  *  重复或过期回复返回中文错误。 */
 export const aiRespondApproval = (key: string, requestId: string, confirmed: boolean) =>
   call<void>('ai_respond_approval', { key, requestId, confirmed });
+/** 回复数据库连接申请（request_db_connection 工具）：approved=true 时 connectionId 为前端
+ *  已保存连接的 id（工具结果直接携带，AI 据此 db_query）；false 为拒绝。校验语义同 aiRespondApproval。 */
+export const aiRespondDbRequest = (key: string, requestId: string, response: { approved: boolean; connectionId?: string }) =>
+  call<void>('ai_respond_db_request', { key, requestId, response: JSON.stringify(response) });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 
@@ -248,6 +269,9 @@ export const memoryPromote = (id: string) => call<string>('memory_promote', { id
 /* ---------------- staging（会话级远程文件暂存，自动备份） ----------------
    快照在 AI 修改远程文件前自动创建；本组命令供「文件暂存区」面板 / diff 标签使用。
    staging_accept 只注册为前端命令，绝不加入 pi 工具 / guard 工具集 / 动作桥。 */
+/** 用户主动暂存远程文件；同一会话已暂存时直接返回既有条目，不覆盖首次快照。 */
+export const stagingAdd = (projectId: string, sessionId: string, serverId: string, remotePath: string) =>
+  call<StagedFile>('staging_add', { projectId, sessionId, serverId, remotePath });
 export const stagingList = (projectId: string, sessionId: string) =>
   call<StagedFile[]>('staging_list', { projectId, sessionId });
 /** 读取快照侧内容：text 为已脱敏文本；二进制/超大只返回 hash/size/mtime 元数据 */

@@ -5,8 +5,7 @@
  * 用法:DOM 构建 el.innerHTML = icon('folder');模板串 `${icon('star')} 命令收藏`。
  */
 
-const PATHS = {
-  folder:
+export const PATHS = {  folder:
     '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>',
   file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
   filePlus:
@@ -32,6 +31,9 @@ const PATHS = {
   database:
     '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
   zap: '<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',
+  // 插头（MCP 接入）
+  plug:
+    '<path d="M9 7V3"/><path d="M15 7V3"/><path d="M6 7h12v4a6 6 0 0 1-12 0V7z"/><path d="M12 17v4"/>',
   bot: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1"/><circle cx="9" cy="13" r="0.5"/><circle cx="15" cy="13" r="0.5"/><path d="M9 17h6"/>',
   terminal: '<path d="M4 17l6-5-6-5"/><path d="M12 19h8"/>',
   minus: '<path d="M5 12h14"/>',
@@ -100,7 +102,7 @@ const PATHS = {
   chart:
     '<path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>',
   diff:
-    '<path d="M12 3v10"/><path d="M12 9h4a2 2 0 0 1 0 4h-4"/><path d="M12 19H8a2 2 0 0 1 0-4h4"/><path d="M12 15v4"/>',
+    '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/><path d="M6.5 9h3"/><path d="M8 7.5v3"/><path d="M14.5 15h3"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

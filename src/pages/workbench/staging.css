@@ -21,6 +21,20 @@
   gap: 6px;
 }
 .staging-title svg { flex: none; }
+.staging-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--bg-3);
+  color: var(--text-1);
+  font: 600 10px/1 var(--font-mono);
+}
+
 .staging-hint {
   flex: none;
   font-size: 11px;
@@ -29,6 +43,21 @@
   border-bottom: 1px solid var(--border);
   line-height: 1.6;
 }
+.staging-toolbar {
+  flex: none;
+  min-height: 38px;
+  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.staging-toolbar[hidden] { display: none; }
+.staging-toolbar-spacer { flex: 1; }
+.staging-selected { font-size: 11.5px; color: var(--text-2); }
+.staging-toolbar .btn:disabled { opacity: .45; cursor: default; }
+
 .staging-body {
   flex: 1;
   overflow: auto;
@@ -55,12 +84,16 @@
   border-bottom: 1px solid var(--border-strong);
   white-space: nowrap;
 }
+.staging-table .st-select { width: 30px; padding-left: 6px; padding-right: 4px; text-align: center; }
+.staging-table .st-select input { margin: 0; accent-color: var(--accent); vertical-align: middle; }
 .staging-table td {
   padding: 6px 8px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
 .staging-table tr:hover td { background: var(--bg-3); }
+.staging-table tr.selected td { background: var(--accent-dim); }
+.staging-table tr.selected:hover td { background: var(--accent-dim); }
 .staging-table .st-server { white-space: nowrap; color: var(--text-1); }
 .staging-table .st-path { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .staging-table .st-path-full { display: none; }

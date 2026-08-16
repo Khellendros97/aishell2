@@ -1,7 +1,8 @@
 //! AI 助手（pi 子进程 RPC 嵌入）。
 //! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)` /
 //! `ai_set_thinking(project_id, level)` / `set_ai_mode(project_id, mode)` /
-//! `ai_respond_approval(key, request_id, confirmed)`；
+//! `ai_respond_approval(key, request_id, confirmed)` /
+//! `ai_respond_db_request(key, request_id, response)`；
 //! 事件 `ai:event:<key>` payload：
 //!   - `{type:"delta",text}` / `{type:"tool",tool,label}` / `{type:"segment"}`
 //!   - `{type:"done"}` / `{type:"error",message}`
@@ -25,9 +26,21 @@
 //! 会话历史经 `--session <agent_dir>/sessions/<projectId>__<sessionId>.jsonl` 恢复。
 //! AI 主动申请切到工作模式：suggest 下工具 request_agent_mode 发 `AISHELL_MODE_REQUEST:`
 //! confirm，经 approval 事件转发前端确认框，同意后前端走 set_ai_mode 实时切换路径。
+//! AI 主动申请数据库连接：agent/yolo 下工具 request_db_connection 发 `AISHELL_DB_REQUEST:`
+//! input（消息为 `{action,intent,summary,connection}`，connection 为 AI 填写的连接信息），
+//! 经 approval 事件（带 connection 字段）转发前端审批对话框；前端把用户填写的密码经
+//! save_db_connection 落 keyring 后，用 ai_respond_db_request 以 `{approved,connectionId}`
+//! JSON 串回执（extension_ui_response value），工具结果直接携带 connectionId 供 db_query。
+//! 该通道独立于 AISHELL_APPROVAL，永不参与智能审批自动放行——授予凭据必须人工填密码。
 //!
 //! 动作执行经内部协议 `AISHELL_ACTION:` input 交给 ai_actions.rs（唯一后端入口：项目根校验 +
 //! 服务器 AI 锁检查，锁只拦 AI，不影响用户手动 SSH/SFTP）。
+//!
+//! 基础工具远程化（read/grep/find/ls/write/edit/delete_path 的可选 serverId 参数）：
+//! 同名覆盖注册在 aishell-guard.ts，远程执行经本桥新增的 remote_* 动作（ai_actions.rs）；
+//! 远程写/删在自动备份开启时执行前 ensure_snapshot（与 run_command 远程写入同一暂存区）。
+//! 远程 write/edit 不登记 pending_paths（不发 fs:changed），前端凭 actionStart 的
+//! args.serverId 区分并改发 staging-changed（见 ai.ts）。
 //!
 //! 与计划唯一偏差：`procs` 字段为 `Arc<Mutex<HashMap<...>>>`（计划给的是裸 `Mutex`）——
 //! 因为 stdout 读取线程必须在进程退出/管道破裂时「从 map 摘除」条目，裸 Mutex 无法被线程共享。
@@ -39,6 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base64::Engine as _;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -69,9 +83,11 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。默认 10 秒超时，可用 timeoutSeconds（1–3600 秒）覆盖；预计超过 10 秒的命令应主动设置合理超时。
 - list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
+- 远程文件读写：read/grep/find/ls/write/edit/delete_path 都支持可选 serverId 参数（先用 list_servers 确认 serverId；不传则操作本地项目目录）。远程文件的内容查看/修改**优先用这些工具**，不要用 run_command 的 cat/sed/echo/tee 等命令读写远程文件内容——基础工具的远程写入/删除会自动进入会话暂存（自动备份原始快照，可 diff/还原）；run_command 用于服务管理、进程、包管理等非文件内容操作。远程路径可用绝对路径（/ 开头）或相对服务器登录目录的相对路径；不支持盘符形态。
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
+- request_db_connection：当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时，调用该工具申请添加连接。把已知的连接信息填进参数（serverId 取自 list_servers；名称、类型、主机、端口、用户名、默认库），主机相对该服务器（数据库在服务器本机填 127.0.0.1）；申请理由（reason）用一句中文说明用途。用户会在审批对话框里补密码并勾选查询权限，批准后工具结果会直接返回 connectionId，用它继续 db_query；被拒绝时不要反复重试，向用户说明需要哪些信息或请其在「服务器设置-数据库连接」中手动配置。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
-- 远程文件暂存（staging_list / staging_diff / staging_restore）：自动备份开启时，AI 修改远程文件（run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff、按用户要求把远程文件还原到首次修改前的内容；**不能接受（清除）暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
+- 远程文件暂存（staging_list / staging_diff / staging_restore）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff、按用户要求把远程文件还原到首次修改前的内容；**不能接受（清除）暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
 - 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
 凭据纪律（硬性，优先级高于任务效率）：
@@ -150,8 +166,8 @@ fn impact_fingerprint(command: &str, target: &str, server_id: &str, cwd: &str) -
 
 /// 动作参数语义指纹：只比较影响执行的字段——guard 的动作桥会在 payload 上附加
 /// `action` / `sessionId` 等桥字段（tool_execution_start 的 args 里没有），直接整体比较
-/// 必然误报。run_command / sftp_upload 取关键字段；其余动作按全量序列化（serde_json 的
-/// Map 为 BTreeMap，对象键序无关）。
+/// 必然误报。按工具关键字段判定（登记 args 无 action 字段，动作桥 payload 有）；
+/// 其余动作按全量序列化（serde_json 的 Map 为 BTreeMap，对象键序无关）。
 fn payload_fingerprint(p: &serde_json::Value) -> String {
     let get = |k: &str| p.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
     let core = if p.get("command").is_some() && p.get("target").is_some() {
@@ -488,7 +504,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,request_db_connection")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -686,23 +702,33 @@ impl AiManager {
                     // 其余工具仍走瞬时小字行（tool）。
                     "tool_execution_start" => {
                         let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
-                        // write/edit 的目标路径（相对项目根）先登记：end 成功时据此广播 fs:changed
+                        // write/edit 的目标路径（相对项目根）先登记：end 成功时据此广播 fs:changed。
+                        // 远程模式（args 带 serverId）跳过：改的是远端文件，不发本地 fs:changed
+                        //（前端凭 args.serverId 区分并改发 staging-changed）。
                         if tool == "write" || tool == "edit" {
-                            let raw = ev
+                            let is_remote = ev
                                 .get("args")
-                                .and_then(|a| a.get("path"))
+                                .and_then(|a| a.get("serverId"))
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or("");
-                            if !raw.is_empty() {
-                                let abs = std::path::absolute(Path::new(&cwd2).join(raw))
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|_| Path::new(&cwd2).join(raw).to_string_lossy().into_owned());
-                                let id = ev
-                                    .get("toolCallId")
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false);
+                            if !is_remote {
+                                let raw = ev
+                                    .get("args")
+                                    .and_then(|a| a.get("path"))
                                     .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                pending_paths.insert(id, abs);
+                                    .unwrap_or("");
+                                if !raw.is_empty() {
+                                    let abs = std::path::absolute(Path::new(&cwd2).join(raw))
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|_| Path::new(&cwd2).join(raw).to_string_lossy().into_owned());
+                                    let id = ev
+                                        .get("toolCallId")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    pending_paths.insert(id, abs);
+                                }
                             }
                         }
                         if mode != AiMode::Suggest && CONTROLLED_TOOLS.contains(&tool) {
@@ -748,6 +774,7 @@ impl AiManager {
                                         .or_else(|| a.get("pattern"))
                                         .or_else(|| a.get("command"))
                                         .or_else(|| a.get("query"))
+                                        .or_else(|| a.get("name"))
                                 })
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("");
@@ -1021,6 +1048,49 @@ fn handle_extension_ui_request(
                 "action": "request_agent_mode",
                 "intent": "AI 申请切换到工作模式",
                 "summary": reason,
+            }),
+        );
+    } else if method == "input" && title.starts_with("AISHELL_DB_REQUEST:") {
+        // AI 申请数据库连接（agent/yolo 的 request_db_connection 工具）：
+        // 经 approval 事件（带 connection 字段）转发前端审批对话框；前端把用户填写的
+        // 密码落 keyring 后经 ai_respond_db_request 回执 extension_ui_response(value)。
+        // 独立于 AISHELL_APPROVAL 通道：不参与智能审批，授予凭据必须人工填密码。
+        let tool_call_id = title["AISHELL_DB_REQUEST:".len()..].to_string();
+        if let Ok(mut map) = approvals2.lock() {
+            map.insert(id.clone(), tool_call_id.clone());
+        }
+        // input 方法的请求正文在 placeholder 字段（与 AISHELL_ACTION 动作桥同协议）
+        let info: serde_json::Value = ev
+            .get("placeholder")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| json!({}));
+        let action = info
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("request_db_connection")
+            .to_string();
+        let intent = info
+            .get("intent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let summary = info
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let connection = info.get("connection").cloned().unwrap_or_else(|| json!({}));
+        let _ = app2.emit(
+            event,
+            json!({
+                "type": "approval",
+                "requestId": id,
+                "toolCallId": tool_call_id,
+                "action": action,
+                "intent": intent,
+                "summary": summary,
+                "connection": connection,
             }),
         );
     } else if method == "confirm" && title.starts_with("AISHELL_APPROVAL:") {
@@ -1430,6 +1500,119 @@ async fn run_internal_action(
                 .await
                 .map(|text| json!({"ok": true, "text": text}))
         }
+        // 基础工具远程化：read/grep/find/ls/write/edit/delete_path 的 serverId 模式
+        // （guard 覆盖版工具经动作桥调用；远程写入/删除的自动备份在 ai_actions 内完成）
+        "remote_stat" => {
+            let server_id = str_field("serverId");
+            let path = str_field("path");
+            actions
+                .remote_stat(&server_id, &path)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "remote_read" => {
+            let server_id = str_field("serverId");
+            let path = str_field("path");
+            actions
+                .remote_read(&server_id, &path)
+                .await
+                .map(|bytes| {
+                    json!({"ok": true, "b64": base64::engine::general_purpose::STANDARD.encode(bytes)})
+                })
+        }
+        "remote_mkdir" => {
+            let server_id = str_field("serverId");
+            let dir = str_field("dir");
+            actions
+                .remote_mkdir(&server_id, &dir)
+                .await
+                .map(|_| json!({"ok": true, "text": format!("目录已就绪：{dir}")}))
+        }
+        "remote_write" => {
+            let server_id = str_field("serverId");
+            let path = str_field("path");
+            let content = str_field("content");
+            actions
+                .remote_write(project_id, session_id, &server_id, &path, &content)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "remote_listdir" => {
+            let server_id = str_field("serverId");
+            let path = str_field("path");
+            actions
+                .remote_listdir(&server_id, &path)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "remote_glob" => {
+            let server_id = str_field("serverId");
+            let base = str_field("base");
+            let pattern = str_field("pattern");
+            let ignore: Vec<String> = payload
+                .get("ignore")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let limit = payload
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(100)
+                .max(1) as usize;
+            actions
+                .remote_glob(&server_id, &base, &pattern, &ignore, limit)
+                .await
+                .map(|paths| {
+                    let text = serde_json::to_string(&paths).unwrap_or_else(|_| "[]".to_string());
+                    json!({"ok": true, "text": text})
+                })
+        }
+        "remote_grep" => {
+            let server_id = str_field("serverId");
+            let pattern = str_field("pattern");
+            let path = str_field("path");
+            let glob = payload
+                .get("glob")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let ignore_case = payload
+                .get("ignoreCase")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let literal = payload
+                .get("literal")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let context = payload
+                .get("context")
+                .and_then(serde_json::Value::as_u64)
+                .map(|c| c as u32);
+            actions
+                .remote_grep(
+                    &server_id,
+                    &pattern,
+                    &path,
+                    glob.as_deref(),
+                    ignore_case,
+                    literal,
+                    context,
+                )
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "remote_delete" => {
+            let server_id = str_field("serverId");
+            let path = str_field("path");
+            actions
+                .remote_delete(project_id, session_id, &server_id, &path)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
         other => Err(format!("未知动作：{other}")),
     };
     match result {
@@ -1835,6 +2018,39 @@ pub async fn ai_respond_approval(
     Ok(())
 }
 
+/// 回复数据库连接申请（request_db_connection 工具）：与 ai_respond_approval 同校验，
+/// 但按 input 子协议回写 value（JSON 串 `{approved, connectionId?}`，guard 解析后
+/// 作为工具结果返回给模型；approved=false 时工具返回「用户拒绝了该申请」文案）。
+#[tauri::command]
+pub async fn ai_respond_db_request(
+    mgr: State<'_, Arc<AiManager>>,
+    key: String,
+    request_id: String,
+    response: String,
+) -> Result<(), String> {
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+    let Some(proc) = procs.get_mut(&key) else {
+        return Err("pi 进程不存在".to_string());
+    };
+    let mut approvals = proc.approvals.lock().map_err(|e| e.to_string())?;
+    let Some(_tool_call_id) = approvals.remove(&request_id) else {
+        return Err("审批请求已过期或不存在".to_string());
+    };
+    drop(approvals);
+    let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+    let mut buf = serde_json::to_vec(&json!({
+        "type": "extension_ui_response",
+        "id": request_id,
+        "value": response,
+    }))
+    .map_err(|e| e.to_string())?;
+    buf.push(b'\n');
+    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- tests
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2043,6 +2259,34 @@ mod tests {
     }
 
     #[test]
+    fn payload_fingerprint_ignores_bridge_fields() {
+        use serde_json::json;
+        // 登记 args（tool_execution_start，无 action/sessionId）与动作桥 payload 必须同指纹
+        let registered = json!({
+            "intent": "清空配置", "command": "cd /var/www/app && : > config.json",
+            "target": "remote", "serverId": "srv-a", "timeoutSeconds": 10,
+        });
+        let bridge = json!({
+            "action": "run_command", "intent": "清空配置",
+            "command": "cd /var/www/app && : > config.json",
+            "target": "remote", "sessionId": "sess-1", "serverId": "srv-a", "timeoutSeconds": 10,
+        });
+        assert_eq!(payload_fingerprint(&registered), payload_fingerprint(&bridge));
+        // 关键字段变化 → 指纹不同（防篡改）
+        let tampered = json!({
+            "action": "run_command", "command": "cd /var/www/app && : > other.json",
+            "target": "remote", "serverId": "srv-a",
+        });
+        assert_ne!(payload_fingerprint(&registered), payload_fingerprint(&tampered));
+        // sftp_upload：登记（无 action/sessionId）与桥 payload 同指纹；overwrite 缺省=false
+        let reg_up = json!({ "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp" });
+        let bridge_up = json!({ "action": "sftp_upload", "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp", "sessionId": "x", "overwrite": false });
+        assert_eq!(payload_fingerprint(&reg_up), payload_fingerprint(&bridge_up));
+        let overwrite = json!({ "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp", "overwrite": true });
+        assert_ne!(payload_fingerprint(&reg_up), payload_fingerprint(&overwrite));
+    }
+
+    #[test]
     fn guard_extension_has_staging_tools_but_never_accept() {
         // 探针：AI 工具清单有 staging_list/diff/restore，绝无 staging_accept（接受只在前端面板）
         assert!(GUARD_EXT.contains("staging_list"), "guard 应注册 staging_list");
@@ -2063,6 +2307,28 @@ mod tests {
         // ai.rs 侧动作卡列表：staging_restore 有卡片，但接受类动作绝不入列
         assert!(CONTROLLED_TOOLS.contains(&"staging_restore"));
         assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("staging_accept")));
+    }
+
+    #[test]
+    fn guard_extension_registers_remote_basic_tool_overrides() {
+        // 基础工具远程化探针：guard 必须同名覆盖六基础工具 + delete_path（createXxxTool 工厂），
+        // 带 serverId 参数 schema；远程动作经动作桥（remote_*）；suggest 远程调用被阻止
+        assert!(GUARD_EXT.contains("createReadTool"), "guard 应覆盖 read");
+        assert!(GUARD_EXT.contains("createWriteTool"), "guard 应覆盖 write");
+        assert!(GUARD_EXT.contains("createEditTool"), "guard 应覆盖 edit");
+        assert!(GUARD_EXT.contains("createLsTool"), "guard 应覆盖 ls");
+        assert!(GUARD_EXT.contains("createFindTool"), "guard 应覆盖 find");
+        assert!(GUARD_EXT.contains("createGrepTool"), "guard 应覆盖 grep");
+        assert!(GUARD_EXT.contains("SERVER_ID_PARAM"), "guard 应定义 serverId 参数");
+        assert!(GUARD_EXT.contains("remote_grep"), "grep 远程分支应走 remote_grep 动作");
+        assert!(GUARD_EXT.contains("remote_write"), "写远程应经 remote_write 动作");
+        assert!(GUARD_EXT.contains("remote_read"), "读远程应经 remote_read 动作");
+        assert!(GUARD_EXT.contains("remote_delete"), "远程删除应经 remote_delete 动作");
+        // suggest 阻止文案（远程能力仅 agent/yolo）
+        assert!(GUARD_EXT.contains("仅建议模式不能操作远程文件"), "suggest 远程调用应被阻止");
+        // 覆盖后仍保留本地分支：委托本地实例执行
+        assert!(GUARD_EXT.contains("localRead.execute"), "无 serverId 应委托本地 read");
+        assert!(GUARD_EXT.contains("localGrep.execute"), "无 serverId 应委托本地 grep");
     }
 
     #[test]

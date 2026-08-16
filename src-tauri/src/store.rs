@@ -385,6 +385,123 @@ impl DbConnection {
     }
 }
 
+/// MCP 服务全局配置（AppState 顶层字段，旧配置无此字段按默认端口）。
+/// 端口只在本机回环监听（127.0.0.1），不做局域网暴露。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServiceConfig {
+    pub port: u16,
+}
+
+impl Default for McpServiceConfig {
+    fn default() -> Self {
+        Self { port: 8945 }
+    }
+}
+
+/// MCP 单项功能开关（每服务器独立；**默认全关**，不扩大权限）。
+/// 服务器 locked 时无论开关如何，所有 MCP 工具调用一律拒绝（与 AI 锁同语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpFeatures {
+    /// SFTP：目录查询（sftp_list 工具）
+    #[serde(default)]
+    pub sftp_list: bool,
+    /// SFTP：上传（sftp_upload 工具，本地源限于 MCP 传输目录）
+    #[serde(default)]
+    pub sftp_upload: bool,
+    /// SFTP：下载（sftp_download 工具，落地限于 MCP 传输目录）
+    #[serde(default)]
+    pub sftp_download: bool,
+    /// SFTP：重命名/移动（sftp_rename 工具）
+    #[serde(default)]
+    pub sftp_rename: bool,
+    /// SFTP：删除（sftp_delete 工具，目录递归删除）
+    #[serde(default)]
+    pub sftp_delete: bool,
+    /// 远程文件读取（read_file 工具，>5MB/二进制拒绝）
+    #[serde(default)]
+    pub file_read: bool,
+    /// 远程文件写入（write_file 工具，整体覆写，支持冲突检测）
+    #[serde(default)]
+    pub file_write: bool,
+    /// 远程文件编辑（edit_file 工具，oldText→newText 精确替换）
+    #[serde(default)]
+    pub file_edit: bool,
+    /// 执行远程命令（exec_command 工具，不经 AI 审批）
+    #[serde(default)]
+    pub exec: bool,
+    /// 数据库管道查询（db_query 工具，白名单与 AI 通道一致，仅暴露启用中的连接）
+    #[serde(default)]
+    pub db_query: bool,
+}
+
+impl McpFeatures {
+    /// 已启用功能的中文清单（list_devices / 设置页展示用）。
+    pub fn enabled_labels(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.sftp_list {
+            out.push("SFTP 目录查询");
+        }
+        if self.sftp_upload {
+            out.push("SFTP 上传");
+        }
+        if self.sftp_download {
+            out.push("SFTP 下载");
+        }
+        if self.sftp_rename {
+            out.push("SFTP 重命名");
+        }
+        if self.sftp_delete {
+            out.push("SFTP 删除");
+        }
+        if self.file_read {
+            out.push("文件读取");
+        }
+        if self.file_write {
+            out.push("文件写入");
+        }
+        if self.file_edit {
+            out.push("文件编辑");
+        }
+        if self.exec {
+            out.push("执行命令");
+        }
+        if self.db_query {
+            out.push("数据库查询");
+        }
+        out
+    }
+
+    /// 单项功能是否放行某个 MCP 工具（mcp.rs 调用裁决用）。
+    pub fn tool_enabled(&self, tool: &str) -> bool {
+        match tool {
+            "sftp_list" => self.sftp_list,
+            "sftp_upload" => self.sftp_upload,
+            "sftp_download" => self.sftp_download,
+            "sftp_rename" => self.sftp_rename,
+            "sftp_delete" => self.sftp_delete,
+            "read_file" => self.file_read,
+            "write_file" => self.file_write,
+            "edit_file" => self.file_edit,
+            "exec_command" => self.exec,
+            "db_query" => self.db_query,
+            _ => false,
+        }
+    }
+}
+
+/// MCP 设备配置（每服务器独立）：enabled = 加入 MCP 可发现设备列表。
+/// 服务器被删除时该条目级联清理（delete_server / clear_all_servers）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpDeviceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub features: McpFeatures,
+}
+
 /// Xshell 一键导入结果（camelCase 与前端 src/types.ts 的 XshellImportResult 对齐）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -554,6 +671,13 @@ pub struct AppState {
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
     pub db_connections: HashMap<String, Vec<DbConnection>>,
+    /// MCP 服务全局配置（回环监听端口）；旧配置无此字段按默认端口 8945。
+    #[serde(default)]
+    pub mcp: McpServiceConfig,
+    /// MCP 设备配置：serverId → 配置（enabled = 加入 MCP 可发现设备列表 + 功能开关）。
+    /// 旧配置无此字段按空 map（全部未启用）。
+    #[serde(default)]
+    pub mcp_devices: HashMap<String, McpDeviceConfig>,
     /// 已完成内置技能播种的 workspace（规范化路径）；旧配置无此字段按空列表。
     /// 用户删除/修改内置技能后不会被同一 workspace 的重启/保存设置流程复活。
     #[serde(default)]
@@ -576,6 +700,10 @@ const KEYRING_ACCOUNT_BRAVE: &str = "brave:apikey";
 /// 云服务 OAuth 令牌（CR-1.5）：access_token 过期由 refresh_token 轮换，均只存 keyring。
 const KEYRING_ACCOUNT_CLOUD_ACCESS: &str = "cloud:access_token";
 const KEYRING_ACCOUNT_CLOUD_REFRESH: &str = "cloud:refresh_token";
+/// MCP 接入令牌（自签本地配对令牌，非第三方凭据）。
+/// 规则例外说明：`mcp_ensure_token` 命令会把它返回前端供显示/复制——这是「密钥永不返回
+/// 前端」的唯一例外，因为令牌必须展示给用户粘贴到外部 agent 工具；仍存 keyring 不入 JSON。
+const KEYRING_ACCOUNT_MCP: &str = "mcp:token";
 
 fn keyring_account_server(id: &str) -> String {
     format!("server:{id}")
@@ -1061,6 +1189,7 @@ impl Store {
         self.secrets.delete(&keyring_account_server(id))?;
         self.with_state(|s| {
             s.servers.retain(|sv| sv.id != id);
+            s.mcp_devices.remove(id);
             for p in &mut s.projects {
                 p.server_ids.retain(|sid| sid != id);
             }
@@ -1077,6 +1206,7 @@ impl Store {
         }
         self.with_state(|s| {
             s.servers.clear();
+            s.mcp_devices.clear();
             for p in &mut s.projects {
                 p.server_ids.clear();
             }
@@ -1448,6 +1578,11 @@ impl Store {
     // ---------------------------------------------------------- 下游模块 API
     // ssh.rs / sftp.rs / ai.rs 依赖以下 pub 方法（SshManager::new(store: Arc<Store>)）。
 
+    /// 配置目录（mcp.rs 传输目录回退用）。
+    pub fn config_dir(&self) -> &std::path::Path {
+        &self.config_dir
+    }
+
     /// 取服务器配置（clone 返回，不含密码）；不存在返回 None。
     pub fn server(&self, id: &str) -> Option<Server> {
         let guard = self.state.lock().ok()?;
@@ -1630,6 +1765,111 @@ impl Store {
         let _ = self.secrets.delete(&keyring_account_db(server_id, conn_id));
         Ok(())
     }
+
+    // ---------------------------------------------------------- MCP 服务
+    // 配置存 aishell.json；接入令牌存 keyring（KEYRING_ACCOUNT_MCP）。
+
+    /// 当前 MCP 服务配置（clone）。
+    pub fn mcp_config(&self) -> McpServiceConfig {
+        self.state
+            .lock()
+            .map(|g| g.mcp)
+            .unwrap_or_default()
+    }
+
+    /// 修改 MCP 监听端口（1024–65535），只改目标字段。
+    pub fn set_mcp_port(&self, port: u16) -> Result<(), String> {
+        if !(1024..=65535).contains(&port) {
+            return Err("MCP 端口必须在 1024–65535 之间".to_string());
+        }
+        self.with_state(|s| {
+            s.mcp.port = port;
+            Ok(())
+        })
+    }
+
+    /// 某服务器的 MCP 设备配置（clone）；未配置返回 None。
+    pub fn mcp_device(&self, server_id: &str) -> Option<McpDeviceConfig> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|g| g.mcp_devices.get(server_id).cloned())
+    }
+
+    /// 保存 MCP 设备配置（服务器必须存在；由 mcp_set_device 命令调用并同步监听）。
+    pub fn set_mcp_device(&self, server_id: &str, config: McpDeviceConfig) -> Result<(), String> {
+        if self.server(server_id).is_none() {
+            return Err(format!("服务器不存在：{server_id}"));
+        }
+        self.with_state(|s| {
+            s.mcp_devices.insert(server_id.to_string(), config);
+            Ok(())
+        })
+    }
+
+    /// 全部 MCP 设备配置（带服务器信息，list_devices 与监听判断用）。
+    pub fn mcp_devices(&self) -> Vec<(Server, McpDeviceConfig)> {
+        self.state
+            .lock()
+            .map(|g| {
+                g.mcp_devices
+                    .iter()
+                    .filter_map(|(sid, cfg)| {
+                        g.servers
+                            .iter()
+                            .find(|s| &s.id == sid)
+                            .map(|s| (s.clone(), cfg.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 已启用 MCP 的设备数（>0 时监听需运行）。
+    pub fn mcp_enabled_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|g| g.mcp_devices.values().filter(|d| d.enabled).count())
+            .unwrap_or(0)
+    }
+
+    /// 读取或生成 MCP 接入令牌（keyring account `mcp:token`）。
+    /// 自签本地配对令牌：sha256(纳秒时间戳‖pid‖进程内计数器‖旧值) 十六进制前 32 字符。
+    pub fn mcp_token_ensure(&self) -> Result<String, String> {
+        if let Ok(t) = self.secrets.get(KEYRING_ACCOUNT_MCP) {
+            if t.len() >= 16 {
+                return Ok(t);
+            }
+        }
+        let token = self.mcp_token_generate();
+        self.secrets.set(KEYRING_ACCOUNT_MCP, &token)?;
+        Ok(token)
+    }
+
+    /// 重置 MCP 接入令牌（返回新值；旧令牌立即失效——校验每次从 keyring 现读）。
+    pub fn mcp_token_reset(&self) -> Result<String, String> {
+        let token = self.mcp_token_generate();
+        self.secrets.set(KEYRING_ACCOUNT_MCP, &token)?;
+        Ok(token)
+    }
+
+    fn mcp_token_generate(&self) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        h.update(now.to_le_bytes());
+        h.update(std::process::id().to_le_bytes());
+        h.update(CTR.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        if let Ok(old) = self.secrets.get(KEYRING_ACCOUNT_MCP) {
+            h.update(old.as_bytes());
+        }
+        hex::encode(h.finalize())[..32].to_string()
+    }
 }
 
 // ---------------------------------------------------------------- Tauri commands
@@ -1677,8 +1917,15 @@ pub async fn upsert_server(
 }
 
 #[tauri::command]
-pub async fn delete_server(store: State<'_, Arc<Store>>, id: String) -> Result<(), String> {
-    store.delete_server(&id)
+pub async fn delete_server(
+    store: State<'_, Arc<Store>>,
+    mcp: State<'_, Arc<crate::mcp::McpService>>,
+    id: String,
+) -> Result<(), String> {
+    store.delete_server(&id)?;
+    // 级联清理 MCP 设备配置后同步监听（可能需停止）
+    mcp.sync().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1823,8 +2070,14 @@ pub async fn set_sftp_favorites(
 }
 
 #[tauri::command]
-pub async fn clear_all_servers(store: State<'_, Arc<Store>>) -> Result<(), String> {
-    store.clear_all_servers()
+pub async fn clear_all_servers(
+    store: State<'_, Arc<Store>>,
+    mcp: State<'_, Arc<crate::mcp::McpService>>,
+) -> Result<(), String> {
+    store.clear_all_servers()?;
+    // 设备配置已全部清空 → 停止 MCP 监听
+    mcp.sync().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- tests
@@ -1955,6 +2208,24 @@ mod tests {
             sftp_history: HashMap::new(),
             sftp_favorites: HashMap::new(),
             db_connections: HashMap::new(),
+            mcp: McpServiceConfig::default(),
+            mcp_devices: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "srv-1".to_string(),
+                    McpDeviceConfig {
+                        enabled: true,
+                        features: McpFeatures {
+                            sftp_list: true,
+                            file_read: true,
+                            exec: true,
+                            db_query: true,
+                            ..Default::default()
+                        },
+                    },
+                );
+                m
+            },
             // 与 settings.workspace_dir 一致：reload 时视为已播种（不创建 D:\AIShellWorkspace，不破坏往返相等）
             seeded_skill_workspaces: vec!["D:\\AIShellWorkspace".to_string()],
         }
@@ -1987,6 +2258,11 @@ mod tests {
             "\"autoSwitchAiWorkdir\"",
             "\"projectView\"",
             "\"seededSkillWorkspaces\"",
+            "\"mcp\"",
+            "\"mcpDevices\"",
+            "\"sftpList\"",
+            "\"fileRead\"",
+            "\"dbQuery\"",
         ] {
             assert!(json.contains(key), "序列化 JSON 缺少字段 {key}: {json}");
         }
@@ -4270,4 +4546,125 @@ mod tests {
         assert!(ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
         assert_eq!(store.state.lock().unwrap().seeded_skill_workspaces.len(), 1);
     }
+
+    /// 旧 aishell.json 无 mcp / mcpDevices 字段：正常解析，MCP 默认全关、端口默认。
+    #[test]
+    fn legacy_state_without_mcp_fields_parses() {
+        let dir = temp_config_dir("mcp-legacy");
+        let old = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark"},"servers":[],"projects":[],"sessions":{},"projectFolders":[],"commandFolders":[],"uiExpanded":{},"sftpHistory":{},"sftpFavorites":{},"dbConnections":{}}"#;
+        fs::write(dir.join("aishell.json"), old).unwrap();
+        let store = test_store(dir.clone());
+        assert_eq!(store.mcp_config().port, 8945, "旧配置端口应回落到默认 8945");
+        assert_eq!(store.mcp_enabled_count(), 0, "旧配置无任何 MCP 设备");
+        assert!(store.mcp_device("srv-x").is_none());
+        // 落盘往返：默认 mcp 字段写回后仍可解析
+        let back: AppState =
+            serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
+        assert_eq!(back.mcp.port, 8945);
+        assert!(back.mcp_devices.is_empty());
+    }
+
+    /// MCP 设备配置保存/读取/级联删除。
+    #[test]
+    fn mcp_device_lifecycle_and_cascade() {
+        let dir = temp_config_dir("mcp-device");
+        let store = test_store(dir.clone());
+        // 服务器不存在 → 拒绝
+        assert!(store
+            .set_mcp_device("ghost", McpDeviceConfig::default())
+            .is_err());
+        // 建服务器后保存设备配置
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-mcp".to_string(),
+                    name: "MCP 测试机".to_string(),
+                    host: "10.0.0.1".to_string(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "root".to_string(),
+                    key_path: String::new(),
+                    locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
+                },
+                Some("pw"),
+            )
+            .unwrap();
+        let cfg = McpDeviceConfig {
+            enabled: true,
+            features: McpFeatures {
+                exec: true,
+                db_query: true,
+                ..Default::default()
+            },
+        };
+        store.set_mcp_device("srv-mcp", cfg.clone()).unwrap();
+        assert_eq!(store.mcp_device("srv-mcp"), Some(cfg));
+        assert_eq!(store.mcp_enabled_count(), 1);
+        // 落盘往返
+        let reload = test_store(dir.clone());
+        assert!(reload.mcp_device("srv-mcp").unwrap().features.exec);
+        // 删除服务器 → 设备配置级联清理
+        reload.delete_server("srv-mcp").unwrap();
+        assert!(reload.mcp_device("srv-mcp").is_none());
+        assert_eq!(reload.mcp_enabled_count(), 0);
+    }
+
+    /// 端口校验与持久化。
+    #[test]
+    fn mcp_port_validate_and_persist() {
+        let dir = temp_config_dir("mcp-port");
+        let store = test_store(dir.clone());
+        assert!(store.set_mcp_port(1023).is_err(), "低于 1024 应拒绝");
+        store.set_mcp_port(1024).unwrap();
+        store.set_mcp_port(65535).unwrap();
+        assert_eq!(store.mcp_config().port, 65535);
+        let reload = test_store(dir.clone());
+        assert_eq!(reload.mcp_config().port, 65535);
+    }
+
+    /// MCP 令牌：ensure 生成且可复用、reset 生成新值、存 keyring 不入 JSON。
+    #[test]
+    fn mcp_token_ensure_reset_not_in_json() {
+        let dir = temp_config_dir("mcp-token");
+        let store = test_store(dir.clone());
+        let t1 = store.mcp_token_ensure().unwrap();
+        assert_eq!(t1.len(), 32, "令牌应为 32 字符十六进制");
+        assert_eq!(store.mcp_token_ensure().unwrap(), t1, "重复 ensure 返回同一令牌");
+        let t2 = store.mcp_token_reset().unwrap();
+        assert_eq!(t2.len(), 32);
+        assert_ne!(t1, t2, "重置后令牌必须变化");
+        assert_eq!(store.mcp_token_ensure().unwrap(), t2, "重置后 ensure 返回新令牌");
+        // 令牌不进 aishell.json（且令牌测试不应产生配置文件——从未触发 with_state 持久化）
+        assert!(
+            !dir.join("aishell.json").exists(),
+            "令牌测试不应产生配置文件"
+        );
+    }
+
+    /// 功能开关默认全关；tool_enabled 映射与设置页一致。
+    #[test]
+    fn mcp_features_default_off_and_mapping() {
+        let f = McpFeatures::default();
+        for tool in [
+            "sftp_list", "sftp_upload", "sftp_download", "sftp_rename", "sftp_delete",
+            "read_file", "write_file", "edit_file", "exec_command", "db_query",
+        ] {
+            assert!(!f.tool_enabled(tool), "{tool} 默认应关闭");
+        }
+        let on = McpFeatures {
+            exec: true,
+            db_query: true,
+            ..Default::default()
+        };
+        assert!(on.tool_enabled("exec_command"));
+        assert!(on.tool_enabled("db_query"));
+        assert!(!on.tool_enabled("sftp_list"));
+        assert!(!on.tool_enabled("未知工具"));
+        // 中文清单
+        let labels = on.enabled_labels();
+        assert_eq!(labels, vec!["执行命令", "数据库查询"]);
+    }
+
 }
