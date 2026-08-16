@@ -135,6 +135,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
   const aiVisible = useWorkbench((s) => s.aiVisible);
   const tabs = useWorkbench((s) => s.tabs);
   const activeId = useWorkbench((s) => s.activeId);
+  const project = useWorkbench((s) => s.project);
 
   const workbenchRef = useRef<HTMLDivElement>(null);
   const activityBarRef = useRef<HTMLDivElement>(null);
@@ -293,7 +294,10 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
           className={`wb-resize-handle${aiVisible ? '' : ' hidden'}`}
           role="separator" aria-orientation="vertical" aria-label="调整 AI 面板宽度" tabIndex={0}
         ></div>
-        <div id="ai-panel" ref={aiPanelRef} className={aiVisible ? '' : 'hidden'}><AiPanel /></div>
+        {/* AI 面板须在项目装载完成后才挂载(对照旧版 workbench.ts:装载段完成后才 setAiVisible(true)→mountAiPanel):
+            ai-engine 在挂载时一次性快照 useWorkbench.getState().project,渲染即挂载会早于异步装载读到 null,
+            导致发送消息恒报「项目未加载」。project 门控恢复旧版时序;换项目时整树经 key 重建,AiPanel 随之重挂。 */}
+        <div id="ai-panel" ref={aiPanelRef} className={aiVisible ? '' : 'hidden'}>{project ? <AiPanel /> : null}</div>
       </div>
     </>
   );
