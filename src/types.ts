@@ -305,6 +305,41 @@ export interface PathRef {
   isDir: boolean;
 }
 
+/** 内置浏览器元素引用：UI 以 @browser:#id 或标签名 标签呈现，发送时展开为页面信息 + 元素 HTML */
+export interface BrowserRef {
+  /** 显示名：有 id 为 #id，否则小写标签名 */
+  name: string;
+  tagName: string;
+  /** 元素 id（可空串） */
+  elementId: string;
+  /** 选中时的页面地址与标题 */
+  url: string;
+  title: string;
+  /** 元素完整 outerHTML（注入脚本已截 20000 字符） */
+  outerHTML: string;
+  ts: number;
+}
+
+/** browser:event 事件 payload（Rust browser.rs 发射） */
+export interface BrowserEvent {
+  kind: 'url' | 'title' | 'element' | 'ai-navigate';
+  url?: string;
+  title?: string;
+  /** kind=element 时的元素引用字段（与 BrowserRef 对齐） */
+  name?: string;
+  tagName?: string;
+  elementId?: string;
+  outerHTML?: string;
+  ts?: number;
+}
+
+/** browser_ensure 返回：面板重挂时恢复地址栏/标题/检查模式状态 */
+export interface BrowserState {
+  url: string;
+  title: string;
+  inspect: boolean;
+}
+
 export interface ChatMsg {
   role: 'user' | 'assistant';
   content: string;
@@ -314,6 +349,8 @@ export interface ChatMsg {
   serverRefs: ServerRef[];
   /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容）；旧会话为空 */
   pathRefs: PathRef[];
+  /** 内置浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；旧会话为空 */
+  browserRefs: BrowserRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
   actions: AiActionRecord[];
   ts: number;
@@ -525,4 +562,23 @@ export interface RestoreOutcome {
   restored: boolean;
   conflict: RestoreConflict | null;
   entry: StagedFile | null;
+}
+
+/** staging_clear 结果：removed 为「无变更已清除」的条目；kept 为仍有变更/检查失败而保留的条目 */
+export interface StagingClearOutcome {
+  removed: StagedFile[];
+  kept: StagedFile[];
+  /** 检查失败的条目说明（对应条目保留在 kept 中） */
+  errors: string[];
+}
+
+/** 递归暂存目录 / 清理的进度（staging:progress 事件；与 staging.rs StagingProgress serde camelCase 对齐） */
+export interface StagingProgress {
+  projectId: string;
+  sessionId: string;
+  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目 */
+  phase: 'walk' | 'stage' | 'clear';
+  done: number;
+  total: number;
+  currentPath: string;
 }

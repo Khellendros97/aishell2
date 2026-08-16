@@ -1,7 +1,9 @@
 /**
  * 工作台页面外壳(React 版):对照 src/pages/workbench/workbench.ts + core.ts 的标签栏。
  * 结构照 .proto/workbench.html,DOM id/class 不变(workbench.css 直接复用):
- * - activity-bar 四个面板按钮(explorer/servers/commands/skills)+ 底部 AI 面板开关;
+ * - activity-bar 面板按钮(explorer/servers/commands/skills)+ 浏览器入口(打开中央标签页)+
+ *   底部 AI 面板开关;浏览器是主工作区标签页而非侧栏面板(用户要求窗口大),固定 id 'browser'
+ *   单实例,openTab 同 id 去重激活;
  * - commands 准入在 store.setPanel(活跃标签须为终端);活跃标签变为非终端时自动切回 explorer;
  * - 侧栏/ AI 面板可拖宽(语义同旧版 bindPanelResize:指针拖拽 + 键盘方向键 + 出屏钳制);
  * - 标签栏:同 id 去重激活、终端同名自动编号、终端右键菜单(添加到对话/重命名/复制 SSH 渠道/关闭);
@@ -21,6 +23,7 @@ import {
 } from '../../stores/workbench';
 import { PANELS } from './sidebar/panels';
 import { TAB_TYPES } from './tabs/registry';
+import { setWorkbenchActive } from './tabs/browser-engine';
 import { AiPanel } from './ai/AiPanel';
 import './workbench.css';
 
@@ -206,6 +209,11 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     void onCloudChanged(render).then((u) => { un = u; }).catch(() => {});
     return () => { un?.(); };
   }, []);
+  /* ---------- 保活隐藏联动:路由离开工作台(设置/欢迎页)时工作台 display:none,
+     浏览器子 webview 必须跟随隐藏,否则永远浮在主 webview 上盖住其他页面 ---------- */
+  useEffect(() => {
+    setWorkbenchActive(active);
+  }, [active]);
 
   /* ---------- 正在显示 commands 时活跃标签变为非终端(或 null)→ 自动切回 explorer ---------- */
   useEffect(() => {
@@ -214,13 +222,18 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     if (s.panel === 'commands' && (!activeTab || activeTab.type !== 'terminal')) s.setPanel('explorer');
   }, [activeId, panel]);
 
-  /* ---------- activity-bar 点击:面板切换 / AI 面板开关 ---------- */
+  /* ---------- activity-bar 点击:面板切换 / 浏览器标签页入口 / AI 面板开关 ---------- */
   const onActivityClick = (e: ReactMouseEvent<HTMLDivElement>): void => {
     const iconEl = (e.target as HTMLElement).closest('.activity-icon');
     if (!iconEl) return;
     const p = iconEl.getAttribute('data-panel');
     const s = useWorkbench.getState();
     if (p === 'ai') { s.setAiVisible(!s.aiVisible); return; }
+    if (p === 'browser') {
+      // 浏览器是中央标签页(非侧栏面板):固定 id 单实例,openTab 同 id 去重激活
+      s.openTab({ id: 'browser', type: 'browser', title: '浏览器' });
+      return;
+    }
     if (!p || p === s.panel) return;
     s.setPanel(p as PanelKey);
   };
@@ -266,6 +279,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
           <div className={`activity-icon${panel === 'servers' ? ' active' : ''}`} data-panel="servers" title="服务器列表"><Icon name="monitor" /></div>
           <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
           <div className={`activity-icon${panel === 'skills' ? ' active' : ''}`} data-panel="skills" title="Skill"><Icon name="sparkles" /></div>
+          <div className="activity-icon" data-panel="browser" title="浏览器(在标签页中打开)"><Icon name="globe" /></div>
           <div className={`activity-icon ai-toggle${aiVisible ? ' active' : ''}`} data-panel="ai" title="AI 助手"><Icon name="bot" /></div>
           {avatar.visible ? (
             <div

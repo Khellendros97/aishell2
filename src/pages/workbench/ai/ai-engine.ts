@@ -3,7 +3,7 @@
  * 对照 legacy/pages/workbench/ai.ts 逐行移植，逻辑/交互/DOM 类名/文案逐条一致
  * （.proto/workbench-ai.js 为交互规格；mock 回复换成 pi 子进程流式事件
  * ai:event:<key>，见 src/api.ts）。挂载时写 wbHandles.ai = { addSnapshot, addFileRef,
- * addServerRef, addPathRef, currentSessionId }，清理时置 null 并 aiKillProject 清理该项目
+ * addServerRef, addPathRef, addBrowserRef, currentSessionId }，清理时置 null 并 aiKillProject 清理该项目
  * pi 进程。
  * 基础工具远程化：actionStart 的 args 携带 serverId 表示远程 write/edit/delete_path（guard
  * 覆盖版工具经动作桥执行，见 aishell-guard.ts）；这类动作完成后额外广播 staging-changed
@@ -12,10 +12,13 @@
  * （只读展示 AI 填写的连接信息）→ 点【审批】打开审批对话框（./AiDbApproval，用户只填密码 +
  * 勾查询权限）→ 通过先 saveDbConnection 落库再 aiRespondDbRequest 回执 connectionId；
  * 关闭对话框不回执，卡片可重开。
- * 输入区 chip 四类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端
- * 引用 @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名
- * （发送时展开为说明文本拼进 prompt）；Settings.autoSwitchAiWorkdir 开启时输入区固定显示
+ * 输入区 chip 五类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端
+ * 引用 @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名、
+ * 浏览器元素引用 @browser:#id 或标签名（发送时展开为说明文本/元素 HTML 拼进 prompt）；
+ * Settings.autoSwitchAiWorkdir 开启时输入区固定显示
  * 工作区域标签，随激活终端自动切换并作为当前目标上下文带入。
+ * AI 回复中的链接：普通点击在内置浏览器标签页打开（browser_navigate + openTab('browser')），
+ * Ctrl/Shift+点击仍走系统浏览器（openUrl）。
  *
  * React 差异（语义对齐 legacy，对照 stores/workbench.ts）：
  * - 旧 bus 'tab-activated' → useWorkbench.subscribe 按 activeId 变化推导（激活标签变化时
@@ -35,15 +38,16 @@
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, TermSnapshot } from '../../../types';
+import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, TermSnapshot } from '../../../types';
 import { icon } from '../../../icons';
 import {
-  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, onAiEvent, saveDbConnection, saveSettings,
+  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, saveDbConnection, saveSettings,
   sessionUpsert, sessionsGet, setAiMode, stagingList,
   type AiEvent,
 } from '../../../api';
 import { getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
 import { addQuickCommandModal } from '../tabs/useTerminal';
+import { hideStagingProgress } from '../tabs/staging-progress';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { openAiDbApprovalModal, type DbRequestDetail } from './AiDbApproval';
 import { DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
@@ -347,6 +351,8 @@ const ACTION_NAMES: Record<string, string> = {
   staging_list: '查看暂存列表',
   staging_diff: '查看暂存 diff',
   staging_restore: '还原暂存文件',
+  staging_add: '主动暂存文件',
+  staging_clear: '清理无变更暂存',
   request_db_connection: '申请数据库连接',
 };
 
@@ -384,6 +390,10 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `查看暂存条目 diff（${String(args.entryId ?? '')}）`;
     case 'staging_restore':
       return `还原暂存条目（${String(args.entryId ?? '')}）`;
+    case 'staging_add':
+      return `主动暂存 ${String(args.remotePath ?? '')}（服务器 ${String(args.serverId ?? '')}）`;
+    case 'staging_clear':
+      return '清理暂存区无变更条目';
     default:
       return '';
   }
@@ -400,6 +410,7 @@ const snapshots = new Map<string, TermSnapshot>(); // 快照 id -> 全文（输�
 const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编辑器选区，@文件名_起_止 标签）
 const serverRefs = new Map<string, ServerRef>(); // 服务器/本地引用 key -> 引用（key = serverId ?? 'local'，@remote:名称 / @local 标签）
 const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -> 引用（@file:文件名 / @path:目录名 标签）
+const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key -> 引用（key = `${name}:${ts}`，@browser:名称 标签）
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
 /** 当前 AI 工作区域（默认本地；随激活终端自动切换） */
@@ -489,6 +500,7 @@ export function mountAiPanel(container: HTMLElement): () => void {
   fileRefs.clear();
   serverRefs.clear();
   pathRefs.clear();
+  browserRefs.clear();
   autoSwitchAiWorkdir = false;
   workareaRef = null;
   workareaChipEl = null;
@@ -616,6 +628,14 @@ const aiHandle = {
     }
     pathRefs.set(ref.path, ref);
     addPathRefChip(ref);
+  },
+  /** 浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；
+   *  同名元素（如多个 button）允许重复添加——chip 各自携带完整快照数据 */
+  addBrowserRef(ref: BrowserRef): void {
+    if (!ref || (!ref.name && !ref.tagName)) return;
+    const key = `${ref.name || ref.tagName}:${ref.ts}`;
+    browserRefs.set(key, ref);
+    addBrowserRefChip(ref, key);
   },
   currentSessionId(): string | null {
     return activeSessionId || null;
@@ -853,9 +873,12 @@ function handleEvent(key: string, ev: AiEvent): void {
     const isRemoteFileOp = ['write', 'edit', 'delete_path'].includes(ev.tool) && !!existing?.serverId;
     if (ev.tool === 'run_command' || ev.tool === 'sftp_upload'
       || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff'
+      || ev.tool === 'staging_add' || ev.tool === 'staging_clear'
       || isRemoteFileOp) {
       wbEvents.emit('staging-changed');
     }
+    /* AI 目录暂存 / 清理结束（成功/失败）→ 收起右下角进度弹窗（staging:progress 事件驱动显示） */
+    if (ev.tool === 'staging_add' || ev.tool === 'staging_clear') hideStagingProgress();
   } else if (ev.type === 'segment') {
     /* 新一轮 assistant 消息分段（工具来回时），仅流式中有文本才分段 */
     const cur = pendingBy.get(sid) ?? null;
@@ -908,6 +931,7 @@ function finalize(sid: string): void {
     fileRefs: [],
     serverRefs: [],
     pathRefs: [],
+    browserRefs: [],
     actions: collectActions(p),
     ts: Date.now(),
   });
@@ -928,6 +952,7 @@ function leaveSession(sid: string): void {
         fileRefs: [],
         serverRefs: [],
         pathRefs: [],
+        browserRefs: [],
         actions: collectActions(p),
         ts: Date.now(),
       });
@@ -1094,6 +1119,7 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
     // 历史消息的快照/文件引用全文也进 map，chip 点击可查看
     m.snapshots.forEach((snap) => snapshots.set(snap.id, snap));
     m.fileRefs.forEach((ref) => fileRefs.set(ref.id, ref));
+    (m.browserRefs ?? []).forEach((r) => browserRefs.set(`${r.name}:${r.ts}`, r));
     const chips = [
       ...m.snapshots.map((snap) =>
         `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(snap.id)}" title="点击查看快照全文">@terminal_${escapeHtml(snap.id)}</span>`,
@@ -1112,6 +1138,9 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
         const label = r.isDir ? `@path:${name}` : `@file:${name}`;
         return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(r.path)}" data-kind="path" title="引用路径">${escapeHtml(label)}</span>`;
       }),
+      ...(m.browserRefs ?? []).map((r) =>
+        `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(`${r.name}:${r.ts}`)}" data-kind="browser" title="点击查看元素引用（${escapeHtml(r.url)}）">@browser:${escapeHtml(r.name)}</span>`,
+      ),
     ].join('');
     wrap.innerHTML =
       `<div class="ai-bubble">${chips ? `<div class="ai-msg-chips">${chips}</div>` : ''}` +
@@ -1207,6 +1236,24 @@ function renderAI(text: string): string {
   return parts.map(renderPart).join('');
 }
 
+/** 文本建议是否可视为单条 URL（http/https/file 开头且无空白 → 可一键内置浏览器打开） */
+function isSingleUrl(s: string): boolean {
+  const t = s.trim();
+  if (!t || /\s/.test(t)) return false;
+  return /^(https?|file):\/\//i.test(t);
+}
+
+/** 在内置浏览器标签页打开地址（共享单实例:固定 id 去重激活） */
+async function openUrlInBrowser(url: string): Promise<void> {
+  try {
+    await browserEnsure();
+    await browserNavigate(url);
+    useWorkbench.getState().openTab({ id: 'browser', type: 'browser', title: '浏览器' });
+  } catch (err) {
+    toast(`无法打开链接: ${String(err)}`, 'error');
+  }
+}
+
 function renderPart(p: { kind: string; lang: string; body: string }): string {
   switch (p.kind) {
     case 'command':
@@ -1218,12 +1265,17 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
         <code class="ai-suggest-main">${escapeHtml(p.body)}</code>
         <button class="icon-btn ai-qc-fav" type="button" title="收藏为命令收藏">${icon('star')}</button>
       </div>`;
-    case 'text':
+    case 'text': {
+      const isUrl = isSingleUrl(p.body);
       return `<div class="ai-suggest text" data-action="copy" data-text="${escapeHtml(p.body)}" title="点击卡片复制到剪贴板">
         <div class="ai-suggest-head"><span class="ai-suggest-icon">${icon('message')}</span>
-        <button class="btn small" type="button">复制到剪贴板</button></div>
+        <span class="ai-suggest-actions">
+          ${isUrl ? `<button class="icon-btn ai-suggest-open" type="button" title="在内置浏览器中打开">${icon('globe')}</button>` : ''}
+          <button class="icon-btn" type="button" title="复制到剪贴板">${icon('copy')}</button>
+        </span></div>
         <span class="ai-suggest-main">${escapeHtml(p.body)}</span>
       </div>`;
+    }
     case 'code':
       return `<pre class="ai-code-block">${p.lang ? `<span class="ai-code-lang">${escapeHtml(p.lang)}</span>` : ''}<code>${escapeHtml(p.body)}</code></pre>`;
     default:
@@ -1274,6 +1326,7 @@ function autoResumeAfterModeSwitch(sid: string): void {
     fileRefs: [],
     serverRefs: [],
     pathRefs: [],
+    browserRefs: [],
     actions: [],
     ts: Date.now(),
   });
@@ -1424,18 +1477,32 @@ function onChatClick(e: MouseEvent): void {
     }
     return;
   }
-  /* Markdown 链接：系统浏览器打开（卡片区无 <a>，不会与图钉/粘贴动作冲突） */
+  /* Markdown 链接：普通点击在内置浏览器标签页打开（openUrlInBrowser）；Ctrl/Shift+点击走系统浏览器 */
   const link = target.closest('a[href]') as HTMLAnchorElement | null;
   if (link) {
     e.preventDefault();
-    void openUrl(link.href).catch((err) => toast(`无法打开链接: ${String(err)}`, 'error'));
+    if (e.ctrlKey || e.shiftKey || e.metaKey) {
+      void openUrl(link.href).catch((err) => toast(`无法打开链接: ${String(err)}`, 'error'));
+      return;
+    }
+    void openUrlInBrowser(link.href);
     return;
   }
   /* 收藏按钮在命令卡片内部，优先于卡片的 paste 动作 */
   const fav = target.closest('.ai-qc-fav') as HTMLElement | null;
   if (fav) {
-    const card = fav.closest('[data-cmd]') as HTMLElement | null;
+    const card = fav.closest('[data-action]') as HTMLElement | null;
     if (card) addQuickCommandModal(card.dataset.cmd ?? '');
+    return;
+  }
+  /* 文本建议的「在内置浏览器中打开」按钮：只开浏览器，不触发卡片的复制动作 */
+  const openBtn = target.closest('.ai-suggest-open') as HTMLElement | null;
+  if (openBtn) {
+    const card = openBtn.closest('[data-action]') as HTMLElement | null;
+    if (card && card.dataset.text) {
+      e.preventDefault();
+      void openUrlInBrowser(card.dataset.text.trim());
+    }
     return;
   }
   const card = target.closest('[data-action]') as HTMLElement | null;
@@ -1464,8 +1531,9 @@ function onChatClick(e: MouseEvent): void {
   const chip = target.closest('[data-snap-id]') as HTMLElement | null;
   if (chip) {
     const id = chip.dataset.snapId ?? '';
-    if (chip.dataset.kind === 'server') return; // 服务器引用无详情弹窗
+    if (chip.dataset.kind === 'server' || chip.dataset.kind === 'path') return; // 服务器/路径引用无详情弹窗
     if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(id));
+    else if (chip.dataset.kind === 'browser') openBrowserRefModal(browserRefs.get(id));
     else openSnapModal(snapshots.get(id));
   }
 }
@@ -1522,6 +1590,17 @@ function addPathRefChip(ref: PathRef): void {
   chipRow.appendChild(c);
 }
 
+/** 浏览器元素引用 chip：@browser:#id 或标签名，title 带页面地址，点击查看元素详情 */
+function addBrowserRefChip(ref: BrowserRef, key: string): void {
+  const c = document.createElement('span');
+  c.className = 'tag blue ai-snap-chip';
+  c.dataset.id = key;
+  c.dataset.kind = 'browser';
+  c.title = `页面元素引用 ${ref.name}（${ref.url}），点击查看元素 HTML，✕ 移除`;
+  c.innerHTML = `@browser:${escapeHtml(ref.name || ref.tagName)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
+  chipRow.appendChild(c);
+}
+
 const clearChips = (): void => {
   chipRow.innerHTML = '';
   /* 状态 Map 必须与 chip DOM 同步清空:此前只清 DOM,serverRefs 等残留导致
@@ -1530,6 +1609,7 @@ const clearChips = (): void => {
   fileRefs.clear();
   serverRefs.clear();
   pathRefs.clear();
+  browserRefs.clear();
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
 };
 
@@ -1596,11 +1676,13 @@ function onChipRowClick(e: MouseEvent): void {
   if (target.closest('.ai-chip-x')) {
     if (chip.dataset.kind === 'server') serverRefs.delete(chip.dataset.id ?? '');
     else if (chip.dataset.kind === 'path') pathRefs.delete(chip.dataset.id ?? '');
+    else if (chip.dataset.kind === 'browser') browserRefs.delete(chip.dataset.id ?? '');
     chip.remove();
     return;
   }
   if (chip.dataset.kind === 'server' || chip.dataset.kind === 'path') return; // 服务器/路径引用无详情弹窗
   if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(chip.dataset.id ?? ''));
+  else if (chip.dataset.kind === 'browser') openBrowserRefModal(browserRefs.get(chip.dataset.id ?? ''));
   else openSnapModal(snapshots.get(chip.dataset.id ?? ''));
 }
 
@@ -1653,6 +1735,31 @@ function openFileRefModal(ref: FileRef | undefined): void {
   });
 }
 
+/** 浏览器元素引用详情：页面标题/地址 + 元素完整 HTML */
+function openBrowserRefModal(ref: BrowserRef | undefined): void {
+  if (!ref) return;
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = `
+    <div class="modal" style="width:560px">
+      <div class="modal-head"><h3>页面元素引用 · @browser:${escapeHtml(ref.name)}</h3><button class="icon-btn ai-modal-x" title="关闭">${icon('x')}</button></div>
+      <div class="modal-body">
+        <div class="ai-snap-command mono">${escapeHtml(ref.title || '（无标题）')} · ${escapeHtml(ref.url)}</div>
+        <pre class="ai-snap-pre">${escapeHtml(ref.outerHTML || '')}</pre>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  requestAnimationFrame(() => mask.classList.add('open'));
+  const close = (): void => {
+    mask.classList.remove('open');
+    setTimeout(() => mask.remove(), 160);
+  };
+  (mask.querySelector('.ai-modal-x') as HTMLButtonElement).onclick = close;
+  mask.addEventListener('mousedown', (e) => {
+    if (e.target === mask) close();
+  });
+}
+
 /* ---------- 输入区 ---------- */
 function autoGrow(): void {
   input.style.height = 'auto';
@@ -1689,6 +1796,7 @@ async function send(): Promise<void> {
   const refs: FileRef[] = [];
   const srefs: ServerRef[] = [];
   const prefs: PathRef[] = [];
+  const brefs: BrowserRef[] = [];
   // 固定工作区域引用最先（开启自动切换时）；发送时作为当前目标上下文说明
   if (autoSwitchAiWorkdir && workareaRef) srefs.push(workareaRef);
   chipRow.querySelectorAll('.ai-snap-chip').forEach((c) => {
@@ -1707,14 +1815,17 @@ async function send(): Promise<void> {
     } else if (kind === 'path') {
       const p = pathRefs.get(id);
       if (p) prefs.push(p);
+    } else if (kind === 'browser') {
+      const b = browserRefs.get(id);
+      if (b) brefs.push(b);
     }
   });
-  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0) return;
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0) return;
 
   // 首条用户消息决定会话标题
-  if (s.messages.length === 0) s.title = text.slice(0, 20) || (srefs.length || prefs.length ? '引用' : '文件引用');
+  if (s.messages.length === 0) s.title = text.slice(0, 20) || (brefs.length ? '页面元素引用' : srefs.length || prefs.length ? '引用' : '文件引用');
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, actions: [], ts: Date.now() });
   input.value = '';
   autoGrow();
   clearChips();
@@ -1725,7 +1836,7 @@ async function send(): Promise<void> {
   persistSession(s);
 
   // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器/路径引用说明（UI 气泡只显示 chip）
-  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs);
+  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs, brefs);
   aiChat(`${project.id}:${sid}`, prompt).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
     console.error('[AI] ai_chat 失败:', err);
@@ -1738,12 +1849,12 @@ async function send(): Promise<void> {
 }
 
 /**
- * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器/路径引用说明。
+ * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器/路径/浏览器元素引用说明。
  * 固定工作区域（开启自动切换时 srefs[0]）作为「当前工作区域」上下文说明，
  * 远程引用附 user@host:port 便于 AI 选择命令目标（后端 run_command 的 target 由 AI 工具参数决定）；
- * 路径引用只带完整路径不带文件内容。
+ * 路径引用只带完整路径不带文件内容；浏览器元素引用展开为页面信息 + 元素完整 HTML。
  */
-async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[]): Promise<string> {
+async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[], brefs: BrowserRef[]): Promise<string> {
   let servers: Server[] = [];
   try {
     servers = (await getState()).servers;
@@ -1780,6 +1891,8 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
     + snaps.map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`).join('')
     + refs.map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`).join('')
     + prefs.map((r) => `\n\n[${r.isDir ? '目录路径' : '文件路径'}: ${r.path}]`).join('')
+    + brefs.map((r) =>
+      `\n\n[浏览器元素引用 @browser:${r.name}]\n页面: ${r.title || '（无标题）'} (${r.url})\n元素 HTML:\n${r.outerHTML.slice(0, 8000)}`).join('')
     + refText;
 }
 

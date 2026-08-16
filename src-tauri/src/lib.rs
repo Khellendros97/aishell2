@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod ai_actions;
 pub mod ai_impact;
+pub mod browser;
 pub mod cloud;
 pub mod mcp;
 pub mod redact;
@@ -18,6 +19,7 @@ pub mod xshell;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::Emitter;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -31,6 +33,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // 内置浏览器本地 HTML 协议（browser.rs serve_local_html）：
+        // 本地文件统一走 localhtml://，规避 file:// 空 host 触发的 wry ipc 处理器崩溃
+        .register_uri_scheme_protocol("localhtml", |_ctx, request| browser::serve_local_html(request))
         .setup(|app| {
             let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
             let store = Arc::new(
@@ -44,6 +49,13 @@ pub fn run() {
                 Arc::clone(&ssh),
                 Arc::clone(&store),
             ));
+            // 递归暂存目录的进度事件（staging.rs add_path 逐文件 emit，前端右下角进度弹窗消费）
+            {
+                let app2 = app.handle().clone();
+                staging.set_progress_emitter(Arc::new(move |p| {
+                    let _ = app2.emit("staging:progress", p);
+                }));
+            }
             let terms = Arc::new(term::TermManager::new(ssh.clone()));
             // pi 运行时目录：Windows 安装版把 bundle.resources 装到 exe 旁 resources/ 子目录，
             // macOS 装到 AIShell.app/Contents/Resources/resources/ 子目录；resource_dir() 在各
@@ -88,12 +100,17 @@ pub fn run() {
                 s
             };
             let cloud_mgr = Arc::new(cloud::CloudManager::default());
+            // 内置浏览器（主窗口内嵌子 webview，懒创建）：先注入 AppHandle（事件发射/建视图用），
+            // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一实例（共享单实例语义）
+            browser::set_app(app.handle().clone());
+            let browser = Arc::new(browser::BrowserManager::new());
             let ai = Arc::new(ai::AiManager::new(
                 store.clone(),
                 pi_dir,
                 config_dir.join("pi-agent"),
                 ssh.clone(),
                 staging.clone(),
+                browser.clone(),
                 pi_debug,
                 Some(cloud_mgr.clone()),
             ));
@@ -118,6 +135,7 @@ pub fn run() {
                 cloud::refresh_on_startup(&app2, &store2, &cloud_mgr).await;
             });
             app.manage(mcp.clone());
+            app.manage(browser);
             // 启动时按持久化配置同步监听（有已启用设备则自动拉起）
             tauri::async_runtime::spawn(async move {
                 mcp.sync().await;
@@ -256,6 +274,16 @@ pub fn run() {
             staging::staging_accept,
             staging::staging_restore,
             staging::staging_diff,
+            staging::staging_clear,
+            browser::browser_ensure,
+            browser::browser_set_rect,
+            browser::browser_set_visible,
+            browser::browser_navigate,
+            browser::browser_back,
+            browser::browser_forward,
+            browser::browser_reload,
+            browser::browser_set_inspect,
+            browser::browser_open_devtools,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

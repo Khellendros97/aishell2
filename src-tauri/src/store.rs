@@ -609,6 +609,23 @@ pub struct PathRef {
     pub is_dir: bool,
 }
 
+/// 内置浏览器元素引用：UI 以 @browser:{#id 或标签名} 标签呈现，发送时展开为页面信息 + 元素 HTML。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserRef {
+    /// 显示名：有 id 为 #id，否则小写标签名
+    pub name: String,
+    pub tag_name: String,
+    /// 元素 id（可空）
+    pub element_id: String,
+    /// 选中时的页面地址与标题
+    pub url: String,
+    pub title: String,
+    /// 元素完整 outerHTML（注入脚本已截 20000 字符）
+    pub outer_html: String,
+    pub ts: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMsg {
@@ -624,6 +641,9 @@ pub struct ChatMsg {
     /// 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容）；旧会话无此字段时按空处理
     #[serde(default)]
     pub path_refs: Vec<PathRef>,
+    /// 内置浏览器元素引用（@browser:{#id 或标签名} 标签，发送时展开页面信息 + 元素 HTML）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub browser_refs: Vec<BrowserRef>,
     /// AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话按空。
     #[serde(default)]
     pub actions: Vec<AiActionRecord>,
@@ -2187,6 +2207,15 @@ mod tests {
                                 path: "C:/demo/app.ts".to_string(),
                                 is_dir: false,
                             }],
+                            browser_refs: vec![BrowserRef {
+                                name: "#login-btn".to_string(),
+                                tag_name: "button".to_string(),
+                                element_id: "login-btn".to_string(),
+                                url: "https://example.com/login".to_string(),
+                                title: "登录".to_string(),
+                                outer_html: r#"<button id="login-btn">登录</button>"#.to_string(),
+                                ts: 1_752_000_000_002,
+                            }],
                             actions: vec![AiActionRecord {
                                 tool_call_id: "call-1".to_string(),
                                 tool: "run_command".to_string(),
@@ -3607,6 +3636,7 @@ mod tests {
             file_refs: vec![],
             server_refs: vec![],
             path_refs: vec![],
+            browser_refs: vec![],
             actions: vec![],
             ts: 1,
         };
@@ -3623,6 +3653,7 @@ mod tests {
                     file_refs: vec![],
                     server_refs: vec![],
                     path_refs: vec![],
+                    browser_refs: vec![],
                     actions: vec![AiActionRecord {
                         tool_call_id: "call-1".to_string(),
                         tool: "run_command".to_string(),

@@ -374,7 +374,7 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             Arc::clone(&ssh),
             Arc::clone(&store),
         ));
-        let actions = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store), Arc::clone(&ssh), staging);
+        let actions = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store), Arc::clone(&ssh), staging, std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()));
 
         // AI 远程命令：锁检查先于任何网络请求（服务器从未被连接过，直接返回固定错误）
         let project_dir = std::env::temp_dir().join(format!(
@@ -522,7 +522,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             Arc::clone(&ssh),
             Arc::clone(&store),
         ));
-        let actions = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store), Arc::clone(&ssh), staging);
+        let actions = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store), Arc::clone(&ssh), staging, std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()));
 
         let server = Server {
             id: "s1".to_string(),
@@ -621,7 +621,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             Arc::clone(&ssh2),
             Arc::clone(&store2),
         ));
-        let actions2 = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store2), Arc::clone(&ssh2), staging2);
+        let actions2 = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store2), Arc::clone(&ssh2), staging2, std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()));
         let server2 = Server {
             id: "s2".to_string(),
             name: "loopback-off".to_string(),

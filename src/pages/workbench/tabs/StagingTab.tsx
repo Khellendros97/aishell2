@@ -3,6 +3,7 @@
  * 对照 legacy/pages/workbench/staging.ts(310 行)逐条迁移 DOM 类名 / 交互 / 文案:
  * - 会话级远程文件暂存的可视化(自动备份):AI 会话第一次修改远程文件前自动保存原始快照,
  *   接受 = 确认本次修改并清除暂存条目(不改远程内容);还原 = 恢复首次修改前内容;
+ *   清理 = 远端现状与首次快照一致的条目一次性接受清除(有变更的保留,后端 staging_clear);
  * - 数据源 staging_list / staging_accept / staging_restore(接口点见 src/api.ts staging 段);
  *   服务器名从 getState().servers 查(找不到回退 id);
  * - keep-alive:组件常驻挂载,active 仅切显隐(由外壳 .tab-pane.active 承担,本组件不消费);
@@ -16,11 +17,12 @@
  * '../../../stores/workbench'(registry.ts 接线,不得变更)。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getState, stagingAccept, stagingList, stagingRestore } from '../../../api';
+import { getState, stagingAccept, stagingClear, stagingList, stagingRestore } from '../../../api';
 import type { StagedFile } from '../../../types';
 import { confirmDialog, toast } from '../../../ui';
 import { useWorkbench, wbEvents, type TabProps } from '../../../stores/workbench';
 import { Icon } from '../../../shared/Icon';
+import { hideStagingProgress, showStagingProgress } from './staging-progress';
 import '../staging.css';
 
 function fmtTime(ts: number): string {
@@ -211,6 +213,39 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
     void refresh();
   }
 
+  /** 清理无变更条目：远端现状与首次快照完全一致的条目一次性接受清除（备份已冗余，
+   *  不修改远程内容），有变更/检查失败的保留。不需要先勾选。 */
+  async function doClear(): Promise<void> {
+    if (bulkRunning) return;
+    const ok = await confirmDialog({
+      title: '清理无变更暂存',
+      message: '把「远端现状与首次快照完全一致」的条目全部接受并清除（备份已冗余，不修改远程文件）？\n仍有变更的条目会保留。',
+      okText: '清理',
+    });
+    if (!ok) return;
+    setBulkRunning(true);
+    // 逐条检查远端现状可能较慢：弹出右下角进度框（后端按条目发 staging:progress 事件）
+    showStagingProgress('正在清理暂存区');
+    try {
+      const out = await stagingClear(data.projectId, data.sessionId);
+      if (!out.removed.length) {
+        toast(out.kept.length ? `没有可清理的条目（${out.kept.length} 项仍有变更，已保留）` : '暂存区为空', 'info');
+      } else if (out.errors.length) {
+        toast(`已清理 ${out.removed.length} 项；${out.kept.length} 项保留（${out.errors.length} 项检查失败）`, 'error');
+      } else {
+        toast(`已清理 ${out.removed.length} 个无变更条目，保留 ${out.kept.length} 项有变更条目`, 'success');
+      }
+      setSelected(new Set());
+      wbEvents.emit('staging-changed');
+      void refresh();
+    } catch (err) {
+      toast(String(err), 'error');
+    } finally {
+      setBulkRunning(false);
+      hideStagingProgress();
+    }
+  }
+
   /** 打开 diff 标签(单击「比较差异」/ 双击行;同 id 去重激活) */
   function openDiff(entry: StagedFile): void {
     useWorkbench.getState().openTab({
@@ -236,10 +271,13 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
           <Icon name="refresh" /> 刷新
         </button>
       </div>
-      <div className="staging-hint">自动备份开启后，AI 会话第一次修改远程文件前自动保存原始快照，同一会话后续修改不覆盖。接受 = 确认本次修改并清除暂存条目（不改远程内容）；还原 = 把远程文件恢复到首次修改前的内容。</div>
+      <div className="staging-hint">自动备份开启后，AI 会话第一次修改远程文件前自动保存原始快照，同一会话后续修改不覆盖。接受 = 确认本次修改并清除暂存条目（不改远程内容）；还原 = 把远程文件恢复到首次修改前的内容；清理 = 把「无变更」的条目一次性接受清除。</div>
       <div className="staging-toolbar" hidden={count === 0}>
         <span className="staging-selected">{selCount ? `已选择 ${selCount} 项` : '选择文件后可批量操作'}</span>
         <span className="staging-toolbar-spacer"></span>
+        <button className="btn small" disabled={bulkRunning} title="把远端现状与首次快照一致的条目全部接受并清除（有变更的保留）" onClick={() => void doClear()}>
+          <Icon name="trash" /> 清理无变更
+        </button>
         <button className="btn small primary" disabled={selCount === 0 || bulkRunning} onClick={() => void doBulkAccept()}>批量接受</button>
         <button className="btn small" disabled={selCount === 0 || bulkRunning} onClick={() => void doBulkRestore()}>
           <Icon name="restore" /> 批量还原

@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -266,12 +266,34 @@ export const memorySearch = (query: string, topK?: number, scope?: MemoryScope) 
   call<MemoryHit[]>('memory_search', { query, topK: topK ?? null, scope: scope ?? '' });
 /** 个人卡片提升为共享（POST /api/memories/{id}/promote）；返回新共享卡片 id */
 export const memoryPromote = (id: string) => call<string>('memory_promote', { id });
+/* ---------------- browser（内置浏览器子 webview，Rust browser.rs） ----------------
+   面板占位 div 经 ResizeObserver 同步位置尺寸；element 事件携带检查器选中的元素引用。 */
+/** 懒创建子 webview（全局单实例），返回 url/title/inspect 供面板恢复 */
+export const browserEnsure = () => call<BrowserState>('browser_ensure');
+export const browserSetRect = (x: number, y: number, w: number, h: number) =>
+  call<void>('browser_set_rect', { x, y, w, h });
+/** webview 显隐（面板激活 && 无全屏遮罩 的合成结果由前端计算后传入） */
+export const browserSetVisible = (visible: boolean) =>
+  call<void>('browser_set_visible', { visible });
+/** 地址栏导航：本地路径（盘符/UNC）→ file://，无协议补 https://；返回归一化后的 URL */
+export const browserNavigate = (input: string) =>
+  call<string>('browser_navigate', { input });
+export const browserBack = () => call<void>('browser_back');
+export const browserForward = () => call<void>('browser_forward');
+export const browserReload = () => call<void>('browser_reload');
+/** 检查元素模式开关（点击元素 → browser:event element → AI 引用 chip） */
+export const browserSetInspect = (enabled: boolean) =>
+  call<void>('browser_set_inspect', { enabled });
+export const browserOpenDevtools = () => call<void>('browser_open_devtools');
+export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
+  listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
+
 /* ---------------- staging（会话级远程文件暂存，自动备份） ----------------
    快照在 AI 修改远程文件前自动创建；本组命令供「文件暂存区」面板 / diff 标签使用。
    staging_accept 只注册为前端命令，绝不加入 pi 工具 / guard 工具集 / 动作桥。 */
-/** 用户主动暂存远程文件；同一会话已暂存时直接返回既有条目，不覆盖首次快照。 */
+/** 用户主动暂存远程文件或目录（目录递归暂存全部文件）；同一会话已暂存时复用既有条目，不覆盖首次快照。 */
 export const stagingAdd = (projectId: string, sessionId: string, serverId: string, remotePath: string) =>
-  call<StagedFile>('staging_add', { projectId, sessionId, serverId, remotePath });
+  call<StagedFile[]>('staging_add', { projectId, sessionId, serverId, remotePath });
 export const stagingList = (projectId: string, sessionId: string) =>
   call<StagedFile[]>('staging_list', { projectId, sessionId });
 /** 读取快照侧内容：text 为已脱敏文本；二进制/超大只返回 hash/size/mtime 元数据 */
@@ -290,6 +312,12 @@ export const stagingRestore = (projectId: string, sessionId: string, entryId: st
 /** 行级 diff（文本）或元数据对比（二进制/超大） */
 export const stagingDiff = (projectId: string, sessionId: string, entryId: string) =>
   call<StagingDiff>('staging_diff', { projectId, sessionId, entryId });
+/** 清理无变更条目：远端现状与首次快照完全一致的条目直接接受清除，有变更/检查失败的保留 */
+export const stagingClear = (projectId: string, sessionId: string) =>
+  call<StagingClearOutcome>('staging_clear', { projectId, sessionId });
+/** 暂存/清理的进度事件（staging.rs add_path 逐文件、clear_unchanged 逐条目发送；walk/stage/clear 阶段） */
+export const onStagingProgress = (cb: (p: StagingProgress) => void): Promise<UnlistenFn> =>
+  listen<StagingProgress>('staging:progress', (e) => cb(e.payload));
 
 /* ---------------- skills ---------------- */
 /** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
