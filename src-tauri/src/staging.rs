@@ -8,7 +8,12 @@
 //! 语义：
 //! - [`RemoteStaging::ensure_snapshot`]：AI 会话第一次修改某远程文件前保存原始快照；
 //!   同一会话（projectId+sessionId+serverId+canonical 路径）后续修改复用快照，不覆盖。
-//! - 已有文件保留完整字节；首次创建文件只记录 `Absent`；目录目标一律失败（无法确定目录内文件）。
+//! - 已有文件保留完整字节；首次创建文件只记录 `Absent`；受保护写入的目录目标一律失败
+//!   （无法确定目录内文件）；主动暂存（[`RemoteStaging::add_path`]）则支持目录递归暂存全部文件。
+//! - [`RemoteStaging::clear_unchanged`]：远端现状与首次快照完全一致的条目直接接受清除
+//!   （不触碰远程内容），有变更/检查失败的保留。
+//! - [`RemoteStaging::add_path`] 递归暂存目录时经进度回调（lib.rs 注入 emit `staging:progress`）
+//!   逐文件发送 walk/stage 两阶段进度，前端右下角弹窗展示。
 //! - [`RemoteStaging::accept`] 只删除本地条目，不改远程内容；[`RemoteStaging::restore`]
 //!   先比较暂存记录的 current hash/size/mtime，冲突时返回结构化冲突（force 仅前端用户命令传入）。
 //! - 快照/diff 输出统一经 [`crate::redact::redact_secrets`] 脱敏；二进制或超过编辑上限
@@ -34,6 +39,8 @@ use crate::store::Store;
 const CURRENT_HASH_CAP: u64 = 64 * 1024 * 1024;
 /// 流式拷贝缓冲（与 sftp.rs 一致）。
 const COPY_BUF: usize = 64 * 1024;
+/// 单次主动暂存目录的文件数上限（防误暂存 node_modules 级大目录打爆 blob 存储）。
+const MAX_STAGE_FILES: usize = 2000;
 
 /// 原始/当前存在状态（serde lowercase：existing / absent）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,11 +136,38 @@ pub struct RestoreOutcome {
     pub entry: Option<StagedFile>,
 }
 
+/// staging_clear 结果：removed 为「无变更已清除」的条目；kept 为仍有变更/检查失败而保留的条目。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagingClearOutcome {
+    pub removed: Vec<StagedFile>,
+    pub kept: Vec<StagedFile>,
+    /// 检查失败的条目说明（对应条目保留在 kept 中）
+    pub errors: Vec<String>,
+}
+
+/// 递归暂存目录的进度（add_path 经 `staging:progress` 事件逐文件发送，前端右下角进度弹窗消费）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagingProgress {
+    pub project_id: String,
+    pub session_id: String,
+    /// walk = 枚举目录文件；stage = 逐个暂存文件
+    pub phase: String,
+    pub done: usize,
+    pub total: usize,
+    pub current_path: String,
+}
+
+/// 进度事件回调（lib.rs 注入 emit `staging:progress`；测试环境不注入则静默）。
+type ProgressEmitter = Arc<dyn Fn(&StagingProgress) + Send + Sync>;
+
 /// 会话级暂存管理器（lib.rs 注入，前端命令与 AI 动作共用同一实例）。
 pub struct RemoteStaging {
     root: PathBuf,
     ssh: Arc<SshManager>,
     store: Arc<Store>,
+    progress: StdMutex<Option<ProgressEmitter>>,
     /// 唯一键（projectId:sessionId:serverId:path）→ 进程内锁：避免并发首次写入覆盖原始快照
     locks: StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
@@ -181,9 +215,77 @@ fn is_no_such_file(e: &russh_sftp::client::error::Error) -> bool {
     matches!(e, russh_sftp::client::error::Error::Status(s) if s.status_code == russh_sftp::protocol::StatusCode::NoSuchFile)
 }
 
+/// 递归枚举远端目录下全部文件（绝对路径；符号链接不追踪，防逃逸/防死循环）。
+/// async 递归需装箱（与 sftp.rs copy_one/delete_one 同模式）。
+async fn walk_remote_files(
+    sftp: &russh_sftp::client::SftpSession,
+    dir: &str,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    async fn inner(sftp: &russh_sftp::client::SftpSession, dir: &str, out: &mut Vec<String>) -> Result<(), String> {
+        let rd = sftp
+            .read_dir(dir)
+            .await
+            .map_err(|e| format!("读取远端目录 {dir} 失败: {e}"))?;
+        for ent in rd {
+            let md = ent.metadata();
+            if md.is_symlink() {
+                continue;
+            }
+            let path = ent.path();
+            if md.is_dir() {
+                Box::pin(inner(sftp, &path, out)).await?;
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    Box::pin(inner(sftp, dir, out)).await
+}
+
+/// 远端现状与暂存快照（首次快照）是否完全一致——「没有任何变更」。
+/// remote = 远端 (size, mtime, sha256)；sha256 为 ≤ hash cap 时按需计算的结果（超大文件为 None）。
+/// 超大文件（快照无 hash 记录）只信 size/mtime，与 restore 冲突校验同一保守策略。
+fn snapshot_unchanged(
+    entry: &StagedFile,
+    remote: Option<(Option<u64>, Option<i64>, Option<String>)>,
+) -> bool {
+    match (&entry.original_state, remote) {
+        (StagedState::Absent, None) => true,
+        (StagedState::Existing, Some((size, mtime, sha))) => {
+            if entry.size != size || entry.mtime != mtime {
+                return false;
+            }
+            match (&entry.sha256, sha) {
+                (Some(rec), Some(cur)) => cur == *rec,
+                _ => true,
+            }
+        }
+        _ => false,
+    }
+}
+
 impl RemoteStaging {
     pub fn new(root: PathBuf, ssh: Arc<SshManager>, store: Arc<Store>) -> Self {
-        RemoteStaging { root, ssh, store, locks: StdMutex::new(HashMap::new()) }
+        RemoteStaging {
+            root,
+            ssh,
+            store,
+            progress: StdMutex::new(None),
+            locks: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// 注入进度事件回调（lib.rs：emit `staging:progress`；测试/无 UI 环境不注入则静默）。
+    pub fn set_progress_emitter(&self, f: ProgressEmitter) {
+        *self.progress.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+    }
+
+    fn emit_progress(&self, p: &StagingProgress) {
+        if let Some(f) = self.progress.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            f(p);
+        }
     }
 
     fn validate_session(&self, project_id: &str, session_id: &str, server_id: &str) -> Result<(), String> {
@@ -292,6 +394,154 @@ impl RemoteStaging {
         entries.push(entry.clone());
         self.write_manifest(project_id, session_id, &entries)?;
         Ok(entry)
+    }
+
+    /// 主动暂存文件或目录（用户 SFTP 菜单 / AI staging_add 工具）。
+    /// 文件 → ensure_snapshot；目录 → 递归枚举全部文件逐个暂存（跳过符号链接防逃逸/防环），
+    /// 文件数超过 [`MAX_STAGE_FILES`] 时中止。与 ensure_snapshot 同去重语义：已暂存条目原样返回。
+    pub async fn add_path(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        server_id: &str,
+        remote_path: &str,
+    ) -> Result<Vec<StagedFile>, String> {
+        self.validate_session(project_id, session_id, server_id)?;
+        let remote_path = canonical_remote_path(remote_path)?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        let md = match sftp.metadata(&remote_path).await {
+            Ok(md) => md,
+            Err(e) if is_no_such_file(&e) => return Err(format!("远端路径不存在：{remote_path}")),
+            Err(e) => return Err(format!("读取远端 {remote_path} 状态失败: {e}")),
+        };
+        if !md.is_dir() {
+            let e = self.ensure_snapshot(project_id, session_id, server_id, &remote_path).await?;
+            return Ok(vec![e]);
+        }
+        let mut files: Vec<String> = Vec::new();
+        self.emit_progress(&StagingProgress {
+            project_id: project_id.to_string(),
+            session_id: session_id.to_string(),
+            phase: "walk".into(),
+            done: 0,
+            total: 0,
+            current_path: remote_path.clone(),
+        });
+        walk_remote_files(&sftp, &remote_path, &mut files).await?;
+        if files.is_empty() {
+            return Err(format!("远端目录为空，没有可暂存的文件：{remote_path}"));
+        }
+        if files.len() > MAX_STAGE_FILES {
+            return Err(format!(
+                "远端目录包含 {} 个文件，超过单次暂存上限 {}，已中止（请只暂存需要的子目录）",
+                files.len(),
+                MAX_STAGE_FILES
+            ));
+        }
+        let total = files.len();
+        let mut out = Vec::with_capacity(total);
+        for (i, f) in files.iter().enumerate() {
+            // 逐文件进度（done 为已完成的文件数，当前文件尚未开始）
+            self.emit_progress(&StagingProgress {
+                project_id: project_id.to_string(),
+                session_id: session_id.to_string(),
+                phase: "stage".into(),
+                done: i,
+                total,
+                current_path: f.clone(),
+            });
+            match self.ensure_snapshot(project_id, session_id, server_id, f).await {
+                Ok(e) => out.push(e),
+                Err(e) => {
+                    return Err(format!("暂存 {f} 失败（已暂存 {} 个文件）：{e}", out.len()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 清理无变更条目：远端现状与首次快照完全一致的条目直接接受（清除本地暂存记录），
+    /// 有变更或检查失败（连接/读取出错）的条目保留。单次持有 manifest 锁，逐条 re-stat +
+    /// 条件 hash（≤ CURRENT_HASH_CAP 时比对内容，超大文件只信 size/mtime，与 refresh_current 一致）。
+    pub async fn clear_unchanged(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<StagingClearOutcome, String> {
+        validate_id(project_id, "项目 ID")?;
+        validate_id(session_id, "会话 ID")?;
+        let manifest_lock = self.manifest_lock(project_id, session_id);
+        let _manifest_guard = manifest_lock.lock().await;
+        let entries = self.read_manifest(project_id, session_id)?;
+        if entries.is_empty() {
+            return Ok(StagingClearOutcome { removed: Vec::new(), kept: Vec::new(), errors: Vec::new() });
+        }
+        let mut removed: Vec<StagedFile> = Vec::new();
+        let mut kept: Vec<StagedFile> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let total = entries.len();
+        for (i, entry) in entries.into_iter().enumerate() {
+            // 逐条检查进度（done 为已完成的条目数，当前条目尚未开始）
+            self.emit_progress(&StagingProgress {
+                project_id: project_id.to_string(),
+                session_id: session_id.to_string(),
+                phase: "clear".into(),
+                done: i,
+                total,
+                current_path: entry.remote_path.clone(),
+            });
+            let sftp = match self.ssh.open_sftp(&entry.server_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    errors.push(format!("服务器 {}：{e}", entry.server_id));
+                    kept.push(entry);
+                    continue;
+                }
+            };
+            // 远端现状 (size, mtime, sha256)：sha256 仅 ≤ cap 时按需计算
+            let remote = match sftp.metadata(&entry.remote_path).await {
+                Ok(md) if md.is_dir() => {
+                    // 暂存条目只会是文件；防御性保留，不判定
+                    kept.push(entry);
+                    continue;
+                }
+                Ok(md) => {
+                    let size = md.size;
+                    let mtime = md.mtime.map(|m| m as i64);
+                    let sha = match size {
+                        Some(s) if s <= CURRENT_HASH_CAP => {
+                            match self.read_remote_bytes(&sftp, &entry.remote_path).await {
+                                Ok(b) => Some(hex::encode(Sha256::digest(&b))),
+                                Err(e) => {
+                                    errors.push(format!("{}：{e}", entry.remote_path));
+                                    kept.push(entry);
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    Some((size, mtime, sha))
+                }
+                Err(e) if is_no_such_file(&e) => None,
+                Err(e) => {
+                    errors.push(format!("{}：{e}", entry.remote_path));
+                    kept.push(entry);
+                    continue;
+                }
+            };
+            if snapshot_unchanged(&entry, remote) {
+                removed.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.write_manifest(project_id, session_id, &kept)?;
+        Ok(StagingClearOutcome { removed, kept, errors })
     }
 
     /// 列出某会话全部暂存条目（按暂存时间排序）。manifest 损坏 → 带路径错误。
@@ -906,7 +1156,7 @@ fn lcs_diff(a: &[String], b: &[String]) -> (Vec<DiffLine>, Vec<DiffLine>) {
 
 /* ---------------- Tauri 命令（前端工作台调用；AI 侧经 ai_actions 动作桥） ---------------- */
 
-/// 用户从 SFTP / 远程编辑器主动暂存文件；复用 ensure_snapshot 的会话隔离、去重和目录拒绝语义。
+/// 用户从 SFTP / 远程编辑器主动暂存文件或目录（目录递归暂存全部文件）。
 #[tauri::command]
 pub async fn staging_add(
     staging: State<'_, Arc<RemoteStaging>>,
@@ -914,10 +1164,20 @@ pub async fn staging_add(
     session_id: String,
     server_id: String,
     remote_path: String,
-) -> Result<StagedFile, String> {
+) -> Result<Vec<StagedFile>, String> {
     staging
-        .ensure_snapshot(&project_id, &session_id, &server_id, &remote_path)
+        .add_path(&project_id, &session_id, &server_id, &remote_path)
         .await
+}
+
+/// 清理无变更条目：远端现状与首次快照完全一致的条目直接接受清除，有变更/检查失败的保留。
+#[tauri::command]
+pub async fn staging_clear(
+    staging: State<'_, Arc<RemoteStaging>>,
+    project_id: String,
+    session_id: String,
+) -> Result<StagingClearOutcome, String> {
+    staging.clear_unchanged(&project_id, &session_id).await
 }
 
 #[tauri::command]
@@ -1216,5 +1476,84 @@ mod tests {
         // 文本含凭据 → 脱敏
         let c = content_from_bytes(b"password=secret123", Some(18), Some(1), Some("h".into()), &[]);
         assert!(c.text.unwrap().contains("已脱敏"));
+    }
+
+    #[test]
+    fn snapshot_unchanged_decides_consistent() {
+        let mk = |orig: StagedState, size: Option<u64>, mtime: Option<i64>, sha: Option<String>| StagedFile {
+            entry_id: "e".to_string(),
+            server_id: "s".to_string(),
+            remote_path: "/x".to_string(),
+            original_state: orig.clone(),
+            blob_ref: sha.clone(),
+            size,
+            mtime,
+            sha256: sha,
+            staged_at: 0,
+            current_state: orig,
+            current_size: size,
+            current_mtime: mtime,
+            current_sha256: None,
+        };
+        // 原始不存在且远端不存在 → 无变更（可清理）
+        assert!(snapshot_unchanged(&mk(StagedState::Absent, None, None, None), None));
+        // 原始不存在但远端出现 → 有变更（保留）
+        assert!(!snapshot_unchanged(
+            &mk(StagedState::Absent, None, None, None),
+            Some((Some(1), Some(1), None))
+        ));
+        // 原始存在、远端 size/mtime/hash 全同 → 无变更
+        assert!(snapshot_unchanged(
+            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            Some((Some(10), Some(5), Some("h".to_string())))
+        ));
+        // 同 size 同 mtime 但内容不同（hash 不同）→ 有变更
+        assert!(!snapshot_unchanged(
+            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            Some((Some(10), Some(5), Some("x".to_string())))
+        ));
+        // mtime 变 → 有变更
+        assert!(!snapshot_unchanged(
+            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            Some((Some(10), Some(6), Some("h".to_string())))
+        ));
+        // 远端不存在（文件被删除）→ 有变更
+        assert!(!snapshot_unchanged(
+            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            None
+        ));
+        // 超大文件（快照无 hash）只信 size/mtime
+        assert!(snapshot_unchanged(
+            &mk(StagedState::Existing, Some(100), Some(7), None),
+            Some((Some(100), Some(7), None))
+        ));
+        assert!(!snapshot_unchanged(
+            &mk(StagedState::Existing, Some(100), Some(7), None),
+            Some((Some(101), Some(7), None))
+        ));
+        // 快照有 hash 但远端超大（未计算 hash）→ 只看 size/mtime，保守同 restore 语义
+        assert!(snapshot_unchanged(
+            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            Some((Some(10), Some(5), None))
+        ));
+    }
+
+    #[test]
+    fn clear_unchanged_empty_manifest_is_ok() {
+        let root = test_root("clear-empty");
+        let store = Arc::new(crate::store::test_store(root.join("store")));
+        let staging = RemoteStaging::new(
+            root.clone(),
+            Arc::new(SshManager::new(Arc::clone(&store))),
+            Arc::clone(&store),
+        );
+        let out = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(staging.clear_unchanged("p1", "s1"))
+            .unwrap();
+        assert!(out.removed.is_empty() && out.kept.is_empty() && out.errors.is_empty());
+        // manifest 保持不存在（不创建空清单文件）
+        assert!(!staging.session_dir("p1", "s1").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

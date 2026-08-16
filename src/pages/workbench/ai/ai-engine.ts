@@ -47,6 +47,7 @@ import {
 } from '../../../api';
 import { getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
 import { addQuickCommandModal } from '../tabs/useTerminal';
+import { hideStagingProgress } from '../tabs/staging-progress';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { openAiDbApprovalModal, type DbRequestDetail } from './AiDbApproval';
 import { DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
@@ -350,6 +351,8 @@ const ACTION_NAMES: Record<string, string> = {
   staging_list: '查看暂存列表',
   staging_diff: '查看暂存 diff',
   staging_restore: '还原暂存文件',
+  staging_add: '主动暂存文件',
+  staging_clear: '清理无变更暂存',
   request_db_connection: '申请数据库连接',
 };
 
@@ -387,6 +390,10 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `查看暂存条目 diff（${String(args.entryId ?? '')}）`;
     case 'staging_restore':
       return `还原暂存条目（${String(args.entryId ?? '')}）`;
+    case 'staging_add':
+      return `主动暂存 ${String(args.remotePath ?? '')}（服务器 ${String(args.serverId ?? '')}）`;
+    case 'staging_clear':
+      return '清理暂存区无变更条目';
     default:
       return '';
   }
@@ -866,9 +873,12 @@ function handleEvent(key: string, ev: AiEvent): void {
     const isRemoteFileOp = ['write', 'edit', 'delete_path'].includes(ev.tool) && !!existing?.serverId;
     if (ev.tool === 'run_command' || ev.tool === 'sftp_upload'
       || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff'
+      || ev.tool === 'staging_add' || ev.tool === 'staging_clear'
       || isRemoteFileOp) {
       wbEvents.emit('staging-changed');
     }
+    /* AI 目录暂存 / 清理结束（成功/失败）→ 收起右下角进度弹窗（staging:progress 事件驱动显示） */
+    if (ev.tool === 'staging_add' || ev.tool === 'staging_clear') hideStagingProgress();
   } else if (ev.type === 'segment') {
     /* 新一轮 assistant 消息分段（工具来回时），仅流式中有文本才分段 */
     const cur = pendingBy.get(sid) ?? null;

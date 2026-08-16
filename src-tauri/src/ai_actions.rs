@@ -870,6 +870,51 @@ impl AiActions {
         }
     }
 
+    /// AI 主动暂存文件/目录（备份用途：应用补丁前先把目标备份进会话暂存区，可 diff/还原）。
+    /// 目录递归暂存全部文件；只读远端内容，不修改远程。
+    pub async fn staging_add(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        server_id: &str,
+        remote_path: &str,
+    ) -> Result<String, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let entries = self
+            .staging
+            .add_path(project_id, session_id, server_id, remote_path)
+            .await?;
+        if entries.len() == 1 {
+            Ok(format!("已暂存 1 个文件（{}）", entries[0].remote_path))
+        } else {
+            Ok(format!("已暂存目录 {remote_path} 下的 {} 个文件", entries.len()))
+        }
+    }
+
+    /// AI 清理无变更暂存条目：只移除「远端现状与首次快照完全一致」的条目（相当于自动接受），
+    /// 有变更或检查失败的保留并如实报告。不触碰远程内容。
+    pub async fn staging_clear(&self, project_id: &str, session_id: &str) -> Result<String, String> {
+        let out = self.staging.clear_unchanged(project_id, session_id).await?;
+        if out.removed.is_empty() {
+            return Ok(format!(
+                "暂存区没有可清理的条目（{} 个条目仍有变更或检查失败被保留）",
+                out.kept.len()
+            ));
+        }
+        let mut lines: Vec<String> = out
+            .removed
+            .iter()
+            .map(|e| format!("- {}（服务器 {}）", e.remote_path, e.server_id))
+            .collect();
+        if !out.kept.is_empty() {
+            lines.push(format!("另有 {} 个条目仍有变更，已保留", out.kept.len()));
+        }
+        for e in &out.errors {
+            lines.push(format!("检查失败（已保留）：{e}"));
+        }
+        Ok(format!("已清理 {} 个无变更暂存条目：\n{}", out.removed.len(), lines.join("\n")))
+    }
+
     /// 查询项目绑定的可操作服务器列表（只读；供 LLM 在远程动作前确认 serverId）。
     /// 输出含锁定状态标注；不返回密钥/密钥路径等敏感字段。
     pub fn list_servers(&self, project_id: &str) -> Result<String, String> {

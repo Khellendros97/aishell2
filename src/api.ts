@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingProgress, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -252,9 +252,9 @@ export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<Unlisten
 /* ---------------- staging（会话级远程文件暂存，自动备份） ----------------
    快照在 AI 修改远程文件前自动创建；本组命令供「文件暂存区」面板 / diff 标签使用。
    staging_accept 只注册为前端命令，绝不加入 pi 工具 / guard 工具集 / 动作桥。 */
-/** 用户主动暂存远程文件；同一会话已暂存时直接返回既有条目，不覆盖首次快照。 */
+/** 用户主动暂存远程文件或目录（目录递归暂存全部文件）；同一会话已暂存时复用既有条目，不覆盖首次快照。 */
 export const stagingAdd = (projectId: string, sessionId: string, serverId: string, remotePath: string) =>
-  call<StagedFile>('staging_add', { projectId, sessionId, serverId, remotePath });
+  call<StagedFile[]>('staging_add', { projectId, sessionId, serverId, remotePath });
 export const stagingList = (projectId: string, sessionId: string) =>
   call<StagedFile[]>('staging_list', { projectId, sessionId });
 /** 读取快照侧内容：text 为已脱敏文本；二进制/超大只返回 hash/size/mtime 元数据 */
@@ -273,6 +273,12 @@ export const stagingRestore = (projectId: string, sessionId: string, entryId: st
 /** 行级 diff（文本）或元数据对比（二进制/超大） */
 export const stagingDiff = (projectId: string, sessionId: string, entryId: string) =>
   call<StagingDiff>('staging_diff', { projectId, sessionId, entryId });
+/** 清理无变更条目：远端现状与首次快照完全一致的条目直接接受清除，有变更/检查失败的保留 */
+export const stagingClear = (projectId: string, sessionId: string) =>
+  call<StagingClearOutcome>('staging_clear', { projectId, sessionId });
+/** 暂存/清理的进度事件（staging.rs add_path 逐文件、clear_unchanged 逐条目发送；walk/stage/clear 阶段） */
+export const onStagingProgress = (cb: (p: StagingProgress) => void): Promise<UnlistenFn> =>
+  listen<StagingProgress>('staging:progress', (e) => cb(e.payload));
 
 /* ---------------- skills ---------------- */
 /** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */

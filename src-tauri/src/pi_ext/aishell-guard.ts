@@ -31,9 +31,12 @@
  * sftp_download 及远程文件工具（remote_*）经 `ctx.ui.input('AISHELL_ACTION:<toolCallId>',
  * JSON.stringify(payload))` 走 RPC extension UI 子协议交给 Rust 的 ai_actions（唯一执行入口，
  * 另有后端硬边界）。
- * 会话级文件暂存（staging_list / staging_diff / staging_restore）：只读列表/diff + 还原
- * （agent 下还原逐调用审批），**不接受/清除暂存条目**（staging_accept 只在前端面板，绝不注册为
- * AI 工具）；project/session 不接受任意参数——后端从当前 pi 进程 key 推导，扩展仅携带会话身份环境变量。
+ * 会话级文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：
+ * 只读列表/diff + 主动暂存（staging_add：文件或目录递归备份，更新补丁前用）+ 还原
+ * （agent 下还原逐调用审批）+ 清理无变更条目（staging_clear：只移除远端现状与首次快照一致的
+ * 条目，有变更的保留），**不能接受/清除仍有变更的暂存条目**（staging_accept 只在前端面板，
+ * 绝不注册为 AI 工具）；project/session 不接受任意参数——后端从当前 pi 进程 key 推导，
+ * 扩展仅携带会话身份环境变量。
  * 内置浏览器四件套（browser_open/browser_read/browser_console/browser_screenshot）：只读、
  * 免审批，三档模式都可用（不进 AI_ONLY_TOOLS）；经 AISHELL_ACTION 桥交给 Rust browser.rs 的
  * 共享单实例 webview（后台打开不切面板不抢焦点；截图存 <workspace>/.aishell/tmp/screenshot）。
@@ -63,9 +66,10 @@ const VALID_MODES = ["suggest", "agent", "yolo"] as const;
 type AiMode = (typeof VALID_MODES)[number];
 
 /** 仅 agent/yolo 提供的变更工具（suggest 一律拒绝） */
-const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "request_db_connection"];
+const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "staging_add", "staging_clear", "request_db_connection"];
 /** agent 模式逐调用审批的受控工具：staging_restore 为远程写操作需审批；
- *  staging_list / staging_diff 只读不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
+ *  staging_list / staging_diff 只读、staging_add 主动备份（只读远端）/ staging_clear 只清
+ *  无变更条目，均不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
 const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore"];
 
 /** db_query 只读首词（union 表，与 Rust ai_actions::is_db_read_only 语义一致，见 store.rs DbKind::default_read_commands）。
@@ -280,6 +284,14 @@ export default function (pi: ExtensionAPI) {
 					intent: `还原暂存条目（${String(input.entryId || "")}）`,
 					summary: `staging_restore：把远程文件还原到首次修改前的内容（entryId=${String(input.entryId || "")}）`,
 				};
+			case "staging_add":
+				return {
+					action: "staging_add",
+					intent: `主动暂存 ${String(input.remotePath || "")}（服务器 ${String(input.serverId || "")}）`,
+					summary: `staging_add：暂存文件/目录到当前会话暂存区（备份）`,
+				};
+			case "staging_clear":
+				return { action: "staging_clear", intent: "清理暂存区无变更条目", summary: "staging_clear：接受并清除远端现状与首次快照一致的条目" };
 			default:
 				return { action: tool, intent: "执行操作", summary: "" };
 		}
@@ -454,6 +466,24 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (!(typeof input.entryId === "string" && input.entryId.trim())) {
 					return { block: true, reason: "staging_restore: 缺少 entryId。" };
+				}
+				return undefined;
+			}
+			case "staging_add": {
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不提供远程文件暂存工具。" };
+				}
+				if (!(typeof input.serverId === "string" && input.serverId.trim())) {
+					return { block: true, reason: "staging_add: 缺少 serverId（先调用 list_servers 获取）。" };
+				}
+				if (!(typeof input.remotePath === "string" && input.remotePath.trim())) {
+					return { block: true, reason: "staging_add: 缺少 remotePath（要暂存的远程文件或目录绝对路径）。" };
+				}
+				return undefined;
+			}
+			case "staging_clear": {
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不提供远程文件暂存工具。" };
 				}
 				return undefined;
 			}
@@ -1174,12 +1204,12 @@ export default function (pi: ExtensionAPI) {
 		name: "staging_restore",
 		label: "还原暂存文件",
 		description:
-			"把某条暂存条目对应的远程文件还原到首次修改前的内容（entryId 来自 staging_list）。仅限用户明确要求的还原；外部修改冲突时如实报告冲突，不静默覆盖。不能接受（清除）暂存条目。",
+			"把某条暂存条目对应的远程文件还原到首次修改前的内容（entryId 来自 staging_list）。仅限用户明确要求的还原；外部修改冲突时如实报告冲突，不静默覆盖。不能接受（清除）仍有变更的暂存条目。",
 		promptSnippet: "还原某个暂存条目",
 		promptGuidelines: [
 			"还原是远程写操作，Agent 模式需用户审批；仅当用户明确要求还原某文件时才调用。",
 			"还原遇到「远程文件已被外部修改」冲突时如实报告，不得声称已还原。",
-			"你只能查看、diff、还原暂存条目；接受（清除）暂存由用户在文件暂存区面板操作，调用会被拒绝。",
+			"你只能查看、diff、还原暂存条目、主动暂存（staging_add）或清理无变更条目（staging_clear）；接受（清除）仍有变更的暂存由用户在文件暂存区面板操作，调用会被拒绝。",
 		],
 		parameters: Type.Object({
 			entryId: Type.String({ description: "暂存条目 ID（staging_list 返回的 entryId）" }),
@@ -1188,6 +1218,53 @@ export default function (pi: ExtensionAPI) {
 			return await rustAction(ctx, toolCallId, {
 				action: "staging_restore",
 				entryId: params.entryId,
+				projectId: sessionCtx.projectId,
+				sessionId: sessionCtx.sessionId,
+			});
+		},
+	});
+
+	pi.registerTool({
+		name: "staging_add",
+		label: "主动暂存文件/目录",
+		description:
+			"把远端文件或目录暂存到当前会话暂存区（保存完整原始快照，可 diff / 还原）。目录会递归暂存全部文件（跳过符号链接）。用于应用更新补丁、批量修改前的主动备份。",
+		promptSnippet: "暂存文件/目录作为修改前备份",
+		promptGuidelines: [
+			"应用更新补丁、批量修改远程文件前，先用 staging_add 把目标文件或目录暂存起来，作为可还原的备份。",
+			"目录递归暂存全部文件（上限 2000 个）；已暂存过的路径不会重复存快照（复用原条目）。",
+			"staging_add 只读远端内容并保存到本地暂存区，不修改远程文件，无需审批。",
+		],
+		parameters: Type.Object({
+			serverId: Type.String({ description: "服务器 ID（先调用 list_servers 获取）" }),
+			remotePath: Type.String({ description: "要暂存的远端文件或目录绝对路径（/ 开头）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, {
+				action: "staging_add",
+				serverId: params.serverId,
+				remotePath: params.remotePath,
+				projectId: sessionCtx.projectId,
+				sessionId: sessionCtx.sessionId,
+			});
+		},
+	});
+
+	pi.registerTool({
+		name: "staging_clear",
+		label: "清理无变更暂存条目",
+		description:
+			"清理当前会话暂存区中「远端现状与首次快照完全一致」的条目（备份已冗余，自动接受并清除本地记录，不触碰远程内容）；仍有变更或检查失败的条目保留。适合批量修改后清理无用的备份。",
+		promptSnippet: "清理暂存区中无变更的条目",
+		promptGuidelines: [
+			"staging_clear 只清除「远端文件与首次快照完全一致」的条目（此时备份已冗余）；有变更的条目会保留并如实报告。",
+			"不能清除仍有变更的暂存条目——那需要用户在文件暂存区面板「接受」操作。",
+			"清理后暂存列表会更新；如需还原仍然完整可用的备份不受影响。",
+		],
+		parameters: Type.Object({}),
+		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, {
+				action: "staging_clear",
 				projectId: sessionCtx.projectId,
 				sessionId: sessionCtx.sessionId,
 			});

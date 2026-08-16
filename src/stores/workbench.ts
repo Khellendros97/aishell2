@@ -65,7 +65,7 @@ export interface AiHandle {
 }
 
 const TYPE_ICONS: Record<string, IconName> = {
-  editor: 'file', sftp: 'globe', terminal: 'terminal', 'remote-staging': 'history', 'staging-diff': 'diff',
+  editor: 'file', sftp: 'folderOpen', terminal: 'terminal', 'remote-staging': 'history', 'staging-diff': 'diff',
   browser: 'globe',
 };
 

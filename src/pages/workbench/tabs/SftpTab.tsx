@@ -47,6 +47,7 @@ import {
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
 import { revealLocalPath } from '../sidebar/ExplorerPanel';
+import { hideStagingProgress, showStagingProgress } from './staging-progress';
 
 interface SftpEls {
   body: HTMLElement;
@@ -905,20 +906,34 @@ function startRemoteRename(st: SftpTabState, it: RemoteEntry, row: HTMLElement):
   input.addEventListener('click', (e) => e.stopPropagation());
 }
 
-/** 暂存远端文件到 AI 会话暂存区(供后续 diff / 审批使用) */
-async function stageRemoteFile(st: SftpTabState, entry: RemoteEntry): Promise<void> {
+/** 暂存远端文件/目录到 AI 会话暂存区（目录递归暂存全部文件；供 diff / 审批 / 修改前备份使用） */
+async function stageRemoteItems(st: SftpTabState, items: RemoteEntry[]): Promise<void> {
   const projectId = useWorkbench.getState().project?.id;
   const sessionId = wbHandles.ai?.currentSessionId?.();
   if (!projectId || !sessionId) {
-    toast('AI 会话尚未加载，无法暂存文件', 'error');
+    toast('AI 会话尚未加载，无法暂存', 'error');
     return;
   }
+  // 目录递归暂存较慢：弹出右下角进度框（后端按文件发 staging:progress 事件驱动内容）
+  const hasDir = items.some((e) => e.isDir);
+  if (hasDir) showStagingProgress('正在暂存目录');
+  let total = 0;
   try {
-    await stagingAdd(projectId, sessionId, st.serverId, entry.path);
-    toast(`已暂存：${entry.name}`, 'success');
+    for (const entry of items) {
+      const staged = await stagingAdd(projectId, sessionId, st.serverId, entry.path);
+      total += staged.length;
+    }
+    toast(
+      items.length === 1
+        ? `已暂存 ${total} 个文件（${items[0].name}）`
+        : `已暂存 ${items.length} 项（共 ${total} 个文件）`,
+      'success',
+    );
     wbEvents.emit('staging-changed');
   } catch (err) {
     toast(String(err), 'error');
+  } finally {
+    if (hasDir) hideStagingProgress();
   }
 }
 
@@ -942,9 +957,9 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
     },
     'sep',
     {
-      label: '暂存', iconName: 'history', disabled: multi || first.isDir,
-      disabledTip: multi ? '暂存仅支持单个文件' : (first.isDir ? '目录无法暂存' : undefined),
-      action: () => void stageRemoteFile(st, first),
+      label: '暂存', iconName: 'history',
+      disabledTip: undefined,
+      action: () => void stageRemoteItems(st, items),
     },
     {
       label: '复制', iconName: 'copy',

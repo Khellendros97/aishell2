@@ -426,3 +426,22 @@ export interface RestoreOutcome {
   conflict: RestoreConflict | null;
   entry: StagedFile | null;
 }
+
+/** staging_clear 结果：removed 为「无变更已清除」的条目；kept 为仍有变更/检查失败而保留的条目 */
+export interface StagingClearOutcome {
+  removed: StagedFile[];
+  kept: StagedFile[];
+  /** 检查失败的条目说明（对应条目保留在 kept 中） */
+  errors: string[];
+}
+
+/** 递归暂存目录 / 清理的进度（staging:progress 事件；与 staging.rs StagingProgress serde camelCase 对齐） */
+export interface StagingProgress {
+  projectId: string;
+  sessionId: string;
+  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目 */
+  phase: 'walk' | 'stage' | 'clear';
+  done: number;
+  total: number;
+  currentPath: string;
+}

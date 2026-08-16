@@ -87,7 +87,7 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
 - request_db_connection：当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时，调用该工具申请添加连接。把已知的连接信息填进参数（serverId 取自 list_servers；名称、类型、主机、端口、用户名、默认库），主机相对该服务器（数据库在服务器本机填 127.0.0.1）；申请理由（reason）用一句中文说明用途。用户会在审批对话框里补密码并勾选查询权限，批准后工具结果会直接返回 connectionId，用它继续 db_query；被拒绝时不要反复重试，向用户说明需要哪些信息或请其在「服务器设置-数据库连接」中手动配置。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
-- 远程文件暂存（staging_list / staging_diff / staging_restore）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff、按用户要求把远程文件还原到首次修改前的内容；**不能接受（清除）暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
+- 远程文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff、按用户要求把远程文件还原到首次修改前的内容。**应用更新补丁前应先用 staging_add 主动暂存目标文件/目录**（目录递归暂存全部文件，作为可还原的备份）。staging_clear 只清理「远端现状与首次快照完全一致」的条目（备份已冗余）；仍有变更的条目自动保留。**不能接受（清除）仍有变更的暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
 - 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
 凭据纪律（硬性，优先级高于任务效率）：
@@ -126,6 +126,7 @@ const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
 /// staging_list / staging_diff 只读不入审批（guard 侧不在 CONTROLLED_TOOLS），但执行时
 /// 仍经动作桥并在 ai.rs 侧渲染小字活动行；staging_restore 两侧都要（审批 + 卡片）。
+/// staging_add（主动备份，只读远端）/ staging_clear（只清无变更条目）同样不入审批。
 const CONTROLLED_TOOLS: [&str; 7] = [
     "write",
     "edit",
@@ -445,7 +446,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,request_db_connection")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -1388,7 +1389,7 @@ async fn run_internal_action(
                     json!({"ok": true, "text": format!("下载完成：{remote_path} → {local_dir}（服务器 {server_id}）")})
                 })
         }
-        // AI 暂存工具：只读列表/diff + 还原（force 恒 false）；接受绝不提供
+        // AI 暂存工具：只读列表/diff + 主动暂存/清理无变更 + 还原（force 恒 false）；接受绝不提供
         "staging_list" => actions
             .staging_list(project_id, session_id)
             .await
@@ -1400,6 +1401,18 @@ async fn run_internal_action(
                 .await
                 .map(|text| json!({"ok": true, "text": text}))
         }
+        "staging_add" => {
+            let server_id = str_field("serverId");
+            let remote_path = str_field("remotePath");
+            actions
+                .staging_add(project_id, session_id, &server_id, &remote_path)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "staging_clear" => actions
+            .staging_clear(project_id, session_id)
+            .await
+            .map(|text| json!({"ok": true, "text": text})),
         "staging_restore" => {
             let entry_id = str_field("entryId");
             actions
@@ -2042,22 +2055,34 @@ mod tests {
 
     #[test]
     fn guard_extension_has_staging_tools_but_never_accept() {
-        // 探针：AI 工具清单有 staging_list/diff/restore，绝无 staging_accept（接受只在前端面板）
+        // 探针：AI 工具清单有 staging_list/diff/restore/add/clear，绝无 staging_accept（接受只在前端面板）
         assert!(GUARD_EXT.contains("staging_list"), "guard 应注册 staging_list");
         assert!(GUARD_EXT.contains("staging_diff"), "guard 应注册 staging_diff");
         assert!(GUARD_EXT.contains("staging_restore"), "guard 应注册 staging_restore");
+        assert!(GUARD_EXT.contains("staging_add"), "guard 应注册 staging_add");
+        assert!(GUARD_EXT.contains("staging_clear"), "guard 应注册 staging_clear");
         // 探针核心：AI 工具清单/受控列表绝无 staging_accept（引号形态 = 工具/列表注册；
         // 注释里的裸词说明文字不算注册）
         assert!(!GUARD_EXT.contains("\"staging_accept\""), "guard 绝不可注册 staging_accept");
         assert!(!GUARD_EXT.contains("staging_accept\"}"), "guard 绝不可出现 staging_accept 工具定义");
-        // 还原属受控工具（逐调用审批）；只读列表/diff 不入审批
+        // 还原属受控工具（逐调用审批）；只读列表/diff、主动暂存/清理无变更不入审批
         assert!(GUARD_EXT.contains("\"staging_restore\""), "staging_restore 应受控审批");
+        let controlled_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const CONTROLLED_TOOLS"))
+            .unwrap_or_default();
+        assert!(
+            !controlled_line.contains("staging_add") && !controlled_line.contains("staging_clear"),
+            "staging_add / staging_clear 不应受控审批"
+        );
         // suggest 模式不提供受控远程工具（工具集变量中无 staging_*）
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
         assert!(!tools_suggest.contains("staging_"), "suggest 工具集不应含暂存工具");
-        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore");
+        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear");
         assert!(tools_agent.contains("staging_list"));
         assert!(tools_agent.contains("staging_restore"));
+        assert!(tools_agent.contains("staging_add"));
+        assert!(tools_agent.contains("staging_clear"));
         // ai.rs 侧动作卡列表：staging_restore 有卡片，但接受类动作绝不入列
         assert!(CONTROLLED_TOOLS.contains(&"staging_restore"));
         assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("staging_accept")));

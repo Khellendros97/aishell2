@@ -18,6 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# 内置浏览器 localhtml 自定义协议（本地 HTML 文件加载）：协议响应类型 + 路径百分号解码
+http = "1"
+percent-encoding = "2"
 # devtools: release 安装版也保留 F12 开发者工具，便于现场排查（如 pi 资源布局问题）
 # unstable: 主窗口内嵌子 webview（内置浏览器面板）所需 —— tauri 2.11 的
 #   WebviewBuilder / Window::add_child 均受该 feature 门控

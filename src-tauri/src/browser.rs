@@ -132,6 +132,7 @@ impl BrowserManager {
 
         let mgr_load = Arc::clone(self);
         let mgr_title = Arc::clone(self);
+        let mgr_nav = Arc::clone(self);
         let builder = WebviewBuilder::new(
             BROWSER_LABEL,
             WebviewUrl::External(Url::parse("about:blank").map_err(|e| format!("初始地址非法: {e}"))?),
@@ -139,6 +140,20 @@ impl BrowserManager {
         .initialization_script(INSPECTOR_JS)
         // 保留 WebView2 原生拖放行为（拖入 HTML 文件可直接打开），不走 tauri 的 OLE 拦截
         .disable_drag_drop_handler()
+        // 页面内链接 / JS 跳转到「空 host 的 file://」地址时，wry ipc 处理器会 panic
+        //（http::Uri 拒绝空 authority，见 LOCAL_HTML_SCHEME 注释）—— 拦截并改写为 localhtml 再导航
+        .on_navigation(move |url| {
+            if url.scheme() == "file" && url.host_str().is_none() {
+                let decoded = percent_decode(url.path()).trim_start_matches('/').to_string();
+                if let Ok(rewritten) = local_file_url(Path::new(&decoded)) {
+                    if let Some(wv) = mgr_nav.inner.lock().unwrap().webview.clone() {
+                        let _ = wv.navigate(rewritten);
+                    }
+                }
+                return false;
+            }
+            true
+        })
         .on_page_load(move |_wv, payload| {
             let url = payload.url().to_string();
             let finished = matches!(payload.event(), PageLoadEvent::Finished);
@@ -151,7 +166,7 @@ impl BrowserManager {
                 (inner.inspect, inner.webview.clone())
             };
             if let Some(a) = app_handle() {
-                let _ = a.emit("browser:event", json!({ "kind": "url", "url": url }));
+                let _ = a.emit("browser:event", json!({ "kind": "url", "url": display_url(&url) }));
             }
             if finished {
                 mgr_load.load_tx.send_if_modified(|v| {
@@ -224,7 +239,7 @@ impl BrowserManager {
             inner.url = url.to_string();
             inner.console.clear();
         }
-        Ok(url.to_string())
+        Ok(display_url(url.as_str()))
     }
 
     /// AI 动作 browser_open：后台导航（不切面板、不抢焦点），等页面加载完成（≤15s）。
@@ -243,9 +258,12 @@ impl BrowserManager {
             inner.console.clear();
         }
         if let Some(a) = app_handle() {
-            let _ = a.emit("browser:event", json!({ "kind": "url", "url": url.as_str() }));
+            let _ = a.emit("browser:event", json!({ "kind": "url", "url": display_url(url.as_str()) }));
             if shown {
-                let _ = a.emit("browser:event", json!({ "kind": "ai-navigate", "url": url.as_str() }));
+                let _ = a.emit(
+                    "browser:event",
+                    json!({ "kind": "ai-navigate", "url": display_url(url.as_str()) }),
+                );
             }
         }
         // 等待加载完成（watch 计数增长）；超时不报错，返回当前状态并注明
@@ -266,7 +284,8 @@ impl BrowserManager {
             (i.url.clone(), i.title.clone())
         };
         Ok(format!(
-            "已打开: {url_s}\n页面标题: {title}\n加载状态: {}",
+            "已打开: {}\n页面标题: {title}\n加载状态: {}",
+            display_url(&url_s),
             if loaded { "完成" } else { "等待超时（页面可能仍在加载），可继续读取内容" }
         ))
     }
@@ -305,6 +324,7 @@ impl BrowserManager {
             return Err(err.to_string());
         }
         let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
+        let url = display_url(url);
         let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
         if let Some(html) = v.get("html").and_then(|x| x.as_str()) {
             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
@@ -419,6 +439,10 @@ fn handle_page_message(mgr: &BrowserManager, msg: &str) {
             if v.get("ts").and_then(|x| x.as_u64()).is_none() {
                 v["ts"] = json!(now_ms());
             }
+            // localhtml 内部形态还原为 file:/// 展示（与地址栏/事件一致）
+            if let Some(u) = v.get("url").and_then(|x| x.as_str()) {
+                v["url"] = json!(display_url(u));
+            }
             if let Some(a) = app_handle() {
                 let _ = a.emit("browser:event", v);
             }
@@ -429,8 +453,110 @@ fn handle_page_message(mgr: &BrowserManager, msg: &str) {
 
 /* ---------------- 地址归一化（纯函数，单测覆盖） ---------------- */
 
-/// 地址栏/AI 工具输入归一化：本地路径（盘符 / UNC）→ file:// URL；
-/// 含 scheme 原样解析；无 scheme 补 https://。
+/// 本地 HTML 的自定义协议。wry 在 Windows 上把它改写为 `http://localhtml.localhost/<path>`
+/// 加载（页面源 URL 因此是 http 形态，wry 的 ipc 处理器可解析），请求经 wry 还原为
+/// `localhtml://localhost/<path>` 交给 [`serve_local_html`]。
+/// 为什么不用 file://：空 host 的 `file:///C:/…` 会让 wry 的 ipc 处理器在
+/// `Request::builder().uri(页面源URL)` 处 panic（http::Uri 拒绝空 authority）——本地页
+/// postMessage（检查器选中元素 / console 钩子）即触发整进程崩溃；而 `file://localhost` 会被
+/// url crate / Chromium 按 WHATWG 规范归一为空 host，同样崩。自定义协议不受该归一影响。
+const LOCAL_HTML_SCHEME: &str = "localhtml";
+const LOCAL_HTML_HTTP_PREFIX: &str = "http://localhtml.localhost/";
+
+/// 本地文件 → localhtml 协议 URL（内部 http 形态，路径由 Url::parse 自动百分号编码）。
+fn local_file_url(path: &Path) -> Result<Url, String> {
+    if !path.exists() {
+        return Err(format!("本地路径不存在: {}", path.display()));
+    }
+    let p = path.to_string_lossy().replace('\\', "/");
+    Url::parse(&format!("{LOCAL_HTML_HTTP_PREFIX}{p}"))
+        .map_err(|_| format!("无法把路径转为浏览器地址: {}", path.display()))
+}
+
+/// 百分号解码（URL 路径段；无效转义按 lossy 处理）。
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
+}
+
+/// 对外展示形态：localhtml 协议（内部 http 形态）还原为 `file:///` + 解码路径，
+/// 供地址栏 / 事件 / 元素引用 / AI 结果展示；重新导航时 normalize_input 会再转回。
+fn display_url(url: &str) -> String {
+    for prefix in [LOCAL_HTML_HTTP_PREFIX, "localhtml://localhost/"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return format!("file:///{}", percent_decode(rest));
+        }
+    }
+    url.to_string()
+}
+
+/// localhtml 协议响应（lib.rs 注册）：还原后的 URI 形如 `localhtml://localhost/C:/x/page.html`，
+/// 百分号解码路径 → 读文件 → 按扩展名给 Content-Type；缺失/读失败返回 404 页。
+pub fn serve_local_html(request: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
+    let not_found = |msg: &str| {
+        http::Response::builder()
+            .status(404)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(
+                format!(
+                    "<!DOCTYPE html><meta charset=\"utf-8\"><h3>无法打开本地文件</h3><p>{msg}</p>"
+                )
+                .into_bytes(),
+            )
+            .unwrap_or_else(|_| http::Response::new(Vec::new()))
+    };
+    let uri = request.uri().to_string();
+    let decoded = uri
+        .strip_prefix(&format!("{LOCAL_HTML_SCHEME}://"))
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, p)| percent_decode(p.split('?').next().unwrap_or(p)))
+        .unwrap_or_default();
+    if decoded.is_empty() {
+        return not_found("地址缺少文件路径");
+    }
+    let path = Path::new(&decoded);
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return not_found(&format!("{decoded}：{e}")),
+    };
+    http::Response::builder()
+        .status(200)
+        .header("Content-Type", mime_for(path))
+        .body(bytes)
+        .unwrap_or_else(|_| http::Response::new(Vec::new()))
+}
+
+/// 扩展名 → Content-Type（文本类带 charset，二进制不带）。
+fn mime_for(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("txt" | "md") => "text/plain; charset=utf-8",
+        Some("xml") => "application/xml; charset=utf-8",
+        Some("svg") => "image/svg+xml; charset=utf-8",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("pdf") => "application/pdf",
+        Some("wasm") => "application/wasm",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("mp3") => "audio/mpeg",
+        Some("mp4") => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 地址栏/AI 工具输入归一化：本地盘符路径 → localhtml 协议；UNC → file://（已有 host，
+/// wry ipc 可解析）；含 scheme 原样解析（file:/// 空 host 转 localhtml）；无 scheme 补 https://。
 pub fn normalize_input(input: &str) -> Result<Url, String> {
     let s = input.trim();
     if s.is_empty() {
@@ -442,7 +568,10 @@ pub fn normalize_input(input: &str) -> Result<Url, String> {
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/');
     let unc_path = s.starts_with("\\\\");
-    if drive_path || unc_path {
+    if drive_path {
+        return local_file_url(Path::new(s));
+    }
+    if unc_path {
         let p = Path::new(s);
         if !p.exists() {
             return Err(format!("本地路径不存在: {s}"));
@@ -450,7 +579,19 @@ pub fn normalize_input(input: &str) -> Result<Url, String> {
         return Url::from_file_path(p).map_err(|_| format!("无法把路径转为文件地址: {s}"));
     }
     if s.contains("://") || s.starts_with("about:") {
-        return Url::parse(s).map_err(|_| format!("无法解析地址: {s}"));
+        let url = Url::parse(s).map_err(|_| format!("无法解析地址: {s}"))?;
+        // file:///（空 host）→ localhtml（wry ipc 崩溃规避）；file://server/（UNC）保持原样
+        if url.scheme() == "file" && url.host_str().is_none() {
+            return local_file_url(Path::new(&percent_decode(url.path()).trim_start_matches('/')));
+        }
+        // localhtml://localhost/ 原始协议形态 → 内部 http 形态
+        if url.scheme() == LOCAL_HTML_SCHEME && url.host_str() == Some("localhost") {
+            let p = percent_decode(url.path()).trim_start_matches('/').to_string();
+            if let Ok(u) = Url::parse(&format!("{LOCAL_HTML_HTTP_PREFIX}{p}")) {
+                return Ok(u);
+            }
+        }
+        return Ok(url);
     }
     Url::parse(&format!("https://{s}")).map_err(|_| format!("无法解析地址: {s}"))
 }
@@ -484,7 +625,7 @@ pub async fn browser_ensure(mgr: State<'_, Arc<BrowserManager>>) -> Result<Brows
     mgr.ensure().await?;
     let i = mgr.inner.lock().unwrap();
     Ok(BrowserState {
-        url: i.url.clone(),
+        url: display_url(&i.url),
         title: i.title.clone(),
         inspect: i.inspect,
     })
@@ -718,16 +859,92 @@ mod tests {
     }
 
     #[test]
-    fn normalize_local_file_to_file_url() {
+    fn wry_ipc_uri_parse_requires_host() {
+        // 回归：wry 的 ipc 处理器对每条 web message 做 `Request::builder().uri(页面源URL).unwrap()`。
+        // 空 host 的 file:/// 会被 http::Uri 拒绝（绝对 URI 必须非空 authority）→ panic 崩溃；
+        // localhtml 协议的内部 http 形态（页面实际源 URL）必须可解析。
+        let err = "file:///C:/x/page.html".parse::<http::Uri>();
+        assert!(err.is_err(), "空 host 的 file:// 应解析失败: {err:?}");
+        let ok = "http://localhtml.localhost/C:/x/page.html".parse::<http::Uri>();
+        assert!(ok.is_ok(), "localhtml 内部形态应可解析: {ok:?}");
+        // 常见页面源（http/https/UNC file 带 host/自定义 scheme 带 host）都安全
+        for s in [
+            "https://example.com/a",
+            "file://server/share/x.html",
+            "tauri://localhost/main",
+        ] {
+            assert!(s.parse::<http::Uri>().is_ok(), "应可解析: {s}");
+        }
+    }
+
+    #[test]
+    fn normalize_local_file_to_localhtml_url() {
         let dir = std::env::temp_dir().join(format!("aishell-browser-test-{}", now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("page.html");
         std::fs::write(&file, "<html></html>").unwrap();
         let url = normalize_input(file.to_string_lossy().as_ref()).unwrap();
-        assert_eq!(url.scheme(), "file");
+        // 走 localhtml 协议（http 内部形态）：页面源 URL 可被 wry ipc 处理器解析，postMessage 不崩
+        assert_eq!(url.scheme(), "http", "本地文件应走 localhtml 协议: {url}");
+        assert_eq!(url.host_str(), Some("localhtml.localhost"));
         assert!(url.path().ends_with("page.html"));
-        let _ = std::fs::remove_file(&file);
-        let _ = std::fs::remove_dir(&dir);
+        // 粘贴的 file:/// 形态（空 host）同样转 localhtml；路径不存在时给中文报错
+        let pasted = normalize_input(format!("file:///{}", file.to_string_lossy().replace('\\', "/")).as_str())
+            .unwrap();
+        assert_eq!(pasted.host_str(), Some("localhtml.localhost"));
+        assert!(pasted.path().ends_with("page.html"));
+        let missing = normalize_input("file:///C:/definitely/not/exist.html").unwrap_err();
+        assert!(missing.contains("不存在"), "unexpected: {missing}");
+        // UNC 已有 host（file://server/…），wry ipc 可解析，保持原样（存在性由实际访问决定）
+        let unc = normalize_input("file://server/share/page.html").unwrap();
+        assert_eq!(unc.scheme(), "file");
+        assert_eq!(unc.host_str(), Some("server"));
+        // 路径含空格/中文：Url::parse 自动百分号编码
+        let sp = dir.join("my page 测试.html");
+        std::fs::write(&sp, "<html></html>").unwrap();
+        let url2 = normalize_input(sp.to_string_lossy().as_ref()).unwrap();
+        assert!(url2.as_str().contains("%20"), "空格应被编码: {url2}");
+        assert!(url2.as_str().contains("%E6%B5%8B%E8%AF%95"), "中文应被编码: {url2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_url_roundtrips_localhtml() {
+        assert_eq!(
+            display_url("http://localhtml.localhost/C:/My%20Docs/%E9%A1%B5.html"),
+            "file:///C:/My Docs/页.html"
+        );
+        assert_eq!(
+            display_url("localhtml://localhost/C:/x/a.html"),
+            "file:///C:/x/a.html"
+        );
+        assert_eq!(display_url("https://example.com/a"), "https://example.com/a");
+        assert_eq!(display_url("file://server/share/x.html"), "file://server/share/x.html");
+    }
+
+    #[test]
+    fn serve_local_html_reads_file_and_404s() {
+        let dir = std::env::temp_dir().join(format!("aishell-serve-test-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("page.html");
+        std::fs::write(&file, "<html><body>hi</body></html>").unwrap();
+        let uri = format!("localhtml://localhost/{}", file.to_string_lossy().replace('\\', "/"));
+        let req = http::Request::builder().uri(uri).body(Vec::new()).unwrap();
+        let resp = serve_local_html(req);
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.body(), b"<html><body>hi</body></html>");
+        assert_eq!(
+            resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        // 缺失文件 → 404
+        let req2 = http::Request::builder()
+            .uri(format!("localhtml://localhost/{}/nope.html", dir.to_string_lossy().replace('\\', "/")))
+            .body(Vec::new())
+            .unwrap();
+        let resp2 = serve_local_html(req2);
+        assert_eq!(resp2.status(), 404);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
