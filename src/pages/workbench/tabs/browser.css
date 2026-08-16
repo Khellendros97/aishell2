@@ -1,0 +1,70 @@
+/* 内置浏览器标签页(无 .proto 对照,全新功能):工具栏 + 占位区(原生子 webview 覆盖其上)。
+   引擎见 ./browser-engine.ts,薄壳见 ./BrowserTab.tsx。 */
+
+.browser-tab-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+}
+
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.browser-address {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-0);
+  font-size: 13px;
+}
+
+.browser-address:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 原生 webview 覆盖区:未导航时显示提示,导航后被 webview 盖住 */
+.browser-view {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-1);
+}
+
+.browser-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-2);
+  font-size: 13px;
+  text-align: center;
+  line-height: 1.8;
+  padding: 0 24px;
+}
+
+.browser-hint-icon .ic {
+  width: 32px;
+  height: 32px;
+  opacity: 0.6;
+}
+
+.browser-inspect-btn.active {
+  color: var(--accent);
+  background: var(--accent-dim);
+}

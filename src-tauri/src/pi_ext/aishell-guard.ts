@@ -34,6 +34,9 @@
  * 会话级文件暂存（staging_list / staging_diff / staging_restore）：只读列表/diff + 还原
  * （agent 下还原逐调用审批），**不接受/清除暂存条目**（staging_accept 只在前端面板，绝不注册为
  * AI 工具）；project/session 不接受任意参数——后端从当前 pi 进程 key 推导，扩展仅携带会话身份环境变量。
+ * 内置浏览器四件套（browser_open/browser_read/browser_console/browser_screenshot）：只读、
+ * 免审批，三档模式都可用（不进 AI_ONLY_TOOLS）；经 AISHELL_ACTION 桥交给 Rust browser.rs 的
+ * 共享单实例 webview（后台打开不切面板不抢焦点；截图存 <workspace>/.aishell/tmp/screenshot）。
  * 路径处理：path.resolve 归一（相对路径、`..`、绝对路径）后统一小写做前缀比较
  * （Windows 大小写不敏感）；8.3 短文件名等无法归一的形式会因前缀失配被拒（安全方向）。
  */
@@ -452,6 +455,29 @@ export default function (pi: ExtensionAPI) {
 				if (!(typeof input.entryId === "string" && input.entryId.trim())) {
 					return { block: true, reason: "staging_restore: 缺少 entryId。" };
 				}
+				return undefined;
+			}
+			case "browser_open": {
+				// 内置浏览器（只读、免审批、三档模式可用）：后台打开指定 URL/本地 HTML
+				if (!(typeof input.url === "string" && input.url.trim())) {
+					return { block: true, reason: "browser_open: 缺少 url（网页地址或本地 HTML 文件路径）。" };
+				}
+				return undefined;
+			}
+			case "browser_read": {
+				if (input.selector !== undefined && typeof input.selector !== "string") {
+					return { block: true, reason: "browser_read: selector 必须是字符串。" };
+				}
+				return undefined;
+			}
+			case "browser_console": {
+				if (input.limit !== undefined
+					&& (!Number.isInteger(input.limit) || (input.limit as number) < 1 || (input.limit as number) > 500)) {
+					return { block: true, reason: "browser_console: limit 必须是 1–500 之间的整数。" };
+				}
+				return undefined;
+			}
+			case "browser_screenshot": {
 				return undefined;
 			}
 			case "request_agent_mode":
@@ -1017,6 +1043,80 @@ export default function (pi: ExtensionAPI) {
 				remotePath: params.remotePath,
 				localDir: params.localDir,
 			});
+		},
+	});
+
+	/* ---------- 内置浏览器（只读、免审批、三档模式可用；后台打开不打扰用户） ---------- */
+	pi.registerTool({
+		name: "browser_open",
+		label: "打开网页",
+		description:
+			"用内置浏览器在后台打开指定 URL（或本地 HTML 文件路径），等待页面加载完成后返回地址与标题。不切换面板、不抢占用户焦点；用户正停留在浏览器面板时会收到提示。之后可用 browser_read / browser_console / browser_screenshot 读取该页面。",
+		promptSnippet: "用内置浏览器打开网页",
+		promptGuidelines: [
+			"需要查阅网页文档、接口说明或复现用户描述的页面问题时，先用 browser_open 打开，再用 browser_read 读取内容。",
+			"本地 HTML 文件可直接传绝对路径（如 D:\\site\\index.html）。",
+		],
+		parameters: Type.Object({
+			url: Type.String({ description: "网页地址（无协议默认 https）或本地 HTML 文件绝对路径" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, { action: "browser_open", url: params.url });
+		},
+	});
+
+	pi.registerTool({
+		name: "browser_read",
+		label: "读取浏览器页面",
+		description:
+			"读取内置浏览器当前页面的正文文本（默认截取前 10000 字符，附页面标题与地址）。可选 selector（CSS 选择器）返回首个匹配元素的完整 HTML——用户对话中的 @browser:{#id 或标签名} 引用给出的名称可直接用作 selector（如 #login、button），便于定位到具体元素。",
+		promptSnippet: "读取浏览器当前页面内容",
+		promptGuidelines: [
+			"查整页内容不带 selector；用户引用了页面元素（@browser: 标签）时，把元素名称作为 selector 读取该元素的完整 HTML 再分析。",
+			"页面大量内容在前 10000 字符之外时，可用 selector 按区域（如 main、#content）分段读取。",
+		],
+		parameters: Type.Object({
+			selector: Type.Optional(Type.String({ description: "CSS 选择器；给定时返回首个匹配元素的 outerHTML 而非整页文本" })),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			const payload: Record<string, unknown> = { action: "browser_read" };
+			if (typeof params.selector === "string" && params.selector.trim()) payload.selector = params.selector.trim();
+			return await rustAction(ctx, toolCallId, payload);
+		},
+	});
+
+	pi.registerTool({
+		name: "browser_console",
+		label: "读取浏览器日志",
+		description:
+			"读取内置浏览器当前页面最近捕获的 console 输出（log/info/warn/error 与全局未捕获错误；页面加载时自动开始捕获，导航后清空）。默认返回最近 200 条。",
+		promptSnippet: "读取浏览器 console 日志",
+		promptGuidelines: [
+			"排查页面行为异常（脚本报错、接口失败提示）时，结合 browser_read 与 browser_console 一起看。",
+		],
+		parameters: Type.Object({
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, description: "返回最近多少条，默认 200" })),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			const payload: Record<string, unknown> = { action: "browser_console" };
+			if (params.limit !== undefined) payload.limit = params.limit;
+			return await rustAction(ctx, toolCallId, payload);
+		},
+	});
+
+	pi.registerTool({
+		name: "browser_screenshot",
+		label: "浏览器截图",
+		description:
+			"对内置浏览器当前页面截图（整页视口 PNG），保存到项目目录 <workspace>/.aishell/tmp/screenshot/ 下（最多保留最新 20 张），返回截图文件的绝对路径。截图是给用户看页面现状用的，你看不到图片内容，需要结合 browser_read 分析。",
+		promptSnippet: "截取浏览器当前页面",
+		promptGuidelines: [
+			"向用户报告页面问题（布局错乱、报错页面等）时截图留证，并在回复中给出截图路径。",
+			"你看不到截图内容；分析页面内容请用 browser_read，截图仅供用户核对。",
+		],
+		parameters: Type.Object({}),
+		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, { action: "browser_screenshot" });
 		},
 	});
 

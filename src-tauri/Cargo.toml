@@ -19,7 +19,21 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # devtools: release 安装版也保留 F12 开发者工具，便于现场排查（如 pi 资源布局问题）
-tauri = { version = "2", features = ["devtools"] }
+# unstable: 主窗口内嵌子 webview（内置浏览器面板）所需 —— tauri 2.11 的
+#   WebviewBuilder / Window::add_child 均受该 feature 门控
+# default-features=false 剔除 common-controls-v6：该 feature 只切换 muda 内部错误弹窗的
+# TaskDialog 实现（v6 独占符号）；应用二进制的 comctl32 v6 清单由 tauri-build 无条件嵌入、
+# 外观不受影响。但启用后 lib 单测二进制（无嵌入清单）会因加载 v5 comctl32 报
+# STATUS_ENTRYPOINT_NOT_FOUND，故必须关闭。
+tauri = { version = "2", default-features = false, features = [
+  "devtools",
+  "unstable",
+  "wry",
+  "compression",
+  "dynamic-acl",
+  "x11",
+  "dbus",
+] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

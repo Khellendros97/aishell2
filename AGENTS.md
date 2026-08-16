@@ -31,6 +31,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 7. **图标一律走 `src/icons.ts`,禁止 emoji**:React JSX 里用 `src/shared/Icon.tsx` 的 `<Icon name="..." />`,命令式/模板串场景用 `icon()` 字符串版;新图标往 `PATHS` 里加,不要内联 SVG 到业务文件。
 8. **DOM 行闭包引用的树节点对象不可无差别替换**(explorer 教训:轮询刷新曾整体重建 children 数组,行点击把状态写进孤儿节点导致展开失效);命令式引擎里变更时按 key reconcile 复用未变节点,React 树里列表必须 keyed 正确(节点路径作 key)。
 9. **工作台 keep-alive 不变量**:所有标签 pane 常驻挂载、`active` 只切显隐(App.tsx 离开路由也只 display:none)——终端/SSH/AI 会话靠这个跨导航存活;后端资源回收(term_close 等)只能发生在组件卸载(useEffect return)。给标签组件写 effect 时依赖用 `tab.id`,不要用 `tab` 对象(store setTabTitle 会换对象引用,作依赖会导致改名即重建会话)。
+10. **内置浏览器(tauri `unstable` feature 的坑)**:子 webview(`WebviewBuilder`/`Window::add_child`)需 tauri `unstable` feature,且 Windows 上**只能在 async 命令里创建 webview**(同步命令会死锁);启用后必须同时 `default-features = false` 剔除 `common-controls-v6`——否则 lib 单测二进制(无嵌入清单)加载 v5 comctl32 时报 `STATUS_ENTRYPOINT_NOT_FOUND`(缺 `TaskDialogIndirect`),应用二进制不受影响(v6 清单由 tauri-build 无条件嵌入)。浏览器模块见 `browser.rs`,新工具走 guard 扩展 `AISHELL_ACTION` 桥 + `run_internal_action` 分发。
 
 ## 架构要点
 

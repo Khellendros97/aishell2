@@ -154,8 +154,14 @@ impl McpService {
 
 impl McpCore {
     pub(crate) fn new(store: Arc<Store>, ssh: Arc<SshManager>, staging: Arc<RemoteStaging>) -> Self {
-        // 先克隆再构造（结构体字面量按书写顺序求值，store/ssh 移动后不能再借用）
-        let actions = Arc::new(AiActions::new(Arc::clone(&store), Arc::clone(&ssh), staging));
+        // 先克隆再构造（结构体字面量按书写顺序求值，store/ssh 移动后不能再借用）。
+        // 浏览器动作不面向 MCP 设备开放：这里挂独立空管理器（无 webview，browser_* 一律报「尚未创建」）
+        let actions = Arc::new(AiActions::new(
+            Arc::clone(&store),
+            Arc::clone(&ssh),
+            staging,
+            Arc::new(crate::browser::BrowserManager::new()),
+        ));
         McpCore {
             store,
             ssh,

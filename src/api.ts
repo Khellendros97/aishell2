@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -226,6 +226,28 @@ export const aiRespondDbRequest = (key: string, requestId: string, response: { a
   call<void>('ai_respond_db_request', { key, requestId, response: JSON.stringify(response) });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
+
+/* ---------------- browser（内置浏览器子 webview，Rust browser.rs） ----------------
+   面板占位 div 经 ResizeObserver 同步位置尺寸；element 事件携带检查器选中的元素引用。 */
+/** 懒创建子 webview（全局单实例），返回 url/title/inspect 供面板恢复 */
+export const browserEnsure = () => call<BrowserState>('browser_ensure');
+export const browserSetRect = (x: number, y: number, w: number, h: number) =>
+  call<void>('browser_set_rect', { x, y, w, h });
+/** webview 显隐（面板激活 && 无全屏遮罩 的合成结果由前端计算后传入） */
+export const browserSetVisible = (visible: boolean) =>
+  call<void>('browser_set_visible', { visible });
+/** 地址栏导航：本地路径（盘符/UNC）→ file://，无协议补 https://；返回归一化后的 URL */
+export const browserNavigate = (input: string) =>
+  call<string>('browser_navigate', { input });
+export const browserBack = () => call<void>('browser_back');
+export const browserForward = () => call<void>('browser_forward');
+export const browserReload = () => call<void>('browser_reload');
+/** 检查元素模式开关（点击元素 → browser:event element → AI 引用 chip） */
+export const browserSetInspect = (enabled: boolean) =>
+  call<void>('browser_set_inspect', { enabled });
+export const browserOpenDevtools = () => call<void>('browser_open_devtools');
+export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
+  listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
 
 /* ---------------- staging（会话级远程文件暂存，自动备份） ----------------
    快照在 AI 修改远程文件前自动创建；本组命令供「文件暂存区」面板 / diff 标签使用。

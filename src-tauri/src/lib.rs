@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod ai_actions;
 pub mod ai_impact;
+pub mod browser;
 pub mod mcp;
 pub mod redact;
 pub mod smart_approval;
@@ -86,12 +87,17 @@ pub fn run() {
                 }
                 s
             };
+            // 内置浏览器（主窗口内嵌子 webview，懒创建）：先注入 AppHandle（事件发射/建视图用），
+            // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一实例（共享单实例语义）
+            browser::set_app(app.handle().clone());
+            let browser = Arc::new(browser::BrowserManager::new());
             let ai = Arc::new(ai::AiManager::new(
                 store.clone(),
                 pi_dir,
                 config_dir.join("pi-agent"),
                 ssh.clone(),
                 staging.clone(),
+                browser.clone(),
                 pi_debug,
             ));
             // MCP 服务端：按已启用设备自动监听 127.0.0.1:<port>/mcp（见 mcp.rs）
@@ -106,6 +112,7 @@ pub fn run() {
             app.manage(ai.clone());
             app.manage(staging);
             app.manage(mcp.clone());
+            app.manage(browser);
             // 启动时按持久化配置同步监听（有已启用设备则自动拉起）
             tauri::async_runtime::spawn(async move {
                 mcp.sync().await;
@@ -231,6 +238,15 @@ pub fn run() {
             staging::staging_accept,
             staging::staging_restore,
             staging::staging_diff,
+            browser::browser_ensure,
+            browser::browser_set_rect,
+            browser::browser_set_visible,
+            browser::browser_navigate,
+            browser::browser_back,
+            browser::browser_forward,
+            browser::browser_reload,
+            browser::browser_set_inspect,
+            browser::browser_open_devtools,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

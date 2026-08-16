@@ -119,7 +119,8 @@ const GUARD_EXT: &str = include_str!("pi_ext/aishell-guard.ts");
 const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit";
+/// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
+const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
@@ -315,9 +316,10 @@ impl AiManager {
         agent_dir: PathBuf,
         ssh: Arc<crate::ssh::SshManager>,
         staging: Arc<crate::staging::RemoteStaging>,
+        browser: Arc<crate::browser::BrowserManager>,
         pi_debug: String,
     ) -> Self {
-        let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh, staging));
+        let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh, staging, browser));
         AiManager {
             store,
             pi_dir,
@@ -1515,6 +1517,39 @@ async fn run_internal_action(
             let path = str_field("path");
             actions
                 .remote_delete(project_id, session_id, &server_id, &path)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        // 内置浏览器工具（只读，免审批）：共享单实例——AI 后台打开不切面板不抢焦点；
+        // 用户正停留在浏览器面板时后端 emit ai-navigate 由前端 toast 提示
+        "browser_open" => {
+            let url = str_field("url");
+            actions
+                .browser()
+                .open_for_ai(&url)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "browser_read" => {
+            let selector = str_field("selector");
+            let sel = if selector.is_empty() { None } else { Some(selector.as_str()) };
+            actions
+                .browser()
+                .read_page(sel)
+                .await
+                .map(|text| json!({"ok": true, "text": text}))
+        }
+        "browser_console" => {
+            let limit = payload.get("limit").and_then(serde_json::Value::as_u64).map(|l| l as usize);
+            Ok(json!({"ok": true, "text": actions.browser().console_text(limit)}))
+        }
+        "browser_screenshot" => {
+            let Some(dir) = store.project_path(project_id) else {
+                return json!({ "ok": false, "error": "项目路径未配置，无法保存截图" });
+            };
+            actions
+                .browser()
+                .screenshot(std::path::Path::new(&dir))
                 .await
                 .map(|text| json!({"ok": true, "text": text}))
         }

@@ -56,16 +56,28 @@ pub struct CommandResult {
     pub timed_out: bool,
 }
 
-/// AI 动作执行器（由 AiManager 持有并复用 Store + SshManager + RemoteStaging）。
+/// AI 动作执行器（由 AiManager 持有并复用 Store + SshManager + RemoteStaging + BrowserManager）。
 pub struct AiActions {
     store: Arc<Store>,
     ssh: Arc<SshManager>,
     staging: Arc<RemoteStaging>,
+    /// 内置浏览器（browser_open/read/console/screenshot 动作桥共用共享单实例）
+    browser: Arc<crate::browser::BrowserManager>,
 }
 
 impl AiActions {
-    pub fn new(store: Arc<Store>, ssh: Arc<SshManager>, staging: Arc<RemoteStaging>) -> Self {
-        AiActions { store, ssh, staging }
+    pub fn new(
+        store: Arc<Store>,
+        ssh: Arc<SshManager>,
+        staging: Arc<RemoteStaging>,
+        browser: Arc<crate::browser::BrowserManager>,
+    ) -> Self {
+        AiActions { store, ssh, staging, browser }
+    }
+
+    /// 内置浏览器管理器（run_internal_action 的 browser_* 动作分发用）
+    pub fn browser(&self) -> &Arc<crate::browser::BrowserManager> {
+        &self.browser
     }
 
     /// 执行命令：target=local 走本地 shell（项目根 cwd），target=remote 走 SshManager。
@@ -1370,7 +1382,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let ssh = Arc::new(SshManager::new(Arc::clone(&store)));
         let staging = Arc::new(RemoteStaging::new(dir, Arc::clone(&ssh), Arc::clone(&store)));
-        AiActions::new(store, ssh, staging)
+        // 浏览器管理器无 AppHandle（未 set_app）时 webview 懒创建会报中文错误，不影响其余动作
+        AiActions::new(store, ssh, staging, Arc::new(crate::browser::BrowserManager::new()))
     }
 
     #[test]
