@@ -153,7 +153,11 @@ impl McpService {
 }
 
 impl McpCore {
-    pub(crate) fn new(store: Arc<Store>, ssh: Arc<SshManager>, staging: Arc<RemoteStaging>) -> Self {
+    pub(crate) fn new(
+        store: Arc<Store>,
+        ssh: Arc<SshManager>,
+        staging: Arc<RemoteStaging>,
+    ) -> Self {
         // 先克隆再构造（结构体字面量按书写顺序求值，store/ssh 移动后不能再借用）。
         // 浏览器动作不面向 MCP 设备开放：这里挂独立空管理器（无 webview，browser_* 一律报「尚未创建」）
         let actions = Arc::new(AiActions::new(
@@ -296,7 +300,11 @@ impl McpCore {
             .map(|t| t == token.as_str())
             .unwrap_or(false);
         if !auth_ok {
-            return Ok(http_json(StatusCode::UNAUTHORIZED, "Unauthorized", "text/plain"));
+            return Ok(http_json(
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                "text/plain",
+            ));
         }
         // 请求体上限（write_file 内容 5MB + 协议余量）
         let declared = req
@@ -306,7 +314,11 @@ impl McpCore {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
         if declared > MAX_HTTP_BODY_BYTES {
-            return Ok(http_json(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", "text/plain"));
+            return Ok(http_json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload Too Large",
+                "text/plain",
+            ));
         }
         let bytes = match req.collect().await {
             Ok(c) => c.to_bytes(),
@@ -319,7 +331,11 @@ impl McpCore {
             }
         };
         if bytes.len() > MAX_HTTP_BODY_BYTES {
-            return Ok(http_json(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", "text/plain"));
+            return Ok(http_json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload Too Large",
+                "text/plain",
+            ));
         }
         let parsed: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
@@ -370,7 +386,11 @@ impl McpCore {
         };
         let has_id = obj.contains_key("id");
         let id = obj.get("id").cloned().unwrap_or(Value::Null);
-        let method = obj.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
+        let method = obj
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
         let out = match method.as_str() {
             "initialize" => Some(self.rpc_initialize(id.clone(), &params)),
@@ -382,7 +402,11 @@ impl McpCore {
             "ping" => Some(jsonrpc_result(id.clone(), json!({}))),
             "resources/list" => Some(jsonrpc_result(id.clone(), json!({ "resources": [] }))),
             "prompts/list" => Some(jsonrpc_result(id.clone(), json!({ "prompts": [] }))),
-            _ => Some(jsonrpc_error(id.clone(), -32601, format!("方法不存在：{method}"))),
+            _ => Some(jsonrpc_error(
+                id.clone(),
+                -32601,
+                format!("方法不存在：{method}"),
+            )),
         };
         match (has_id, out) {
             (true, Some(v)) => v,
@@ -426,7 +450,11 @@ impl McpCore {
     }
 
     async fn rpc_tools_call(&self, id: Value, params: &Value) -> Value {
-        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
         if !args.is_object() {
             return jsonrpc_error(id, -32602, "arguments 必须是 JSON 对象".to_string());
@@ -450,8 +478,12 @@ impl McpCore {
         jsonrpc_result(
             id,
             match result {
-                Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
-                Err(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
+                Ok(text) => {
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
+                }
+                Err(text) => {
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": true })
+                }
             },
         )
     }
@@ -517,10 +549,17 @@ impl McpCore {
                 let conns = self.store.db_connections(&sv.id);
                 let enabled: Vec<_> = conns.iter().filter(|c| c.enabled).collect();
                 if enabled.is_empty() {
-                    lines.push("  - 数据库连接：无（需在「服务器设置-数据库连接」中配置并启用）".to_string());
+                    lines.push(
+                        "  - 数据库连接：无（需在「服务器设置-数据库连接」中配置并启用）"
+                            .to_string(),
+                    );
                 } else {
                     for c in &enabled {
-                        let db = if c.database.is_empty() { "-".to_string() } else { c.database.clone() };
+                        let db = if c.database.is_empty() {
+                            "-".to_string()
+                        } else {
+                            c.database.clone()
+                        };
                         lines.push(format!(
                             "  - 数据库连接 connectionId={}，名称={}，类型={}，默认库={}，允许命令={}",
                             c.id,
@@ -534,7 +573,10 @@ impl McpCore {
             }
         }
         if shown == 0 {
-            return Ok("没有已启用 MCP 的服务器。请先在 AIShell 的「服务器卡片 → 更多 → MCP」中启用。".to_string());
+            return Ok(
+                "没有已启用 MCP 的服务器。请先在 AIShell 的「服务器卡片 → 更多 → MCP」中启用。"
+                    .to_string(),
+            );
         }
         let mut text = format!("MCP 可用设备（{shown} 台）：\n{}", lines.join("\n"));
         text.push_str("\n提示：各工具通过 serverId 指定目标；锁定服务器会被拒绝。数据库查询用 db_query，connectionId 取上方「数据库连接」条目。");
@@ -638,7 +680,9 @@ impl McpCore {
         };
         let sftp = self.ssh.open_sftp(&server_id).await?;
         let landed = crate::sftp::download_one(&sftp, &remote_path, &local_dir).await?;
-        Ok(format!("已下载到：{landed}（服务器 {server_id}；本地重名自动改名）"))
+        Ok(format!(
+            "已下载到：{landed}（服务器 {server_id}；本地重名自动改名）"
+        ))
     }
 
     async fn tool_sftp_rename(&self, args: &Value) -> Result<String, String> {
@@ -717,8 +761,12 @@ impl McpCore {
         } else {
             Ok(format!(
                 "已写入 {path}（size={}，mtime={}）",
-                r.actual_size.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                r.actual_mtime.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+                r.actual_size
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                r.actual_mtime
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
             ))
         }
     }
@@ -762,8 +810,12 @@ impl McpCore {
         } else {
             Ok(format!(
                 "编辑完成：{path}（size={}，mtime={}）",
-                r.actual_size.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                r.actual_mtime.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+                r.actual_size
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                r.actual_mtime
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
             ))
         }
     }
@@ -771,10 +823,12 @@ impl McpCore {
     async fn tool_exec_command(&self, args: &Value) -> Result<String, String> {
         let server_id = arg_str(args, "serverId")?;
         let command = arg_str(args, "command")?;
-        let timeout_secs = arg_u64_opt(args, "timeoutSeconds")?
-            .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS);
+        let timeout_secs =
+            arg_u64_opt(args, "timeoutSeconds")?.unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS);
         if !(1..=MAX_EXEC_TIMEOUT_SECS).contains(&timeout_secs) {
-            return Err(format!("timeoutSeconds 必须在 1–{MAX_EXEC_TIMEOUT_SECS} 秒之间"));
+            return Err(format!(
+                "timeoutSeconds 必须在 1–{MAX_EXEC_TIMEOUT_SECS} 秒之间"
+            ));
         }
         if command.trim().is_empty() {
             return Err("命令不能为空".to_string());
@@ -803,10 +857,16 @@ impl McpCore {
     fn assemble_command_result(&self, r: &crate::ai_actions::CommandResult) -> String {
         let mut text = String::new();
         if !r.stdout.is_empty() {
-            text.push_str(&format!("标准输出：\n{}\n", truncate(&self.redact(&r.stdout))));
+            text.push_str(&format!(
+                "标准输出：\n{}\n",
+                truncate(&self.redact(&r.stdout))
+            ));
         }
         if !r.stderr.is_empty() {
-            text.push_str(&format!("标准错误：\n{}\n", truncate(&self.redact(&r.stderr))));
+            text.push_str(&format!(
+                "标准错误：\n{}\n",
+                truncate(&self.redact(&r.stderr))
+            ));
         }
         match r.exit_code {
             Some(code) => text.push_str(&format!("退出码：{code}")),
@@ -1009,7 +1069,10 @@ fn http_json(status: StatusCode, body: &str, content_type: &'static str) -> Resp
             .parse()
             .unwrap(),
     );
-    h.insert(hyper::header::ACCESS_CONTROL_MAX_AGE, "86400".parse().unwrap());
+    h.insert(
+        hyper::header::ACCESS_CONTROL_MAX_AGE,
+        "86400".parse().unwrap(),
+    );
     resp
 }
 
@@ -1133,19 +1196,15 @@ pub async fn mcp_reset_token(store: State<'_, Arc<Store>>) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{
-        test_store, AuthType, DbConnection, DbKind, McpFeatures, Server,
-    };
+    use crate::store::{test_store, AuthType, DbConnection, DbKind, McpFeatures, Server};
     use std::path::PathBuf;
 
     /// 唯一临时目录（并行测试同 tag 会互相删除，必须逐次唯一）。
     fn temp_dir(tag: &str) -> PathBuf {
         static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "aishell-mcp-test-{tag}-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aishell-mcp-test-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1213,13 +1272,25 @@ mod tests {
         let tools = out["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for t in [
-            "list_devices", "sftp_list", "sftp_upload", "sftp_download", "sftp_rename",
-            "sftp_delete", "read_file", "write_file", "edit_file", "exec_command", "db_query",
+            "list_devices",
+            "sftp_list",
+            "sftp_upload",
+            "sftp_download",
+            "sftp_rename",
+            "sftp_delete",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "exec_command",
+            "db_query",
         ] {
             assert!(names.contains(&t), "tools/list 缺少 {t}");
         }
         for t in tools {
-            assert!(!t["description"].as_str().unwrap().is_empty(), "描述不能为空");
+            assert!(
+                !t["description"].as_str().unwrap().is_empty(),
+                "描述不能为空"
+            );
             assert!(t["inputSchema"].is_object(), "inputSchema 必须是对象");
         }
     }
@@ -1270,7 +1341,12 @@ mod tests {
             }))
             .await
         }
-        let text = |out: &Value| out["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        let text = |out: &Value| {
+            out["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
         // 1) 未启用 MCP
         let out = call_tool(&core, json!({ "serverId": "srv-1", "command": "echo hi" })).await;
         assert_eq!(out["result"]["isError"], true);
@@ -1336,7 +1412,10 @@ mod tests {
         };
         // 未启用任何设备 → 引导文案
         let out = call().await;
-        let text = out["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        let text = out["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(text.contains("没有已启用 MCP 的服务器"), "{text}");
         // 启用 exec + db_query，并配置一条数据库连接
         core.store
@@ -1370,7 +1449,10 @@ mod tests {
             )
             .unwrap();
         let out = call().await;
-        let text = out["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        let text = out["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(text.contains("serverId=srv-1"), "{text}");
         assert!(text.contains("执行命令"), "{text}");
         assert!(text.contains("connectionId=dbc-1"), "{text}");
@@ -1378,7 +1460,10 @@ mod tests {
         // 锁定后仍列出但标注
         core.store.set_server_locked("srv-1", true).unwrap();
         let out = call().await;
-        let text = out["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        let text = out["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(text.contains("已锁定"), "{text}");
     }
 

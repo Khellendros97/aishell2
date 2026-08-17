@@ -57,12 +57,16 @@ static RE_CRED_FILE_ETC: LazyLock<Regex> =
 
 /// 密钥材料扩展名：ssl.key、ca.pem、*.p12/*.pfx/*.keystore/*.jks。
 static RE_CRED_EXT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:^|[\s/"'=])[\w./-]*\.(?:key|pem|p12|pfx|keystore|jks)(?:\s|$|["')|;&`])"#).unwrap()
+    Regex::new(r#"(?i)(?:^|[\s/"'=])[\w./-]*\.(?:key|pem|p12|pfx|keystore|jks)(?:\s|$|["')|;&`])"#)
+        .unwrap()
 });
 
 /// 检索/提取工具名。
 static RE_TOOL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:grep|egrep|fgrep|rg|sed|awk|gawk|mawk|perl|ruby|python\d*|strings|jq|yq)\b").unwrap()
+    Regex::new(
+        r"(?i)\b(?:grep|egrep|fgrep|rg|sed|awk|gawk|mawk|perl|ruby|python\d*|strings|jq|yq)\b",
+    )
+    .unwrap()
 });
 
 /// 凭据关键词（提取/注入判定共用；pwd 太常用故不收）。
@@ -81,8 +85,15 @@ static RE_SUBST: LazyLock<Regex> = LazyLock::new(|| {
 /// 三类：已知凭据文件、命令替换注入凭据、检索工具+凭据关键词的提取形态。
 /// 普通 cat/读配置不命中——由 redact 输出脱敏兜底，避免审批疲劳。
 pub fn precheck_credential_access(command: &str) -> Option<String> {
-    if let Some(m) = RE_CRED_FILE_BASE.find(command).or_else(|| RE_CRED_FILE_ETC.find(command)).or_else(|| RE_CRED_EXT.find(command)) {
-        return Some(format!("命令涉及凭据文件（{}），读取需人工确认", m.as_str().trim()));
+    if let Some(m) = RE_CRED_FILE_BASE
+        .find(command)
+        .or_else(|| RE_CRED_FILE_ETC.find(command))
+        .or_else(|| RE_CRED_EXT.find(command))
+    {
+        return Some(format!(
+            "命令涉及凭据文件（{}），读取需人工确认",
+            m.as_str().trim()
+        ));
     }
     if RE_SUBST.is_match(command) {
         return Some("命令将凭据内容注入命令行（命令替换），需人工确认".to_string());
@@ -247,13 +258,26 @@ pub fn parse_judgement(text: &str) -> Result<JudgeOutput, String> {
                 .get("destination")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            Ok(FileChange { operation, path, destination })
+            Ok(FileChange {
+                operation,
+                path,
+                destination,
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
     // 格式校验：非绝对路径 / bounded 无 changes / none 携带 changes → Err（调用方按 unbounded）
-    let plan = ImpactPlan { effect, changes: changes.clone(), reason: reason.clone() };
+    let plan = ImpactPlan {
+        effect,
+        changes: changes.clone(),
+        reason: reason.clone(),
+    };
     crate::ai_impact::validate_impact_plan(&plan)?;
-    Ok(JudgeOutput { dangerous, reason, effect, changes })
+    Ok(JudgeOutput {
+        dangerous,
+        reason,
+        effect,
+        changes,
+    })
 }
 
 #[cfg(test)]
@@ -362,19 +386,31 @@ mod tests {
     #[test]
     fn parse_missing_or_invalid_fields() {
         // 缺 dangerous
-        assert!(parse_judgement(r#"{"reason": "x", "filesystemEffect": "none", "changes": []}"#).is_err());
+        assert!(
+            parse_judgement(r#"{"reason": "x", "filesystemEffect": "none", "changes": []}"#)
+                .is_err()
+        );
         // dangerous 非布尔
-        assert!(parse_judgement(r#"{"dangerous": "yes", "filesystemEffect": "none", "changes": []}"#).is_err());
+        assert!(parse_judgement(
+            r#"{"dangerous": "yes", "filesystemEffect": "none", "changes": []}"#
+        )
+        .is_err());
         // 缺 filesystemEffect
         assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "changes": []}"#).is_err());
         // filesystemEffect 非法
-        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "partial", "changes": []}"#).is_err());
+        assert!(parse_judgement(
+            r#"{"dangerous": false, "reason": "x", "filesystemEffect": "partial", "changes": []}"#
+        )
+        .is_err());
         // operation 非法
         assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "bounded", "changes": [{"operation": "truncate", "path": "/a"}]}"#).is_err());
         // 非绝对路径 → Err（不降级为 none）
         assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "bounded", "changes": [{"operation": "modify", "path": "config.json"}]}"#).is_err());
         // bounded 无 changes → Err
-        assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "bounded", "changes": []}"#).is_err());
+        assert!(parse_judgement(
+            r#"{"dangerous": false, "reason": "x", "filesystemEffect": "bounded", "changes": []}"#
+        )
+        .is_err());
         // none 携带 changes → Err
         assert!(parse_judgement(r#"{"dangerous": false, "reason": "x", "filesystemEffect": "none", "changes": [{"operation": "modify", "path": "/a"}]}"#).is_err());
         // 无 JSON

@@ -490,6 +490,63 @@ export interface SkillDocument {
   content: string;
 }
 
+/* ---------------- SkillHub（与 cloud.rs SkillHub API serde camelCase 对齐） ---------------- */
+export interface SkillHubVersion {
+  id: number;
+  version: string;
+  status: string;
+  changelog: string;
+  fileCount: number;
+  totalSize: number;
+  publishedAt: string;
+  downloadAvailable: boolean;
+  metadata: Record<string, unknown>;
+  body: string;
+}
+
+export interface SkillHubItem {
+  id: number;
+  namespace: string;
+  slug: string;
+  displayName: string;
+  summary: string;
+  tags: Record<string, string>;
+  labels: string[];
+  downloads: number;
+  stars: number;
+  downloadCount: number;
+  starCount: number;
+  ratingAvg: number;
+  ratingCount: number;
+  createdAt: number;
+  updatedAt: number;
+  latestVersion: string;
+  changelog: string;
+  license: string;
+  ownerId: string;
+  ownerDisplayName: string;
+  visibility: string;
+  status: string;
+  hidden: boolean;
+  headlineVersion?: SkillHubVersion | null;
+  publishedVersion?: SkillHubVersion | null;
+  ownerPreviewVersion?: SkillHubVersion | null;
+  resolutionMode: string;
+}
+
+export interface SkillHubList {
+  items: SkillHubItem[];
+  nextCursor: string;
+}
+
+export interface SkillHubDetail {
+  skill: SkillHubItem;
+}
+
+export interface SkillHubVersionDetail {
+  version: SkillHubVersion;
+}
+
 /* ---------------- 会话级远程文件暂存（与 staging.rs serde camelCase 对齐） ---------------- */
 
 /** 原始/当前存在状态 —— 与 staging.rs StagedState serde lowercase 对齐 */

@@ -135,7 +135,9 @@ impl BrowserManager {
         let mgr_nav = Arc::clone(self);
         let builder = WebviewBuilder::new(
             BROWSER_LABEL,
-            WebviewUrl::External(Url::parse("about:blank").map_err(|e| format!("初始地址非法: {e}"))?),
+            WebviewUrl::External(
+                Url::parse("about:blank").map_err(|e| format!("初始地址非法: {e}"))?,
+            ),
         )
         .initialization_script(INSPECTOR_JS)
         // 保留 WebView2 原生拖放行为（拖入 HTML 文件可直接打开），不走 tauri 的 OLE 拦截
@@ -144,7 +146,9 @@ impl BrowserManager {
         //（http::Uri 拒绝空 authority，见 LOCAL_HTML_SCHEME 注释）—— 拦截并改写为 localhtml 再导航
         .on_navigation(move |url| {
             if url.scheme() == "file" && url.host_str().is_none() {
-                let decoded = percent_decode(url.path()).trim_start_matches('/').to_string();
+                let decoded = percent_decode(url.path())
+                    .trim_start_matches('/')
+                    .to_string();
                 if let Ok(rewritten) = local_file_url(Path::new(&decoded)) {
                     if let Some(wv) = mgr_nav.inner.lock().unwrap().webview.clone() {
                         let _ = wv.navigate(rewritten);
@@ -166,7 +170,10 @@ impl BrowserManager {
                 (inner.inspect, inner.webview.clone())
             };
             if let Some(a) = app_handle() {
-                let _ = a.emit("browser:event", json!({ "kind": "url", "url": display_url(&url) }));
+                let _ = a.emit(
+                    "browser:event",
+                    json!({ "kind": "url", "url": display_url(&url) }),
+                );
             }
             if finished {
                 mgr_load.load_tx.send_if_modified(|v| {
@@ -176,7 +183,9 @@ impl BrowserManager {
                 // 检查模式跨导航保持：新页面重新激活检查器
                 if inspect {
                     if let Some(wv) = wv {
-                        let _ = wv.eval("window.__aishellInspector && window.__aishellInspector.enable();");
+                        let _ = wv.eval(
+                            "window.__aishellInspector && window.__aishellInspector.enable();",
+                        );
                     }
                 }
             }
@@ -189,7 +198,11 @@ impl BrowserManager {
         });
 
         let wv = win
-            .add_child(builder, LogicalPosition::new(-20000.0, 0.0), LogicalSize::new(1280.0, 800.0))
+            .add_child(
+                builder,
+                LogicalPosition::new(-20000.0, 0.0),
+                LogicalSize::new(1280.0, 800.0),
+            )
             .map_err(|e| format!("创建浏览器视图失败: {e}"))?;
         let _ = wv.hide();
 
@@ -258,7 +271,10 @@ impl BrowserManager {
             inner.console.clear();
         }
         if let Some(a) = app_handle() {
-            let _ = a.emit("browser:event", json!({ "kind": "url", "url": display_url(url.as_str()) }));
+            let _ = a.emit(
+                "browser:event",
+                json!({ "kind": "url", "url": display_url(url.as_str()) }),
+            );
             if shown {
                 let _ = a.emit(
                     "browser:event",
@@ -286,7 +302,11 @@ impl BrowserManager {
         Ok(format!(
             "已打开: {}\n页面标题: {title}\n加载状态: {}",
             display_url(&url_s),
-            if loaded { "完成" } else { "等待超时（页面可能仍在加载），可继续读取内容" }
+            if loaded {
+                "完成"
+            } else {
+                "等待超时（页面可能仍在加载），可继续读取内容"
+            }
         ))
     }
 
@@ -350,7 +370,11 @@ impl BrowserManager {
         if lines.is_empty() {
             return "（暂无 console 输出）".to_string();
         }
-        format!("最近 {} 条 console 日志:\n{}", lines.len(), lines.join("\n"))
+        format!(
+            "最近 {} 条 console 日志:\n{}",
+            lines.len(),
+            lines.join("\n")
+        )
     }
 
     /// AI 动作 browser_screenshot：CDP Page.captureScreenshot 截图存
@@ -373,11 +397,13 @@ impl BrowserManager {
         let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
         let sent = wv.with_webview(move |pw| unsafe {
             use windows::core::PCWSTR;
-            let Ok(core) = pw.controller().CoreWebView2() else { return };
+            let Ok(core) = pw.controller().CoreWebView2() else {
+                return;
+            };
             let method = windows::core::HSTRING::from("Page.captureScreenshot");
             let params = windows::core::HSTRING::from(r#"{"format":"png"}"#);
-            let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-                move |_err, result_json: String| {
+            let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(
+                Box::new(move |_err, result_json: String| {
                     let out = (|| {
                         let v: serde_json::Value = serde_json::from_str(&result_json)
                             .map_err(|e| format!("截图结果解析失败: {e}"))?;
@@ -390,8 +416,8 @@ impl BrowserManager {
                     })();
                     let _ = tx.send(out);
                     Ok(())
-                },
-            ));
+                }),
+            );
             let _ = core.CallDevToolsProtocolMethod(
                 PCWSTR::from_raw(method.as_ptr()),
                 PCWSTR::from_raw(params.as_ptr()),
@@ -420,12 +446,22 @@ impl BrowserManager {
 /* ---------------- 页面消息（WebMessageReceived）分发 ---------------- */
 
 fn handle_page_message(mgr: &BrowserManager, msg: &str) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) else {
+        return;
+    };
     match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
         "console" => {
             let entry = ConsoleEntry {
-                level: v.get("level").and_then(|x| x.as_str()).unwrap_or("log").to_string(),
-                text: v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                level: v
+                    .get("level")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("log")
+                    .to_string(),
+                text: v
+                    .get("text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 ts: v.get("ts").and_then(|x| x.as_u64()).unwrap_or_else(now_ms),
             };
             let mut inner = mgr.inner.lock().unwrap();
@@ -475,7 +511,9 @@ fn local_file_url(path: &Path) -> Result<Url, String> {
 
 /// 百分号解码（URL 路径段；无效转义按 lossy 处理）。
 fn percent_decode(s: &str) -> String {
-    percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// 对外展示形态：localhtml 协议（内部 http 形态）还原为 `file:///` + 解码路径，
@@ -582,11 +620,15 @@ pub fn normalize_input(input: &str) -> Result<Url, String> {
         let url = Url::parse(s).map_err(|_| format!("无法解析地址: {s}"))?;
         // file:///（空 host）→ localhtml（wry ipc 崩溃规避）；file://server/（UNC）保持原样
         if url.scheme() == "file" && url.host_str().is_none() {
-            return local_file_url(Path::new(&percent_decode(url.path()).trim_start_matches('/')));
+            return local_file_url(Path::new(
+                &percent_decode(url.path()).trim_start_matches('/'),
+            ));
         }
         // localhtml://localhost/ 原始协议形态 → 内部 http 形态
         if url.scheme() == LOCAL_HTML_SCHEME && url.host_str() == Some("localhost") {
-            let p = percent_decode(url.path()).trim_start_matches('/').to_string();
+            let p = percent_decode(url.path())
+                .trim_start_matches('/')
+                .to_string();
             if let Ok(u) = Url::parse(&format!("{LOCAL_HTML_HTTP_PREFIX}{p}")) {
                 return Ok(u);
             }
@@ -605,7 +647,11 @@ fn save_screenshot(project_path: &Path, bytes: &[u8]) -> Result<String, String> 
     let mut names: Vec<String> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("png"))
+            })
             .filter_map(|e| e.file_name().into_string().ok())
             .collect(),
         Err(e) => return Err(format!("读取截图目录失败: {e}")),
@@ -889,8 +935,10 @@ mod tests {
         assert_eq!(url.host_str(), Some("localhtml.localhost"));
         assert!(url.path().ends_with("page.html"));
         // 粘贴的 file:/// 形态（空 host）同样转 localhtml；路径不存在时给中文报错
-        let pasted = normalize_input(format!("file:///{}", file.to_string_lossy().replace('\\', "/")).as_str())
-            .unwrap();
+        let pasted = normalize_input(
+            format!("file:///{}", file.to_string_lossy().replace('\\', "/")).as_str(),
+        )
+        .unwrap();
         assert_eq!(pasted.host_str(), Some("localhtml.localhost"));
         assert!(pasted.path().ends_with("page.html"));
         let missing = normalize_input("file:///C:/definitely/not/exist.html").unwrap_err();
@@ -904,7 +952,10 @@ mod tests {
         std::fs::write(&sp, "<html></html>").unwrap();
         let url2 = normalize_input(sp.to_string_lossy().as_ref()).unwrap();
         assert!(url2.as_str().contains("%20"), "空格应被编码: {url2}");
-        assert!(url2.as_str().contains("%E6%B5%8B%E8%AF%95"), "中文应被编码: {url2}");
+        assert!(
+            url2.as_str().contains("%E6%B5%8B%E8%AF%95"),
+            "中文应被编码: {url2}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -918,8 +969,14 @@ mod tests {
             display_url("localhtml://localhost/C:/x/a.html"),
             "file:///C:/x/a.html"
         );
-        assert_eq!(display_url("https://example.com/a"), "https://example.com/a");
-        assert_eq!(display_url("file://server/share/x.html"), "file://server/share/x.html");
+        assert_eq!(
+            display_url("https://example.com/a"),
+            "https://example.com/a"
+        );
+        assert_eq!(
+            display_url("file://server/share/x.html"),
+            "file://server/share/x.html"
+        );
     }
 
     #[test]
@@ -928,18 +985,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("page.html");
         std::fs::write(&file, "<html><body>hi</body></html>").unwrap();
-        let uri = format!("localhtml://localhost/{}", file.to_string_lossy().replace('\\', "/"));
+        let uri = format!(
+            "localhtml://localhost/{}",
+            file.to_string_lossy().replace('\\', "/")
+        );
         let req = http::Request::builder().uri(uri).body(Vec::new()).unwrap();
         let resp = serve_local_html(req);
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.body(), b"<html><body>hi</body></html>");
         assert_eq!(
-            resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
             Some("text/html; charset=utf-8")
         );
         // 缺失文件 → 404
         let req2 = http::Request::builder()
-            .uri(format!("localhtml://localhost/{}/nope.html", dir.to_string_lossy().replace('\\', "/")))
+            .uri(format!(
+                "localhtml://localhost/{}/nope.html",
+                dir.to_string_lossy().replace('\\', "/")
+            ))
             .body(Vec::new())
             .unwrap();
         let resp2 = serve_local_html(req2);
@@ -961,12 +1026,22 @@ mod tests {
         let names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("png")))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("png"))
+            })
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         assert_eq!(names.len(), SCREENSHOT_KEEP);
-        assert!(names.iter().any(|n| n == "100024.png"), "最新的旧截图应保留");
-        assert!(!names.iter().any(|n| n == "100000.png"), "最旧的旧截图应被清理");
+        assert!(
+            names.iter().any(|n| n == "100024.png"),
+            "最新的旧截图应保留"
+        );
+        assert!(
+            !names.iter().any(|n| n == "100000.png"),
+            "最旧的旧截图应被清理"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

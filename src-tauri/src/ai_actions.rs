@@ -72,7 +72,12 @@ impl AiActions {
         staging: Arc<RemoteStaging>,
         browser: Arc<crate::browser::BrowserManager>,
     ) -> Self {
-        AiActions { store, ssh, staging, browser }
+        AiActions {
+            store,
+            ssh,
+            staging,
+            browser,
+        }
     }
 
     /// 内置浏览器管理器（run_internal_action 的 browser_* 动作分发用）
@@ -122,8 +127,7 @@ impl AiActions {
                 self.run_local(&root, &command, timeout).await
             }
             "remote" => {
-                let sid =
-                    server_id.ok_or_else(|| "远程目标必须提供 serverId".to_string())?;
+                let sid = server_id.ok_or_else(|| "远程目标必须提供 serverId".to_string())?;
                 self.ensure_ai_allowed(&sid)?;
                 // 有效工作目录：调用方解析结果优先（与审批分析同源），否则现取
                 let effective_cwd = match &working_directory {
@@ -231,10 +235,8 @@ impl AiActions {
                 Err(reason) => {
                     // 审批阶段已确认「不保证完整备份」（agent 人工确认）→ 放行；
                     // 否则（yolo / 未经过审批）拒绝，避免绕过保护
-                    let approved_unbounded = matches!(
-                        impact.as_ref().map(|p| p.effect),
-                        Some(Effect::Unbounded)
-                    );
+                    let approved_unbounded =
+                        matches!(impact.as_ref().map(|p| p.effect), Some(Effect::Unbounded));
                     if !approved_unbounded {
                         return Err(format!(
                             "{reason}，已拒绝覆盖上传；请改用受管文件操作（如上传到新目录）或手动 SFTP"
@@ -245,11 +247,7 @@ impl AiActions {
         }
         let sftp = self.ssh.open_sftp(&server_id).await?;
         let landed = crate::sftp::upload_one(&sftp, &local, &remote_dir, overwrite).await?;
-        let full = format!(
-            "{}/{}",
-            remote_dir.trim_end_matches('/'),
-            landed
-        );
+        let full = format!("{}/{}", remote_dir.trim_end_matches('/'), landed);
         // 顶层落地名与本地文件名不同 = 远端已有同名 → 自动创建了副本（upload_one 返回的落地名）
         let base_name = local
             .file_name()
@@ -257,9 +255,13 @@ impl AiActions {
             .unwrap_or("")
             .to_string();
         if !overwrite && landed != base_name {
-            Ok(format!("远端已存在同名文件，已创建副本：{full}（服务器 {server_id}）"))
+            Ok(format!(
+                "远端已存在同名文件，已创建副本：{full}（服务器 {server_id}）"
+            ))
         } else if overwrite {
-            Ok(format!("上传完成（已覆盖远端同名文件）：{full}（服务器 {server_id}）"))
+            Ok(format!(
+                "上传完成（已覆盖远端同名文件）：{full}（服务器 {server_id}）"
+            ))
         } else {
             Ok(format!("上传完成：{full}（服务器 {server_id}）"))
         }
@@ -267,7 +269,12 @@ impl AiActions {
 
     /// 覆盖上传的最终远程目标清单：文件 → 单一目标；目录 → 递归枚举本地文件映射远端相对路径。
     /// 枚举失败返回 Err（调用方按 unbounded/拒绝处理）。
-    async fn upload_targets(&self, local: &Path, remote_dir: &str, server_id: &str) -> Result<Vec<String>, String> {
+    async fn upload_targets(
+        &self,
+        local: &Path,
+        remote_dir: &str,
+        server_id: &str,
+    ) -> Result<Vec<String>, String> {
         let md = std::fs::metadata(local)
             .map_err(|e| format!("读取本地 {} 失败: {e}", local.display()))?;
         if !md.is_file() && !md.is_dir() {
@@ -278,7 +285,11 @@ impl AiActions {
             remote_dir.trim_end_matches('/').to_string()
         } else {
             let home = self.remote_home(server_id).await?;
-            format!("{}/{}", home.trim_end_matches('/'), remote_dir.trim_end_matches('/'))
+            format!(
+                "{}/{}",
+                home.trim_end_matches('/'),
+                remote_dir.trim_end_matches('/')
+            )
         };
         if md.is_file() {
             let name = local
@@ -371,7 +382,11 @@ impl AiActions {
             crate::staging::canonical_remote_path(path)
         } else {
             let home = self.remote_home(server_id).await?;
-            crate::staging::canonical_remote_path(&format!("{}/{}", home.trim_end_matches('/'), path))
+            crate::staging::canonical_remote_path(&format!(
+                "{}/{}",
+                home.trim_end_matches('/'),
+                path
+            ))
         }
     }
 
@@ -442,7 +457,9 @@ impl AiActions {
             if scanned < crate::fsops::BINARY_SCAN_BYTES {
                 let head = &buf[..n.min(crate::fsops::BINARY_SCAN_BYTES - scanned)];
                 if head.contains(&0) {
-                    return Err(format!("远端 {resolved} 为二进制文件，无法读取（远程暂不支持二进制/图片）"));
+                    return Err(format!(
+                        "远端 {resolved} 为二进制文件，无法读取（远程暂不支持二进制/图片）"
+                    ));
                 }
                 scanned += head.len();
             }
@@ -490,7 +507,10 @@ impl AiActions {
                 .await?;
         }
         // 父目录自动创建（write 语义：父目录不存在会自动创建）
-        if let Some(parent) = resolved.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/" } else { p }) {
+        if let Some(parent) = resolved
+            .rsplit_once('/')
+            .map(|(p, _)| if p.is_empty() { "/" } else { p })
+        {
             remote_mkdir_impl(&sftp, parent).await?;
         }
         let mut f = sftp
@@ -633,10 +653,15 @@ impl AiActions {
             return Err("搜索模式不能为空".to_string());
         }
         let resolved = self.resolve_remote_path(server_id, path).await?;
-        let cmd = build_remote_grep_command(pattern, &resolved, glob, ignore_case, literal, context);
+        let cmd =
+            build_remote_grep_command(pattern, &resolved, glob, ignore_case, literal, context);
         let result = self
             .ssh
-            .exec_with_timeout(server_id, &cmd, Duration::from_secs(REMOTE_GREP_TIMEOUT_SECS))
+            .exec_with_timeout(
+                server_id,
+                &cmd,
+                Duration::from_secs(REMOTE_GREP_TIMEOUT_SECS),
+            )
             .await?;
         if result.timed_out {
             return Err(format!(
@@ -667,7 +692,9 @@ impl AiActions {
         let (masked, redacted) = crate::redact::redact_secrets(&text, &self.store.known_secrets());
         text = masked;
         if redacted > 0 {
-            text.push_str(&format!("\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"));
+            text.push_str(&format!(
+                "\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"
+            ));
         }
         if text.len() > AI_RESULT_CAP {
             text.truncate(AI_RESULT_CAP);
@@ -786,7 +813,11 @@ impl AiActions {
                 format_staged_ts(e.staged_at)
             ));
         }
-        Ok(format!("当前会话暂存条目（{} 个）：\n{}", entries.len(), lines.join("\n")))
+        Ok(format!(
+            "当前会话暂存条目（{} 个）：\n{}",
+            entries.len(),
+            lines.join("\n")
+        ))
     }
 
     /// AI 查看某条目 diff（只读工具）。
@@ -804,8 +835,11 @@ impl AiActions {
                 format!(
                     "sha256={} size={} mtime={}",
                     sha.as_deref().unwrap_or("-"),
-                    size.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                    mtime.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+                    size.map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    mtime
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string())
                 )
             };
             return Ok(format!(
@@ -822,13 +856,24 @@ impl AiActions {
             lines.push("（当前：远端文件已不存在）".to_string());
         }
         for l in &d.left {
-            lines.push(format!("{} {}", if l.kind == "del" { "-" } else { " " }, l.text));
+            lines.push(format!(
+                "{} {}",
+                if l.kind == "del" { "-" } else { " " },
+                l.text
+            ));
         }
         lines.push("─".repeat(40));
         for l in &d.right {
-            lines.push(format!("{} {}", if l.kind == "add" { "+" } else { " " }, l.text));
+            lines.push(format!(
+                "{} {}",
+                if l.kind == "add" { "+" } else { " " },
+                l.text
+            ));
         }
-        Ok(format!("暂存条目 {entry_id} diff（上：首次快照；下：当前）：\n{}", lines.join("\n")))
+        Ok(format!(
+            "暂存条目 {entry_id} diff（上：首次快照；下：当前）：\n{}",
+            lines.join("\n")
+        ))
     }
 
     /// AI 还原某条目（force 恒 false：外部修改冲突如实报告，不静默覆盖）。
@@ -861,8 +906,12 @@ impl AiActions {
             Err(format!(
                 "还原冲突：远程文件已被外部修改（size={}，mtime={}，sha256={}），未执行还原。\
                  如需强制还原请用户在暂存面板确认",
-                c.current_size.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                c.current_mtime.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+                c.current_size
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                c.current_mtime
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 c.current_sha256.as_deref().unwrap_or("-")
             ))
         } else {
@@ -887,13 +936,20 @@ impl AiActions {
         if entries.len() == 1 {
             Ok(format!("已暂存 1 个文件（{}）", entries[0].remote_path))
         } else {
-            Ok(format!("已暂存目录 {remote_path} 下的 {} 个文件", entries.len()))
+            Ok(format!(
+                "已暂存目录 {remote_path} 下的 {} 个文件",
+                entries.len()
+            ))
         }
     }
 
     /// AI 清理无变更暂存条目：只移除「远端现状与首次快照完全一致」的条目（相当于自动接受），
     /// 有变更或检查失败的保留并如实报告。不触碰远程内容。
-    pub async fn staging_clear(&self, project_id: &str, session_id: &str) -> Result<String, String> {
+    pub async fn staging_clear(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<String, String> {
         let out = self.staging.clear_unchanged(project_id, session_id).await?;
         if out.removed.is_empty() {
             return Ok(format!(
@@ -912,7 +968,11 @@ impl AiActions {
         for e in &out.errors {
             lines.push(format!("检查失败（已保留）：{e}"));
         }
-        Ok(format!("已清理 {} 个无变更暂存条目：\n{}", out.removed.len(), lines.join("\n")))
+        Ok(format!(
+            "已清理 {} 个无变更暂存条目：\n{}",
+            out.removed.len(),
+            lines.join("\n")
+        ))
     }
 
     /// 查询项目绑定的可操作服务器列表（只读；供 LLM 在远程动作前确认 serverId）。
@@ -943,14 +1003,19 @@ impl AiActions {
                 let enabled: Vec<_> = conns.iter().filter(|c| c.enabled).collect();
                 if enabled.is_empty() {
                     let note = if conns.is_empty() {
-                        "无（需用户先在「服务器设置-数据库连接」中配置，AI 才能 db_query）".to_string()
+                        "无（需用户先在「服务器设置-数据库连接」中配置，AI 才能 db_query）"
+                            .to_string()
                     } else {
                         format!("无启用中的连接（{} 条已禁用）", conns.len())
                     };
                     lines.push(format!("  - 数据库连接：{note}"));
                 } else {
                     for c in &enabled {
-                        let db = if c.database.is_empty() { "-".to_string() } else { c.database.clone() };
+                        let db = if c.database.is_empty() {
+                            "-".to_string()
+                        } else {
+                            c.database.clone()
+                        };
                         lines.push(format!(
                             "  - 数据库连接 connectionId={}，名称={}，类型={}，地址={}:{}，默认库={}，AI 可执行命令={}",
                             c.id,
@@ -968,7 +1033,11 @@ impl AiActions {
         if lines.is_empty() {
             return Ok("项目未绑定任何远程服务器".to_string());
         }
-        let mut text = format!("项目绑定服务器（{} 台）：\n{}", lines.len(), lines.join("\n"));
+        let mut text = format!(
+            "项目绑定服务器（{} 台）：\n{}",
+            lines.len(),
+            lines.join("\n")
+        );
         text.push_str("\n提示：远程 run_command / sftp_upload / sftp_download 请使用上述 serverId；锁定服务器会返回「已锁定」错误。数据库查询用 db_query，connectionId 取上述「数据库连接」条目中的 connectionId。");
         Ok(text)
     }
@@ -999,7 +1068,12 @@ impl AiActions {
         let pass = self
             .store
             .db_secret(&server_id, &connection_id)
-            .map_err(|_| format!("数据库连接「{}」未配置密码，请先在服务器设置中配置", conn.name))?;
+            .map_err(|_| {
+                format!(
+                    "数据库连接「{}」未配置密码，请先在服务器设置中配置",
+                    conn.name
+                )
+            })?;
         let command = match conn.kind {
             DbKind::Mysql => embed_script(
                 &[
@@ -1282,11 +1356,16 @@ fn glob_matches(re: &Regex, pattern: &str, rel: &str) -> bool {
 /// ignore 目录判定（core 默认传 `**/node_modules/**`、`**/.git/**`）：
 /// 剥掉 `**/` 前缀与 `/**` 后缀后按名称 glob 匹配。
 fn ignore_dir_match(glob: &str, name: &str) -> bool {
-    let g = glob.trim().trim_start_matches("**/").trim_end_matches("/**");
+    let g = glob
+        .trim()
+        .trim_start_matches("**/")
+        .trim_end_matches("/**");
     if g.is_empty() || g == "**" || g.contains('/') {
         return false;
     }
-    glob_to_regex(g).map(|re| re.is_match(name)).unwrap_or(false)
+    glob_to_regex(g)
+        .map(|re| re.is_match(name))
+        .unwrap_or(false)
 }
 
 /// 组装远端 grep 命令：固定模板 + 全参数 shell_quote（模式/路径/glob 无注入面）。
@@ -1312,7 +1391,11 @@ fn build_remote_grep_command(
     if let Some(g) = glob {
         cmd.push_str(&format!(" --include={}", shell_quote(g)));
     }
-    cmd.push_str(&format!(" -e {} -- {}", shell_quote(pattern), shell_quote(resolved)));
+    cmd.push_str(&format!(
+        " -e {} -- {}",
+        shell_quote(pattern),
+        shell_quote(resolved)
+    ));
     cmd
 }
 
@@ -1349,8 +1432,15 @@ const POSTGRES_SCRIPT_BODY: &str = r#"SQL=$(mktemp /tmp/aishell-db-pg.XXXXXX.sql
 fn embed_script(values: &[(&str, &str)], body: &str, export_keys: &[&str]) -> String {
     let mut s = String::new();
     for (k, v) in values {
-        let prefix = if export_keys.contains(k) { "export " } else { "" };
-        s.push_str(&format!("{prefix}{k}=$(echo '{}' | base64 -d 2>/dev/null || true); ", b64(v)));
+        let prefix = if export_keys.contains(k) {
+            "export "
+        } else {
+            ""
+        };
+        s.push_str(&format!(
+            "{prefix}{k}=$(echo '{}' | base64 -d 2>/dev/null || true); ",
+            b64(v)
+        ));
     }
     s.push_str(body);
     s
@@ -1377,18 +1467,23 @@ fn validate_db_command(kind: DbKind, command: &str, allowed: &[String]) -> Resul
     let mut segments: Vec<String> = Vec::new();
     match kind {
         DbKind::Mysql | DbKind::Clickhouse | DbKind::Postgres => {
-            segments = trimmed.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            segments = trimmed
+                .split(';')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         DbKind::Redis => {
             // redis 命令不应含 shell 元字符（$ 命令替换、` 反引号、| 管道、&&、; 等）
             if trimmed.contains([';', '|', '&', '>', '<', '`', '$', '(', ')']) {
-                return Err("redis 命令包含非法字符（; | & < > 反引号 $ 等），仅允许单条命令".to_string());
+                return Err(
+                    "redis 命令包含非法字符（; | & < > 反引号 $ 等），仅允许单条命令".to_string(),
+                );
             }
             segments.push(trimmed.to_string());
         }
     }
     if segments.is_empty() {
-
         return Err("SQL/命令不能为空".to_string());
     }
     for seg in &segments {
@@ -1420,15 +1515,22 @@ mod tests {
 
     /// 测试用 AiActions：临时暂存根 + test_store（不碰真实 keyring / Store::new）。
     fn test_actions(store: Arc<Store>) -> AiActions {
-        let dir = std::env::temp_dir().join(format!(
-            "aishell-ai-actions-staging-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aishell-ai-actions-staging-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let ssh = Arc::new(SshManager::new(Arc::clone(&store)));
-        let staging = Arc::new(RemoteStaging::new(dir, Arc::clone(&ssh), Arc::clone(&store)));
+        let staging = Arc::new(RemoteStaging::new(
+            dir,
+            Arc::clone(&ssh),
+            Arc::clone(&store),
+        ));
         // 浏览器管理器无 AppHandle（未 set_app）时 webview 懒创建会报中文错误，不影响其余动作
-        AiActions::new(store, ssh, staging, Arc::new(crate::browser::BrowserManager::new()))
+        AiActions::new(
+            store,
+            ssh,
+            staging,
+            Arc::new(crate::browser::BrowserManager::new()),
+        )
     }
 
     #[test]
@@ -1449,10 +1551,7 @@ mod tests {
             command_timeout(None).unwrap(),
             Duration::from_secs(DEFAULT_RUN_COMMAND_TIMEOUT_SECS)
         );
-        assert_eq!(
-            command_timeout(Some(30)).unwrap(),
-            Duration::from_secs(30)
-        );
+        assert_eq!(command_timeout(Some(30)).unwrap(), Duration::from_secs(30));
         assert!(command_timeout(Some(0)).is_err());
         assert!(command_timeout(Some(MAX_RUN_COMMAND_TIMEOUT_SECS + 1)).is_err());
     }
@@ -1478,21 +1577,33 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         // 合法只读
-        assert!(validate_db_command(DbKind::Mysql, "SELECT * FROM online_radius LIMIT 5", &allowed).is_ok());
+        assert!(validate_db_command(
+            DbKind::Mysql,
+            "SELECT * FROM online_radius LIMIT 5",
+            &allowed
+        )
+        .is_ok());
         assert!(validate_db_command(DbKind::Mysql, "show databases;", &allowed).is_ok());
         assert!(validate_db_command(DbKind::Mysql, "SELECT 1; SELECT 2", &allowed).is_ok());
         // 多语句夹写操作：第二段 DROP 不在白名单 → 拒绝（防绕过）
-        assert!(validate_db_command(DbKind::Mysql, "SELECT 1; DROP TABLE users", &allowed).is_err());
+        assert!(
+            validate_db_command(DbKind::Mysql, "SELECT 1; DROP TABLE users", &allowed).is_err()
+        );
         // 首词不在白名单
         assert!(validate_db_command(DbKind::Mysql, "UPDATE t SET a=1", &allowed).is_err());
         assert!(validate_db_command(DbKind::Mysql, "DELETE FROM t", &allowed).is_err());
         // 空命令
         assert!(validate_db_command(DbKind::Mysql, "   ", &allowed).is_err());
         // postgres 与 mysql 同为 SQL 分段校验：白名单内通过
-        assert!(validate_db_command(DbKind::Postgres, "SELECT id FROM users LIMIT 3", &allowed).is_ok());
-        assert!(validate_db_command(DbKind::Postgres, "SELECT 1; SHOW search_path", &allowed).is_ok());
+        assert!(
+            validate_db_command(DbKind::Postgres, "SELECT id FROM users LIMIT 3", &allowed).is_ok()
+        );
+        assert!(
+            validate_db_command(DbKind::Postgres, "SELECT 1; SHOW search_path", &allowed).is_ok()
+        );
         // 多语句绕过：分段逐段校验，写命令拒绝
-        let err = validate_db_command(DbKind::Postgres, "SELECT 1; DROP TABLE users", &allowed).unwrap_err();
+        let err = validate_db_command(DbKind::Postgres, "SELECT 1; DROP TABLE users", &allowed)
+            .unwrap_err();
         assert!(err.contains("DROP"), "应拒绝白名单外的 DROP: {err}");
         assert!(validate_db_command(DbKind::Postgres, "   ", &allowed).is_err());
     }
@@ -1501,7 +1612,10 @@ mod tests {
     fn is_db_read_only_accepts_postgres_read_words() {
         use crate::store::DbKind;
         assert!(is_db_read_only(DbKind::Postgres, "SELECT * FROM t"));
-        assert!(is_db_read_only(DbKind::Postgres, "explain analyze select 1"));
+        assert!(is_db_read_only(
+            DbKind::Postgres,
+            "explain analyze select 1"
+        ));
         assert!(!is_db_read_only(DbKind::Postgres, "UPDATE t SET a=1"));
         assert!(!is_db_read_only(DbKind::Postgres, "VACUUM"));
     }
@@ -1534,7 +1648,10 @@ mod tests {
         assert!(is_db_read_only(DbKind::Redis, "GET k"));
         assert!(is_db_read_only(DbKind::Redis, "HGETALL h"));
         assert!(!is_db_read_only(DbKind::Redis, "SET k v"));
-        assert!(is_db_read_only(DbKind::Clickhouse, "SELECT * FROM t LIMIT 1"));
+        assert!(is_db_read_only(
+            DbKind::Clickhouse,
+            "SELECT * FROM t LIMIT 1"
+        ));
     }
 
     #[test]
@@ -1700,12 +1817,21 @@ mod tests {
         assert!(text.contains("10.0.0.1:22"));
         assert!(text.contains("状态=可用"), "未锁定应标可用: {text}");
         assert!(text.contains("serverId=srv-b"));
-        assert!(text.contains("状态=已锁定（AI 无法执行远程操作）"), "锁定应标注: {text}");
-        assert!(!text.contains("srv-unbound"), "未绑定服务器不应出现: {text}");
+        assert!(
+            text.contains("状态=已锁定（AI 无法执行远程操作）"),
+            "锁定应标注: {text}"
+        );
+        assert!(
+            !text.contains("srv-unbound"),
+            "未绑定服务器不应出现: {text}"
+        );
         assert!(!text.contains("C:\\key"), "不得泄露密钥路径: {text}");
         // 项目不存在 → 中文错误
         let err = actions.list_servers("proj-missing").unwrap_err();
-        assert!(err.contains("项目不存在：proj-missing"), "错误串不符: {err}");
+        assert!(
+            err.contains("项目不存在：proj-missing"),
+            "错误串不符: {err}"
+        );
         // 无绑定 → 明确提示
         store
             .upsert_project(crate::store::Project {
@@ -1729,7 +1855,10 @@ mod tests {
         let re = glob_to_regex("*.ts").unwrap();
         assert!(re.is_match("a.ts"));
         assert!(!re.is_match("a.txt"));
-        assert!(!re.is_match("sub/a.ts"), "无 '/' 的 pattern 由 glob_matches 按 basename 匹配");
+        assert!(
+            !re.is_match("sub/a.ts"),
+            "无 '/' 的 pattern 由 glob_matches 按 basename 匹配"
+        );
         // ** 跨目录
         let re = glob_to_regex("**/*.spec.ts").unwrap();
         assert!(re.is_match("a.spec.ts"));
@@ -1759,7 +1888,10 @@ mod tests {
     #[test]
     fn glob_matches_basename_rule_for_slashless_patterns() {
         let re = glob_to_regex("*.ts").unwrap();
-        assert!(glob_matches(&re, "*.ts", "src/sub/a.ts"), "无 '/' 的 pattern 匹配任意层级 basename");
+        assert!(
+            glob_matches(&re, "*.ts", "src/sub/a.ts"),
+            "无 '/' 的 pattern 匹配任意层级 basename"
+        );
         assert!(!glob_matches(&re, "*.ts", "src/a.txt"));
         let re2 = glob_to_regex("src/**/*.ts").unwrap();
         assert!(glob_matches(&re2, "src/**/*.ts", "src/sub/b.ts"));
@@ -1779,7 +1911,10 @@ mod tests {
     fn build_remote_grep_command_quotes_all_params() {
         let cmd = build_remote_grep_command("foo bar", "/var/www/app", None, false, false, None);
         assert!(cmd.starts_with("grep -rn --color=never"), "{cmd}");
-        assert!(cmd.contains("-e 'foo bar' -- '/var/www/app'"), "参数必须 shell_quote: {cmd}");
+        assert!(
+            cmd.contains("-e 'foo bar' -- '/var/www/app'"),
+            "参数必须 shell_quote: {cmd}"
+        );
         // 选项组合
         let cmd2 = build_remote_grep_command("FIXME", "/etc", Some("*.conf"), true, true, Some(2));
         assert!(cmd2.contains(" -i"), "{cmd2}");
@@ -1793,10 +1928,8 @@ mod tests {
 
     #[test]
     fn resolve_remote_path_rejects_drive_forms_and_folds_absolute() {
-        let dir = std::env::temp_dir().join(format!(
-            "aishell-ai-actions-resolve-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aishell-ai-actions-resolve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(crate::store::test_store(dir.clone()));
         let actions = test_actions(Arc::clone(&store));

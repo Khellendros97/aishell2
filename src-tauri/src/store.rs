@@ -39,7 +39,10 @@ impl<'de> Deserialize<'de> for Effort {
             "high" => Ok(Effort::High),
             "max" => Ok(Effort::Max),
             "medium" => Ok(Effort::Low),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["low", "high", "max"])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &["low", "high", "max"],
+            )),
         }
     }
 }
@@ -297,10 +300,36 @@ impl DbKind {
                 &["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]
             }
             DbKind::Redis => &[
-                "GET", "MGET", "KEYS", "SCAN", "TYPE", "TTL", "PTTL", "EXISTS", "DBSIZE",
-                "INFO", "PING", "STRLEN", "LLEN", "SCARD", "ZCARD", "HLEN", "HGET",
-                "HGETALL", "HKEYS", "HVALS", "SMEMBERS", "LRANGE", "ZRANGE", "SISMEMBER",
-                "HEXISTS", "SRANDMEMBER", "RANDOMKEY", "ZSCORE", "HSTRLEN", "GETRANGE",
+                "GET",
+                "MGET",
+                "KEYS",
+                "SCAN",
+                "TYPE",
+                "TTL",
+                "PTTL",
+                "EXISTS",
+                "DBSIZE",
+                "INFO",
+                "PING",
+                "STRLEN",
+                "LLEN",
+                "SCARD",
+                "ZCARD",
+                "HLEN",
+                "HGET",
+                "HGETALL",
+                "HKEYS",
+                "HVALS",
+                "SMEMBERS",
+                "LRANGE",
+                "ZRANGE",
+                "SISMEMBER",
+                "HEXISTS",
+                "SRANDMEMBER",
+                "RANDOMKEY",
+                "ZSCORE",
+                "HSTRLEN",
+                "GETRANGE",
             ],
         }
     }
@@ -936,7 +965,10 @@ impl Store {
         // 加载时按现行规则清洗，有变更立即原子写回。
         let known = store.known_secrets();
         let dirty = {
-            let mut guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
             let mut dirty = false;
             for sess in guard.sessions.values_mut().flatten() {
                 if redact_session(sess, &known) {
@@ -946,7 +978,10 @@ impl Store {
             dirty
         };
         if dirty {
-            let guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
             store.persist_locked(&guard)?;
         }
         // 内置技能一次性播种：workspace 已配置且从未播种时创建全局 skill-management；
@@ -963,7 +998,10 @@ impl Store {
     }
 
     /// 锁内变更状态并原子持久化；f 返回 Err 时不变更也不落盘。
-    fn with_state<T>(&self, f: impl FnOnce(&mut AppState) -> Result<T, String>) -> Result<T, String> {
+    fn with_state<T>(
+        &self,
+        f: impl FnOnce(&mut AppState) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut guard = self
             .state
             .lock()
@@ -975,8 +1013,8 @@ impl Store {
 
     /// 先写 aishell.json.tmp 再 rename，避免半截文件。
     fn persist_locked(&self, state: &AppState) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(state)
-            .map_err(|e| format!("序列化状态失败: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(state).map_err(|e| format!("序列化状态失败: {e}"))?;
         let tmp = self.config_dir.join(format!("{STATE_FILE}.tmp"));
         fs::write(&tmp, json).map_err(|e| format!("写入临时文件失败: {e}"))?;
         fs::rename(&tmp, self.config_dir.join(STATE_FILE))
@@ -987,7 +1025,8 @@ impl Store {
     /// 不再要求本地 API Key；否则按个人模式要求 workspace 目录。
     /// 先取令牌再取 state 锁（避免 state→secrets 的锁序交叉）。
     fn is_config_complete(&self) -> bool {
-        let hosted_logged_in = self.cloud_mode() == CloudMode::Hosted && self.cloud_tokens().1.is_some();
+        let hosted_logged_in =
+            self.cloud_mode() == CloudMode::Hosted && self.cloud_tokens().1.is_some();
         if hosted_logged_in {
             return true;
         }
@@ -1042,7 +1081,10 @@ impl Store {
             return Ok(());
         }
         {
-            let guard = self.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
             if guard.seeded_skill_workspaces.contains(&ws) {
                 return Ok(());
             }
@@ -1069,8 +1111,16 @@ impl Store {
     /// 读取云令牌对（access, refresh）；keyring 条目缺失返回 (None, None)。
     pub fn cloud_tokens(&self) -> (Option<String>, Option<String>) {
         let non_empty = |v: String| if v.is_empty() { None } else { Some(v) };
-        let access = self.secrets.get(KEYRING_ACCOUNT_CLOUD_ACCESS).ok().and_then(non_empty);
-        let refresh = self.secrets.get(KEYRING_ACCOUNT_CLOUD_REFRESH).ok().and_then(non_empty);
+        let access = self
+            .secrets
+            .get(KEYRING_ACCOUNT_CLOUD_ACCESS)
+            .ok()
+            .and_then(non_empty);
+        let refresh = self
+            .secrets
+            .get(KEYRING_ACCOUNT_CLOUD_REFRESH)
+            .ok()
+            .and_then(non_empty);
         (access, refresh)
     }
 
@@ -1167,11 +1217,8 @@ impl Store {
             ));
         }
         if let Some(bid) = &server.bastion_id {
-            let bastion_ok = self.with_state(|s| {
-                Ok(s.servers
-                    .iter()
-                    .any(|sv| sv.id == *bid && sv.is_bastion))
-            })?;
+            let bastion_ok =
+                self.with_state(|s| Ok(s.servers.iter().any(|sv| sv.id == *bid && sv.is_bastion)))?;
             if !bastion_ok {
                 return Err(format!(
                     "目标主机「{}」的堡垒机不存在或未开启堡垒机功能（{}）",
@@ -1201,7 +1248,10 @@ impl Store {
                 .any(|sv| sv.bastion_id.as_deref() == Some(id)))
         })?;
         if has_targets {
-            let name = self.server(id).map(|sv| sv.name).unwrap_or_else(|| id.to_string());
+            let name = self
+                .server(id)
+                .map(|sv| sv.name)
+                .unwrap_or_else(|| id.to_string());
             return Err(format!(
                 "堡垒机「{name}」仍有目标主机绑定，请先在「SSH跳转设置」中解除目标主机绑定后再删除"
             ));
@@ -1220,7 +1270,8 @@ impl Store {
     /// 清除全部服务器配置：先删各服务器 keyring 密钥（失败即中止、state 未动），
     /// 再一次性清空 servers 并让所有 projects 解绑，原子落盘。
     pub fn clear_all_servers(&self) -> Result<(), String> {
-        let ids: Vec<String> = self.with_state(|s| Ok(s.servers.iter().map(|sv| sv.id.clone()).collect()))?;
+        let ids: Vec<String> =
+            self.with_state(|s| Ok(s.servers.iter().map(|sv| sv.id.clone()).collect()))?;
         for id in &ids {
             self.secrets.delete(&keyring_account_server(id))?;
         }
@@ -1368,8 +1419,7 @@ impl Store {
             return Err("分类目录名称不能为空".to_string());
         }
         self.with_state(|s| {
-            if s
-                .projects
+            if s.projects
                 .iter()
                 .any(|p| p.quick_commands.iter().any(|qc| qc.folder == folder))
             {
@@ -1532,7 +1582,8 @@ impl Store {
                     s.command_folders.push(f);
                 }
             }
-            if !project_folder.is_empty() && !s.project_folders.iter().any(|x| x == &project_folder) {
+            if !project_folder.is_empty() && !s.project_folders.iter().any(|x| x == &project_folder)
+            {
                 s.project_folders.push(project_folder);
             }
             Ok(())
@@ -1791,10 +1842,7 @@ impl Store {
 
     /// 当前 MCP 服务配置（clone）。
     pub fn mcp_config(&self) -> McpServiceConfig {
-        self.state
-            .lock()
-            .map(|g| g.mcp)
-            .unwrap_or_default()
+        self.state.lock().map(|g| g.mcp).unwrap_or_default()
     }
 
     /// 修改 MCP 监听端口（1024–65535），只改目标字段。
@@ -2106,13 +2154,10 @@ pub async fn clear_all_servers(
 mod tests {
     use super::*;
 
-
     /// 造一个独立的临时配置目录（按 pid+tag 命名，测试间不冲突；不触碰真实用户配置）。
     fn temp_config_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aishell-store-test-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aishell-store-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -2122,7 +2167,8 @@ mod tests {
         AppState {
             settings: Settings {
                 workspace_dir: Some("D:\\AIShellWorkspace".to_string()),
-                llm: LlmConfig::default(),                search: SearchConfig::default(),
+                llm: LlmConfig::default(),
+                search: SearchConfig::default(),
                 theme: Theme::Dark,
                 auto_switch_ai_workdir: true,
                 project_view: ProjectView::Card,
@@ -2548,9 +2594,15 @@ mod tests {
         store.upsert_server(base.clone(), None).unwrap();
 
         // 一台服务器不能同时是堡垒机又是目标主机
-        let both = Server { bastion_id: Some("srv-b".to_string()), ..base.clone() };
+        let both = Server {
+            bastion_id: Some("srv-b".to_string()),
+            ..base.clone()
+        };
         let err = store.upsert_server(both, None).unwrap_err();
-        assert!(err.contains("不能同时作为堡垒机与目标主机"), "错误串不符: {err}");
+        assert!(
+            err.contains("不能同时作为堡垒机与目标主机"),
+            "错误串不符: {err}"
+        );
 
         // 目标主机的堡垒机必须已开启堡垒机功能
         let target_ok = Server {
@@ -2611,7 +2663,10 @@ mod tests {
         assert!(err.contains("不存在或未开启"), "错误串不符: {err}");
 
         // 合法绑定在 state 里完整保存
-        assert_eq!(store.server("srv-t").unwrap().bastion_id.as_deref(), Some("srv-b"));
+        assert_eq!(
+            store.server("srv-t").unwrap().bastion_id.as_deref(),
+            Some("srv-b")
+        );
     }
 
     #[test]
@@ -2668,8 +2723,14 @@ mod tests {
         let dir = temp_config_dir("proj-folder-create");
         let store = test_store(dir.clone());
         // 空串 / 纯分隔符 → 中文错误
-        assert_eq!(store.create_project_folder("  ").unwrap_err(), "分类目录名称不能为空");
-        assert_eq!(store.create_project_folder("///").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.create_project_folder("  ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
+        assert_eq!(
+            store.create_project_folder("///").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 规范化：trim + 去空段；支持层级
         store.create_project_folder(" 生产环境/Web ").unwrap();
         store.create_project_folder("a//b/").unwrap();
@@ -2681,7 +2742,10 @@ mod tests {
             );
         }
         // 重名（规范化后相同）报错，且列表不变
-        assert_eq!(store.create_project_folder("生产环境/Web").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.create_project_folder("生产环境/Web").unwrap_err(),
+            "分类目录已存在"
+        );
         assert_eq!(
             store.state.lock().unwrap().project_folders,
             vec!["生产环境/Web".to_string(), "a/b".to_string()]
@@ -2723,22 +2787,42 @@ mod tests {
             .unwrap();
 
         // 新旧名均按规范化处理：带空白与重复分隔符也应级联生效
-        store.rename_project_folder("生产环境", " 生产环境//Web ").unwrap();
+        store
+            .rename_project_folder("生产环境", " 生产环境//Web ")
+            .unwrap();
 
         let guard = store.state.lock().unwrap();
         assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
         assert_eq!(
-            guard.projects.iter().find(|p| p.id == "proj-r-1").unwrap().folder,
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-r-1")
+                .unwrap()
+                .folder,
             "生产环境/Web"
         );
-        assert_eq!(guard.projects.iter().find(|p| p.id == "proj-r-2").unwrap().folder, "");
+        assert_eq!(
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-r-2")
+                .unwrap()
+                .folder,
+            ""
+        );
         drop(guard);
         // 落盘后重载一致
         let reloaded = test_store(dir);
         let guard = reloaded.state.lock().unwrap();
         assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
         assert_eq!(
-            guard.projects.iter().find(|p| p.id == "proj-r-1").unwrap().folder,
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-r-1")
+                .unwrap()
+                .folder,
             "生产环境/Web"
         );
     }
@@ -2751,15 +2835,27 @@ mod tests {
         store.create_project_folder("乙").unwrap();
 
         // 未分类（空串）不可重命名
-        assert_eq!(store.rename_project_folder("", "x").unwrap_err(), "未分类目录不可重命名");
+        assert_eq!(
+            store.rename_project_folder("", "x").unwrap_err(),
+            "未分类目录不可重命名"
+        );
         // 目标已存在且 ≠ old → 报错
-        assert_eq!(store.rename_project_folder("甲", "乙").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.rename_project_folder("甲", "乙").unwrap_err(),
+            "分类目录已存在"
+        );
         // new 规范化后为空 → 报错
-        assert_eq!(store.rename_project_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.rename_project_folder("甲", " / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // new 规范化后与 old 相同 → no-op，列表不变
         store.rename_project_folder("甲", " 甲 ").unwrap();
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.project_folders, vec!["甲".to_string(), "乙".to_string()]);
+        assert_eq!(
+            guard.project_folders,
+            vec!["甲".to_string(), "乙".to_string()]
+        );
     }
 
     #[test]
@@ -2798,8 +2894,14 @@ mod tests {
         store.create_project_folder("生产环境").unwrap();
         store.create_project_folder("开发环境/Web").unwrap();
         // 未分类空串不可删除；规范化后为空同样报中文错误
-        assert_eq!(store.delete_project_folder("").unwrap_err(), "未分类目录不可删除");
-        assert_eq!(store.delete_project_folder(" / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.delete_project_folder("").unwrap_err(),
+            "未分类目录不可删除"
+        );
+        assert_eq!(
+            store.delete_project_folder(" / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 不存在的目录视为幂等成功
         store.delete_project_folder("不存在的目录").unwrap();
         // 删除成功：入参规范化，仅移除匹配项
@@ -2990,7 +3092,11 @@ mod tests {
             let guard = store.state.lock().unwrap();
             assert_eq!(guard.servers.len(), 3);
             assert_eq!(guard.projects.len(), 2, "两个目录各建一个项目");
-            let web = guard.projects.iter().find(|p| p.name == "生产环境/Web").unwrap();
+            let web = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "生产环境/Web")
+                .unwrap();
             // 新项目：id proj- 前缀、path=None、quick_commands 空、ai_mode 默认、folder 空
             assert!(web.id.starts_with("proj-"), "id 应 proj- 前缀: {}", web.id);
             assert_eq!(web.path, None);
@@ -3002,7 +3108,11 @@ mod tests {
                 vec!["x-1".to_string(), "x-3".to_string()],
                 "同目录服务器应幂等去重绑定"
             );
-            let unnamed = guard.projects.iter().find(|p| p.name == "未命名项目").unwrap();
+            let unnamed = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "未命名项目")
+                .unwrap();
             assert_eq!(unnamed.server_ids, vec!["x-2".to_string()]);
             // 空目录不注册进 project_folders
             assert!(guard.project_folders.is_empty());
@@ -3025,7 +3135,11 @@ mod tests {
         {
             let guard = store.state.lock().unwrap();
             assert_eq!(guard.projects.len(), 2);
-            let web = guard.projects.iter().find(|p| p.name == "生产环境/Web").unwrap();
+            let web = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "生产环境/Web")
+                .unwrap();
             assert_eq!(
                 web.server_ids,
                 vec!["x-1".to_string(), "x-3".to_string()],
@@ -3052,9 +3166,17 @@ mod tests {
             .unwrap();
         assert_eq!(r.projects_created, 0, "同名项目复用不计新建");
         let guard = store.state.lock().unwrap();
-        let pre = guard.projects.iter().find(|p| p.name == "预置目录").unwrap();
+        let pre = guard
+            .projects
+            .iter()
+            .find(|p| p.name == "预置目录")
+            .unwrap();
         assert_eq!(pre.id, "proj-pre", "复用已有项目而非新建");
-        assert_eq!(pre.path, Some("D:\\existing".to_string()), "复用不覆盖原字段");
+        assert_eq!(
+            pre.path,
+            Some("D:\\existing".to_string()),
+            "复用不覆盖原字段"
+        );
         assert_eq!(pre.ai_mode, AiMode::Agent);
         assert_eq!(
             pre.server_ids,
@@ -3091,7 +3213,10 @@ mod tests {
         }"#;
         let state: AppState = serde_json::from_str(old).unwrap();
         assert_eq!(state.servers.len(), 1, "遗留 folder 字段不影响解析");
-        assert!(state.project_folders.is_empty(), "旧 serverFolders 不映射到 project_folders");
+        assert!(
+            state.project_folders.is_empty(),
+            "旧 serverFolders 不映射到 project_folders"
+        );
         assert_eq!(state.projects[0].folder, "", "旧项目无 folder 字段按未分类");
     }
 
@@ -3152,7 +3277,10 @@ mod tests {
             .is_err());
         // 覆盖写第二个 key
         store
-            .set_ui_expanded("welcome:projectGroups".to_string(), vec!["生产环境".to_string()])
+            .set_ui_expanded(
+                "welcome:projectGroups".to_string(),
+                vec!["生产环境".to_string()],
+            )
             .unwrap();
         let reloaded = test_store(dir.clone());
         let guard = reloaded.state.lock().unwrap();
@@ -3193,8 +3321,14 @@ mod tests {
         v.as_object_mut().unwrap().remove("sftpHistory");
         v.as_object_mut().unwrap().remove("sftpFavorites");
         let back: AppState = serde_json::from_value(v).unwrap();
-        assert!(back.sftp_history.is_empty(), "旧 JSON 无 sftpHistory 按空 map");
-        assert!(back.sftp_favorites.is_empty(), "旧 JSON 无 sftpFavorites 按空 map");
+        assert!(
+            back.sftp_history.is_empty(),
+            "旧 JSON 无 sftpHistory 按空 map"
+        );
+        assert!(
+            back.sftp_favorites.is_empty(),
+            "旧 JSON 无 sftpFavorites 按空 map"
+        );
         assert_eq!(back.servers.len(), 2, "其余字段不受影响");
     }
 
@@ -3231,9 +3365,7 @@ mod tests {
         );
         // 空数组覆盖后 key 仍在（清空语义）
         drop(guard);
-        store
-            .set_sftp_history("srv-1".to_string(), vec![])
-            .unwrap();
+        store.set_sftp_history("srv-1".to_string(), vec![]).unwrap();
         let reloaded2 = test_store(dir);
         assert!(
             reloaded2
@@ -3257,8 +3389,14 @@ mod tests {
             .set_sftp_favorites(
                 "srv-1".to_string(),
                 vec![
-                    SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() },
-                    SftpFavorite { path: "/backup".to_string(), title: "备份".to_string() },
+                    SftpFavorite {
+                        path: "/data".to_string(),
+                        title: "数据目录".to_string(),
+                    },
+                    SftpFavorite {
+                        path: "/backup".to_string(),
+                        title: "备份".to_string(),
+                    },
                 ],
             )
             .unwrap();
@@ -3266,7 +3404,10 @@ mod tests {
         assert!(store
             .set_sftp_favorites(
                 String::new(),
-                vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+                vec![SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "数据目录".to_string()
+                }],
             )
             .is_err());
         let reloaded = test_store(dir.clone());
@@ -3274,8 +3415,14 @@ mod tests {
         assert_eq!(
             guard.sftp_favorites.get("srv-1").unwrap(),
             &vec![
-                SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() },
-                SftpFavorite { path: "/backup".to_string(), title: "备份".to_string() },
+                SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "数据目录".to_string()
+                },
+                SftpFavorite {
+                    path: "/backup".to_string(),
+                    title: "备份".to_string()
+                },
             ],
             "收藏条目（含标题）按添加顺序保留"
         );
@@ -3284,7 +3431,10 @@ mod tests {
         store
             .set_sftp_favorites(
                 "srv-1".to_string(),
-                vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+                vec![SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "数据目录".to_string(),
+                }],
             )
             .unwrap();
         let reloaded2 = test_store(dir);
@@ -3296,7 +3446,10 @@ mod tests {
                 .sftp_favorites
                 .get("srv-1")
                 .unwrap(),
-            &vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+            &vec![SftpFavorite {
+                path: "/data".to_string(),
+                title: "数据目录".to_string()
+            }],
             "覆盖写后落盘为新列表"
         );
     }
@@ -3319,14 +3472,23 @@ mod tests {
         assert_eq!(
             guard.sftp_favorites.get("srv-1").unwrap(),
             &vec![
-                SftpFavorite { path: "/data".to_string(), title: "data".to_string() },
-                SftpFavorite { path: "/etc/log".to_string(), title: "log".to_string() },
+                SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "data".to_string()
+                },
+                SftpFavorite {
+                    path: "/etc/log".to_string(),
+                    title: "log".to_string()
+                },
             ],
             "旧纯路径条目按目录名补标题"
         );
         assert_eq!(
             guard.sftp_favorites.get("srv-2").unwrap(),
-            &vec![SftpFavorite { path: "/opt/app".to_string(), title: "核心应用".to_string() }],
+            &vec![SftpFavorite {
+                path: "/opt/app".to_string(),
+                title: "核心应用".to_string()
+            }],
             "新格式条目原样保留"
         );
     }
@@ -3336,8 +3498,14 @@ mod tests {
         let dir = temp_config_dir("qc-folder-create");
         let store = test_store(dir.clone());
         // 空串 / 纯分隔符 → 中文错误
-        assert_eq!(store.create_command_folder("  ").unwrap_err(), "分类目录名称不能为空");
-        assert_eq!(store.create_command_folder("///").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.create_command_folder("  ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
+        assert_eq!(
+            store.create_command_folder("///").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 规范化：trim + 去空段；支持层级
         store.create_command_folder(" 常用/部署 ").unwrap();
         store.create_command_folder("a//b/").unwrap();
@@ -3349,7 +3517,10 @@ mod tests {
             );
         }
         // 重名（规范化后相同）报错，且列表不变
-        assert_eq!(store.create_command_folder("常用/部署").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.create_command_folder("常用/部署").unwrap_err(),
+            "分类目录已存在"
+        );
         assert_eq!(
             store.state.lock().unwrap().command_folders,
             vec!["常用/部署".to_string(), "a/b".to_string()]
@@ -3411,15 +3582,27 @@ mod tests {
         store.create_command_folder("甲").unwrap();
         store.create_command_folder("乙").unwrap();
         // 未分类（空串）不可重命名
-        assert_eq!(store.rename_command_folder("", "x").unwrap_err(), "未分类目录不可重命名");
+        assert_eq!(
+            store.rename_command_folder("", "x").unwrap_err(),
+            "未分类目录不可重命名"
+        );
         // 目标已存在且 ≠ old → 报错
-        assert_eq!(store.rename_command_folder("甲", "乙").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.rename_command_folder("甲", "乙").unwrap_err(),
+            "分类目录已存在"
+        );
         // new 规范化后为空 → 报错
-        assert_eq!(store.rename_command_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.rename_command_folder("甲", " / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // new 规范化后与 old 相同 → no-op，列表不变
         store.rename_command_folder("甲", " 甲 ").unwrap();
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.command_folders, vec!["甲".to_string(), "乙".to_string()]);
+        assert_eq!(
+            guard.command_folders,
+            vec!["甲".to_string(), "乙".to_string()]
+        );
     }
 
     #[test]
@@ -3461,8 +3644,14 @@ mod tests {
         store.create_command_folder("常用").unwrap();
         store.create_command_folder("开发环境/Web").unwrap();
         // 未分类空串不可删除；规范化后为空同样报中文错误
-        assert_eq!(store.delete_command_folder("").unwrap_err(), "未分类目录不可删除");
-        assert_eq!(store.delete_command_folder(" / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.delete_command_folder("").unwrap_err(),
+            "未分类目录不可删除"
+        );
+        assert_eq!(
+            store.delete_command_folder(" / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 不存在的目录视为幂等成功
         store.delete_command_folder("不存在的目录").unwrap();
         // 删除成功：入参规范化，仅移除匹配项
@@ -3658,7 +3847,8 @@ mod tests {
                         tool_call_id: "call-1".to_string(),
                         tool: "run_command".to_string(),
                         intent: "查询在线记录".to_string(),
-                        summary: "执行命令（远程）：mysql -uicc -p'hunter2' -e 'select 1'".to_string(),
+                        summary: "执行命令（远程）：mysql -uicc -p'hunter2' -e 'select 1'"
+                            .to_string(),
                         status: "succeeded".to_string(),
                         timeout_seconds: None,
                         text_len: None,
@@ -3682,7 +3872,9 @@ mod tests {
         let raw2 = std::fs::read_to_string(dir.join(STATE_FILE)).unwrap();
         assert!(!raw2.contains("hunter2"), "加载迁移应清洗历史明文并写回");
         let back2 = store2.sessions_get("proj-mask").unwrap();
-        assert!(back2[0].messages[0].snapshots[0].content.contains("***已脱敏***"));
+        assert!(back2[0].messages[0].snapshots[0]
+            .content
+            .contains("***已脱敏***"));
 
         // 幂等：已脱敏文件重载不再触发写回（内容不再变化）
         drop(store2);
@@ -3708,9 +3900,14 @@ mod tests {
             enabled: true,
         };
         // 默认只读集回退
-        assert_eq!(conn.effective_commands(), vec!["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]);
+        assert_eq!(
+            conn.effective_commands(),
+            vec!["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]
+        );
         // 保存 + keyring
-        store.save_db_connection("srv-a", conn.clone(), Some("pw-db-1")).unwrap();
+        store
+            .save_db_connection("srv-a", conn.clone(), Some("pw-db-1"))
+            .unwrap();
         assert_eq!(store.db_connections("srv-a"), vec![conn.clone()]);
         assert_eq!(store.db_secret("srv-a", "db-1").unwrap(), "pw-db-1");
         // 更新（None 保持密码）
@@ -3727,7 +3924,11 @@ mod tests {
         assert!(store.db_connections("srv-a").is_empty());
         assert!(store.db_secret("srv-a", "db-1").is_err());
         // 校验失败不落盘
-        let bad = DbConnection { id: "db-x".to_string(), name: "".to_string(), ..conn };
+        let bad = DbConnection {
+            id: "db-x".to_string(),
+            name: "".to_string(),
+            ..conn
+        };
         assert!(store.save_db_connection("srv-a", bad, Some("pw")).is_err());
         assert!(store.db_connections("srv-a").is_empty());
     }
@@ -3764,9 +3965,14 @@ mod tests {
             allowed_commands: vec![],
             enabled: true,
         };
-        store.save_db_connection("srv-a", conn, Some("srun_3000@redis")).unwrap();
+        store
+            .save_db_connection("srv-a", conn, Some("srun_3000@redis"))
+            .unwrap();
         let known = store.known_secrets();
-        assert!(known.contains(&"srun_3000@redis".to_string()), "数据库密码应参与输出脱敏");
+        assert!(
+            known.contains(&"srun_3000@redis".to_string()),
+            "数据库密码应参与输出脱敏"
+        );
     }
 
     #[test]
@@ -3898,7 +4104,9 @@ mod tests {
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
         assert_eq!(r.projects_created, 0);
         // 配置有变化：覆盖并计 updated（不新增重复项）
-        let r = store.merge_xshell_servers(&[srv("xshell-bbb", 22)]).unwrap();
+        let r = store
+            .merge_xshell_servers(&[srv("xshell-bbb", 22)])
+            .unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 1, 0));
         // 新会话：imported；旧会话原样仍 unchanged
         let r = store
@@ -3908,7 +4116,11 @@ mod tests {
         // 全部归入同一个「未命名项目」，绑定去重
         {
             let guard = store.state.lock().unwrap();
-            let unnamed = guard.projects.iter().find(|p| p.name == "未命名项目").unwrap();
+            let unnamed = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "未命名项目")
+                .unwrap();
             assert_eq!(unnamed.server_ids.len(), 3, "三个会话都绑定且不重复");
         }
         // 内存状态与落盘一致
@@ -3917,7 +4129,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.join(STATE_FILE)).unwrap()).unwrap();
         assert_eq!(saved.servers.len(), 3);
         assert_eq!(
-            saved.servers.iter().find(|s| s.id == "xshell-bbb").unwrap().port,
+            saved
+                .servers
+                .iter()
+                .find(|s| s.id == "xshell-bbb")
+                .unwrap()
+                .port,
             22,
             "更新的配置应已持久化"
         );
@@ -4020,7 +4237,9 @@ mod tests {
         );
         assert!(!store.settings().search.enabled);
         // 空串视为覆盖（与 api_key 语义一致）
-        store.save_settings(store.settings(), None, Some("")).unwrap();
+        store
+            .save_settings(store.settings(), None, Some(""))
+            .unwrap();
         assert_eq!(store.read_secret("brave:apikey").unwrap(), "");
     }
 
@@ -4049,8 +4268,15 @@ mod tests {
         let state: AppState = serde_json::from_str(old).unwrap();
         assert!(!state.servers[0].locked, "旧服务器默认未锁定");
         assert!(!state.servers[0].is_bastion, "旧服务器默认不是堡垒机");
-        assert_eq!(state.servers[0].bastion_id, None, "旧服务器默认无堡垒机绑定");
-        assert_eq!(state.projects[0].ai_mode, AiMode::Suggest, "旧项目默认 suggest");
+        assert_eq!(
+            state.servers[0].bastion_id, None,
+            "旧服务器默认无堡垒机绑定"
+        );
+        assert_eq!(
+            state.projects[0].ai_mode,
+            AiMode::Suggest,
+            "旧项目默认 suggest"
+        );
         // 旧 ChatMsg 无 actions → 空
         let old_msg = r#"{"role":"assistant","content":"hi","snapshots":[],"fileRefs":[],"ts":1}"#;
         let msg: ChatMsg = serde_json::from_str(old_msg).unwrap();
@@ -4137,10 +4363,7 @@ mod tests {
 
         store.set_server_locked("sv-a", true).unwrap();
         assert!(store.server("sv-a").unwrap().locked);
-        assert!(
-            !store.server("sv-b").unwrap().locked,
-            "只改目标服务器"
-        );
+        assert!(!store.server("sv-b").unwrap().locked, "只改目标服务器");
         // 落盘持久化
         let store2 = test_store(dir);
         assert!(store2.server("sv-a").unwrap().locked);
@@ -4149,7 +4372,10 @@ mod tests {
         assert!(!store2.server("sv-a").unwrap().locked);
         // 不存在 → 中文错误
         let err = store2.set_server_locked("sv-missing", true).unwrap_err();
-        assert!(err.contains("服务器不存在：sv-missing"), "错误串不符: {err}");
+        assert!(
+            err.contains("服务器不存在：sv-missing"),
+            "错误串不符: {err}"
+        );
     }
 
     #[test]
@@ -4229,9 +4455,16 @@ mod tests {
         let store = test_store(temp_config_dir("cloud-tokens"));
         assert_eq!(store.cloud_tokens(), (None, None), "初始无令牌");
         store.cloud_set_tokens("acc-1", "ref-1").unwrap();
-        assert_eq!(store.cloud_tokens(), (Some("acc-1".into()), Some("ref-1".into())));
+        assert_eq!(
+            store.cloud_tokens(),
+            (Some("acc-1".into()), Some("ref-1".into()))
+        );
         store.cloud_set_access_token("acc-2").unwrap();
-        assert_eq!(store.cloud_tokens().0.as_deref(), Some("acc-2"), "仅更新 access");
+        assert_eq!(
+            store.cloud_tokens().0.as_deref(),
+            Some("acc-2"),
+            "仅更新 access"
+        );
         store.cloud_clear_tokens().unwrap();
         assert_eq!(store.cloud_tokens(), (None, None), "清空后无令牌");
         // 重复清除不算错
@@ -4282,7 +4515,12 @@ mod tests {
         store.cloud_set_tokens("acc", "ref").unwrap();
         store
             .cloud_login_info(
-                CloudUser { id: None, name: "旧名".into(), avatar: None, dept: None },
+                CloudUser {
+                    id: None,
+                    name: "旧名".into(),
+                    avatar: None,
+                    dept: None,
+                },
                 CloudCapabilities::default(),
             )
             .unwrap();
@@ -4291,7 +4529,12 @@ mod tests {
         // 启动刷新：更新资料与能力，模式保持 personal
         store
             .cloud_update_profile(
-                CloudUser { id: Some(7), name: "张三".into(), avatar: None, dept: None },
+                CloudUser {
+                    id: Some(7),
+                    name: "张三".into(),
+                    avatar: None,
+                    dept: None,
+                },
                 CloudCapabilities {
                     models: vec!["gpt-4o".into()],
                     search: true,
@@ -4300,7 +4543,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(store.cloud_mode(), CloudMode::Personal, "启动刷新不应改模式");
+        assert_eq!(
+            store.cloud_mode(),
+            CloudMode::Personal,
+            "启动刷新不应改模式"
+        );
         let (u, c) = store.cloud_profile();
         assert_eq!(u.as_ref().map(|u| u.name.as_str()), Some("张三"));
         assert_eq!(c.map(|c| c.search), Some(true));
@@ -4339,10 +4586,17 @@ mod tests {
     #[test]
     fn cloud_config_survives_reload_and_legacy_json_defaults() {
         let dir = temp_config_dir("cloud-reload");
-        let user = CloudUser { id: Some(7), name: "李四".into(), avatar: None, dept: None };
+        let user = CloudUser {
+            id: Some(7),
+            name: "李四".into(),
+            avatar: None,
+            dept: None,
+        };
         {
             let store = test_store(dir.clone());
-            store.cloud_login_info(user.clone(), CloudCapabilities::default()).unwrap();
+            store
+                .cloud_login_info(user.clone(), CloudCapabilities::default())
+                .unwrap();
             store.cloud_set_tokens("acc", "ref").unwrap();
         }
         // 重新加载：cloud 段持久（aishell.json）；令牌在 keyring——MemorySecrets 每实例独立，
@@ -4350,12 +4604,20 @@ mod tests {
         let store = test_store(dir.clone());
         assert_eq!(store.cloud_mode(), CloudMode::Hosted);
         assert_eq!(store.cloud_profile().0, Some(user));
-        assert_eq!(store.cloud_tokens(), (None, None), "内存密钥后端跨实例不保留");
+        assert_eq!(
+            store.cloud_tokens(),
+            (None, None),
+            "内存密钥后端跨实例不保留"
+        );
         // 旧配置无 cloud 段：serde 默认 personal（构造无 cloud 的 JSON 验证）
         let legacy = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"b","effort":"low"},"search":{"enabled":false},"theme":"dark","autoSwitchAiWorkdir":true,"projectView":"card","approvalMode":"smart"},"servers":[],"projects":[],"sessions":{}}"#;
         std::fs::write(dir.join("aishell.json"), legacy).unwrap();
         let store2 = test_store(dir.clone());
-        assert_eq!(store2.cloud_mode(), CloudMode::Personal, "旧配置按未接入处理");
+        assert_eq!(
+            store2.cloud_mode(),
+            CloudMode::Personal,
+            "旧配置按未接入处理"
+        );
         assert_eq!(store2.cloud_profile(), (None, None));
     }
 
@@ -4377,14 +4639,30 @@ mod tests {
                 None,
             )
             .unwrap();
-        let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
+        let file = ws
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md");
         assert!(file.is_file(), "首次保存未播种内置技能");
         let content = fs::read_to_string(&file).unwrap();
         // 内容含两个目录、目录结构、scope/enabled 语义
-        assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {content}");
-        assert!(content.contains("<name>/SKILL.md"), "缺少目录结构: {content}");
-        assert!(content.contains("## scope 语义"), "缺少 scope 语义: {content}");
-        assert!(content.contains("enabled") && content.contains("scope"), "缺少字段 schema");
+        assert!(
+            content.contains("## 两个技能根目录"),
+            "缺少目录说明: {content}"
+        );
+        assert!(
+            content.contains("<name>/SKILL.md"),
+            "缺少目录结构: {content}"
+        );
+        assert!(
+            content.contains("## scope 语义"),
+            "缺少 scope 语义: {content}"
+        );
+        assert!(
+            content.contains("enabled") && content.contains("scope"),
+            "缺少字段 schema"
+        );
         // 播种记录已落盘（记录的是 normalize_ws 规范化路径：canonicalize + 剥 verbatim 前缀）
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
@@ -4402,7 +4680,11 @@ mod tests {
     fn seed_never_overwrites_or_resurrects() {
         let dir = temp_config_dir("seed-keep");
         let ws = temp_config_dir("seed-keep-ws");
-        let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
+        let file = ws
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md");
         // 预置用户文件 → 保存设置不覆盖
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, "用户自建的内容").unwrap();
@@ -4417,7 +4699,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(fs::read_to_string(&file).unwrap(), "用户自建的内容", "已存在文件被覆盖");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "用户自建的内容",
+            "已存在文件被覆盖"
+        );
         // 用户删除后：重启（重新加载）不复活
         fs::remove_dir_all(ws.join(".aishell")).unwrap();
         let _store2 = test_store(dir.clone());
@@ -4463,8 +4749,18 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(ws1.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
-        assert!(ws2.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
+        assert!(ws1
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md")
+            .is_file());
+        assert!(ws2
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md")
+            .is_file());
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
         assert_eq!(state.seeded_skill_workspaces.len(), 2);
@@ -4511,7 +4807,10 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert!(err.contains("创建内置技能目录失败") || err.contains("创建技能根失败"), "错误串不符: {err}");
+        assert!(
+            err.contains("创建内置技能目录失败") || err.contains("创建技能根失败"),
+            "错误串不符: {err}"
+        );
         // 设置与播种记录保持旧值（ws1）
         let settings = store.settings();
         assert_eq!(
@@ -4521,7 +4820,11 @@ mod tests {
         );
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
-        assert_eq!(state.seeded_skill_workspaces.len(), 1, "失败后播种记录被污染");
+        assert_eq!(
+            state.seeded_skill_workspaces.len(),
+            1,
+            "失败后播种记录被污染"
+        );
         assert!(state.seeded_skill_workspaces[0].contains("seed-fail-ws1"));
     }
 
@@ -4539,7 +4842,11 @@ mod tests {
             seeded_skill_workspaces: Vec::new(),
             ..Default::default()
         };
-        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        fs::write(
+            dir.join("aishell.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
         // 让播种失败：.aishell 被文件占位
         fs::write(ws.join(".aishell"), "占位文件").unwrap();
         let res = Store::with_secrets(dir.clone(), std::sync::Arc::new(MemorySecrets::default()));
@@ -4550,7 +4857,8 @@ mod tests {
         assert!(err.contains("内置技能"), "错误串不符: {err}");
         // 修复后加载成功
         fs::remove_file(ws.join(".aishell")).unwrap();
-        let store = Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
+        let store =
+            Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
         assert!(store.settings().workspace_dir.is_some());
     }
 
@@ -4563,7 +4871,12 @@ mod tests {
         let old = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark"},"servers":[],"projects":[],"sessions":{},"projectFolders":[],"commandFolders":[],"uiExpanded":{},"sftpHistory":{},"sftpFavorites":{},"dbConnections":{}}"#;
         fs::write(dir.join("aishell.json"), old).unwrap();
         let store = test_store(dir.clone());
-        assert!(store.state.lock().unwrap().seeded_skill_workspaces.is_empty());
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .seeded_skill_workspaces
+            .is_empty());
         // workspace 已配置但旧配置无播种字段 → 加载时播种一次并记录
         let state = AppState {
             settings: Settings {
@@ -4572,9 +4885,18 @@ mod tests {
             },
             ..Default::default()
         };
-        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        fs::write(
+            dir.join("aishell.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
         let store = test_store(dir);
-        assert!(ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
+        assert!(ws
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md")
+            .is_file());
         assert_eq!(store.state.lock().unwrap().seeded_skill_workspaces.len(), 1);
     }
 
@@ -4662,11 +4984,19 @@ mod tests {
         let store = test_store(dir.clone());
         let t1 = store.mcp_token_ensure().unwrap();
         assert_eq!(t1.len(), 32, "令牌应为 32 字符十六进制");
-        assert_eq!(store.mcp_token_ensure().unwrap(), t1, "重复 ensure 返回同一令牌");
+        assert_eq!(
+            store.mcp_token_ensure().unwrap(),
+            t1,
+            "重复 ensure 返回同一令牌"
+        );
         let t2 = store.mcp_token_reset().unwrap();
         assert_eq!(t2.len(), 32);
         assert_ne!(t1, t2, "重置后令牌必须变化");
-        assert_eq!(store.mcp_token_ensure().unwrap(), t2, "重置后 ensure 返回新令牌");
+        assert_eq!(
+            store.mcp_token_ensure().unwrap(),
+            t2,
+            "重置后 ensure 返回新令牌"
+        );
         // 令牌不进 aishell.json（且令牌测试不应产生配置文件——从未触发 with_state 持久化）
         assert!(
             !dir.join("aishell.json").exists(),
@@ -4679,8 +5009,16 @@ mod tests {
     fn mcp_features_default_off_and_mapping() {
         let f = McpFeatures::default();
         for tool in [
-            "sftp_list", "sftp_upload", "sftp_download", "sftp_rename", "sftp_delete",
-            "read_file", "write_file", "edit_file", "exec_command", "db_query",
+            "sftp_list",
+            "sftp_upload",
+            "sftp_download",
+            "sftp_rename",
+            "sftp_delete",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "exec_command",
+            "db_query",
         ] {
             assert!(!f.tool_enabled(tool), "{tool} 默认应关闭");
         }
@@ -4697,5 +5035,4 @@ mod tests {
         let labels = on.enabled_labels();
         assert_eq!(labels, vec!["执行命令", "数据库查询"]);
     }
-
 }

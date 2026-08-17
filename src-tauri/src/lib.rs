@@ -3,16 +3,16 @@ pub mod ai_actions;
 pub mod ai_impact;
 pub mod browser;
 pub mod cloud;
-pub mod mcp;
-pub mod redact;
-pub mod smart_approval;
-pub mod staging;
+pub mod fsops;
 #[cfg(windows)]
 pub mod gitinstall;
-pub mod fsops;
+pub mod mcp;
+pub mod redact;
 pub mod sftp;
 pub mod skills;
+pub mod smart_approval;
 pub mod ssh;
+pub mod staging;
 pub mod store;
 pub mod term;
 pub mod xshell;
@@ -35,13 +35,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // 内置浏览器本地 HTML 协议（browser.rs serve_local_html）：
         // 本地文件统一走 localhtml://，规避 file:// 空 host 触发的 wry ipc 处理器崩溃
-        .register_uri_scheme_protocol("localhtml", |_ctx, request| browser::serve_local_html(request))
+        .register_uri_scheme_protocol("localhtml", |_ctx, request| {
+            browser::serve_local_html(request)
+        })
         .setup(|app| {
             let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-            let store = Arc::new(
-                store::Store::new(config_dir.clone())
-                    .map_err(std::io::Error::other)?,
-            );
+            let store =
+                Arc::new(store::Store::new(config_dir.clone()).map_err(std::io::Error::other)?);
             let ssh = Arc::new(ssh::SshManager::new(store.clone()));
             // 会话级远程文件暂存（自动备份）：config_dir/remote-staging
             let staging = Arc::new(staging::RemoteStaging::new(
@@ -246,6 +246,10 @@ pub fn run() {
             skills::skill_save,
             skills::skill_delete,
             skills::skill_set_enabled,
+            cloud::skillhub_list,
+            cloud::skillhub_detail,
+            cloud::skillhub_version_detail,
+            cloud::skillhub_download,
             ai::ai_chat,
             ai::ai_abort,
             ai::ai_debug_info,

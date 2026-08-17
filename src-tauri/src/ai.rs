@@ -58,7 +58,9 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ai_actions::AiActions;
-use crate::ai_impact::{analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan};
+use crate::ai_impact::{
+    analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan,
+};
 use crate::skills::{SkillOrigin, SkillSummary};
 use crate::store::{AiMode, ApprovalMode, CloudMode, Store};
 
@@ -120,7 +122,8 @@ const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot";
+const BASE_TOOLS: &str =
+    "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
@@ -171,7 +174,12 @@ fn impact_fingerprint(command: &str, target: &str, server_id: &str, cwd: &str) -
 /// 必然误报。按工具关键字段判定（登记 args 无 action 字段，动作桥 payload 有）；
 /// 其余动作按全量序列化（serde_json 的 Map 为 BTreeMap，对象键序无关）。
 fn payload_fingerprint(p: &serde_json::Value) -> String {
-    let get = |k: &str| p.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let get = |k: &str| {
+        p.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let core = if p.get("command").is_some() && p.get("target").is_some() {
         // run_command：命令/目标/服务器/超时
         format!(
@@ -179,7 +187,9 @@ fn payload_fingerprint(p: &serde_json::Value) -> String {
             get("command"),
             get("target"),
             get("serverId"),
-            p.get("timeoutSeconds").map(|v| v.to_string()).unwrap_or_default()
+            p.get("timeoutSeconds")
+                .map(|v| v.to_string())
+                .unwrap_or_default()
         )
     } else if p.get("localPath").is_some() && p.get("remoteDir").is_some() {
         // sftp_upload：服务器/本地源/远端目录/覆盖开关
@@ -188,7 +198,9 @@ fn payload_fingerprint(p: &serde_json::Value) -> String {
             get("serverId"),
             get("localPath"),
             get("remoteDir"),
-            p.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            p.get("overwrite")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
         )
     } else {
         p.to_string()
@@ -257,7 +269,8 @@ fn select_enabled_skills(
     project: Vec<SkillSummary>,
 ) -> (Vec<SkillSummary>, Vec<SkillSummary>) {
     let mut global_enabled: Vec<SkillSummary> = global.into_iter().filter(|s| s.enabled).collect();
-    let mut project_enabled: Vec<SkillSummary> = project.into_iter().filter(|s| s.enabled).collect();
+    let mut project_enabled: Vec<SkillSummary> =
+        project.into_iter().filter(|s| s.enabled).collect();
     global_enabled.sort_by(|a, b| a.name.cmp(&b.name));
     project_enabled.sort_by(|a, b| a.name.cmp(&b.name));
     let project_names: HashSet<&str> = project_enabled.iter().map(|s| s.name.as_str()).collect();
@@ -369,7 +382,11 @@ impl AiManager {
             .iter()
             .map(|s| format!("{}（{}）", s.name, s.path))
             .collect();
-        Ok(LoadedSkills { final_list, fingerprint, global_root })
+        Ok(LoadedSkills {
+            final_list,
+            fingerprint,
+            global_root,
+        })
     }
 
     /// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
@@ -453,9 +470,8 @@ impl AiManager {
         let hosted = self.store.cloud_mode() == CloudMode::Hosted;
         // 托管模式：LLM 走公司服务器代理（token 由调用方续期传入，缺失即登录失效）
         let api_key = if hosted {
-            cloud_token.ok_or_else(|| {
-                "登录已过期，请前往账号页重新登录后使用公司服务".to_string()
-            })?
+            cloud_token
+                .ok_or_else(|| "登录已过期，请前往账号页重新登录后使用公司服务".to_string())?
         } else {
             self.store
                 .read_secret("llm:apikey")
@@ -484,7 +500,8 @@ impl AiManager {
             .project_path(project_id)
             .unwrap_or_else(|| self.agent_dir.to_string_lossy().into_owned());
         // 门控扩展落盘（每次 spawn 重写，内容与仓库内源码同步）
-        std::fs::create_dir_all(&self.agent_dir).map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
+        std::fs::create_dir_all(&self.agent_dir)
+            .map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
         let guard_path = self.agent_dir.join("aishell-guard.ts");
         std::fs::write(&guard_path, GUARD_EXT).map_err(|e| format!("写入门控扩展失败: {e}"))?;
         // 联网搜索扩展落盘（enabled 开关决定是否挂载，与 key 是否配置无关）
@@ -602,9 +619,15 @@ impl AiManager {
         }
         let mut child = cmd.spawn().map_err(|e| format!("启动 pi 进程失败: {e}"))?;
         let stdin = Arc::new(Mutex::new(
-            child.stdin.take().ok_or_else(|| "pi 进程 stdin 不可用".to_string())?,
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "pi 进程 stdin 不可用".to_string())?,
         ));
-        let stdout = child.stdout.take().ok_or_else(|| "pi 进程 stdout 不可用".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "pi 进程 stdout 不可用".to_string())?;
 
         let busy = Arc::new(AtomicBool::new(false));
         let killed = Arc::new(AtomicBool::new(false));
@@ -652,14 +675,19 @@ impl AiManager {
                 };
                 match ty {
                     "message_update" => {
-                        let Some(ae) = ev.get("assistantMessageEvent") else { continue };
+                        let Some(ae) = ev.get("assistantMessageEvent") else {
+                            continue;
+                        };
                         match ae.get("type").and_then(serde_json::Value::as_str) {
                             // 文本增量
                             Some("text_delta") => {
-                                if let Some(delta) = ae.get("delta").and_then(serde_json::Value::as_str) {
+                                if let Some(delta) =
+                                    ae.get("delta").and_then(serde_json::Value::as_str)
+                                {
                                     text_started = true;
                                     turn_text.push_str(delta);
-                                    let _ = app2.emit(&event, json!({"type": "delta", "text": delta}));
+                                    let _ =
+                                        app2.emit(&event, json!({"type": "delta", "text": delta}));
                                 }
                             }
                             // 生成出错（type=error 也在 message_update 信封里）
@@ -706,7 +734,10 @@ impl AiManager {
                     // 工具活动：受控工具在 agent/yolo 下以动作卡（actionStart/actionEnd）呈现，
                     // 其余工具仍走瞬时小字行（tool）。
                     "tool_execution_start" => {
-                        let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let tool = ev
+                            .get("toolName")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
                         // write/edit 的目标路径（相对项目根）先登记：end 成功时据此广播 fs:changed。
                         // 远程模式（args 带 serverId）跳过：改的是远端文件，不发本地 fs:changed
                         //（前端凭 args.serverId 区分并改发 staging-changed）。
@@ -726,7 +757,12 @@ impl AiManager {
                                 if !raw.is_empty() {
                                     let abs = std::path::absolute(Path::new(&cwd2).join(raw))
                                         .map(|p| p.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|_| Path::new(&cwd2).join(raw).to_string_lossy().into_owned());
+                                        .unwrap_or_else(|_| {
+                                            Path::new(&cwd2)
+                                                .join(raw)
+                                                .to_string_lossy()
+                                                .into_owned()
+                                        });
                                     let id = ev
                                         .get("toolCallId")
                                         .and_then(serde_json::Value::as_str)
@@ -783,14 +819,23 @@ impl AiManager {
                                 })
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("");
-                            let _ = app2.emit(&event, json!({"type": "tool", "tool": tool, "label": label}));
+                            let _ = app2.emit(
+                                &event,
+                                json!({"type": "tool", "tool": tool, "label": label}),
+                            );
                         }
                     }
                     "tool_execution_end" => {
-                        let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let tool = ev
+                            .get("toolName")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
                         // AI 写文件成功落盘 → 全局广播，前端刷新已打开的对应编辑器标签
                         if (tool == "write" || tool == "edit")
-                            && !ev.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                            && !ev
+                                .get("isError")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
                         {
                             let id = ev
                                 .get("toolCallId")
@@ -807,7 +852,10 @@ impl AiManager {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            let is_error = ev.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            let is_error = ev
+                                .get("isError")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
                             // 结果正文：优先 result.content[0].text；错误时回退 errorMessage
                             let result = ev
                                 .get("result")
@@ -816,7 +864,9 @@ impl AiManager {
                                 .and_then(|arr| arr.first())
                                 .and_then(|b| b.get("text"))
                                 .and_then(serde_json::Value::as_str)
-                                .or_else(|| ev.get("errorMessage").and_then(serde_json::Value::as_str))
+                                .or_else(|| {
+                                    ev.get("errorMessage").and_then(serde_json::Value::as_str)
+                                })
                                 .unwrap_or(if is_error { "动作执行失败" } else { "" })
                                 .to_string();
                             let _ = app2.emit(
@@ -884,7 +934,10 @@ impl AiManager {
                             terminal_emitted = true;
                             settled = true;
                             busy2.store(false, Ordering::SeqCst);
-                            let _ = app2.emit(&event, json!({"type": "error", "message": err_message(&ev)}));
+                            let _ = app2.emit(
+                                &event,
+                                json!({"type": "error", "message": err_message(&ev)}),
+                            );
                         }
                     }
                     // 扩展 UI 请求：`AISHELL_APPROVAL:` confirm 转发前端审批；
@@ -928,7 +981,10 @@ impl AiManager {
             // stdout 关闭：进程退出或管道破裂
             busy2.store(false, Ordering::SeqCst);
             if !settled && !killed2.load(Ordering::SeqCst) {
-                let _ = app2.emit(&event, json!({"type": "error", "message": "pi 进程异常退出"}));
+                let _ = app2.emit(
+                    &event,
+                    json!({"type": "error", "message": "pi 进程异常退出"}),
+                );
             }
             procs2
                 .lock()
@@ -936,21 +992,18 @@ impl AiManager {
                 .remove(&key2);
         });
 
-        self.procs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                key.to_string(),
-                AiProc {
-                    child,
-                    stdin,
-                    busy,
-                    killed,
-                    approvals,
-                    skill_fingerprint: loaded.fingerprint,
-                    last_prompt,
-                },
-            );
+        self.procs.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            key.to_string(),
+            AiProc {
+                child,
+                stdin,
+                busy,
+                killed,
+                approvals,
+                skill_fingerprint: loaded.fingerprint,
+                last_prompt,
+            },
+        );
         Ok(())
     }
 
@@ -999,11 +1052,21 @@ fn handle_extension_ui_request(
     impact_tracker: &mut HashMap<String, ImpactEntry>,
     rt: &mut Option<tokio::runtime::Runtime>,
 ) {
-    let Some(id) = ev.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
+    let Some(id) = ev
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
         return;
     };
-    let method = ev.get("method").and_then(serde_json::Value::as_str).unwrap_or("");
-    let title = ev.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+    let method = ev
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let title = ev
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
 
     if method == "input" && title.starts_with("AISHELL_ACTION:") {
         // 内部动作：执行并回写结果（不透传前端）。
@@ -1029,7 +1092,10 @@ fn handle_extension_ui_request(
             impact_tracker,
             &payload,
         ));
-        write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}));
+        write_stdin_json(
+            stdin2,
+            &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}),
+        );
     } else if method == "confirm" && title.starts_with("AISHELL_MODE_REQUEST:") {
         // AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：
         // 与审批同通道转发前端（action=request_agent_mode），前端确认后经
@@ -1042,7 +1108,11 @@ fn handle_extension_ui_request(
             .get("message")
             .and_then(serde_json::Value::as_str)
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-            .and_then(|v| v.get("reason").and_then(serde_json::Value::as_str).map(str::to_string))
+            .and_then(|v| {
+                v.get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
         let _ = app2.emit(
             event,
@@ -1108,9 +1178,21 @@ fn handle_extension_ui_request(
             .and_then(serde_json::Value::as_str)
             .and_then(|m| serde_json::from_str(m).ok())
             .unwrap_or_else(|| json!({}));
-        let action = info.get("action").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        let intent = info.get("intent").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        let summary = info.get("summary").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        let action = info
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let intent = info
+            .get("intent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let summary = info
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
 
         // 自动备份开关（决定是否做影响分析与快照）
         let auto_backup = store2.settings().auto_backup_remote_files;
@@ -1170,7 +1252,8 @@ fn handle_extension_ui_request(
                     .expect("创建智能审批 runtime 失败")
             });
             let cloud_mgr = app2.state::<Arc<crate::cloud::CloudManager>>();
-            let (command, target, server_id, cwd) = approval_context(impact_tracker.get(&tool_call_id), &action);
+            let (command, target, server_id, cwd) =
+                approval_context(impact_tracker.get(&tool_call_id), &action);
             let judge_result = runtime.block_on(crate::smart_approval::judge(
                 store2, &cloud_mgr, &action, &intent, &summary, &command, &target, &server_id, &cwd,
             ));
@@ -1224,7 +1307,9 @@ fn handle_extension_ui_request(
                             effective_plan
                                 .as_ref()
                                 .map(|p| p.reason.clone())
-                                .unwrap_or_else(|| "命令影响范围无法完整确定，不保证完整备份".to_string()),
+                                .unwrap_or_else(|| {
+                                    "命令影响范围无法完整确定，不保证完整备份".to_string()
+                                }),
                         );
                     }
                     // 落盘计划（人工确认后执行时消费；unbounded 由用户确认后放行）
@@ -1275,10 +1360,7 @@ fn handle_extension_ui_request(
 }
 
 /// 审批上下文：run_command 取命令/目标/服务器/工作目录（LLM 判定输入）；其余动作空串。
-fn approval_context(
-    entry: Option<&ImpactEntry>,
-    action: &str,
-) -> (String, String, String, String) {
+fn approval_context(entry: Option<&ImpactEntry>, action: &str) -> (String, String, String, String) {
     if action == "run_command" {
         if let Some(e) = entry {
             let strf = |k: &str| {
@@ -1288,7 +1370,12 @@ fn approval_context(
                     .unwrap_or("")
                     .to_string()
             };
-            return (strf("command"), strf("target"), strf("serverId"), e.cwd.clone().unwrap_or_default());
+            return (
+                strf("command"),
+                strf("target"),
+                strf("serverId"),
+                e.cwd.clone().unwrap_or_default(),
+            );
         }
     }
     (String::new(), String::new(), String::new(), String::new())
@@ -1344,7 +1431,10 @@ fn compute_approval_impact(
             ));
             match plan {
                 Ok(p) => (Some(p), None),
-                Err(e) => (Some(ImpactPlan::unbounded(&format!("无法枚举上传覆盖范围：{e}"))), None),
+                Err(e) => (
+                    Some(ImpactPlan::unbounded(&format!("无法枚举上传覆盖范围：{e}"))),
+                    None,
+                ),
             }
         }
         _ => (None, None),
@@ -1364,7 +1454,10 @@ async fn run_internal_action(
     impact_tracker: &mut HashMap<String, ImpactEntry>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    let action = payload.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+    let action = payload
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let str_field = |k: &str| {
         payload
             .get(k)
@@ -1406,7 +1499,16 @@ async fn run_internal_action(
                 },
             };
             // 执行环境：复用审批阶段解析的工作目录（保证分析与 exec 一致）；无登记时现取
-            let (cwd, plan) = resolve_exec_plan(actions, &entry, &command, &target, &server_id, session_id, auto_backup).await;
+            let (cwd, plan) = resolve_exec_plan(
+                actions,
+                &entry,
+                &command,
+                &target,
+                &server_id,
+                session_id,
+                auto_backup,
+            )
+            .await;
             let (cwd, plan) = match (cwd, plan) {
                 (Ok(c), Ok(p)) => (c, p),
                 (Err(e), _) | (_, Err(e)) => {
@@ -1423,7 +1525,10 @@ async fn run_internal_action(
                 }
             }
             // yolo + 自动备份 + unbounded：直接拒绝，避免绕过保护（agent 已在审批卡确认放行）
-            if auto_backup && plan.effect == Effect::Unbounded && store.ai_mode(project_id) == Some(AiMode::Yolo) {
+            if auto_backup
+                && plan.effect == Effect::Unbounded
+                && store.ai_mode(project_id) == Some(AiMode::Yolo)
+            {
                 return json!({
                     "ok": false,
                     "error": "该命令的影响范围无法完整确定（不保证完整备份），已拒绝自动执行。请改用受管文件操作（sftp_upload 等），或切换到工作模式由用户确认后执行"
@@ -1642,7 +1747,11 @@ async fn run_internal_action(
         }
         "browser_read" => {
             let selector = str_field("selector");
-            let sel = if selector.is_empty() { None } else { Some(selector.as_str()) };
+            let sel = if selector.is_empty() {
+                None
+            } else {
+                Some(selector.as_str())
+            };
             actions
                 .browser()
                 .read_page(sel)
@@ -1650,7 +1759,10 @@ async fn run_internal_action(
                 .map(|text| json!({"ok": true, "text": text}))
         }
         "browser_console" => {
-            let limit = payload.get("limit").and_then(serde_json::Value::as_u64).map(|l| l as usize);
+            let limit = payload
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .map(|l| l as usize);
             Ok(json!({"ok": true, "text": actions.browser().console_text(limit)}))
         }
         "browser_screenshot" => {
@@ -1687,7 +1799,12 @@ async fn resolve_exec_plan(
     }
     let sid = match server_id {
         Some(s) => s.clone(),
-        None => return (Err("远程目标必须提供 serverId".to_string()), Err("远程目标必须提供 serverId".to_string())),
+        None => {
+            return (
+                Err("远程目标必须提供 serverId".to_string()),
+                Err("远程目标必须提供 serverId".to_string()),
+            )
+        }
     };
     match entry {
         Some(e) if e.tool == "run_command" => {
@@ -1697,7 +1814,10 @@ async fn resolve_exec_plan(
             };
             match cwd {
                 Ok(c) => {
-                    let plan = e.plan.clone().unwrap_or_else(|| analyze_remote_command(command, &c));
+                    let plan = e
+                        .plan
+                        .clone()
+                        .unwrap_or_else(|| analyze_remote_command(command, &c));
                     (Ok(c), Ok(plan))
                 }
                 Err(err) => {
@@ -1706,18 +1826,16 @@ async fn resolve_exec_plan(
                 }
             }
         }
-        _ => {
-            match actions.remote_home(&sid).await {
-                Ok(c) => {
-                    let plan = analyze_remote_command(command, &c);
-                    (Ok(c), Ok(plan))
-                }
-                Err(err) => {
-                    let e2 = err.clone();
-                    (Err(err), Err(e2))
-                }
+        _ => match actions.remote_home(&sid).await {
+            Ok(c) => {
+                let plan = analyze_remote_command(command, &c);
+                (Ok(c), Ok(plan))
             }
-        }
+            Err(err) => {
+                let e2 = err.clone();
+                (Err(err), Err(e2))
+            }
+        },
     }
 }
 
@@ -1737,7 +1855,9 @@ fn assemble_command_text(store: &Arc<Store>, r: crate::ai_actions::CommandResult
     let (masked, redacted) = crate::redact::redact_secrets(&text, &store.known_secrets());
     text = masked;
     if redacted > 0 {
-        text.push_str(&format!("\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"));
+        text.push_str(&format!(
+            "\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"
+        ));
     }
     if text.len() > MAX_RESULT_CHARS {
         text.truncate(MAX_RESULT_CHARS);
@@ -1754,7 +1874,8 @@ fn assemble_command_text(store: &Arc<Store>, r: crate::ai_actions::CommandResult
 }
 
 /// 向 pi stdin 写一条 JSONL（严格单个 LF 结尾；不手拼 JSON）。
-fn write_stdin_json(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {    let mut buf = serde_json::to_vec(value).unwrap_or_default();
+fn write_stdin_json(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {
+    let mut buf = serde_json::to_vec(value).unwrap_or_default();
     buf.push(b'\n');
     if let Ok(mut w) = stdin.lock() {
         let _ = w.write_all(&buf);
@@ -1781,7 +1902,10 @@ fn cancel_approvals(proc: &mut AiProc) {
 /// 提取 `response` 事件里 error 字段原文。
 fn err_message(ev: &serde_json::Value) -> String {
     match ev.get("error") {
-        Some(v) => v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()),
+        Some(v) => v
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string()),
         None => "未知错误".to_string(),
     }
 }
@@ -1954,20 +2078,23 @@ pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(),
 /// 附带最近一次技能装载中被项目同名技能覆盖的全局技能（避免 pi「同名保留第一个」依赖未声明顺序）。
 #[tauri::command]
 pub async fn ai_debug_info(mgr: State<'_, Arc<AiManager>>) -> Result<String, String> {
-    let covered = mgr
-        .covered_skills
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let covered = mgr.covered_skills.lock().unwrap_or_else(|p| p.into_inner());
     let mut out = mgr.pi_debug.clone();
     if !covered.is_empty() {
-        out.push_str(&format!("\n被项目同名技能覆盖的全局技能: {}\n", covered.join(", ")));
+        out.push_str(&format!(
+            "\n被项目同名技能覆盖的全局技能: {}\n",
+            covered.join(", ")
+        ));
     }
     Ok(out)
 }
 
 /// 工作台卸载/切换项目时调用：杀掉该项目全部 pi 进程。
 #[tauri::command]
-pub async fn ai_kill_project(mgr: State<'_, Arc<AiManager>>, project_id: String) -> Result<(), String> {
+pub async fn ai_kill_project(
+    mgr: State<'_, Arc<AiManager>>,
+    project_id: String,
+) -> Result<(), String> {
     mgr.kill_project(&project_id);
     Ok(())
 }
@@ -1992,7 +2119,11 @@ pub async fn ai_set_thinking(
             let mut buf = msg.clone();
             buf.push(b'\n');
             // 写失败（进程已死）忽略，读取线程会自行摘除
-            let _ = proc.stdin.lock().ok().and_then(|mut w| w.write_all(&buf).ok());
+            let _ = proc
+                .stdin
+                .lock()
+                .ok()
+                .and_then(|mut w| w.write_all(&buf).ok());
         }
     }
     Ok(())
@@ -2032,7 +2163,11 @@ pub async fn set_ai_mode(
             let mut buf = msg.clone();
             buf.push(b'\n');
             // 写失败（进程已死）忽略，读取线程会自行摘除
-            let _ = proc.stdin.lock().ok().and_then(|mut w| w.write_all(&buf).ok());
+            let _ = proc
+                .stdin
+                .lock()
+                .ok()
+                .and_then(|mut w| w.write_all(&buf).ok());
         }
     }
     Ok(())
@@ -2064,7 +2199,8 @@ pub async fn ai_respond_approval(
     }))
     .map_err(|e| e.to_string())?;
     buf.push(b'\n');
-    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    w.write_all(&buf)
+        .map_err(|e| format!("pi 进程已退出: {e}"))?;
     Ok(())
 }
 
@@ -2095,7 +2231,8 @@ pub async fn ai_respond_db_request(
     }))
     .map_err(|e| e.to_string())?;
     buf.push(b'\n');
-    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    w.write_all(&buf)
+        .map_err(|e| format!("pi 进程已退出: {e}"))?;
     Ok(())
 }
 
@@ -2169,8 +2306,7 @@ mod tests {
         // 两条路径均不 panic，验证托管分支可执行。
         match ai.write_models_json() {
             Ok(()) => {
-                let text =
-                    std::fs::read_to_string(ai.agent_dir.join("models.json")).unwrap();
+                let text = std::fs::read_to_string(ai.agent_dir.join("models.json")).unwrap();
                 assert!(
                     text.contains("/api/proxy/llm/v1") || text.contains("$AISHELL_CLOUD_TOKEN"),
                     "托管模式应指向代理端点或使用 token env: {text}"
@@ -2193,14 +2329,19 @@ mod tests {
         );
         assert!(text.contains("$DEEPSEEK_API_KEY"));
         assert!(!text.contains("AISHELL_CLOUD_TOKEN"));
-        assert!(!text.contains("/api/proxy/"), "个人模式不应出现代理地址: {text}");
+        assert!(
+            !text.contains("/api/proxy/"),
+            "个人模式不应出现代理地址: {text}"
+        );
     }
 
     /// 托管模式不注入无意义类型（构造 smoke：类型可编译、SshManager 空实例可构造）。
     #[test]
     fn manager_constructs_with_cloud_config_types() {
         let store = Arc::new(test_store(temp_dir("smoke")));
-        store.cloud_set_mode(crate::store::CloudMode::Hosted).unwrap();
+        store
+            .cloud_set_mode(crate::store::CloudMode::Hosted)
+            .unwrap();
         let _ = manager(store, "smoke");
     }
 
@@ -2232,7 +2373,11 @@ mod tests {
         let (final_list, covered) = select_enabled_skills(global, project);
         let names: Vec<&str> = final_list.iter().map(|s| s.name.as_str()).collect();
         // 项目在前、全局在后，各组按 name 排序；禁用项不进候选
-        assert_eq!(names, vec!["b-proj", "a-global", "z-global"], "顺序/过滤不符: {names:?}");
+        assert_eq!(
+            names,
+            vec!["b-proj", "a-global", "z-global"],
+            "顺序/过滤不符: {names:?}"
+        );
         assert!(covered.is_empty(), "不应有覆盖");
     }
 
@@ -2260,16 +2405,30 @@ mod tests {
         assert_eq!(scope_prompt(&[]), "", "空集合不应产生提示区");
         let skills = vec![
             summary("skill-a", true, &["local", "all"], SkillOrigin::Global),
-            summary("skill-b", true, &["remote:生产-Web-01"], SkillOrigin::Project),
+            summary(
+                "skill-b",
+                true,
+                &["remote:生产-Web-01"],
+                SkillOrigin::Project,
+            ),
         ];
         let prompt = scope_prompt(&skills);
-        assert!(prompt.contains("skill-a => local, all"), "缺少 skill-a: {prompt}");
-        assert!(prompt.contains("skill-b => remote:生产-Web-01"), "缺少 skill-b: {prompt}");
+        assert!(
+            prompt.contains("skill-a => local, all"),
+            "缺少 skill-a: {prompt}"
+        );
+        assert!(
+            prompt.contains("skill-b => remote:生产-Web-01"),
+            "缺少 skill-b: {prompt}"
+        );
         assert!(prompt.contains("不是权限或加载过滤"), "缺少语义说明");
         assert!(prompt.contains("Server.name"), "缺少 remote 语义");
         // 不得包含技能正文或任意密钥值
         assert!(!prompt.contains("SKILL.md"));
-        assert!(!prompt.contains("apiKey") && !prompt.contains("描述"), "提示区泄漏了摘要外内容: {prompt}");
+        assert!(
+            !prompt.contains("apiKey") && !prompt.contains("描述"),
+            "提示区泄漏了摘要外内容: {prompt}"
+        );
     }
 
     #[test]
@@ -2280,7 +2439,10 @@ mod tests {
         assert_eq!(fp1, skill_fingerprint(&skills, &["正文1".to_string()]));
         // scope 改动改变指纹
         let skills_scope = vec![summary("a", true, &["local"], SkillOrigin::Global)];
-        assert_ne!(fp1, skill_fingerprint(&skills_scope, &["正文1".to_string()]));
+        assert_ne!(
+            fp1,
+            skill_fingerprint(&skills_scope, &["正文1".to_string()])
+        );
         // 正文改动改变指纹
         assert_ne!(fp1, skill_fingerprint(&skills, &["正文2".to_string()]));
         // enabled 改动改变指纹
@@ -2291,22 +2453,43 @@ mod tests {
             summary("a", true, &["all"], SkillOrigin::Global),
             summary("b", true, &["all"], SkillOrigin::Project),
         ];
-        assert_ne!(fp1, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
+        assert_ne!(
+            fp1,
+            skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()])
+        );
         // 同 list 序稳定（skill_fingerprint 固定字段顺序，不依赖 hash 随机性）
         let fp_repeated = skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]);
-        assert_eq!(fp_repeated, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
+        assert_eq!(
+            fp_repeated,
+            skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()])
+        );
     }
 
     #[test]
     fn impact_fingerprint_is_stable_and_input_sensitive() {
         let fp1 = impact_fingerprint("echo x > f", "remote", "srv-a", "/root");
         // 稳定：同输入同指纹
-        assert_eq!(fp1, impact_fingerprint("echo x > f", "remote", "srv-a", "/root"));
+        assert_eq!(
+            fp1,
+            impact_fingerprint("echo x > f", "remote", "srv-a", "/root")
+        );
         // 任一维度变化 → 指纹变化（审批/执行绑定）
-        assert_ne!(fp1, impact_fingerprint("echo x > g", "remote", "srv-a", "/root"));
-        assert_ne!(fp1, impact_fingerprint("echo x > f", "local", "srv-a", "/root"));
-        assert_ne!(fp1, impact_fingerprint("echo x > f", "remote", "srv-b", "/root"));
-        assert_ne!(fp1, impact_fingerprint("echo x > f", "remote", "srv-a", "/var/www"));
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > g", "remote", "srv-a", "/root")
+        );
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > f", "local", "srv-a", "/root")
+        );
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > f", "remote", "srv-b", "/root")
+        );
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > f", "remote", "srv-a", "/var/www")
+        );
     }
 
     #[test]
@@ -2322,35 +2505,71 @@ mod tests {
             "command": "cd /var/www/app && : > config.json",
             "target": "remote", "sessionId": "sess-1", "serverId": "srv-a", "timeoutSeconds": 10,
         });
-        assert_eq!(payload_fingerprint(&registered), payload_fingerprint(&bridge));
+        assert_eq!(
+            payload_fingerprint(&registered),
+            payload_fingerprint(&bridge)
+        );
         // 关键字段变化 → 指纹不同（防篡改）
         let tampered = json!({
             "action": "run_command", "command": "cd /var/www/app && : > other.json",
             "target": "remote", "serverId": "srv-a",
         });
-        assert_ne!(payload_fingerprint(&registered), payload_fingerprint(&tampered));
+        assert_ne!(
+            payload_fingerprint(&registered),
+            payload_fingerprint(&tampered)
+        );
         // sftp_upload：登记（无 action/sessionId）与桥 payload 同指纹；overwrite 缺省=false
         let reg_up = json!({ "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp" });
         let bridge_up = json!({ "action": "sftp_upload", "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp", "sessionId": "x", "overwrite": false });
-        assert_eq!(payload_fingerprint(&reg_up), payload_fingerprint(&bridge_up));
+        assert_eq!(
+            payload_fingerprint(&reg_up),
+            payload_fingerprint(&bridge_up)
+        );
         let overwrite = json!({ "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp", "overwrite": true });
-        assert_ne!(payload_fingerprint(&reg_up), payload_fingerprint(&overwrite));
+        assert_ne!(
+            payload_fingerprint(&reg_up),
+            payload_fingerprint(&overwrite)
+        );
     }
 
     #[test]
     fn guard_extension_has_staging_tools_but_never_accept() {
         // 探针：AI 工具清单有 staging_list/diff/restore/add/clear，绝无 staging_accept（接受只在前端面板）
-        assert!(GUARD_EXT.contains("staging_list"), "guard 应注册 staging_list");
-        assert!(GUARD_EXT.contains("staging_diff"), "guard 应注册 staging_diff");
-        assert!(GUARD_EXT.contains("staging_restore"), "guard 应注册 staging_restore");
-        assert!(GUARD_EXT.contains("staging_add"), "guard 应注册 staging_add");
-        assert!(GUARD_EXT.contains("staging_clear"), "guard 应注册 staging_clear");
+        assert!(
+            GUARD_EXT.contains("staging_list"),
+            "guard 应注册 staging_list"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_diff"),
+            "guard 应注册 staging_diff"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_restore"),
+            "guard 应注册 staging_restore"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_add"),
+            "guard 应注册 staging_add"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_clear"),
+            "guard 应注册 staging_clear"
+        );
         // 探针核心：AI 工具清单/受控列表绝无 staging_accept（引号形态 = 工具/列表注册；
         // 注释里的裸词说明文字不算注册）
-        assert!(!GUARD_EXT.contains("\"staging_accept\""), "guard 绝不可注册 staging_accept");
-        assert!(!GUARD_EXT.contains("staging_accept\"}"), "guard 绝不可出现 staging_accept 工具定义");
+        assert!(
+            !GUARD_EXT.contains("\"staging_accept\""),
+            "guard 绝不可注册 staging_accept"
+        );
+        assert!(
+            !GUARD_EXT.contains("staging_accept\"}"),
+            "guard 绝不可出现 staging_accept 工具定义"
+        );
         // 还原属受控工具（逐调用审批）；只读列表/diff、主动暂存/清理无变更不入审批
-        assert!(GUARD_EXT.contains("\"staging_restore\""), "staging_restore 应受控审批");
+        assert!(
+            GUARD_EXT.contains("\"staging_restore\""),
+            "staging_restore 应受控审批"
+        );
         let controlled_line = GUARD_EXT
             .lines()
             .find(|l| l.contains("const CONTROLLED_TOOLS"))
@@ -2361,7 +2580,10 @@ mod tests {
         );
         // suggest 模式不提供受控远程工具（工具集变量中无 staging_*）
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
-        assert!(!tools_suggest.contains("staging_"), "suggest 工具集不应含暂存工具");
+        assert!(
+            !tools_suggest.contains("staging_"),
+            "suggest 工具集不应含暂存工具"
+        );
         let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear");
         assert!(tools_agent.contains("staging_list"));
         assert!(tools_agent.contains("staging_restore"));
@@ -2369,7 +2591,9 @@ mod tests {
         assert!(tools_agent.contains("staging_clear"));
         // ai.rs 侧动作卡列表：staging_restore 有卡片，但接受类动作绝不入列
         assert!(CONTROLLED_TOOLS.contains(&"staging_restore"));
-        assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("staging_accept")));
+        assert!(!CONTROLLED_TOOLS
+            .iter()
+            .any(|t| t.contains("staging_accept")));
     }
 
     #[test]
@@ -2382,16 +2606,40 @@ mod tests {
         assert!(GUARD_EXT.contains("createLsTool"), "guard 应覆盖 ls");
         assert!(GUARD_EXT.contains("createFindTool"), "guard 应覆盖 find");
         assert!(GUARD_EXT.contains("createGrepTool"), "guard 应覆盖 grep");
-        assert!(GUARD_EXT.contains("SERVER_ID_PARAM"), "guard 应定义 serverId 参数");
-        assert!(GUARD_EXT.contains("remote_grep"), "grep 远程分支应走 remote_grep 动作");
-        assert!(GUARD_EXT.contains("remote_write"), "写远程应经 remote_write 动作");
-        assert!(GUARD_EXT.contains("remote_read"), "读远程应经 remote_read 动作");
-        assert!(GUARD_EXT.contains("remote_delete"), "远程删除应经 remote_delete 动作");
+        assert!(
+            GUARD_EXT.contains("SERVER_ID_PARAM"),
+            "guard 应定义 serverId 参数"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_grep"),
+            "grep 远程分支应走 remote_grep 动作"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_write"),
+            "写远程应经 remote_write 动作"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_read"),
+            "读远程应经 remote_read 动作"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_delete"),
+            "远程删除应经 remote_delete 动作"
+        );
         // suggest 阻止文案（远程能力仅 agent/yolo）
-        assert!(GUARD_EXT.contains("仅建议模式不能操作远程文件"), "suggest 远程调用应被阻止");
+        assert!(
+            GUARD_EXT.contains("仅建议模式不能操作远程文件"),
+            "suggest 远程调用应被阻止"
+        );
         // 覆盖后仍保留本地分支：委托本地实例执行
-        assert!(GUARD_EXT.contains("localRead.execute"), "无 serverId 应委托本地 read");
-        assert!(GUARD_EXT.contains("localGrep.execute"), "无 serverId 应委托本地 grep");
+        assert!(
+            GUARD_EXT.contains("localRead.execute"),
+            "无 serverId 应委托本地 read"
+        );
+        assert!(
+            GUARD_EXT.contains("localGrep.execute"),
+            "无 serverId 应委托本地 grep"
+        );
     }
 
     #[test]

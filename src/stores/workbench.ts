@@ -66,7 +66,7 @@ export interface AiHandle {
 
 const TYPE_ICONS: Record<string, IconName> = {
   editor: 'file', sftp: 'folderOpen', terminal: 'terminal', 'remote-staging': 'history', 'staging-diff': 'diff',
-  browser: 'globe',
+  browser: 'globe', 'skill-hub': 'package',
 };
 
 export type PanelKey = 'explorer' | 'servers' | 'commands' | 'skills';

@@ -13,6 +13,7 @@ import { SftpTab } from './SftpTab';
 import { StagingTab } from './StagingTab';
 import { DiffTab } from './DiffTab';
 import BrowserTab from './BrowserTab';
+import SkillHubTab from './SkillHubTab';
 
 export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   terminal: TerminalTab,
@@ -21,4 +22,5 @@ export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   'remote-staging': StagingTab,
   'staging-diff': DiffTab,
   browser: BrowserTab,
+  'skill-hub': SkillHubTab,
 };

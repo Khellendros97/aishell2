@@ -18,22 +18,30 @@ pub const MASK: &str = "***已脱敏***";
 
 /// 凭据键名（大小写不敏感；前后缀变体如 db_password / main_server_pwd 均命中）。
 /// 不含 pwd 单词外的短词（user/account 等不算凭据）。
-const KEY: &str =
-    r"\w*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|requirepass|masterauth)\w*";
+const KEY: &str = r"\w*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|requirepass|masterauth)\w*";
 
 /// 双引号值：`db_password="xxx"` / `"api_key": "xxx"`
 static RE_DOUBLE_QUOTED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r#"(?i)({KEY}["']?\s*[:=]\s*")([^"\r\n]{{1,256}})(")"#)).unwrap()
+    Regex::new(&format!(
+        r#"(?i)({KEY}["']?\s*[:=]\s*")([^"\r\n]{{1,256}})(")"#
+    ))
+    .unwrap()
 });
 
 /// 单引号值：`db_password='xxx'`
 static RE_SINGLE_QUOTED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r#"(?i)({KEY}["']?\s*[:=]\s*')([^'\r\n]{{1,256}})(')"#)).unwrap()
+    Regex::new(&format!(
+        r#"(?i)({KEY}["']?\s*[:=]\s*')([^'\r\n]{{1,256}})(')"#
+    ))
+    .unwrap()
 });
 
 /// 裸值：`db_password=xxx` / `token: xxx`（值到空白/常见分隔符为止，≥2 字符降低误报）
 static RE_BARE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r#"(?i)({KEY}["']?\s*[:=]\s*)([^\s,;&|"'`]{{2,256}})"#)).unwrap()
+    Regex::new(&format!(
+        r#"(?i)({KEY}["']?\s*[:=]\s*)([^\s,;&|"'`]{{2,256}})"#
+    ))
+    .unwrap()
 });
 
 /// redis 配置的空格分隔形态：`requirepass xxx` / `masterauth xxx`（空白收进组 1，替换不丢分隔）
@@ -79,7 +87,12 @@ pub fn redact_secrets(text: &str, known_secrets: &[String]) -> (String, usize) {
 /// 从文本的 KV 形态中收集凭据值（追加到 out，调用方负责去重）。
 /// 过滤：长度 <6、纯数字/点分（IP、版本号）、MASK 本身、纯星号——降低误伤面。
 pub fn harvest_secrets(text: &str, out: &mut Vec<String>) {
-    for re in [&*RE_DOUBLE_QUOTED, &*RE_SINGLE_QUOTED, &*RE_BARE, &*RE_SPACE_SEP] {
+    for re in [
+        &*RE_DOUBLE_QUOTED,
+        &*RE_SINGLE_QUOTED,
+        &*RE_BARE,
+        &*RE_SPACE_SEP,
+    ] {
         for caps in re.captures_iter(text) {
             let v = caps[2].to_string();
             if v.len() < 6
@@ -175,7 +188,8 @@ mod tests {
 
     #[test]
     fn leaves_normal_output_untouched() {
-        let text = "Filesystem Size Used Avail Use%\ndevtmpfs 16G 0 16G 0%\ndb_user=icc\ndb_port=3506";
+        let text =
+            "Filesystem Size Used Avail Use%\ndevtmpfs 16G 0 16G 0%\ndb_user=icc\ndb_port=3506";
         let (out, n) = redact(text);
         assert_eq!(out, text);
         assert_eq!(n, 0);

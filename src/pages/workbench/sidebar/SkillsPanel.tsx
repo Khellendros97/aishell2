@@ -5,7 +5,7 @@
  * 新增/编辑模态为 body 级浮层(createRoot 挂载):完整 SKILL.md textarea 原样提交,
  * scope 编辑区(local/all + 远程主机卡片 + 其它 remote: 名称 chips)独立收集后作为
  * skillSave 显式参数交给后端(后端只重写顶层 scope,其余字节不动),前端不解析重写 YAML。
- * 契约:skillsPanel 导出(标题 + HeadActions「+ 添加」)。
+ * 契约:skillsPanel 导出(标题 + HeadActions「Skill Hub / + 添加」)。
  * 接口点:src/api.ts skills 段(skillsList / skillRead / skillSave / skillDelete / skillSetEnabled)。
  */
 import { useEffect, useRef, useState } from 'react';
@@ -405,12 +405,21 @@ function SkillsPanelBody(): JSX.Element {
   );
 }
 
-/* ---------- 侧栏头操作区:「+ 添加」 ---------- */
+/* ---------- 侧栏头操作区:「Skill Hub」入口 + 「+ 添加」 ---------- */
 function SkillsHeadActions(): JSX.Element {
   return (
-    <button className="btn small primary" onClick={() => openSkillModal(null)}>
-      + 添加
-    </button>
+    <div className="wbs-skills-head-actions">
+      <button
+        className="btn small wbs-skillhub-btn"
+        title="在主工作区打开 Skill Hub"
+        onClick={() => useWorkbench.getState().openTab({ id: 'skill-hub', type: 'skill-hub', title: 'Skill Hub' })}
+      >
+        <Icon name="package" /> Skill Hub
+      </button>
+      <button className="btn small primary" onClick={() => openSkillModal(null)}>
+        + 添加
+      </button>
+    </div>
   );
 }
 

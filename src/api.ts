@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -339,6 +339,21 @@ export const skillDelete = (projectId: string, origin: SkillOrigin, name: string
 /** 启停（只改 frontmatter 顶层 enabled 标量） */
 export const skillSetEnabled = (projectId: string, origin: SkillOrigin, name: string, enabled: boolean) =>
   call<SkillSummary>('skill_set_enabled', { projectId, origin, name, enabled });
+
+/* ---------------- SkillHub（云端技能市场） ---------------- */
+export const skillHubList = (q: string, cursor: string | null, size = 24) =>
+  call<SkillHubList>('skillhub_list', { q: q || null, cursor, size });
+export const skillHubDetail = (namespace: string, slug: string) =>
+  call<SkillHubDetail>('skillhub_detail', { namespace, slug });
+export const skillHubVersionDetail = (namespace: string, slug: string, version: string) =>
+  call<SkillHubVersionDetail>('skillhub_version_detail', { namespace, slug, version });
+export const skillHubDownload = (
+  projectId: string,
+  origin: SkillOrigin,
+  namespace: string,
+  slug: string,
+  version: string,
+) => call<SkillSummary>('skillhub_download', { projectId, origin, namespace, slug, version });
 
 /* ---------------- misc ---------------- */
 export { open as openDialog } from '@tauri-apps/plugin-dialog';

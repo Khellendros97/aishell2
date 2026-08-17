@@ -65,11 +65,7 @@ pub(crate) async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FsEnt
         });
     }
     // 目录优先，再按名称排序（与原型 listChildren 行为一致）
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
     Ok(entries)
 }
 
@@ -136,7 +132,11 @@ pub async fn sftp_upload(
         return Err("本地路径不能为空".to_string());
     }
     let target = if remote_dir.trim().is_empty() || remote_dir == "." {
-        ssh.inner().open_sftp(&server_id).await?.canonicalize(".").await
+        ssh.inner()
+            .open_sftp(&server_id)
+            .await?
+            .canonicalize(".")
+            .await
             .map_err(|e| format!("解析远端目录失败: {e}"))?
     } else {
         remote_dir

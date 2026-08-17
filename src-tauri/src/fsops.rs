@@ -37,8 +37,8 @@ pub struct FsStat {
 #[tauri::command]
 pub fn fs_stat(path: String) -> Result<FsStat, String> {
     let file = non_empty(&path)?;
-    let meta = fs::symlink_metadata(&file)
-        .map_err(|e| format!("无法访问「{}」：{e}", file.display()))?;
+    let meta =
+        fs::symlink_metadata(&file).map_err(|e| format!("无法访问「{}」：{e}", file.display()))?;
     let mtime = meta
         .modified()
         .ok()
@@ -64,7 +64,9 @@ pub fn fs_stat(path: String) -> Result<FsStat, String> {
         mode,
         readonly: meta.permissions().readonly(),
         link_target: if meta.file_type().is_symlink() {
-            fs::read_link(&file).ok().map(|t| t.to_string_lossy().into_owned())
+            fs::read_link(&file)
+                .ok()
+                .map(|t| t.to_string_lossy().into_owned())
         } else {
             None
         },
@@ -83,10 +85,14 @@ fn non_empty(path: &str) -> Result<PathBuf, String> {
 pub fn fs_list(path: String) -> Result<Vec<FsEntry>, String> {
     let dir = non_empty(&path)?;
     let mut entries: Vec<FsEntry> = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| format!("无法读取目录「{}」：{e}", dir.display()))? {
+    for entry in
+        fs::read_dir(&dir).map_err(|e| format!("无法读取目录「{}」：{e}", dir.display()))?
+    {
         let entry = entry.map_err(|e| format!("读取目录条目失败：{e}"))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let meta = entry.metadata().map_err(|e| format!("读取「{name}」属性失败：{e}"))?;
+        let meta = entry
+            .metadata()
+            .map_err(|e| format!("读取「{name}」属性失败：{e}"))?;
         let mtime = meta
             .modified()
             .ok()
@@ -101,11 +107,9 @@ pub fn fs_list(path: String) -> Result<Vec<FsEntry>, String> {
         });
     }
     entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then_with(|| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-        })
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
 }
@@ -176,7 +180,12 @@ pub fn fs_create(path: String, is_dir: bool) -> Result<(), String> {
 /// 导入 OS 拖入的文件/目录：重名自动 `name (1).ext`；文件内容走 base64。
 /// 返回最终落地的名称（前端据此递归子项）。
 #[tauri::command]
-pub fn fs_import(dir: String, name: String, is_dir: bool, data: Option<String>) -> Result<String, String> {
+pub fn fs_import(
+    dir: String,
+    name: String,
+    is_dir: bool,
+    data: Option<String>,
+) -> Result<String, String> {
     let dir = non_empty(&dir)?;
     if !dir.is_dir() {
         return Err(format!("目标目录不存在：{}", dir.display()));
@@ -187,7 +196,8 @@ pub fn fs_import(dir: String, name: String, is_dir: bool, data: Option<String>) 
     let final_name = unique_local_name(&dir, &name)?;
     let target = dir.join(&final_name);
     if is_dir {
-        fs::create_dir(&target).map_err(|e| format!("创建目录「{}」失败：{e}", target.display()))?;
+        fs::create_dir(&target)
+            .map_err(|e| format!("创建目录「{}」失败：{e}", target.display()))?;
     } else {
         let b64 = data.ok_or_else(|| "缺少文件数据".to_string())?;
         let bytes = decode_base64(&b64)?;
@@ -327,7 +337,11 @@ pub fn fs_reveal(path: String) -> Result<(), String> {
         } else {
             p.parent().unwrap_or(p.as_path())
         };
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         std::process::Command::new(opener)
             .arg(dir)
             .spawn()
@@ -344,7 +358,8 @@ pub fn fs_delete(path: String) -> Result<(), String> {
         return Err(format!("「{}」不存在", target.display()));
     }
     if target.is_dir() {
-        fs::remove_dir_all(&target).map_err(|e| format!("删除目录「{}」失败：{e}", target.display()))
+        fs::remove_dir_all(&target)
+            .map_err(|e| format!("删除目录「{}」失败：{e}", target.display()))
     } else {
         fs::remove_file(&target).map_err(|e| format!("删除文件「{}」失败：{e}", target.display()))
     }
@@ -359,7 +374,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "aishell-fsops-{tag}-{}-{:?}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -406,7 +424,10 @@ mod tests {
         assert_eq!(fs::read_to_string(&p2).unwrap(), "hello");
         // 目录递归复制,源不动
         let p3 = fs_copy(s("d"), s("out")).unwrap();
-        assert_eq!(fs::read_to_string(PathBuf::from(&p3).join("nested/g.txt")).unwrap(), "world");
+        assert_eq!(
+            fs::read_to_string(PathBuf::from(&p3).join("nested/g.txt")).unwrap(),
+            "world"
+        );
         assert!(dir.join("d/nested/g.txt").exists());
         // 目录禁止复制进自身子孙
         assert!(fs_copy(s("d"), s("d/nested")).is_err());
@@ -424,7 +445,9 @@ mod tests {
         let entries = fs_list(dir.to_string_lossy().into_owned()).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["adir", "zdir", "A.txt", "b.txt"]);
-        assert!(entries.iter().all(|e| e.is_dir == entries[0].is_dir || !e.is_dir));
+        assert!(entries
+            .iter()
+            .all(|e| e.is_dir == entries[0].is_dir || !e.is_dir));
         assert!(entries.iter().all(|e| e.mtime > 0));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -444,7 +467,10 @@ mod tests {
 
         let ok = dir.join("ok.txt");
         fs::write(&ok, "你好\n世界").unwrap();
-        assert_eq!(fs_read(ok.to_string_lossy().into_owned()).unwrap(), "你好\n世界");
+        assert_eq!(
+            fs_read(ok.to_string_lossy().into_owned()).unwrap(),
+            "你好\n世界"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -485,12 +511,12 @@ mod tests {
         fs::write(&f, "x").unwrap();
         let t = SystemTime::now() - Duration::from_secs(120);
         let open = fs::File::options().write(true).open(&f).unwrap();
-        if open
-            .set_times(fs::FileTimes::new().set_modified(t))
-            .is_ok()
-        {
+        if open.set_times(fs::FileTimes::new().set_modified(t)).is_ok() {
             let e = fs_list(dir.to_string_lossy().into_owned()).unwrap();
-            assert_eq!(e[0].mtime, t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64);
+            assert_eq!(
+                e[0].mtime,
+                t.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+            );
         }
         fs::remove_dir_all(&dir).unwrap();
     }

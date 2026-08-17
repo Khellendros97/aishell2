@@ -17,6 +17,7 @@
 //! 登出（CR-1.7）：尽力调 `{server}/api/auth/logout` 吊销 refresh_token，失败忽略，
 //! 本地一律清 keyring + cloud 段；个人模式配置（llm/search）不受影响。
 
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,7 +74,9 @@ impl Default for CloudManager {
 
 impl CloudManager {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, CloudInner>, String> {
-        self.inner.lock().map_err(|_| "云会话状态锁损坏".to_string())
+        self.inner
+            .lock()
+            .map_err(|_| "云会话状态锁损坏".to_string())
     }
 }
 
@@ -112,10 +115,7 @@ fn emit_changed(app: &AppHandle, store: &Store) {
 fn random_hex(len: usize) -> Result<String, String> {
     let mut buf = vec![0u8; len / 2];
     getrandom::fill(&mut buf).map_err(|e| format!("生成随机数失败: {e}"))?;
-    Ok(buf
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>())
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 /// 构建注入的服务器地址（去尾斜杠）；未注入返回 None。
@@ -130,9 +130,11 @@ pub fn server_url() -> Option<String> {
 /// 服务器地址去掉尾部斜杠，避免拼接出 `//oauth/token` 双斜杠（配置常带 `/`）。
 fn credentials() -> Result<(String, String, String), String> {
     match (SERVER_URL, CLIENT_ID, CLIENT_SECRET) {
-        (Some(u), Some(i), Some(s)) if !u.is_empty() && !i.is_empty() && !s.is_empty() => {
-            Ok((server_url().unwrap_or_default(), i.to_string(), s.to_string()))
-        }
+        (Some(u), Some(i), Some(s)) if !u.is_empty() && !i.is_empty() && !s.is_empty() => Ok((
+            server_url().unwrap_or_default(),
+            i.to_string(),
+            s.to_string(),
+        )),
         _ => Err("当前构建未配置云服务（缺少服务器地址或应用凭据）".to_string()),
     }
 }
@@ -141,7 +143,9 @@ fn credentials() -> Result<(String, String, String), String> {
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for pair in query.split('&') {
-        let Some((k, v)) = pair.split_once('=') else { continue };
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
         map.insert(
             k.to_string(),
             percent_decode(v).unwrap_or_else(|| v.to_string()),
@@ -186,11 +190,7 @@ fn callback_response_html(ok: bool, message: &str) -> String {
 
 /// 向回调浏览器写出**完整 HTTP 响应**（状态行 + 头 + body）。
 /// 早期实现只写裸 HTML，真实浏览器无法解析协议报文，表现为「无法访问此页面」。
-async fn write_callback_response(
-    stream: &mut tokio::net::TcpStream,
-    ok: bool,
-    message: &str,
-) {
+async fn write_callback_response(stream: &mut tokio::net::TcpStream, ok: bool, message: &str) {
     use tokio::io::AsyncWriteExt;
     let html = callback_response_html(ok, message);
     let status = if ok { "200 OK" } else { "400 Bad Request" };
@@ -218,10 +218,7 @@ async fn handle_callback(
     let request_line = req.lines().next().unwrap_or("");
 
     // 提取路径与 query：GET /auth/callback?code=…&state=… HTTP/1.1
-    let path_query = request_line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or_default();
+    let path_query = request_line.split_whitespace().nth(1).unwrap_or_default();
     let (path, query) = match path_query.split_once('?') {
         Some((p, q)) => (p, q),
         None => (path_query, ""),
@@ -267,7 +264,11 @@ async fn handle_callback(
                         "[cloud] 登录成功，capabilities: models={} search={} knowledge={}",
                         store.cloud_profile().1.map(|c| c.models.len()).unwrap_or(0),
                         store.cloud_profile().1.map(|c| c.search).unwrap_or(false),
-                        store.cloud_profile().1.map(|c| c.knowledge).unwrap_or(false),
+                        store
+                            .cloud_profile()
+                            .1
+                            .map(|c| c.knowledge)
+                            .unwrap_or(false),
                     ));
                     write_callback_response(stream, true, "授权成功，公司账号已关联到 AIShell。")
                         .await;
@@ -344,10 +345,7 @@ async fn refresh_tokens(refresh: &str) -> Result<(String, String, u64), String> 
     let resp = client
         .post(&url)
         .basic_auth(&client_id, Some(&client_secret))
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh),
-        ])
+        .form(&[("grant_type", "refresh_token"), ("refresh_token", refresh)])
         .send()
         .await
         .map_err(|e| format!("连接云平台令牌端点失败: {e}"))?;
@@ -375,7 +373,10 @@ async fn refresh_tokens(refresh: &str) -> Result<(String, String, u64), String> 
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(7200);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7200);
     Ok((access, new_refresh, expires_in))
 }
 
@@ -418,7 +419,10 @@ async fn exchange_tokens(code: &str) -> Result<(String, String, u64), String> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(7200);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7200);
     Ok((access, refresh, expires_in))
 }
 
@@ -446,7 +450,10 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
     // 诊断：完整 me 响应（capabilities 决定工具挂载，字段结构需与服务端对齐）
     crate::term::diag(&format!("[cloud] /api/auth/me 响应: {body}"));
     let data = body.get("data").unwrap_or(&body);
-    let user_obj = data.get("user").or_else(|| body.get("user")).unwrap_or(data);
+    let user_obj = data
+        .get("user")
+        .or_else(|| body.get("user"))
+        .unwrap_or(data);
     let str_field = |v: &serde_json::Value, keys: &[&str]| -> Option<String> {
         keys.iter()
             .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
@@ -454,23 +461,33 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
     };
     let user = CloudUser {
         // 用户 id：记忆卡片权限判断（creatorId === 当前用户 id）依赖该字段
-        id: user_obj
-            .get("id")
-            .and_then(|v| v.as_i64())
-            .or_else(|| {
-                user_obj
-                    .get("userId")
-                    .or_else(|| user_obj.get("uid"))
-                    .and_then(|v| v.as_i64())
-            }),
+        id: user_obj.get("id").and_then(|v| v.as_i64()).or_else(|| {
+            user_obj
+                .get("userId")
+                .or_else(|| user_obj.get("uid"))
+                .and_then(|v| v.as_i64())
+        }),
         name: str_field(
             user_obj,
-            &["name", "username", "nickname", "display_name", "displayName"],
+            &[
+                "name",
+                "username",
+                "nickname",
+                "display_name",
+                "displayName",
+            ],
         )
         .unwrap_or_else(|| "未知用户".to_string()),
         avatar: str_field(
             user_obj,
-            &["avatar", "avatarURL", "avatar_url", "avatarUrl", "photo", "portrait"],
+            &[
+                "avatar",
+                "avatarURL",
+                "avatar_url",
+                "avatarUrl",
+                "photo",
+                "portrait",
+            ],
         ),
         dept: str_field(
             user_obj,
@@ -501,7 +518,10 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
             })
             .unwrap_or_default();
         caps.search = c.get("search").and_then(|v| v.as_bool()).unwrap_or(false);
-        caps.knowledge = c.get("knowledge").and_then(|v| v.as_bool()).unwrap_or(false);
+        caps.knowledge = c
+            .get("knowledge")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         caps.latest_version = str_field(c, &["latest_version", "latestVersion"]);
     }
     Ok((user, caps))
@@ -550,11 +570,7 @@ async fn run_callback_server(
 /// 服务端配置变更（models/search/knowledge）无需用户重登即可生效。
 /// 流程：未登录直接跳过 → valid_access_token（过期自动轮换）→ me → 更新缓存并广播；
 /// 刷新失败（吊销/禁用）→ 登录失效，清登录态（账号页与角标随之刷新）。
-pub async fn refresh_on_startup(
-    app: &AppHandle,
-    store: &Arc<Store>,
-    cloud: &Arc<CloudManager>,
-) {
+pub async fn refresh_on_startup(app: &AppHandle, store: &Arc<Store>, cloud: &Arc<CloudManager>) {
     // 未登录（keyring 无 refresh_token）不处理
     if store.cloud_tokens().1.is_none() {
         return;
@@ -570,7 +586,11 @@ pub async fn refresh_on_startup(
                     "[cloud] 启动刷新：models={} search={} knowledge={}",
                     store.cloud_profile().1.map(|c| c.models.len()).unwrap_or(0),
                     store.cloud_profile().1.map(|c| c.search).unwrap_or(false),
-                    store.cloud_profile().1.map(|c| c.knowledge).unwrap_or(false),
+                    store
+                        .cloud_profile()
+                        .1
+                        .map(|c| c.knowledge)
+                        .unwrap_or(false),
                 ));
                 emit_changed(app, store);
             }
@@ -628,6 +648,55 @@ async fn cloud_api_request(
     serde_json::from_str(t).map_err(|e| format!("解析云平台响应失败: {e}"))
 }
 
+/// 带 Bearer 的二进制下载请求，供 SkillHub ZIP 使用，响应体不经过 JSON 解析。
+async fn cloud_api_download(
+    cloud: &Arc<CloudManager>,
+    store: &Arc<Store>,
+    path: &str,
+    query: &[(&str, String)],
+) -> Result<Vec<u8>, String> {
+    let (server, ..) = credentials()?;
+    let token = cloud.valid_access_token(store).await?;
+    let url = format!("{server}{path}");
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url).bearer_auth(&token);
+    if !query.is_empty() {
+        req = req.query(query);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("连接云平台失败：{e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取云平台错误响应失败：{e}"))?;
+        return Err(api_error_text(status.as_u16(), &text));
+    }
+    const MAX_SKILLHUB_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_SKILLHUB_DOWNLOAD_BYTES as u64)
+    {
+        return Err("SkillHub 下载包过大（上限 50 MiB）".to_string());
+    }
+    let mut resp = resp;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("读取 SkillHub 下载包失败：{e}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_SKILLHUB_DOWNLOAD_BYTES {
+            return Err("SkillHub 下载包过大（上限 50 MiB）".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 /// 非 2xx 响应的中文错误提取：统一格式 {"error": "中文可读信息"}，
 /// 兼容 error_description/msg 兜底；无 JSON 结构时原样截取响应文本。
 fn api_error_text(status: u16, text: &str) -> String {
@@ -642,7 +711,11 @@ fn api_error_text(status: u16, text: &str) -> String {
         })
         .unwrap_or_else(|| {
             let t = text.trim();
-            if t.is_empty() { "无响应内容".to_string() } else { t.to_string() }
+            if t.is_empty() {
+                "无响应内容".to_string()
+            } else {
+                t.to_string()
+            }
         });
     format!("{err}（HTTP {status}）")
 }
@@ -737,7 +810,6 @@ pub struct MemoryHit {
     pub score: f64,
 }
 
-
 // ---------------------------------------------------------------- Tauri commands
 
 /// 发起登录：生成 state、启动本地回调监听，返回授权 URL（前端 openUrl 打开系统浏览器）。
@@ -796,10 +868,7 @@ pub async fn cloud_cancel_login(cloud: State<'_, Arc<CloudManager>>) -> Result<(
 /// 退出登录：尽力吊销服务端 refresh_token（失败忽略），本地清 keyring + cloud 段，
 /// 广播 cloud:changed；个人模式配置不受影响（CR-1.7）。
 #[tauri::command]
-pub async fn cloud_logout(
-    app: AppHandle,
-    store: State<'_, Arc<Store>>,
-) -> Result<(), String> {
+pub async fn cloud_logout(app: AppHandle, store: State<'_, Arc<Store>>) -> Result<(), String> {
     let (server, _, _) = credentials().unwrap_or_default();
     let access = store.cloud_tokens().0;
     if !server.is_empty() {
@@ -807,16 +876,198 @@ pub async fn cloud_logout(
             let url = format!("{server}/api/auth/logout");
             let client = reqwest::Client::new();
             // 吊销失败不阻塞本地登出
-            let _ = client
-                .post(&url)
-                .bearer_auth(token)
-                .send()
-                .await;
+            let _ = client.post(&url).bearer_auth(token).send().await;
         }
     }
     store.cloud_clear()?;
     emit_changed(&app, &store);
     Ok(())
+}
+// ---------------------------------------------------------------- SkillHub（文档 §8）
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillHubItem {
+    #[serde(default)]
+    pub id: i64,
+    pub namespace: String,
+    pub slug: String,
+    pub display_name: String,
+    pub summary: String,
+    #[serde(default)]
+    pub tags: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub stars: u64,
+    #[serde(default)]
+    pub download_count: u64,
+    #[serde(default)]
+    pub star_count: u64,
+    #[serde(default)]
+    pub rating_avg: f64,
+    #[serde(default)]
+    pub rating_count: u64,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub latest_version: String,
+    #[serde(default)]
+    pub changelog: String,
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default)]
+    pub owner_display_name: String,
+    #[serde(default)]
+    pub visibility: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub headline_version: Option<SkillHubVersion>,
+    #[serde(default)]
+    pub published_version: Option<SkillHubVersion>,
+    #[serde(default)]
+    pub owner_preview_version: Option<SkillHubVersion>,
+    #[serde(default)]
+    pub resolution_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillHubVersion {
+    #[serde(default)]
+    pub id: i64,
+    pub version: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub changelog: String,
+    #[serde(default)]
+    pub file_count: u64,
+    #[serde(default)]
+    pub total_size: u64,
+    #[serde(default)]
+    pub published_at: String,
+    #[serde(default)]
+    pub download_available: bool,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillHubList {
+    pub items: Vec<SkillHubItem>,
+    #[serde(default)]
+    pub next_cursor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillHubDetail {
+    pub skill: SkillHubItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillHubVersionDetail {
+    pub version: SkillHubVersion,
+}
+
+fn skillhub_segment(value: &str) -> String {
+    utf8_percent_encode(value.trim(), NON_ALPHANUMERIC).to_string()
+}
+
+#[tauri::command]
+pub async fn skillhub_list(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    q: Option<String>,
+    cursor: Option<String>,
+    size: Option<u32>,
+) -> Result<SkillHubList, String> {
+    let mut query = Vec::new();
+    if let Some(value) = q.filter(|value| !value.trim().is_empty()) {
+        query.push(("q", value.trim().to_string()));
+    }
+    if let Some(value) = cursor.filter(|value| !value.trim().is_empty()) {
+        query.push(("cursor", value));
+    }
+    query.push(("size", size.unwrap_or(24).clamp(1, 100).to_string()));
+    let value = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::GET,
+        "/api/skills",
+        &query,
+        None,
+    )
+    .await?;
+    serde_json::from_value(value).map_err(|e| format!("解析 SkillHub 列表失败：{e}"))
+}
+
+#[tauri::command]
+pub async fn skillhub_detail(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    namespace: String,
+    slug: String,
+) -> Result<SkillHubDetail, String> {
+    let path = format!(
+        "/api/skills/{}/{}",
+        skillhub_segment(&namespace),
+        skillhub_segment(&slug)
+    );
+    let value = cloud_api_request(&cloud, &store, reqwest::Method::GET, &path, &[], None).await?;
+    serde_json::from_value(value).map_err(|e| format!("解析 SkillHub 详情失败：{e}"))
+}
+
+#[tauri::command]
+pub async fn skillhub_version_detail(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    namespace: String,
+    slug: String,
+    version: String,
+) -> Result<SkillHubVersionDetail, String> {
+    let path = format!(
+        "/api/skills/{}/{}/versions/{}",
+        skillhub_segment(&namespace),
+        skillhub_segment(&slug),
+        skillhub_segment(&version)
+    );
+    let value = cloud_api_request(&cloud, &store, reqwest::Method::GET, &path, &[], None).await?;
+    serde_json::from_value(value).map_err(|e| format!("解析 SkillHub 版本详情失败：{e}"))
+}
+
+#[tauri::command]
+pub async fn skillhub_download(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    project_id: String,
+    origin: crate::skills::SkillOrigin,
+    namespace: String,
+    slug: String,
+    version: String,
+) -> Result<crate::skills::SkillSummary, String> {
+    let path = format!(
+        "/api/skills/{}/{}/download",
+        skillhub_segment(&namespace),
+        skillhub_segment(&slug)
+    );
+    let query = vec![("version", version)];
+    let bytes = cloud_api_download(&cloud, &store, &path, &query).await?;
+    crate::skills::install_skillhub_zip(store.inner().as_ref(), &project_id, origin, &slug, &bytes)
 }
 
 /// 当前云状态：登录态、用户资料、能力清单、服务器地址（构建常量）、模式。
@@ -885,8 +1136,19 @@ pub async fn memories_list(
         Some(s) if !s.trim().is_empty() && s != "all" => vec![("scope", s.trim().to_string())],
         _ => Vec::new(),
     };
-    let v = cloud_api_request(&cloud, &store, reqwest::Method::GET, "/api/memories", &q, None).await?;
-    let cards = v.get("memories").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::GET,
+        "/api/memories",
+        &q,
+        None,
+    )
+    .await?;
+    let cards = v
+        .get("memories")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     serde_json::from_value(cards).map_err(|e| format!("解析记忆卡片列表失败: {e}"))
 }
 
@@ -910,7 +1172,15 @@ pub async fn memory_create(
             body["scope"] = serde_json::json!(s.trim());
         }
     }
-    let v = cloud_api_request(&cloud, &store, reqwest::Method::POST, "/api/memories", &[], Some(body)).await?;
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::POST,
+        "/api/memories",
+        &[],
+        Some(body),
+    )
+    .await?;
     serde_json::from_value(v).map_err(|e| format!("解析记忆卡片失败: {e}"))
 }
 
@@ -982,7 +1252,10 @@ pub async fn memory_history(
         None,
     )
     .await?;
-    let events = v.get("history").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let events = v
+        .get("history")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     serde_json::from_value(events).map_err(|e| format!("解析记忆历史失败: {e}"))
 }
 
@@ -1014,7 +1287,10 @@ pub async fn memory_search(
         Some(body),
     )
     .await?;
-    let hits = v.get("results").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let hits = v
+        .get("results")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     serde_json::from_value(hits).map_err(|e| format!("解析记忆检索结果失败: {e}"))
 }
 
@@ -1118,9 +1394,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_build_uses_local_server_url() {
+        assert_eq!(server_url().as_deref(), Some("http://localhost:8080"));
+    }
+
     #[test]
     fn parse_query_handles_encoded_and_plain() {
-        let m = parse_query("code=abc123&state=xyz&redirect_uri=http%3A%2F%2F127.0.0.1%3A38901%2Fauth%2Fcallback");
+        let m = parse_query(
+            "code=abc123&state=xyz&redirect_uri=http%3A%2F%2F127.0.0.1%3A38901%2Fauth%2Fcallback",
+        );
         assert_eq!(m.get("code").map(String::as_str), Some("abc123"));
         assert_eq!(m.get("state").map(String::as_str), Some("xyz"));
         assert_eq!(
@@ -1178,7 +1462,8 @@ mod tests {
     #[test]
     fn usage_report_tolerates_missing_fields() {
         // 服务端旧版本/字段缺失：按默认值兜底，不整卡失败
-        let r: UsageReport = serde_json::from_str(r#"{"from":"2026-08-01","to":"2026-08-11"}"#).unwrap();
+        let r: UsageReport =
+            serde_json::from_str(r#"{"from":"2026-08-01","to":"2026-08-11"}"#).unwrap();
         assert_eq!(r.timezone, "");
         assert_eq!(r.summary.requests, 0);
         assert!(r.daily.is_empty());
@@ -1219,10 +1504,9 @@ mod tests {
 
     #[test]
     fn memory_card_personal_scope_parses() {
-        let c: MemoryCard = serde_json::from_str(
-            r#"{"id":"p1","content":"个人工作笔记","scope":"personal"}"#,
-        )
-        .unwrap();
+        let c: MemoryCard =
+            serde_json::from_str(r#"{"id":"p1","content":"个人工作笔记","scope":"personal"}"#)
+                .unwrap();
         assert_eq!(c.scope.as_deref(), Some("personal"));
     }
 
@@ -1289,7 +1573,10 @@ mod tests {
             "只能编辑自己上传的记忆卡片（HTTP 403）"
         );
         // 非 JSON：原样截取
-        assert_eq!(api_error_text(502, "Bad Gateway"), "Bad Gateway（HTTP 502）");
+        assert_eq!(
+            api_error_text(502, "Bad Gateway"),
+            "Bad Gateway（HTTP 502）"
+        );
         // 空体
         assert_eq!(api_error_text(204, ""), "无响应内容（HTTP 204）");
     }
@@ -1317,12 +1604,62 @@ mod tests {
     #[test]
     fn sediment_dialogue_empty_messages_noop() {
         // 空消息不触碰云会话/网络：构造最小实例验证短路语义
-        let dir = std::env::temp_dir().join(format!("aishell-sediment-noop-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aishell-sediment-noop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(crate::store::test_store(dir));
         let cloud = Arc::new(CloudManager::default());
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let res = rt.block_on(sediment_dialogue(&cloud, &store, vec![], None, None));
         assert!(res.is_ok(), "空消息应无操作成功返回");
+    }
+    #[test]
+    fn skillhub_models_parse_and_escape_path_segments() {
+        let list: SkillHubList = serde_json::from_value(json!({
+            "items": [{
+                "namespace": "global",
+                "slug": "skillhub-hello",
+                "displayName": "SkillHub Hello",
+                "summary": "演示技能",
+                "tags": {"category": "demo"},
+                "downloads": 12,
+                "stars": 3,
+                "latestVersion": "1.0.0",
+                "updatedAt": 1786516613789_i64
+            }],
+            "nextCursor": ""
+        }))
+        .unwrap();
+        assert_eq!(list.items[0].id, 0);
+        assert_eq!(
+            list.items[0].tags.get("category").map(String::as_str),
+            Some("demo")
+        );
+        assert_eq!(list.items[0].latest_version, "1.0.0");
+        assert_eq!(skillhub_segment("team/skill"), "team%2Fskill");
+        assert_eq!(skillhub_segment("  latest  "), "latest");
+    }
+
+    #[test]
+    fn skillhub_version_detail_parses_body_and_metadata() {
+        let detail: SkillHubVersionDetail = serde_json::from_value(json!({
+            "version": {
+                "version": "2.0.0",
+                "status": "PUBLISHED",
+                "fileCount": 2,
+                "totalSize": 1024,
+                "downloadAvailable": true,
+                "metadata": {"frontmatter": {"name": "demo"}},
+                "body": "# Demo"
+            }
+        }))
+        .unwrap();
+        assert_eq!(detail.version.id, 0);
+        assert_eq!(detail.version.file_count, 2);
+        assert_eq!(detail.version.metadata["frontmatter"]["name"], "demo");
+        assert_eq!(detail.version.body, "# Demo");
     }
 }

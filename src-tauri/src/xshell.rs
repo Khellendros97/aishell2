@@ -209,7 +209,11 @@ fn safe_user_key_name(user_key: &str) -> Option<String> {
 /// 只导入 Protocol=SSH 且 Host 非空、Port 1..65535 的会话；其余返回 None（计 skipped）。
 /// 返回 (ScannedSession, 是否需要用户处理)；所属目录随 ScannedSession.folder 携带，
 /// 服务器本身不再存目录（目录只用于导入时按目录自动建项目）。
-fn parse_session_file(path: &Path, rel: &Path, user_keys_dir: &Path) -> Option<(ScannedSession, bool)> {
+fn parse_session_file(
+    path: &Path,
+    rel: &Path,
+    user_keys_dir: &Path,
+) -> Option<(ScannedSession, bool)> {
     let bytes = fs::read(path).ok()?;
     let text = decode_xsh(&bytes)?;
     let fields = parse_xsh(&text);
@@ -780,8 +784,7 @@ mod tests {
         )
         .unwrap();
 
-        let (scanned, attention, skipped) =
-            scan_roots(&[root.join("NetSarang Computer")]).unwrap();
+        let (scanned, attention, skipped) = scan_roots(&[root.join("NetSarang Computer")]).unwrap();
         assert_eq!(scanned.len(), 2);
         assert_eq!(attention, 1); // web-01 是密码认证
         assert_eq!(skipped, 3);
@@ -796,9 +799,7 @@ mod tests {
         assert_eq!(web01.server.port, 22);
         assert_eq!(web01.server.auth_type, AuthType::Password);
         assert!(web01.server.key_path.is_empty());
-        assert!(
-            web01.server.id.starts_with("xshell-") && web01.server.id.len() == 23
-        );
+        assert!(web01.server.id.starts_with("xshell-") && web01.server.id.len() == 23);
 
         let web02 = scanned
             .iter()
@@ -821,14 +822,8 @@ mod tests {
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
         assert_eq!(r.projects_created, 0, "重复导入不重复建项目");
         // 内存状态可通过生产只读 API 查询，避免测试跨模块触碰 Store 私有字段
-        assert_eq!(
-            store.server(&web01.server.id),
-            Some(web01.server.clone())
-        );
-        assert_eq!(
-            store.server(&web02.server.id),
-            Some(web02.server.clone())
-        );
+        assert_eq!(store.server(&web01.server.id), Some(web01.server.clone()));
+        assert_eq!(store.server(&web02.server.id), Some(web02.server.clone()));
     }
 
     #[test]
