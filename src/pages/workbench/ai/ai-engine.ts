@@ -413,8 +413,10 @@ const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -
 const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key -> 引用（key = `${name}:${ts}`，@browser:名称 标签）
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
-/** 当前 AI 工作区域（默认本地；随激活终端自动切换） */
+/** 当前 AI 工作区域（默认本地；随激活终端/浏览器标签自动切换） */
 let workareaRef: ServerRef | null = null;
+/** 当前浏览器工作区域不使用服务器引用，单独记录以便发送时注入明确上下文。 */
+let browserWorkarea = false;
 /** 工作区域固定标签 DOM（不可移除；clearChips 清空后由 renderWorkareaChip 重建） */
 let workareaChipEl: HTMLElement | null = null;
 let activeSessionId = '';
@@ -503,6 +505,7 @@ export function mountAiPanel(container: HTMLElement): () => void {
   browserRefs.clear();
   autoSwitchAiWorkdir = false;
   workareaRef = null;
+  browserWorkarea = false;
   workareaChipEl = null;
   activeSessionId = '';
 
@@ -725,10 +728,10 @@ async function loadEffort(): Promise<void> {
   } catch {
     /* 读取失败保持默认 low / 开启（与 Settings 默认一致） */
   }
-  // 开启自动切换时：初始工作区域默认本地；已有激活终端则跟随其归属
+  // 开启自动切换时：初始工作区域默认本地；已有激活标签则跟随终端或浏览器
   if (autoSwitchAiWorkdir) {
     const active = getActiveTab(useWorkbench.getState());
-    if (active && active.type === 'terminal') updateWorkareaFromTab(active);
+    if (active) updateWorkareaFromTab(active);
     renderWorkareaChip();
   }
 }
@@ -1619,6 +1622,23 @@ function renderWorkareaChip(): void {
     if (workareaChipEl) { workareaChipEl.remove(); workareaChipEl = null; }
     return;
   }
+  if (browserWorkarea) {
+    const label = '@browser';
+    const title = '当前 AI 工作区域：浏览器（随活跃标签页自动切换）';
+    if (workareaChipEl && workareaChipEl.isConnected) {
+      workareaChipEl.innerHTML = `${icon('globe')} ${label}`;
+      workareaChipEl.title = title;
+      return;
+    }
+    const c = document.createElement('span');
+    c.className = 'tag blue ai-snap-chip ai-workarea-chip';
+    c.dataset.kind = 'workarea';
+    c.title = title;
+    c.innerHTML = `${icon('globe')} ${label}`;
+    chipRow.prepend(c);
+    workareaChipEl = c;
+    return;
+  }
   if (!workareaRef) workareaRef = { serverId: null, name: '本地终端' };
   const label = workareaRef.serverId ? `@remote:${workareaRef.name}` : '@local';
   const title = workareaRef.serverId
@@ -1640,6 +1660,7 @@ function renderWorkareaChip(): void {
 
 /** 工作区域切换：更新固定标签；同名手动引用被覆盖（固定引用不重复插入） */
 function setWorkarea(ref: ServerRef): void {
+  browserWorkarea = false;
   const key = serverRefKey(ref);
   if (workareaRef && serverRefKey(workareaRef) === key) {
     // 名称可能变化（如服务器改名），仍刷新标签
@@ -1657,15 +1678,19 @@ function setWorkarea(ref: ServerRef): void {
   renderWorkareaChip();
 }
 
-/** 激活终端 → 工作区域：SSH 终端取服务器引用，本地终端取本地引用；非终端标签不切换 */
+/** 激活终端或浏览器 → 工作区域；其他标签保持当前工作区域不变 */
 function updateWorkareaFromTab(t: Tab | null): void {
-  if (!t || t.type !== 'terminal') return;
-  const data = t.data as { kind?: string; serverId?: string };
-  if (data.kind === 'ssh' && data.serverId) {
-    setWorkarea({ serverId: data.serverId, name: String(t.title || '服务器') });
-  } else {
-    setWorkarea({ serverId: null, name: '本地终端' });
+  if (!t) return;
+  if (t.type === 'browser') {
+    browserWorkarea = true;
+    renderWorkareaChip();
+    return;
   }
+  if (t.type !== 'terminal') return;
+  setWorkarea({
+    serverId: t.data.kind === 'ssh' && t.data.serverId ? String(t.data.serverId) : null,
+    name: t.data.kind === 'ssh' && t.data.serverId ? String(t.title || '服务器') : '本地终端',
+  });
 }
 
 function onChipRowClick(e: MouseEvent): void {
@@ -1797,8 +1822,8 @@ async function send(): Promise<void> {
   const srefs: ServerRef[] = [];
   const prefs: PathRef[] = [];
   const brefs: BrowserRef[] = [];
-  // 固定工作区域引用最先（开启自动切换时）；发送时作为当前目标上下文说明
-  if (autoSwitchAiWorkdir && workareaRef) srefs.push(workareaRef);
+  // 固定工作区域引用最先（开启自动切换时）；浏览器工作区不携带上一终端引用
+  if (autoSwitchAiWorkdir && !browserWorkarea && workareaRef) srefs.push(workareaRef);
   chipRow.querySelectorAll('.ai-snap-chip').forEach((c) => {
     const el = c as HTMLElement;
     const id = el.dataset.id ?? '';
@@ -1868,7 +1893,9 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
     return `[引用服务器: ${sv.name} (${sv.username}@${sv.host}:${sv.port})]`;
   };
   const parts: string[] = [];
-  if (autoSwitchAiWorkdir && workareaRef && srefs[0] === workareaRef) {
+  if (autoSwitchAiWorkdir && browserWorkarea) {
+    parts.push('[当前工作区域: 浏览器]');
+  } else if (autoSwitchAiWorkdir && workareaRef && srefs[0] === workareaRef) {
     // 固定工作区域：作为当前目标上下文说明
     const wr: ServerRef = workareaRef; // 具名 const：IIFE 闭包内保持收窄
     parts.push(

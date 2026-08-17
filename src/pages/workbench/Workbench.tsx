@@ -139,6 +139,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
   const tabs = useWorkbench((s) => s.tabs);
   const activeId = useWorkbench((s) => s.activeId);
   const project = useWorkbench((s) => s.project);
+  const activeTab = tabs.find((t) => t.id === activeId) ?? null;
 
   const workbenchRef = useRef<HTMLDivElement>(null);
   const activityBarRef = useRef<HTMLDivElement>(null);
@@ -256,15 +257,15 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
   return (
     <>
       <Topbar activePage={null} />
-      <div id="workbench" ref={workbenchRef} aria-hidden={!active}>
-        <div id="activity-bar" ref={activityBarRef} onClick={onActivityClick}>
-          <div className={`activity-icon${panel === 'explorer' ? ' active' : ''}`} data-panel="explorer" title="文件资源管理器"><Icon name="folder" /></div>
-          <div className={`activity-icon${panel === 'servers' ? ' active' : ''}`} data-panel="servers" title="服务器列表"><Icon name="monitor" /></div>
-          <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
-          <div className={`activity-icon${panel === 'skills' ? ' active' : ''}`} data-panel="skills" title="Skill"><Icon name="sparkles" /></div>
-          <div className="activity-icon" data-panel="browser" title="浏览器(在标签页中打开)"><Icon name="globe" /></div>
-          <div className={`activity-icon ai-toggle${aiVisible ? ' active' : ''}`} data-panel="ai" title="AI 助手"><Icon name="bot" /></div>
-        </div>
+      <div id="workbench-shell">
+        <div id="workbench" ref={workbenchRef} aria-hidden={!active}>
+          <div id="activity-bar" ref={activityBarRef} onClick={onActivityClick}>
+            <div className={`activity-icon${panel === 'explorer' ? ' active' : ''}`} data-panel="explorer" title="文件资源管理器"><Icon name="folder" /></div>
+            <div className={`activity-icon${panel === 'servers' ? ' active' : ''}`} data-panel="servers" title="服务器列表"><Icon name="monitor" /></div>
+            <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
+            <div className={`activity-icon${panel === 'skills' ? ' active' : ''}`} data-panel="skills" title="Skill"><Icon name="sparkles" /></div>
+            <div className="activity-icon" data-panel="browser" title="浏览器(在标签页中打开)"><Icon name="globe" /></div>
+          </div>
         <div id="sidebar" ref={sidebarRef}>
           <div id="sidebar-head">
             <span id="sidebar-title">{def.title}</span>
@@ -313,6 +314,28 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
             ai-engine 在挂载时一次性快照 useWorkbench.getState().project,渲染即挂载会早于异步装载读到 null,
             导致发送消息恒报「项目未加载」。project 门控恢复旧版时序;换项目时整树经 key 重建,AiPanel 随之重挂。 */}
         <div id="ai-panel" ref={aiPanelRef} className={aiVisible ? '' : 'hidden'}>{project ? <AiPanel /> : null}</div>
+        </div>
+        <div id="workbench-statusbar" role="status" aria-label="工作台状态栏">
+          <div className="statusbar-left">
+            {project && <span className="statusbar-item" title={`当前项目：${project.name}`}><Icon name="folder" />{project.name}</span>}
+            <span className="statusbar-item statusbar-active-tab" title={activeTab ? `当前标签页：${activeTab.title}` : '当前没有活跃标签页'}>
+              {activeTab ? <><Icon name={activeTab.icon} />{activeTab.title}</> : '无活动标签页'}
+            </span>
+          </div>
+          <div className="statusbar-right">
+            <button
+              type="button"
+              className={`statusbar-ai-toggle${aiVisible ? ' active' : ''}`}
+              title={aiVisible ? '隐藏 AI 助手' : '显示 AI 助手'}
+              aria-controls="ai-panel"
+              aria-expanded={aiVisible}
+              onClick={() => useWorkbench.getState().setAiVisible(!aiVisible)}
+            >
+              <Icon name="bot" />
+              <span>AI 助手</span>
+            </button>
+          </div>
+        </div>
       </div>
     </>
   );
