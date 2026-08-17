@@ -103,6 +103,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "keyring",
+ "parking_lot",
  "percent-encoding",
  "portable-pty",
  "regex",

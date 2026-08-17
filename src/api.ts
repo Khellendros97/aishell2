@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -285,6 +285,9 @@ export const browserReload = () => call<void>('browser_reload');
 export const browserSetInspect = (enabled: boolean) =>
   call<void>('browser_set_inspect', { enabled });
 export const browserOpenDevtools = () => call<void>('browser_open_devtools');
+/** 驱动受限本地 ZIP 走可见的 SkillHub 页面流程；只返回终态，不额外广播进度事件。 */
+export const browserPublishSkillhub = (projectId: string, origin: SkillOrigin, packagePath: string) =>
+  call<SkillHubPublishOutcome>('browser_publish_skillhub', { projectId, origin, packagePath });
 export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
   listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
 
@@ -339,6 +342,9 @@ export const skillDelete = (projectId: string, origin: SkillOrigin, name: string
 /** 启停（只改 frontmatter 顶层 enabled 标量） */
 export const skillSetEnabled = (projectId: string, origin: SkillOrigin, name: string, enabled: boolean) =>
   call<SkillSummary>('skill_set_enabled', { projectId, origin, name, enabled });
+/** 打包本地 Skill 为仅供 browserPublishSkillhub 使用的临时 ZIP，返回规范化绝对路径。 */
+export const skillPackUpload = (projectId: string, origin: SkillOrigin, name: string) =>
+  call<string>('skill_pack_upload', { projectId, origin, name });
 
 /* ---------------- SkillHub（云端技能市场） ---------------- */
 export const skillHubList = (q: string, cursor: string | null, size = 24) =>

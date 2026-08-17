@@ -246,6 +246,7 @@ pub fn run() {
             skills::skill_save,
             skills::skill_delete,
             skills::skill_set_enabled,
+            skills::skill_pack_upload,
             cloud::skillhub_list,
             cloud::skillhub_detail,
             cloud::skillhub_version_detail,
@@ -288,6 +289,7 @@ pub fn run() {
             browser::browser_reload,
             browser::browser_set_inspect,
             browser::browser_open_devtools,
+            browser::browser_publish_skillhub,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

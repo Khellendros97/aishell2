@@ -490,6 +490,13 @@ export interface SkillDocument {
   content: string;
 }
 
+/** SkillHub 本地发布终态：published 时临时 ZIP 已删除；manual 时保留路径供当前浏览器页面手动选择。 */
+export interface SkillHubPublishOutcome {
+  status: 'published' | 'manual';
+  packagePath: string;
+  message: string;
+}
+
 /* ---------------- SkillHub（与 cloud.rs SkillHub API serde camelCase 对齐） ---------------- */
 export interface SkillHubVersion {
   id: number;

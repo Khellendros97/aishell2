@@ -2,6 +2,8 @@
 //! 契约（与 src/api.ts / browser-engine.ts 严格对齐）：
 //! - 命令 `browser_ensure` / `browser_set_rect` / `browser_set_visible` / `browser_navigate` /
 //!   `browser_back` / `browser_forward` / `browser_reload` / `browser_set_inspect` / `browser_open_devtools`；
+//! - 业务专用命令 `browser_publish_skillhub` 仅接收 skills.rs 生成并校验的临时 ZIP，复用可见单例
+//!   WebView 完成 CAS 后的发布页交互；其终态通过 Promise 返回，不新增 browser:event；
 //! - 事件 `browser:event` payload `{ kind: 'url'|'title'|'element'|'ai-navigate', ... }`；
 //! - AI 动作桥（ai.rs run_internal_action）：browser_open / browser_read / browser_console / browser_screenshot。
 //!
@@ -13,7 +15,8 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -23,7 +26,10 @@ use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State, Url, Webview, WebviewBuilder,
     WebviewUrl, Wry,
 };
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
+
+use crate::skills::{self, SkillOrigin};
+use crate::store::Store;
 
 /// 子 webview 标签（区别于主窗口 "main"；不进 capability，页面无 IPC 权限，回传走 WebMessage）。
 const BROWSER_LABEL: &str = "browser";
@@ -69,6 +75,108 @@ pub struct BrowserState {
     pub inspect: bool,
 }
 
+/// SkillHub 发布的唯一前端终态；自动化不确定时保留页面和 ZIP，交给用户完成。
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillHubPublishOutcome {
+    pub status: SkillHubPublishStatus,
+    pub package_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum SkillHubPublishStatus {
+    Published,
+    Manual,
+}
+
+const SKILLHUB_DASHBOARD_URL: &str = "https://skillhub.srun.com:6780/dashboard";
+const SKILLHUB_PUBLISH_URL: &str = "https://skillhub.srun.com:6780/dashboard/publish";
+const SKILLHUB_SKILLS_URL: &str = "https://skillhub.srun.com:6780/dashboard/skills";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishDiscoveryAction {
+    Wait,
+    NavigatePublish,
+    Prepare,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishSubmitAction {
+    Wait,
+    Published,
+    Manual(String),
+}
+
+fn should_navigate_skillhub_publish(url: &str, already_navigated: bool) -> bool {
+    url == SKILLHUB_DASHBOARD_URL && !already_navigated
+}
+
+fn publish_submit_action(url: &str, snapshot: &PublishPageSnapshot) -> PublishSubmitAction {
+    if url == SKILLHUB_SKILLS_URL {
+        PublishSubmitAction::Published
+    } else if snapshot.risk_dialog || snapshot.dialog.is_some() {
+        PublishSubmitAction::Manual(
+            snapshot
+                .dialog
+                .clone()
+                .unwrap_or_else(|| "发布页出现对话框，请手动确认".to_string()),
+        )
+    } else if let Some(toast) = &snapshot.toast {
+        PublishSubmitAction::Manual(toast.clone())
+    } else {
+        PublishSubmitAction::Wait
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PublishPageSnapshot {
+    ready: bool,
+    dialog: Option<String>,
+    risk_dialog: bool,
+    toast: Option<String>,
+}
+
+/// 发布页识别只接受稳定 URL 与固定控件；CAS / 钉钉及未知页面一律等待。
+fn publish_discovery_action(url: &str, snapshot: &PublishPageSnapshot) -> PublishDiscoveryAction {
+    if url == SKILLHUB_DASHBOARD_URL {
+        PublishDiscoveryAction::NavigatePublish
+    } else if url == SKILLHUB_PUBLISH_URL && snapshot.ready {
+        PublishDiscoveryAction::Prepare
+    } else {
+        PublishDiscoveryAction::Wait
+    }
+}
+
+fn manual_outcome(package_path: &Path, message: impl Into<String>) -> SkillHubPublishOutcome {
+    SkillHubPublishOutcome {
+        status: SkillHubPublishStatus::Manual,
+        package_path: package_path.to_string_lossy().into_owned(),
+        message: message.into(),
+    }
+}
+
+fn publish_timeout_outcome(package_path: &Path) -> SkillHubPublishOutcome {
+    manual_outcome(
+        package_path,
+        "自动上传未完成，请在当前发布页手动选择刚才打包的技能包。".to_string(),
+    )
+}
+
+fn cdp_file_input_requests(package_path: &Path) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("DOM.getDocument", json!({})),
+        (
+            "DOM.querySelector",
+            json!({ "selector": r#"input[type="file"][accept*=".zip"]"# }),
+        ),
+        (
+            "DOM.setFileInputFiles",
+            json!({ "files": [package_path], "nodeId": 0 }),
+        ),
+    ]
+}
+
 struct BrowserInner {
     webview: Option<Webview<Wry>>,
     inspect: bool,
@@ -85,8 +193,11 @@ pub struct BrowserManager {
     inner: Mutex<BrowserInner>,
     /// 页面加载完成计数（on_page_load Finished 时 +1；browser_open 用 watch 等待）
     load_tx: watch::Sender<u64>,
+    /// 首次创建 WebView 的临界区：browser_ensure 与 SkillHub 发布可并发到达，必须共用同一把锁。
+    ensure_lock: AsyncMutex<()>,
+    /// 全局子 WebView 只能有一个 SkillHub 发布状态机，避免 CAS / 表单互相导航。
+    publish_lock: AsyncMutex<()>,
 }
-
 impl Default for BrowserManager {
     fn default() -> Self {
         Self::new()
@@ -107,13 +218,310 @@ impl BrowserManager {
                 rect: (0.0, 0.0, 1280.0, 800.0),
             }),
             load_tx,
+            ensure_lock: AsyncMutex::new(()),
+            publish_lock: AsyncMutex::new(()),
+        }
+    }
+
+    fn current_url(&self) -> String {
+        self.inner.lock().url.clone()
+    }
+
+    async fn eval_json(&self, js: String, context: &str) -> Result<serde_json::Value, String> {
+        let wv = self.webview()?;
+        let (tx, rx) = oneshot::channel::<String>();
+        let tx = Mutex::new(Some(tx));
+        wv.eval_with_callback(js, move |result| {
+            if let Some(tx) = tx.lock().take() {
+                let _ = tx.send(result);
+            }
+        })
+        .map_err(|e| format!("{context}失败: {e}"))?;
+        let raw = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| format!("{context}超时"))?
+            .map_err(|_| format!("{context}回调丢失"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("{context}结果解析失败: {e}"))
+    }
+
+    async fn wait_publish_tick(
+        rx: &mut watch::Receiver<u64>,
+        deadline: tokio::time::Instant,
+    ) {
+        let wake = (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline);
+        tokio::select! {
+            _ = rx.changed() => {}
+            _ = tokio::time::sleep_until(wake) => {}
+        }
+    }
+
+    async fn inspect_publish_page(&self) -> Result<PublishPageSnapshot, String> {
+        let value = self
+            .eval_json(
+                r#"(() => {
+                    try {
+                      const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                      const button = [...document.querySelectorAll('button')].find((el) => (el.textContent || '').trim() === '确认发布');
+                      const dialog = [...document.querySelectorAll('[role="dialog"]')].find(visible);
+                      const toast = [...document.querySelectorAll('[data-sonner-toast][data-type="error"], [data-sonner-toast][data-type="warning"]')]
+                        .find(visible);
+                      const dialogText = dialog ? (dialog.textContent || '').trim() : '';
+                      return {
+                        ready: !!document.querySelector('#namespace[role="combobox"]')
+                          && !!document.querySelector('#visibility[role="combobox"]')
+                          && !!document.querySelector('input[type="file"][accept*=".zip"]')
+                          && !!button,
+                        dialog: dialogText || null,
+                        riskDialog: !!dialog && dialogText.includes('发布前风险提醒')
+                          && [...dialog.querySelectorAll('button')].some((el) => (el.textContent || '').trim() === '继续发布'),
+                        toast: toast ? (toast.textContent || '').trim() : null,
+                      };
+                    } catch (e) { return { ready: false, dialog: null, riskDialog: false, toast: null }; }
+                  })()"#.to_string(),
+                "探测 SkillHub 发布页",
+            )
+            .await?;
+        Ok(PublishPageSnapshot {
+            ready: value.get("ready").and_then(|v| v.as_bool()).unwrap_or(false),
+            dialog: value
+                .get("dialog")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            risk_dialog: value
+                .get("riskDialog")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            toast: value
+                .get("toast")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        })
+    }
+
+    async fn select_publish_options(&self) -> Result<bool, String> {
+        let value = self
+            .eval_json(
+                r#"(() => {
+                    try {
+                      const text = (el) => (el.textContent || '').trim();
+                      const option = (value) => [...document.querySelectorAll('[role="option"]')].find((el) => text(el) === value);
+                      const namespace = document.querySelector('#namespace[role="combobox"]');
+                      const visibility = document.querySelector('#visibility[role="combobox"]');
+                      if (!namespace || !visibility) return { ok: false };
+                      if (!text(namespace).includes('Global (@global)')) {
+                        namespace.click();
+                        const global = option('Global (@global)');
+                        if (!global) return { ok: false };
+                        global.click();
+                      }
+                      if (text(visibility) !== '公开') {
+                        visibility.click();
+                        const publicOption = option('公开');
+                        if (!publicOption) return { ok: false };
+                        publicOption.click();
+                      }
+                      return { ok: text(namespace).includes('Global (@global)') && text(visibility) === '公开' };
+                    } catch (e) { return { ok: false }; }
+                  })()"#.to_string(),
+                "设置 SkillHub 发布选项",
+            )
+            .await?;
+        Ok(value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    async fn call_devtools_json(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let wv = self.webview()?;
+        let (tx, rx) = oneshot::channel::<Result<String, String>>();
+        let method = method.to_string();
+        let params_text = serde_json::to_string(&params)
+            .map_err(|e| format!("序列化浏览器 CDP 参数失败: {e}"))?;
+        let sent = wv.with_webview(move |pw| unsafe {
+            use windows::core::{HSTRING, PCWSTR};
+            let Ok(core) = pw.controller().CoreWebView2() else {
+                let _ = tx.send(Err("浏览器 CDP 不可用".to_string()));
+                return;
+            };
+            let method = HSTRING::from(method);
+            let params = HSTRING::from(params_text);
+            let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(
+                Box::new(move |_err, result_json: String| {
+                    let _ = tx.send(Ok(result_json));
+                    Ok(())
+                }),
+            );
+            let _ = core.CallDevToolsProtocolMethod(
+                PCWSTR::from_raw(method.as_ptr()),
+                PCWSTR::from_raw(params.as_ptr()),
+                &handler,
+            );
+        });
+        if let Err(e) = sent {
+            return Err(format!("调用浏览器 CDP 失败: {e}"));
+        }
+        let raw = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| "调用浏览器 CDP 超时".to_string())?
+            .map_err(|_| "浏览器 CDP 回调丢失".to_string())??;
+        serde_json::from_str(&raw).map_err(|e| format!("解析浏览器 CDP 结果失败: {e}"))
+    }
+
+    async fn inject_publish_file(&self, package_path: &Path) -> Result<(), String> {
+        let requests = cdp_file_input_requests(package_path);
+        let document = self.call_devtools_json(requests[0].0, requests[0].1.clone()).await?;
+        let root_id = document
+            .pointer("/root/nodeId")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| "浏览器 CDP 未返回页面根节点".to_string())?;
+        let mut query = requests[1].1.clone();
+        query["nodeId"] = json!(root_id);
+        let node = self.call_devtools_json(requests[1].0, query).await?;
+        let node_id = node
+            .get("nodeId")
+            .and_then(|v| v.as_i64())
+            .filter(|id| *id > 0)
+            .ok_or_else(|| "SkillHub 发布页未找到 ZIP 文件选择框".to_string())?;
+        let mut set_files = requests[2].1.clone();
+        set_files["nodeId"] = json!(node_id);
+        self.call_devtools_json(requests[2].0, set_files).await?;
+        Ok(())
+    }
+
+    async fn confirm_publish_file(&self, package_path: &Path) -> Result<bool, String> {
+        let name = package_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("SkillHub 上传包文件名无效：{}", package_path.display()))?;
+        let name = serde_json::to_string(name).map_err(|e| format!("序列化文件名失败: {e}"))?;
+        let value = self
+            .eval_json(
+                format!(
+                    r#"(() => {{
+                      try {{
+                        const input = document.querySelector('input[type="file"][accept*=".zip"]');
+                        const button = [...document.querySelectorAll('button')].find((el) => (el.textContent || '').trim() === '确认发布');
+                        if (!input || !button || input.files.length !== 1 || input.files[0].name !== {name} || button.disabled) return {{ ok: false }};
+                        button.click();
+                        return {{ ok: true }};
+                      }} catch (e) {{ return {{ ok: false }}; }}
+                    }})()"#
+                ),
+                "确认 SkillHub 上传文件",
+            )
+            .await?;
+        Ok(value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    /// CDP 写入 files 后 React Dropzone 需要一个渲染周期同步状态；仅在文件名精确匹配且发布按钮
+    /// 已启用时点击，避免把可恢复的短暂状态误降级为人工操作。
+    async fn click_publish_when_ready(&self, package_path: &Path) -> Result<bool, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.confirm_publish_file(package_path).await? {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 监控现有全局 WebView 完成 SkillHub 发布；不导航启动页，保留 CAS 登录链与人工回退现场。
+    pub async fn publish_skillhub(
+        self: &Arc<Self>,
+        package_path: &Path,
+    ) -> Result<SkillHubPublishOutcome, String> {
+        let _lock = self.publish_lock.lock().await;
+        self.ensure().await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut loads = self.load_tx.subscribe();
+        let discovery_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut navigated_dashboard = false;
+        loop {
+            if tokio::time::Instant::now() >= discovery_deadline {
+                return Ok(publish_timeout_outcome(package_path));
+            }
+            let url = self.current_url();
+            let snapshot = if url == SKILLHUB_PUBLISH_URL {
+                self.inspect_publish_page().await.unwrap_or_default()
+            } else {
+                PublishPageSnapshot::default()
+            };
+            match publish_discovery_action(&url, &snapshot) {
+                PublishDiscoveryAction::NavigatePublish
+                    if should_navigate_skillhub_publish(&url, navigated_dashboard) =>
+                {
+                    self.navigate_str(SKILLHUB_PUBLISH_URL)?;
+                    navigated_dashboard = true;
+                }
+                PublishDiscoveryAction::Prepare => {
+                    if !self.select_publish_options().await? {
+                        Self::wait_publish_tick(&mut loads, discovery_deadline).await;
+                        continue;
+                    }
+                    if self.inject_publish_file(package_path).await.is_err()
+                        || !self.click_publish_when_ready(package_path).await?
+                    {
+                        return Ok(manual_outcome(
+                            package_path,
+                            "自动上传未完成，请在当前发布页手动选择刚才打包的技能包。".to_string(),
+                        ));
+                    }
+                    break;
+                }
+                _ => {}
+            }
+            Self::wait_publish_tick(&mut loads, discovery_deadline).await;
+        }
+
+        let submit_deadline = tokio::time::Instant::now() + Duration::from_secs(65);
+        loop {
+            if tokio::time::Instant::now() >= submit_deadline {
+                return Ok(manual_outcome(
+                    package_path,
+                    "自动提交未完成，请在当前发布页手动完成发布。".to_string(),
+                ));
+            }
+            let url = self.current_url();
+            let snapshot = if url == SKILLHUB_PUBLISH_URL {
+                match self.inspect_publish_page().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        return Ok(manual_outcome(
+                            package_path,
+                            "自动提交未完成，请在当前发布页手动完成发布。".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                PublishPageSnapshot::default()
+            };
+            match publish_submit_action(&url, &snapshot) {
+                PublishSubmitAction::Published => {
+                    return Ok(SkillHubPublishOutcome {
+                        status: SkillHubPublishStatus::Published,
+                        package_path: package_path.to_string_lossy().into_owned(),
+                        message: "Skill 已提交到 Skill Hub".to_string(),
+                    });
+                }
+                PublishSubmitAction::Manual(message) => {
+                    return Ok(manual_outcome(package_path, message));
+                }
+                PublishSubmitAction::Wait => {}
+            }
+            Self::wait_publish_tick(&mut loads, submit_deadline).await;
         }
     }
 
     fn webview(&self) -> Result<Webview<Wry>, String> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.inner.lock()
             .webview
             .clone()
             .ok_or_else(|| "浏览器尚未创建".to_string())
@@ -122,7 +530,8 @@ impl BrowserManager {
     /// 懒创建子 webview（已存在直接返回）。初始离屏 + 隐藏：
     /// 面板挂载后 set_rect 归位；AI 后台使用时离屏渲染（截图不闪屏）。
     pub async fn ensure(self: &Arc<Self>) -> Result<(), String> {
-        if self.inner.lock().unwrap().webview.is_some() {
+        let _ensure = self.ensure_lock.lock().await;
+        if self.inner.lock().webview.is_some() {
             return Ok(());
         }
         let handle = app_handle().ok_or_else(|| "浏览器未初始化（应用句柄缺失）".to_string())?;
@@ -150,7 +559,7 @@ impl BrowserManager {
                     .trim_start_matches('/')
                     .to_string();
                 if let Ok(rewritten) = local_file_url(Path::new(&decoded)) {
-                    if let Some(wv) = mgr_nav.inner.lock().unwrap().webview.clone() {
+                    if let Some(wv) = mgr_nav.inner.lock().webview.clone() {
                         let _ = wv.navigate(rewritten);
                     }
                 }
@@ -162,7 +571,7 @@ impl BrowserManager {
             let url = payload.url().to_string();
             let finished = matches!(payload.event(), PageLoadEvent::Finished);
             let (inspect, wv) = {
-                let mut inner = mgr_load.inner.lock().unwrap();
+                let mut inner = mgr_load.inner.lock();
                 inner.url = url.clone();
                 if finished {
                     inner.console.clear();
@@ -191,7 +600,7 @@ impl BrowserManager {
             }
         })
         .on_document_title_changed(move |_wv, title| {
-            mgr_title.inner.lock().unwrap().title = title.clone();
+            mgr_title.inner.lock().title = title.clone();
             if let Some(a) = app_handle() {
                 let _ = a.emit("browser:event", json!({ "kind": "title", "title": title }));
             }
@@ -230,7 +639,7 @@ impl BrowserManager {
         });
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             if inner.webview.is_some() {
                 // 并发 ensure 竞态：后建者直接丢弃
                 let _ = wv.close();
@@ -248,7 +657,7 @@ impl BrowserManager {
         wv.navigate(url.clone())
             .map_err(|e| format!("导航失败: {e}"))?;
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.url = url.to_string();
             inner.console.clear();
         }
@@ -261,12 +670,12 @@ impl BrowserManager {
         self.ensure().await?;
         let url = normalize_input(input)?;
         let before = *self.load_tx.borrow();
-        let shown = self.inner.lock().unwrap().shown;
+        let shown = self.inner.lock().shown;
         let wv = self.webview()?;
         wv.navigate(url.clone())
             .map_err(|e| format!("导航失败: {e}"))?;
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.url = url.to_string();
             inner.console.clear();
         }
@@ -296,7 +705,7 @@ impl BrowserManager {
             loaded = *rx.borrow_and_update() > before;
         }
         let (url_s, title) = {
-            let i = self.inner.lock().unwrap();
+            let i = self.inner.lock();
             (i.url.clone(), i.title.clone())
         };
         Ok(format!(
@@ -329,7 +738,7 @@ impl BrowserManager {
         let (tx, rx) = oneshot::channel::<String>();
         let tx = Mutex::new(Some(tx));
         wv.eval_with_callback(js, move |result| {
-            if let Some(tx) = tx.lock().unwrap().take() {
+            if let Some(tx) = tx.lock().take() {
                 let _ = tx.send(result);
             }
         })
@@ -357,7 +766,7 @@ impl BrowserManager {
 
     /// AI 动作 browser_console：最近 limit 条（默认 200）console 日志。
     pub fn console_text(&self, limit: Option<usize>) -> String {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let limit = limit.unwrap_or(200).min(inner.console.len());
         let lines: Vec<String> = inner
             .console
@@ -384,7 +793,7 @@ impl BrowserManager {
         self.ensure().await?;
         let wv = self.webview()?;
         let (was_shown, rect) = {
-            let i = self.inner.lock().unwrap();
+            let i = self.inner.lock();
             (i.shown, i.rect)
         };
         if !was_shown {
@@ -464,7 +873,7 @@ fn handle_page_message(mgr: &BrowserManager, msg: &str) {
                     .to_string(),
                 ts: v.get("ts").and_then(|x| x.as_u64()).unwrap_or_else(now_ms),
             };
-            let mut inner = mgr.inner.lock().unwrap();
+            let mut inner = mgr.inner.lock();
             if inner.console.len() >= CONSOLE_CAP {
                 inner.console.pop_front();
             }
@@ -669,7 +1078,7 @@ fn save_screenshot(project_path: &Path, bytes: &[u8]) -> Result<String, String> 
 #[tauri::command]
 pub async fn browser_ensure(mgr: State<'_, Arc<BrowserManager>>) -> Result<BrowserState, String> {
     mgr.ensure().await?;
-    let i = mgr.inner.lock().unwrap();
+    let i = mgr.inner.lock();
     Ok(BrowserState {
         url: display_url(&i.url),
         title: i.title.clone(),
@@ -687,7 +1096,7 @@ pub async fn browser_set_rect(
 ) -> Result<(), String> {
     let (w, h) = (w.max(1.0), h.max(1.0));
     let wv = mgr.webview()?;
-    mgr.inner.lock().unwrap().rect = (x, y, w, h);
+    mgr.inner.lock().rect = (x, y, w, h);
     wv.set_position(LogicalPosition::new(x, y))
         .map_err(|e| format!("同步浏览器位置失败: {e}"))?;
     wv.set_size(LogicalSize::new(w, h))
@@ -701,9 +1110,36 @@ pub async fn browser_set_visible(
     visible: bool,
 ) -> Result<(), String> {
     let wv = mgr.webview()?;
-    mgr.inner.lock().unwrap().shown = visible;
+    mgr.inner.lock().shown = visible;
     let r = if visible { wv.show() } else { wv.hide() };
     r.map_err(|e| format!("切换浏览器显示失败: {e}"))
+}
+
+/// 发布本地 Skill：仅接受 skills.rs 校验过的临时 ZIP；发布成功才删除该临时文件。
+#[tauri::command]
+pub async fn browser_publish_skillhub(
+    mgr: State<'_, Arc<BrowserManager>>,
+    store: State<'_, Arc<Store>>,
+    project_id: String,
+    origin: SkillOrigin,
+    package_path: String,
+) -> Result<SkillHubPublishOutcome, String> {
+    let package = skills::validate_upload_package_path(
+        &store,
+        &project_id,
+        origin,
+        Path::new(&package_path),
+    )?;
+    let outcome = mgr.publish_skillhub(&package).await?;
+    if outcome.status == SkillHubPublishStatus::Published {
+        skills::remove_upload_package(&store, &project_id, origin, &package).map_err(|e| {
+            format!(
+                "{e}；发布已完成，请手动处理临时包：{}",
+                package.display()
+            )
+        })?;
+    }
+    Ok(outcome)
 }
 
 #[tauri::command]
@@ -740,7 +1176,7 @@ pub async fn browser_set_inspect(
     mgr: State<'_, Arc<BrowserManager>>,
     enabled: bool,
 ) -> Result<(), String> {
-    mgr.inner.lock().unwrap().inspect = enabled;
+    mgr.inner.lock().inspect = enabled;
     let js = if enabled {
         "window.__aishellInspector && window.__aishellInspector.enable();"
     } else {
@@ -1043,5 +1479,80 @@ mod tests {
             "最旧的旧截图应被清理"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skillhub_publish_page_state_machine_is_fail_closed() {
+        let incomplete = PublishPageSnapshot::default();
+        assert_eq!(
+            publish_discovery_action("https://cas.srun.com:6780/signin", &incomplete),
+            PublishDiscoveryAction::Wait
+        );
+        assert_eq!(
+            publish_discovery_action(SKILLHUB_DASHBOARD_URL, &incomplete),
+            PublishDiscoveryAction::NavigatePublish
+        );
+        assert!(should_navigate_skillhub_publish(SKILLHUB_DASHBOARD_URL, false));
+        assert!(!should_navigate_skillhub_publish(SKILLHUB_DASHBOARD_URL, true));
+        assert_eq!(
+            publish_discovery_action(SKILLHUB_PUBLISH_URL, &incomplete),
+            PublishDiscoveryAction::Wait
+        );
+        let ready = PublishPageSnapshot { ready: true, ..Default::default() };
+        assert_eq!(
+            publish_discovery_action(SKILLHUB_PUBLISH_URL, &ready),
+            PublishDiscoveryAction::Prepare
+        );
+    }
+
+    #[test]
+    fn skillhub_publish_terminal_states_keep_manual_fallback() {
+        assert_eq!(
+            publish_submit_action(SKILLHUB_SKILLS_URL, &PublishPageSnapshot::default()),
+            PublishSubmitAction::Published
+        );
+        let risk = PublishPageSnapshot {
+            risk_dialog: true,
+            dialog: Some("发布前风险提醒继续发布".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            publish_submit_action(SKILLHUB_PUBLISH_URL, &risk),
+            PublishSubmitAction::Manual("发布前风险提醒继续发布".to_string())
+        );
+        let toast = PublishPageSnapshot {
+            toast: Some("上传失败".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            publish_submit_action(SKILLHUB_PUBLISH_URL, &toast),
+            PublishSubmitAction::Manual("上传失败".to_string())
+        );
+        let package = Path::new(r"C:\tmp\skill.zip");
+        assert_eq!(
+            publish_timeout_outcome(package).status,
+            SkillHubPublishStatus::Manual
+        );
+        assert!(!publish_timeout_outcome(package).message.contains("skill.zip"));
+        assert_eq!(
+            manual_outcome(package, "提交超时").status,
+            SkillHubPublishStatus::Manual
+        );
+    }
+
+    #[test]
+    fn skillhub_cdp_file_injection_requests_are_exact_and_escaped() {
+        let package = Path::new(r#"C:\tmp\name "quoted".zip"#);
+        let requests = cdp_file_input_requests(package);
+        assert_eq!(requests[0].0, "DOM.getDocument");
+        assert_eq!(requests[1].0, "DOM.querySelector");
+        assert_eq!(
+            requests[1].1["selector"],
+            r#"input[type="file"][accept*=".zip"]"#
+        );
+        assert_eq!(requests[2].0, "DOM.setFileInputFiles");
+        assert_eq!(requests[2].1["files"][0], r#"C:\tmp\name "quoted".zip"#);
+        let json = serde_json::to_string(&requests[2].1).unwrap();
+        assert!(json.contains(r#"\"quoted\""#), "路径 JSON 未正确转义：{json}");
     }
 }

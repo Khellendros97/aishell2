@@ -7,8 +7,8 @@
  * 原生子 webview 由 Rust 持有(全局单实例,跨标签关闭/跨项目保留),本引擎只负责:
  * - 工具栏 UI(后退/前进/刷新/地址栏/打开本地 HTML/检查元素/开发者工具);
  * - 容器 div 的 rect 同步(ResizeObserver + window resize,逻辑坐标与窗口 1:1);
- * - 显隐合成:标签激活 && 无全屏遮罩(.modal-mask/.ctx-menu 挂 body 直下)才显示——
- *   子 webview 永远浮在主 webview 之上,遮罩出现时必须让位;
+ * - 显隐合成:标签激活 && 无全屏遮罩(.modal-mask/.ctx-menu)才显示——
+ *   子 webview 永远浮在主 webview 之上，遮罩出现时必须让位；
  * - 检查模式开关;element 事件 → wbHandles.ai.addBrowserRef(chip 引用,发送时展开)。
  * 状态放模块级(同 explorer 模式):标签关闭再打开不丢 url/检查模式。
  * 挂载契约:每次挂载完整初始化 DOM/监听/观察,清理函数完整回收;引擎状态跨挂载保留。
@@ -52,6 +52,14 @@ function syncRect(): void {
   const r = el.getBoundingClientRect();
   if (r.width < 2 || r.height < 2) return;
   void browserSetRect(r.x, r.y, r.width, r.height).catch(() => { /* 标签切换竞态可忽略 */ });
+}
+
+/** 原生子 WebView 的层级高于主 WebView；全屏遮罩和右键菜单出现时必须临时隐藏它。 */
+function hasBlockingOverlay(): boolean {
+  return Array.from(document.body.children).some(
+    (n) => n instanceof HTMLElement
+      && (n.classList.contains('modal-mask') || n.classList.contains('ctx-menu')),
+  );
 }
 
 function applyVisibility(): void {
@@ -190,16 +198,10 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
   if (viewEl) ro.observe(viewEl);
   window.addEventListener('resize', syncRect);
 
-  /* 遮罩避让:modal-mask / ctx-menu 挂 body 直下,出现/移除时重算可见性 */
-  overlayOpen = Array.from(document.body.children).some(
-    (n) => n instanceof HTMLElement
-      && (n.classList.contains('modal-mask') || n.classList.contains('ctx-menu')),
-  );
+  /* 子 WebView 会盖住主页面的模态与菜单；它们出现/移除时重算可见性。 */
+  overlayOpen = hasBlockingOverlay();
   const overlayObserver = new MutationObserver(() => {
-    const open = Array.from(document.body.children).some(
-      (n) => n instanceof HTMLElement
-        && (n.classList.contains('modal-mask') || n.classList.contains('ctx-menu')),
-    );
+    const open = hasBlockingOverlay();
     if (open !== overlayOpen) {
       overlayOpen = open;
       applyVisibility();

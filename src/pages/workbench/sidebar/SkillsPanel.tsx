@@ -6,12 +6,13 @@
  * scope 编辑区(local/all + 远程主机卡片 + 其它 remote: 名称 chips)独立收集后作为
  * skillSave 显式参数交给后端(后端只重写顶层 scope,其余字节不动),前端不解析重写 YAML。
  * 契约:skillsPanel 导出(标题 + HeadActions「Skill Hub / + 添加」)。
- * 接口点:src/api.ts skills 段(skillsList / skillRead / skillSave / skillDelete / skillSetEnabled)。
+ * 接口点:src/api.ts skills 段(skillsList / skillRead / skillSave / skillDelete / skillSetEnabled /
+ * skillPackUpload) 与 browser 段(browserEnsure / browserNavigate / browserPublishSkillhub)。
  */
 import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { Server, SkillOrigin, SkillSummary } from '../../../types';
-import { getState, skillDelete, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
+import { browserEnsure, browserNavigate, browserPublishSkillhub, getState, skillDelete, skillPackUpload, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
 import { useWorkbench, wbEvents } from '../../../stores/workbench';
 import { confirmDialog, toast } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
@@ -236,10 +237,13 @@ function openSkillModal(d: SkillSummary | null): void {
 }
 
 /* ---------- 卡片 ---------- */
-function SkillCard({ d, onToggle, onDelete }: {
+function SkillCard({ d, onToggle, onDelete, onUpload, uploading, uploadBusy }: {
   d: SkillSummary;
   onToggle(d: SkillSummary, next: boolean): Promise<boolean>;
   onDelete(d: SkillSummary): void;
+  onUpload(d: SkillSummary): void;
+  uploading: boolean;
+  uploadBusy: boolean;
 }): JSX.Element {
   const [pending, setPending] = useState(false);
   /** 请求期间的显示值(原值;成功后随 d.enabled 同步) */
@@ -247,7 +251,7 @@ function SkillCard({ d, onToggle, onDelete }: {
   useEffect(() => { setDisplay(d.enabled); }, [d.enabled]);
 
   const handleToggle = (next: boolean): void => {
-    if (pending) return;
+    if (pending || uploading) return;
     setPending(true);
     setDisplay(!next); // 请求期间显示原值(与 legacy 一致)
     void onToggle(d, next).then((ok) => {
@@ -270,12 +274,15 @@ function SkillCard({ d, onToggle, onDelete }: {
       </div>
       <div className="wbs-skills-actions">
         <label className="db-switch" title="启用/禁用（只改 SKILL.md 顶层 enabled）">
-          <input type="checkbox" className="wbs-skills-toggle" checked={display} disabled={pending}
+          <input type="checkbox" className="wbs-skills-toggle" checked={display} disabled={pending || uploading}
             onChange={(e) => handleToggle(e.currentTarget.checked)} />
           <span className="db-switch-track"></span>
         </label>
-        <button className="icon-btn" title="编辑" onClick={() => openSkillModal(d)}><Icon name="pencil" /></button>
-        <button className="icon-btn danger" title="删除" onClick={() => void onDelete(d)}><Icon name="trash" /></button>
+        <button className="icon-btn" title="上传到 Skill Hub" disabled={uploadBusy} onClick={() => onUpload(d)}>
+          <Icon name={uploading ? 'loader' : 'upload'} />
+        </button>
+        <button className="icon-btn" title="编辑" disabled={uploading} onClick={() => openSkillModal(d)}><Icon name="pencil" /></button>
+        <button className="icon-btn danger" title="删除" disabled={uploading} onClick={() => void onDelete(d)}><Icon name="trash" /></button>
       </div>
     </div>
   );
@@ -287,6 +294,11 @@ function SkillsPanelBody(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [searchText, setSearchText] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
+  const [uploadingSkillId, setUploadingSkillId] = useState<string | null>(null);
+  const uploadingRef = useRef<string | null>(null);
+  const aliveRef = useRef(true);
+
+  useEffect(() => () => { aliveRef.current = false; }, []);
 
   /* 挂载时注册面板刷新句柄(模态保存成功后经它重拉列表;卸载清理) */
   useEffect(() => {
@@ -328,6 +340,50 @@ function SkillsPanelBody(): JSX.Element {
       void skillDelete(projectId(), d.origin, d.name)
         .then(() => { setReloadKey((k) => k + 1); toast(`Skill「${d.name}」已删除`, 'success'); })
         .catch((err) => toast(String(err), 'error'));
+    });
+  };
+
+  /** 打包与可见浏览器导航并行；浏览器启动失败时保留 ZIP，让用户直接在当前页手动选择。 */
+  const onUpload = (d: SkillSummary): void => {
+    if (uploadingRef.current) return;
+    uploadingRef.current = d.id;
+    setUploadingSkillId(d.id);
+    const navigation = new Promise<void>((resolve, reject) => {
+      useWorkbench.getState().openTab({ id: 'browser', type: 'browser', title: '浏览器' });
+      void (async () => {
+        await browserEnsure();
+        await browserNavigate('https://skillhub.srun.com:6780/dashboard/publish');
+      })().then(resolve, reject);
+    });
+    const packed = skillPackUpload(projectId(), d.origin, d.name);
+
+    void Promise.allSettled([packed, navigation]).then(async ([packResult, navigationResult]) => {
+      if (packResult.status === 'rejected') {
+        if (aliveRef.current) toast(`Skill 打包失败：${String(packResult.reason)}`, 'error');
+        return;
+      }
+      const packagePath = packResult.value;
+      if (navigationResult.status === 'rejected') {
+        if (aliveRef.current) {
+          toast(
+            `打开 Skill Hub 失败：${String(navigationResult.reason)}。请在当前发布页手动选择刚才打包的技能包。`,
+            'error',
+            3000,
+          );
+        }
+        return;
+      }
+      try {
+        const outcome = await browserPublishSkillhub(projectId(), d.origin, packagePath);
+        if (!aliveRef.current) return;
+        if (outcome.status === 'published') toast(`Skill「${d.name}」已提交到 Skill Hub`, 'success');
+        else toast(outcome.message, 'info', 3000);
+      } catch (err) {
+        if (aliveRef.current) toast(`自动上传失败：${String(err)}`, 'error');
+      }
+    }).finally(() => {
+      uploadingRef.current = null;
+      if (aliveRef.current) setUploadingSkillId(null);
     });
   };
 
@@ -393,7 +449,15 @@ function SkillsPanelBody(): JSX.Element {
                 </div>
                 <div className={`wbs-skills-group-list${expanded ? '' : ' hidden'}`}>
                   {groupItems.map((s) => (
-                    <SkillCard key={s.id} d={s} onToggle={onToggle} onDelete={onDelete} />
+                    <SkillCard
+                      key={s.id}
+                      d={s}
+                      onToggle={onToggle}
+                      onDelete={onDelete}
+                      onUpload={onUpload}
+                      uploading={uploadingSkillId === s.id}
+                      uploadBusy={uploadingSkillId !== null}
+                    />
                   ))}
                 </div>
               </div>
