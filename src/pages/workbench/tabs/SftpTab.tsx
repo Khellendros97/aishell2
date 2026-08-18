@@ -47,7 +47,7 @@ import {
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
 import { revealLocalPath } from '../sidebar/ExplorerPanel';
-import { hideProgress, showProgress } from '../statusbar-progress';
+import { hideProgress } from '../statusbar-progress';
 
 interface SftpEls {
   body: HTMLElement;
@@ -914,10 +914,9 @@ async function stageRemoteItems(st: SftpTabState, items: RemoteEntry[]): Promise
     toast('AI 会话尚未加载，无法暂存', 'error');
     return;
   }
-  // 目录递归暂存较慢：底边栏显示进度（后端按文件发 staging:progress 事件驱动内容，占位槽与事件槽同 key）
-  const hasDir = items.some((e) => e.isDir);
+  // 目录递归暂存较慢：底边栏显示进度（纯事件驱动——后端 add_path 遍历前即发 walk 事件，
+  // 逐文件 stage、结束 done 自动收起；不额外占位，避免与事件槽并存成双条）
   const progKey = `staging:${projectId}:${sessionId}`;
-  if (hasDir) showProgress('正在暂存目录', progKey);
   let total = 0;
   try {
     for (const entry of items) {
@@ -934,7 +933,8 @@ async function stageRemoteItems(st: SftpTabState, items: RemoteEntry[]): Promise
   } catch (err) {
     toast(String(err), 'error');
   } finally {
-    if (hasDir) hideProgress(progKey);
+    // 兜底：操作中途失败无 done 事件时收起残留槽（正常路径 done 已移除，此处无操作）
+    hideProgress(progKey);
   }
 }
 

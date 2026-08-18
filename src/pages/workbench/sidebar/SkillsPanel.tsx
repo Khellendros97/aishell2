@@ -12,7 +12,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { Server, SkillOrigin, SkillSummary } from '../../../types';
 import { getState, skillDelete, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
-import { useWorkbench, wbEvents } from '../../../stores/workbench';
+import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, toast } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
@@ -274,11 +274,22 @@ function SkillCard({ d, onToggle, onDelete }: {
             onChange={(e) => handleToggle(e.currentTarget.checked)} />
           <span className="db-switch-track"></span>
         </label>
+        <button className="icon-btn" title="添加到 AI 对话" onClick={() => addSkillToChat(d)}><Icon name="chatPlus" /></button>
         <button className="icon-btn" title="编辑" onClick={() => openSkillModal(d)}><Icon name="pencil" /></button>
         <button className="icon-btn danger" title="删除" onClick={() => void onDelete(d)}><Icon name="trash" /></button>
       </div>
     </div>
   );
+}
+
+/** 把技能引用加入 AI 输入框（@skill:名称 标签，发送时展开名/来源/scope/描述，AI 可循此读取技能文件）；
+ *  AI 面板未挂载时提示。 */
+function addSkillToChat(d: SkillSummary): void {
+  if (wbHandles.ai?.addSkillRef) {
+    wbHandles.ai.addSkillRef({ name: d.name, origin: d.origin, scope: d.scope, description: d.description });
+  } else {
+    toast('AI 面板尚未就绪');
+  }
 }
 
 /* ---------- 面板主体 ---------- */

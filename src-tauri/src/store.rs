@@ -570,6 +570,21 @@ pub struct BrowserRef {
     pub ts: i64,
 }
 
+/// 技能引用：UI 以 @skill:名称 标签呈现，发送时展开为名称/来源/scope/描述（AI 可循此读取技能文件）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRef {
+    pub name: String,
+    /// global | project
+    pub origin: String,
+    /// scope 标签（local/all/remote:xxx）
+    #[serde(default)]
+    pub scope: Vec<String>,
+    /// 一句话描述
+    #[serde(default)]
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMsg {
@@ -588,6 +603,9 @@ pub struct ChatMsg {
     /// 内置浏览器元素引用（@browser:{#id 或标签名} 标签，发送时展开页面信息 + 元素 HTML）；旧会话无此字段时按空处理
     #[serde(default)]
     pub browser_refs: Vec<BrowserRef>,
+    /// 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub skill_refs: Vec<SkillRef>,
     /// AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话按空。
     #[serde(default)]
     pub actions: Vec<AiActionRecord>,
@@ -2055,6 +2073,12 @@ mod tests {
                                 outer_html: r#"<button id="login-btn">登录</button>"#.to_string(),
                                 ts: 1_752_000_000_002,
                             }],
+                            skill_refs: vec![SkillRef {
+                                name: "code-review".to_string(),
+                                origin: "project".to_string(),
+                                scope: vec!["all".to_string()],
+                                description: "代码审查".to_string(),
+                            }],
                             actions: vec![AiActionRecord {
                                 tool_call_id: "call-1".to_string(),
                                 tool: "run_command".to_string(),
@@ -3476,6 +3500,7 @@ mod tests {
             server_refs: vec![],
             path_refs: vec![],
             browser_refs: vec![],
+            skill_refs: vec![],
             actions: vec![],
             ts: 1,
         };
@@ -3493,6 +3518,7 @@ mod tests {
                     server_refs: vec![],
                     path_refs: vec![],
                     browser_refs: vec![],
+                    skill_refs: vec![],
                     actions: vec![AiActionRecord {
                         tool_call_id: "call-1".to_string(),
                         tool: "run_command".to_string(),

@@ -43,7 +43,7 @@
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, TermSnapshot } from '../../../types';
+import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon } from '../../../icons';
 import {
   aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, saveDbConnection, saveSettings,
@@ -429,6 +429,7 @@ const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编�
 const serverRefs = new Map<string, ServerRef>(); // 服务器/本地引用 key -> 引用（key = serverId ?? 'local'，@remote:名称 / @local 标签）
 const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -> 引用（@file:文件名 / @path:目录名 标签）
 const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key -> 引用（key = `${name}:${ts}`，@browser:名称 标签）
+const skillRefs = new Map<string, SkillRef>(); // 技能引用 key -> 引用（key = `${origin}:${name}`，@skill:名称 标签）
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
 /** 当前 AI 工作区域（默认本地；随激活终端/浏览器标签自动切换） */
@@ -521,6 +522,7 @@ export function mountAiPanel(container: HTMLElement): () => void {
   serverRefs.clear();
   pathRefs.clear();
   browserRefs.clear();
+  skillRefs.clear();
   autoSwitchAiWorkdir = false;
   workareaRef = null;
   browserWorkarea = false;
@@ -659,6 +661,17 @@ const aiHandle = {
     const key = `${ref.name || ref.tagName}:${ref.ts}`;
     browserRefs.set(key, ref);
     addBrowserRefChip(ref, key);
+  },
+  /** 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述，AI 可循此读取技能文件）；重复添加时提示 */
+  addSkillRef(ref: SkillRef): void {
+    if (!ref || typeof ref.name !== 'string' || !ref.name.trim()) return;
+    const key = skillRefKey(ref);
+    if (skillRefs.has(key)) {
+      toast('该引用已在输入框中');
+      return;
+    }
+    skillRefs.set(key, ref);
+    addSkillRefChip(ref, key);
   },
   currentSessionId(): string | null {
     return activeSessionId || null;
@@ -968,6 +981,7 @@ function finalize(sid: string): void {
     serverRefs: [],
     pathRefs: [],
     browserRefs: [],
+    skillRefs: [],
     actions: collectActions(p),
     ts: Date.now(),
   });
@@ -989,6 +1003,7 @@ function leaveSession(sid: string): void {
         serverRefs: [],
         pathRefs: [],
         browserRefs: [],
+        skillRefs: [],
         actions: collectActions(p),
         ts: Date.now(),
       });
@@ -1177,6 +1192,9 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
       ...(m.browserRefs ?? []).map((r) =>
         `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(`${r.name}:${r.ts}`)}" data-kind="browser" title="点击查看元素引用（${escapeHtml(r.url)}）">@browser:${escapeHtml(r.name)}</span>`,
       ),
+      ...(m.skillRefs ?? []).map((r) =>
+        `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(skillRefKey(r))}" data-kind="skill" title="技能引用「${escapeHtml(r.name)}」（${r.origin === 'global' ? '全局' : '项目'}）">@skill:${escapeHtml(r.name)}</span>`,
+      ),
     ].join('');
     wrap.innerHTML =
       `<div class="ai-bubble">${chips ? `<div class="ai-msg-chips">${chips}</div>` : ''}` +
@@ -1363,6 +1381,7 @@ function autoResumeAfterModeSwitch(sid: string): void {
     serverRefs: [],
     pathRefs: [],
     browserRefs: [],
+    skillRefs: [],
     actions: [],
     ts: Date.now(),
   });
@@ -1642,6 +1661,22 @@ function addBrowserRefChip(ref: BrowserRef, key: string): void {
   chipRow.appendChild(c);
 }
 
+/** 技能引用 key：来源 + 名称（全局/项目同名技能并存） */
+function skillRefKey(r: SkillRef): string {
+  return `${r.origin}:${r.name}`;
+}
+
+/** 技能引用 chip：@skill:名称，title 带来源与 scope，点击查看详情 */
+function addSkillRefChip(ref: SkillRef, key: string): void {
+  const c = document.createElement('span');
+  c.className = 'tag blue ai-snap-chip';
+  c.dataset.id = key;
+  c.dataset.kind = 'skill';
+  c.title = `技能引用「${ref.name}」（${ref.origin === 'global' ? '全局' : '项目'}），✕ 移除`;
+  c.innerHTML = `@skill:${escapeHtml(ref.name)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
+  chipRow.appendChild(c);
+}
+
 const clearChips = (): void => {
   chipRow.innerHTML = '';
   /* 状态 Map 必须与 chip DOM 同步清空:此前只清 DOM,serverRefs 等残留导致
@@ -1651,6 +1686,7 @@ const clearChips = (): void => {
   serverRefs.clear();
   pathRefs.clear();
   browserRefs.clear();
+  skillRefs.clear();
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
 };
 
@@ -1740,6 +1776,7 @@ function onChipRowClick(e: MouseEvent): void {
     if (chip.dataset.kind === 'server') serverRefs.delete(chip.dataset.id ?? '');
     else if (chip.dataset.kind === 'path') pathRefs.delete(chip.dataset.id ?? '');
     else if (chip.dataset.kind === 'browser') browserRefs.delete(chip.dataset.id ?? '');
+    else if (chip.dataset.kind === 'skill') skillRefs.delete(chip.dataset.id ?? '');
     chip.remove();
     return;
   }
@@ -1864,6 +1901,7 @@ async function send(): Promise<void> {
   const srefs: ServerRef[] = [];
   const prefs: PathRef[] = [];
   const brefs: BrowserRef[] = [];
+  const skrefs: SkillRef[] = [];
   // 固定工作区域引用最先（开启自动切换时）；浏览器工作区不携带上一终端引用
   if (autoSwitchAiWorkdir && !browserWorkarea && workareaRef) srefs.push(workareaRef);
   chipRow.querySelectorAll('.ai-snap-chip').forEach((c) => {
@@ -1885,14 +1923,17 @@ async function send(): Promise<void> {
     } else if (kind === 'browser') {
       const b = browserRefs.get(id);
       if (b) brefs.push(b);
+    } else if (kind === 'skill') {
+      const r = skillRefs.get(id);
+      if (r) skrefs.push(r);
     }
   });
-  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0) return;
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && skrefs.length === 0) return;
 
   // 首条用户消息决定会话标题
-  if (s.messages.length === 0) s.title = text.slice(0, 20) || (brefs.length ? '页面元素引用' : srefs.length || prefs.length ? '引用' : '文件引用');
+  if (s.messages.length === 0) s.title = text.slice(0, 20) || (brefs.length ? '页面元素引用' : skrefs.length ? '技能引用' : srefs.length || prefs.length ? '引用' : '文件引用');
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, skillRefs: skrefs, actions: [], ts: Date.now() });
   input.value = '';
   autoGrow();
   clearChips();
@@ -1902,8 +1943,8 @@ async function send(): Promise<void> {
   updateSendBtn();
   persistSession(s);
 
-  // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器/路径引用说明（UI 气泡只显示 chip）
-  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs, brefs);
+  // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器/路径/技能引用说明（UI 气泡只显示 chip）
+  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs, brefs, skrefs);
   aiChat(`${project.id}:${sid}`, prompt).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
     console.error('[AI] ai_chat 失败:', err);
@@ -1916,12 +1957,13 @@ async function send(): Promise<void> {
 }
 
 /**
- * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器/路径/浏览器元素引用说明。
+ * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器/路径/浏览器元素/技能引用说明。
  * 固定工作区域（开启自动切换时 srefs[0]）作为「当前工作区域」上下文说明，
  * 远程引用附 user@host:port 便于 AI 选择命令目标（后端 run_command 的 target 由 AI 工具参数决定）；
- * 路径引用只带完整路径不带文件内容；浏览器元素引用展开为页面信息 + 元素完整 HTML。
+ * 路径引用只带完整路径不带文件内容；浏览器元素引用展开为页面信息 + 元素完整 HTML；
+ * 技能引用展开为名称/来源/scope/描述（AI 可循技能目录读取 SKILL.md 后按技能工作）。
  */
-async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[], brefs: BrowserRef[]): Promise<string> {
+async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[], brefs: BrowserRef[], skrefs: SkillRef[]): Promise<string> {
   let servers: Server[] = [];
   try {
     servers = (await getState()).servers;
@@ -1967,6 +2009,8 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
     }).join('')
     + brefs.map((r) =>
       `\n\n[浏览器元素引用 @browser:${r.name}]\n页面: ${r.title || '（无标题）'} (${r.url})\n元素 HTML:\n${r.outerHTML.slice(0, 8000)}`).join('')
+    + skrefs.map((r) =>
+      `\n\n[技能引用 @skill:${r.name}]\n名称: ${r.name}（${r.origin === 'global' ? '全局' : '项目'}）\nscope: ${r.scope.join(', ') || '-'}\n描述: ${r.description}`).join('')
     + refText;
 }
 

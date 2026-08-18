@@ -10,7 +10,7 @@
  * 与后端的接口点:无(纯前端状态);项目数据事实源仍在 Rust 端 aishell.json。
  */
 import { create } from 'zustand';
-import type { BrowserRef, FileRef, PathRef, Project, ServerRef, TermSnapshot } from '../types';
+import type { BrowserRef, FileRef, PathRef, Project, ServerRef, SkillRef, TermSnapshot } from '../types';
 import type { IconName } from '../icons';
 import { toast } from '../ui';
 
@@ -60,6 +60,8 @@ export interface AiHandle {
   addPathRef?(ref: PathRef): void;
   /** 内置浏览器元素引用(@browser:#id 或标签名 标签,发送时展开页面信息 + 元素 HTML) */
   addBrowserRef?(ref: BrowserRef): void;
+  /** 技能引用(@skill:名称 标签,发送时展开名/来源/scope/描述) */
+  addSkillRef?(ref: SkillRef): void;
   /** 当前 AI 会话 ID;会话尚未加载时返回 null。 */
   currentSessionId?(): string | null;
 }

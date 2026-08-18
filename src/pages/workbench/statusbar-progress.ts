@@ -133,7 +133,10 @@ export function hideProgress(key = 'manual'): void {
   finish(key);
 }
 
-/** 工作台挂载完成时补渲染（事件在容器出现前到达时任务已入队列，需刷新展示） */
+/** 工作台挂载完成时补渲染（事件在容器出现前到达时任务已入队列，需刷新展示）；
+ *  同时确保事件订阅已建立——SFTP 传输为纯事件驱动，若惰性只在 showProgress 时注册，
+ *  用户直接上传/下载将收不到进度（曾因此不显示）。 */
 export function refreshProgress(): void {
+  ensureSubscribed();
   render();
 }

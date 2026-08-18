@@ -185,6 +185,16 @@ export interface BrowserRef {
   ts: number;
 }
 
+/** 技能引用：UI 以 @skill:名称 标签呈现，发送时展开为技能名称/来源/scope/描述（AI 可循此读取技能文件） */
+export interface SkillRef {
+  name: string;
+  origin: 'global' | 'project';
+  /** scope 标签（local/all/remote:xxx） */
+  scope: string[];
+  /** 一句话描述 */
+  description: string;
+}
+
 /** browser:event 事件 payload（Rust browser.rs 发射） */
 export interface BrowserEvent {
   kind: 'url' | 'title' | 'element' | 'ai-navigate';
@@ -216,6 +226,8 @@ export interface ChatMsg {
   pathRefs: PathRef[];
   /** 内置浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；旧会话为空 */
   browserRefs: BrowserRef[];
+  /** 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话为空 */
+  skillRefs: SkillRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
   actions: AiActionRecord[];
   ts: number;

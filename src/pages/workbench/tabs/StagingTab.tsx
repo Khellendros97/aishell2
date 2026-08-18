@@ -22,7 +22,7 @@ import type { StagedFile } from '../../../types';
 import { confirmDialog, toast } from '../../../ui';
 import { useWorkbench, wbEvents, type TabProps } from '../../../stores/workbench';
 import { Icon } from '../../../shared/Icon';
-import { hideProgress, showProgress } from '../statusbar-progress';
+import { hideProgress } from '../statusbar-progress';
 import '../staging.css';
 
 function fmtTime(ts: number): string {
@@ -224,9 +224,9 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
     });
     if (!ok) return;
     setBulkRunning(true);
-    // 逐条检查远端现状可能较慢：底边栏显示进度（后端按条目发 staging:progress 事件，占位槽与事件槽同 key）
+    // 逐条检查远端现状可能较慢：底边栏显示进度（纯事件驱动——后端 clear_unchanged
+    // 逐条目发 staging:progress、结束 done 自动收起；不额外占位避免与事件槽并存）
     const progKey = `staging:${data.projectId}:${data.sessionId}`;
-    showProgress('正在清理暂存区', progKey);
     try {
       const out = await stagingClear(data.projectId, data.sessionId);
       if (!out.removed.length) {
