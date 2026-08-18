@@ -47,7 +47,7 @@ import {
 } from '../../../api';
 import { getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
 import { addQuickCommandModal } from '../tabs/useTerminal';
-import { hideStagingProgress } from '../tabs/staging-progress';
+import { hideProgress } from '../statusbar-progress';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { openAiDbApprovalModal, type DbRequestDetail } from './AiDbApproval';
 import { DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
@@ -635,15 +635,17 @@ const aiHandle = {
     serverRefs.set(key, ref);
     addServerRefChip(ref);
   },
-  /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容）；重复添加时提示 */
+  /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容；
+   *   serverId 为远端 SFTP 引用，key 带服务器前缀与本地同路径引用区分）；重复添加时提示 */
   addPathRef(ref: PathRef): void {
     if (!ref || typeof ref.path !== 'string' || !ref.path.trim()) return;
-    if (pathRefs.has(ref.path)) {
+    const key = pathRefKey(ref);
+    if (pathRefs.has(key)) {
       toast('该引用已在输入框中');
       return;
     }
-    pathRefs.set(ref.path, ref);
-    addPathRefChip(ref);
+    pathRefs.set(key, ref);
+    addPathRefChip(ref, key);
   },
   /** 浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；
    *  同名元素（如多个 button）允许重复添加——chip 各自携带完整快照数据 */
@@ -893,8 +895,8 @@ function handleEvent(key: string, ev: AiEvent): void {
       || isRemoteFileOp) {
       wbEvents.emit('staging-changed');
     }
-    /* AI 目录暂存 / 清理结束（成功/失败）→ 收起右下角进度弹窗（staging:progress 事件驱动显示） */
-    if (ev.tool === 'staging_add' || ev.tool === 'staging_clear') hideStagingProgress();
+    /* AI 目录暂存 / 清理结束（成功/失败）→ 收起底边栏进度（staging:progress 事件驱动显示，done 事件也会自动移除） */
+    if (ev.tool === 'staging_add' || ev.tool === 'staging_clear') hideProgress(`staging:${project?.id ?? ''}:${sid}`);
   } else if (ev.type === 'segment') {
     /* 新一轮 assistant 消息分段（工具来回时），仅流式中有文本才分段 */
     const cur = pendingBy.get(sid) ?? null;
@@ -1152,7 +1154,7 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
       ...(m.pathRefs ?? []).map((r) => {
         const name = r.path.split('/').filter(Boolean).pop() || r.path;
         const label = r.isDir ? `@path:${name}` : `@file:${name}`;
-        return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(r.path)}" data-kind="path" title="引用路径">${escapeHtml(label)}</span>`;
+        return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(pathRefKey(r))}" data-kind="path" title="引用路径${r.serverId ? `（服务器 ${escapeHtml(r.serverId)}）` : ''}">${escapeHtml(label)}</span>`;
       }),
       ...(m.browserRefs ?? []).map((r) =>
         `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(`${r.name}:${r.ts}`)}" data-kind="browser" title="点击查看元素引用（${escapeHtml(r.url)}）">@browser:${escapeHtml(r.name)}</span>`,
@@ -1593,15 +1595,20 @@ function addServerRefChip(ref: ServerRef): void {
   chipRow.appendChild(c);
 }
 
-/** 文件/目录路径引用 chip：标签只用路径最后一段（@file:文件名 / @path:目录名），title 带完整路径 */
-function addPathRefChip(ref: PathRef): void {
+/** 文件/目录路径引用 key：远端引用带服务器前缀，本地引用仅路径（与本地 explorer 旧数据一致） */
+function pathRefKey(r: PathRef): string {
+  return r.serverId ? `${r.serverId}:${r.path}` : r.path;
+}
+
+/** 文件/目录路径引用 chip：标签只用路径最后一段（@file:文件名 / @path:目录名），title 带完整路径与服务器 */
+function addPathRefChip(ref: PathRef, key: string): void {
   const name = ref.path.split('/').filter(Boolean).pop() || ref.path;
   const label = ref.isDir ? `@path:${name}` : `@file:${name}`;
   const c = document.createElement('span');
   c.className = 'tag blue ai-snap-chip';
-  c.dataset.id = ref.path;
+  c.dataset.id = key;
   c.dataset.kind = 'path';
-  c.title = `${ref.path}，✕ 移除`;
+  c.title = `${ref.serverId ? `[服务器 ${ref.serverId}] ` : ''}${ref.path}，✕ 移除`;
   c.innerHTML = `${escapeHtml(label)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
   chipRow.appendChild(c);
 }
@@ -1930,7 +1937,12 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
   return text
     + snaps.map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`).join('')
     + refs.map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`).join('')
-    + prefs.map((r) => `\n\n[${r.isDir ? '目录路径' : '文件路径'}: ${r.path}]`).join('')
+    + prefs.map((r) => {
+      if (!r.serverId) return `\n\n[${r.isDir ? '目录路径' : '文件路径'}: ${r.path}]`;
+      const sv = servers.find((s) => s.id === r.serverId);
+      const where = sv ? `${sv.name} (${sv.username}@${sv.host}:${sv.port})` : r.serverId;
+      return `\n\n[${r.isDir ? '远程目录路径' : '远程文件路径'}（服务器 ${where}）: ${r.path}]`;
+    }).join('')
     + brefs.map((r) =>
       `\n\n[浏览器元素引用 @browser:${r.name}]\n页面: ${r.title || '（无标题）'} (${r.url})\n元素 HTML:\n${r.outerHTML.slice(0, 8000)}`).join('')
     + refText;

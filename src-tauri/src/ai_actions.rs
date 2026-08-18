@@ -334,7 +334,7 @@ impl AiActions {
         let sftp = self.ssh.open_sftp(server_id).await?;
         let mut failures = Vec::new();
         for (index, item) in items.iter().enumerate() {
-            if let Err(error) = crate::sftp::upload_one(&sftp, &resolved[index], &remote_dirs[index], item.overwrite).await {
+            if let Err(error) = crate::sftp::upload_one(&sftp, &resolved[index], &remote_dirs[index], item.overwrite, None).await {
                 failures.push(format!("第 {} 项失败：{}", index + 1, error));
             }
         }
@@ -376,7 +376,7 @@ impl AiActions {
         let sftp = self.ssh.open_sftp(server_id).await?;
         let mut failures = Vec::new();
         for (index, _item) in items.iter().enumerate() {
-            if let Err(error) = crate::sftp::download_one(&sftp, &remote_paths[index], &dirs[index]).await {
+            if let Err(error) = crate::sftp::download_one(&sftp, &remote_paths[index], &dirs[index], None).await {
                 failures.push(format!("第 {} 项失败：{}", index + 1, error));
             }
         }

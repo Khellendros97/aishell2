@@ -47,7 +47,7 @@ import {
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
 import { revealLocalPath } from '../sidebar/ExplorerPanel';
-import { hideStagingProgress, showStagingProgress } from './staging-progress';
+import { hideProgress, showProgress } from '../statusbar-progress';
 
 interface SftpEls {
   body: HTMLElement;
@@ -914,9 +914,10 @@ async function stageRemoteItems(st: SftpTabState, items: RemoteEntry[]): Promise
     toast('AI 会话尚未加载，无法暂存', 'error');
     return;
   }
-  // 目录递归暂存较慢：弹出右下角进度框（后端按文件发 staging:progress 事件驱动内容）
+  // 目录递归暂存较慢：底边栏显示进度（后端按文件发 staging:progress 事件驱动内容，占位槽与事件槽同 key）
   const hasDir = items.some((e) => e.isDir);
-  if (hasDir) showStagingProgress('正在暂存目录');
+  const progKey = `staging:${projectId}:${sessionId}`;
+  if (hasDir) showProgress('正在暂存目录', progKey);
   let total = 0;
   try {
     for (const entry of items) {
@@ -933,7 +934,7 @@ async function stageRemoteItems(st: SftpTabState, items: RemoteEntry[]): Promise
   } catch (err) {
     toast(String(err), 'error');
   } finally {
-    if (hasDir) hideStagingProgress();
+    if (hasDir) hideProgress(progKey);
   }
 }
 
@@ -954,6 +955,11 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
       disabled: multi || !editable,
       disabledTip: multi ? '多选时不可用' : (first.isDir ? undefined : '二进制文件或超过 5MB，无法在编辑器中打开'),
       action: () => { if (first.isDir) goTo(st, first.path, true); else openRemoteInEditor(st, first); },
+    },
+    // 把远端文件/目录路径引用加入 AI 输入框(@file:文件名 / @path:目录名 标签,发送时带服务器上下文)
+    {
+      label: '添加到对话', iconName: 'chatPlus', disabled: multi, disabledTip: '多选时不可用',
+      action: () => addSftpPathToChat(st, first.path, first.isDir),
     },
     'sep',
     {
@@ -1035,6 +1041,16 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
   ]);
 }
 
+/** 把远端文件/目录路径引用加入 AI 输入框(@file:文件名 / @path:目录名 标签,发送时带服务器上下文);
+ *  见 core.ts AiHandle.addPathRef;AI 面板未挂载时提示 */
+function addSftpPathToChat(st: SftpTabState, path: string, isDir: boolean): void {
+  if (wbHandles.ai?.addPathRef) {
+    wbHandles.ai.addPathRef({ path, isDir, serverId: st.serverId });
+  } else {
+    toast('AI 面板尚未就绪');
+  }
+}
+
 /** 容器空白区右键:打开终端(新开 SSH 终端标签,自动 cd 到当前目录)+ 粘贴到当前目录 */
 function bindRootContextMenu(root: HTMLElement, st: SftpTabState): void {
   root.addEventListener('contextmenu', (e) => {
@@ -1054,6 +1070,10 @@ function bindRootContextMenu(root: HTMLElement, st: SftpTabState): void {
         action: () => void createRemote(st, true),
       },
       'sep',
+      {
+        label: '把当前目录添加到对话', iconName: 'chatPlus',
+        action: () => addSftpPathToChat(st, st.cwd, true),
+      },
       {
         label: '打开终端', iconName: 'terminal',
         action: () => {

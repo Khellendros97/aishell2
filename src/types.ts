@@ -166,6 +166,8 @@ export interface PathRef {
   path: string;
   /** true = 目录（@path: 标签）；false = 文件（@file: 标签） */
   isDir: boolean;
+  /** 远端服务器 ID（SFTP 面板添加的远程引用）；本地文件/目录引用为空 */
+  serverId?: string | null;
 }
 
 /** 内置浏览器元素引用：UI 以 @browser:#id 或标签名 标签呈现，发送时展开为页面信息 + 元素 HTML */
@@ -439,9 +441,24 @@ export interface StagingClearOutcome {
 export interface StagingProgress {
   projectId: string;
   sessionId: string;
-  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目 */
-  phase: 'walk' | 'stage' | 'clear';
+  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目；done = 操作完成（隐藏进度） */
+  phase: 'walk' | 'stage' | 'clear' | 'done';
   done: number;
   total: number;
   currentPath: string;
+}
+
+/** SFTP 传输进度（sftp:progress 事件；与 sftp.rs SftpProgress serde camelCase 对齐）。
+ *  阶段：bytes = 当前文件字节进度；files = 一个文件完成；done = 整个命令结束（隐藏进度） */
+export interface SftpProgress {
+  taskId: string;
+  serverId: string;
+  direction: 'upload' | 'download';
+  phase: 'bytes' | 'files' | 'done';
+  /** 当前文件路径（bytes 阶段为传输中的文件） */
+  current: string;
+  doneBytes: number;
+  totalBytes: number;
+  filesDone: number;
+  filesTotal: number;
 }

@@ -6,15 +6,49 @@
 //! 权限修改（chmod）不提供后端命令，由前端经迷你终端 autoRun 执行（见 mini-term.ts 契约）。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use russh_sftp::client::SftpSession;
 use serde::Serialize;
-use tauri::State;
+use tauri::{Emitter, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::fsops::{unique_local_name, FsEntry, FsStat};
 use crate::ssh::SshManager;
+
+/// 传输进度事件（sftp_upload / sftp_download 命令经 `sftp:progress` 事件发送，
+/// 前端底边栏进度区消费；与 src/types.ts SftpProgress serde camelCase 对齐）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpProgress {
+    /// 单次命令唯一任务 id（前端按 key 归并显示/隐藏）
+    pub task_id: String,
+    pub server_id: String,
+    /// upload | download
+    pub direction: String,
+    /// bytes = 当前文件字节进度；files = 一个文件完成；done = 整个操作结束
+    pub phase: String,
+    /// 当前文件路径（bytes 阶段为传输中的文件）
+    pub current: String,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    /// files 阶段累计完成文件数（total 未知时为 0）
+    pub files_done: u64,
+    pub files_total: u64,
+}
+
+/// upload_one / download_one 的进度回调事件（命令层转译为 `sftp:progress`）；
+/// AI / MCP 调用传 None（不做前端进度展示）。
+pub(crate) enum ProgressEvent {
+    /// 当前文件流式字节进度
+    Bytes { current: String, done: u64, total: u64 },
+    /// 单个文件已完成
+    FileDone { current: String },
+}
+
+/// 传输进度回调类型。
+pub(crate) type ProgressCb = dyn Fn(ProgressEvent) + Send + Sync;
 
 /// sftp_write 结果：conflict=true 表示远端已被外部修改且未写入（actual_* 为远端当前属性）；
 /// conflict=false 表示已写入（actual_* 为落盘后属性，供前端重建下次保存的基线）。
@@ -125,8 +159,11 @@ pub async fn sftp_stat(
 
 /// 上传本地文件/目录到远端目录：目录递归（本地 walk + 远端逐层建目录），文件流式拷贝；
 /// 目标重名自动改 `name (1).ext`（目录同理 `name (1)`）；返回最终落地名称（前端聚焦用）。
+/// 进度：upload_one 经 `sftp:progress` 事件逐字节/逐文件上报，前端按 total_bytes 决定
+/// 是否显示确定进度条（<10MB 快速传输不打扰）。
 #[tauri::command]
 pub async fn sftp_upload(
+    app: tauri::AppHandle,
     ssh: State<'_, Arc<SshManager>>,
     server_id: String,
     local_path: String,
@@ -142,23 +179,76 @@ pub async fn sftp_upload(
         remote_dir
     };
     let sftp = ssh.inner().open_sftp(&server_id).await?;
-    upload_one(&sftp, Path::new(&local_path), &target, false).await
+    let task_id = transfer_task_id("up");
+    let files_done = Arc::new(AtomicU64::new(0));
+    let cb = {
+        let app = app.clone();
+        let sid = server_id.clone();
+        let task_id = task_id.clone();
+        let files_done = Arc::clone(&files_done);
+        move |ev: ProgressEvent| {
+            let p = match ev {
+                ProgressEvent::Bytes { current, done, total } => SftpProgress {
+                    task_id: task_id.clone(),
+                    server_id: sid.clone(),
+                    direction: "upload".to_string(),
+                    phase: "bytes".to_string(),
+                    current,
+                    done_bytes: done,
+                    total_bytes: total,
+                    files_done: 0,
+                    files_total: 0,
+                },
+                ProgressEvent::FileDone { current } => SftpProgress {
+                    task_id: task_id.clone(),
+                    server_id: sid.clone(),
+                    direction: "upload".to_string(),
+                    phase: "files".to_string(),
+                    current,
+                    done_bytes: 0,
+                    total_bytes: 0,
+                    files_done: files_done.fetch_add(1, Ordering::SeqCst) + 1,
+                    files_total: 0,
+                },
+            };
+            let _ = app.emit("sftp:progress", p);
+        }
+    };
+    let result = upload_one(&sftp, Path::new(&local_path), &target, false, Some(&cb)).await;
+    let _ = app.emit(
+        "sftp:progress",
+        SftpProgress {
+            task_id,
+            server_id,
+            direction: "upload".to_string(),
+            phase: "done".to_string(),
+            current: String::new(),
+            done_bytes: 0,
+            total_bytes: 0,
+            files_done: 0,
+            files_total: 0,
+        },
+    );
+    result
 }
 
 /// 递归上传一个本地文件或目录（async 递归需装箱，见 inner），返回落地名称。
 /// overwrite=true 时远端同名直接覆盖（SFTP create 截断语义）；false 时重名自动 `name (1).ext`。
+/// progress 为可选进度回调：目录递归内每个文件均上报（FileDone），文件流式拷贝报 Bytes。
 /// pub(crate)：ai_actions 的 AI 上传复用（不改变手动 sftp_upload 语义）。
 pub(crate) async fn upload_one(
     sftp: &SftpSession,
     local: &Path,
     remote_dir: &str,
     overwrite: bool,
+    progress: Option<&ProgressCb>,
 ) -> Result<String, String> {
     async fn inner(
         sftp: &SftpSession,
         local: &Path,
         remote_dir: &str,
         overwrite: bool,
+        progress: Option<&ProgressCb>,
     ) -> Result<String, String> {
         let md = std::fs::metadata(local)
             .map_err(|e| format!("读取本地 {} 失败: {e}", local.display()))?;
@@ -180,7 +270,7 @@ pub(crate) async fn upload_one(
                 .map_err(|e| format!("读取本地目录 {} 失败: {e}", local.display()))?;
             for ent in rd {
                 let ent = ent.map_err(|e| format!("读取本地目录 {} 失败: {e}", local.display()))?;
-                Box::pin(inner(sftp, &ent.path(), &dir_path, overwrite)).await?;
+                Box::pin(inner(sftp, &ent.path(), &dir_path, overwrite, progress)).await?;
             }
             Ok(dir_name)
         } else {
@@ -197,24 +287,50 @@ pub(crate) async fn upload_one(
                 .create(&file_path)
                 .await
                 .map_err(|e| format!("创建远端文件 {file_path} 失败: {e}"))?;
-            let mut buf = BufReader::with_capacity(COPY_BUF, &mut src);
-            tokio::io::copy_buf(&mut buf, &mut dst)
-                .await
-                .map_err(|e| format!("上传 {} → {file_path} 中断: {e}", local.display()))?;
+            // 逐块拷贝并上报字节进度（copy_buf 无中间钩子，改手动循环）
+            let total = md.len();
+            let mut copied = 0u64;
+            let mut buf = vec![0u8; COPY_BUF];
+            loop {
+                let n = src
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| format!("读取本地 {} 失败: {e}", local.display()))?;
+                if n == 0 {
+                    break;
+                }
+                dst.write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("上传 {} → {file_path} 中断: {e}", local.display()))?;
+                copied += n as u64;
+                if let Some(cb) = progress {
+                    cb(ProgressEvent::Bytes {
+                        current: file_path.clone(),
+                        done: copied,
+                        total,
+                    });
+                }
+            }
             // shutdown 排空写队列并关闭远端 handle
             dst.shutdown()
                 .await
                 .map_err(|e| format!("关闭远端文件 {file_path} 失败: {e}"))?;
+            if let Some(cb) = progress {
+                cb(ProgressEvent::FileDone { current: file_path });
+            }
             Ok(file_name)
         }
     }
-    Box::pin(inner(sftp, local, remote_dir, overwrite)).await
+    Box::pin(inner(sftp, local, remote_dir, overwrite, progress)).await
 }
 
 /// 下载远端文件/目录到本地目录：对称递归，本地重名同样自动 `name (1).ext`。
 /// 返回最终落地的完整本地路径（前端下载后据此定位高亮）。
+/// 进度：download_one 经 `sftp:progress` 事件逐字节/逐文件上报，前端按 total_bytes 决定
+/// 是否显示确定进度条（<10MB 快速传输不打扰）。
 #[tauri::command]
 pub async fn sftp_download(
+    app: tauri::AppHandle,
     ssh: State<'_, Arc<SshManager>>,
     server_id: String,
     remote_path: String,
@@ -227,20 +343,73 @@ pub async fn sftp_download(
     std::fs::create_dir_all(&local)
         .map_err(|e| format!("创建本地目录 {} 失败: {e}", local.display()))?;
     let sftp = ssh.inner().open_sftp(&server_id).await?;
-    download_one(&sftp, &remote_path, &local).await
+    let task_id = transfer_task_id("down");
+    let files_done = Arc::new(AtomicU64::new(0));
+    let cb = {
+        let app = app.clone();
+        let sid = server_id.clone();
+        let task_id = task_id.clone();
+        let files_done = Arc::clone(&files_done);
+        move |ev: ProgressEvent| {
+            let p = match ev {
+                ProgressEvent::Bytes { current, done, total } => SftpProgress {
+                    task_id: task_id.clone(),
+                    server_id: sid.clone(),
+                    direction: "download".to_string(),
+                    phase: "bytes".to_string(),
+                    current,
+                    done_bytes: done,
+                    total_bytes: total,
+                    files_done: 0,
+                    files_total: 0,
+                },
+                ProgressEvent::FileDone { current } => SftpProgress {
+                    task_id: task_id.clone(),
+                    server_id: sid.clone(),
+                    direction: "download".to_string(),
+                    phase: "files".to_string(),
+                    current,
+                    done_bytes: 0,
+                    total_bytes: 0,
+                    files_done: files_done.fetch_add(1, Ordering::SeqCst) + 1,
+                    files_total: 0,
+                },
+            };
+            let _ = app.emit("sftp:progress", p);
+        }
+    };
+    let result = download_one(&sftp, &remote_path, &local, Some(&cb)).await;
+    let _ = app.emit(
+        "sftp:progress",
+        SftpProgress {
+            task_id,
+            server_id,
+            direction: "download".to_string(),
+            phase: "done".to_string(),
+            current: String::new(),
+            done_bytes: 0,
+            total_bytes: 0,
+            files_done: 0,
+            files_total: 0,
+        },
+    );
+    result
 }
 
 /// 递归下载一个远端文件或目录（async 递归需装箱，见 inner），返回落地完整路径。
+/// progress 为可选进度回调：目录递归内每个文件均上报（FileDone），文件流式拷贝报 Bytes。
 /// pub(crate)：ai_actions 的 AI 下载复用（不改变手动 sftp_download 语义）。
 pub(crate) async fn download_one(
     sftp: &SftpSession,
     remote_path: &str,
     local_dir: &Path,
+    progress: Option<&ProgressCb>,
 ) -> Result<String, String> {
     async fn inner(
         sftp: &SftpSession,
         remote_path: &str,
         local_dir: &Path,
+        progress: Option<&ProgressCb>,
     ) -> Result<String, String> {
         let md = sftp
             .metadata(remote_path)
@@ -261,7 +430,7 @@ pub(crate) async fn download_one(
                 .await
                 .map_err(|e| format!("读取远端目录 {remote_path} 失败: {e}"))?;
             for ent in rd {
-                Box::pin(inner(sftp, &ent.path(), &dir_path)).await?;
+                Box::pin(inner(sftp, &ent.path(), &dir_path, progress)).await?;
             }
             Ok(dir_path.to_string_lossy().into_owned())
         } else {
@@ -274,17 +443,51 @@ pub(crate) async fn download_one(
             let mut dst = tokio::fs::File::create(&file_path)
                 .await
                 .map_err(|e| format!("创建本地 {} 失败: {e}", file_path.display()))?;
-            let mut buf = BufReader::with_capacity(COPY_BUF, &mut src);
-            tokio::io::copy_buf(&mut buf, &mut dst)
-                .await
-                .map_err(|e| format!("下载 {remote_path} → {} 中断: {e}", file_path.display()))?;
+            // 逐块拷贝并上报字节进度（copy_buf 无中间钩子，改手动循环）
+            let total = md.size.unwrap_or(0);
+            let mut copied = 0u64;
+            let mut buf = vec![0u8; COPY_BUF];
+            loop {
+                let n = src
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| format!("下载 {remote_path} → {} 中断: {e}", file_path.display()))?;
+                if n == 0 {
+                    break;
+                }
+                dst.write_all(&buf[..n])
+                    .await
+                    .map_err(|e| format!("写入本地 {} 失败: {e}", file_path.display()))?;
+                copied += n as u64;
+                if let Some(cb) = progress {
+                    cb(ProgressEvent::Bytes {
+                        current: remote_path.to_string(),
+                        done: copied,
+                        total,
+                    });
+                }
+            }
             dst.flush()
                 .await
                 .map_err(|e| format!("写入本地 {} 失败: {e}", file_path.display()))?;
+            if let Some(cb) = progress {
+                cb(ProgressEvent::FileDone { current: remote_path.to_string() });
+            }
             Ok(file_path.to_string_lossy().into_owned())
         }
     }
-    Box::pin(inner(sftp, remote_path, local_dir)).await
+    Box::pin(inner(sftp, remote_path, local_dir, progress)).await
+}
+
+/// 生成单次传输命令的任务 id（同一命令内所有事件共用，前端按 key 归并；unix 毫秒 + 自增后缀）。
+fn transfer_task_id(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{prefix}{ts}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 /// 远端路径 join：处理 "/" 根目录与尾部斜杠。

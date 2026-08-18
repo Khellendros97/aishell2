@@ -542,11 +542,15 @@ pub struct ServerRef {
 }
 
 /// 文件/目录路径引用：UI 以 @file:文件名 / @path:目录名 标签呈现，发送时只带路径不带内容。
+/// server_id = 远端引用（SFTP 面板添加）时的目标服务器；None = 本地项目内文件/目录。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathRef {
     pub path: String,
     pub is_dir: bool,
+    /// 旧会话无此字段时按 None（本地引用）解析
+    #[serde(default)]
+    pub server_id: Option<String>,
 }
 
 /// 内置浏览器元素引用：UI 以 @browser:{#id 或标签名} 标签呈现，发送时展开为页面信息 + 元素 HTML。
@@ -2040,6 +2044,7 @@ mod tests {
                             path_refs: vec![PathRef {
                                 path: "C:/demo/app.ts".to_string(),
                                 is_dir: false,
+                                server_id: None,
                             }],
                             browser_refs: vec![BrowserRef {
                                 name: "#login-btn".to_string(),

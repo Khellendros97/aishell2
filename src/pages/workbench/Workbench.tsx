@@ -25,6 +25,7 @@ import { PANELS } from './sidebar/panels';
 import { TAB_TYPES } from './tabs/registry';
 import { setWorkbenchActive } from './tabs/browser-engine';
 import { AiPanel } from './ai/AiPanel';
+import { refreshProgress } from './statusbar-progress';
 import './workbench.css';
 
 /* ---------- 面板拖宽(指针 + 键盘,出屏钳制;对照旧版 bindPanelResize) ---------- */
@@ -199,6 +200,11 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     setWorkbenchActive(active);
   }, [active]);
 
+  /* ---------- 底边栏进度区:挂载后刷新一次(传输/暂存事件先于容器出现时任务已入队) ---------- */
+  useEffect(() => {
+    refreshProgress();
+  }, []);
+
   /* ---------- 正在显示 commands 时活跃标签变为非终端(或 null)→ 自动切回 explorer ---------- */
   useEffect(() => {
     const s = useWorkbench.getState();
@@ -322,6 +328,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
               {activeTab ? <><Icon name={activeTab.icon} />{activeTab.title}</> : '无活动标签页'}
             </span>
           </div>
+          <div className="statusbar-progress" id="workbench-progress" aria-live="polite"></div>
           <div className="statusbar-right">
             <button
               type="button"
