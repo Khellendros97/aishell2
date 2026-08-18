@@ -9,6 +9,10 @@
 //!   - `{type:"approval",requestId,toolCallId,action,intent,summary}`
 //!   - `{type:"actionStart",toolCallId,tool,args}` / `{type:"actionEnd",toolCallId,tool,isError,result}`
 //!
+//! pi 对瞬时错误（限流/过载/5xx）默认自动重试（settings retry.enabled）：失败尝试的
+//! error 事件照常转发，重试以 `{type:"tool",tool:"自动重试"}` 瞬时行提示；重试成功后
+//! text_delta 会重置终态抑制，agent_settled 照常补发 done（前端流式不中断也不卡死）。
+//!
 //! 另发全局事件 `fs:changed` payload `{path}`：AI 的 write/edit 工具成功落盘后广播
 //! 规范化绝对路径，前端编辑器据此刷新已打开的对应文件（见 editor.ts）。
 //!
@@ -573,7 +577,8 @@ impl AiManager {
             let mut pending_paths: HashMap<String, String> = HashMap::new();
             // 是否已收到过终止性事件（done/error）：正常收尾后退出不再报「异常退出」
             let mut settled = false;
-            // 本轮生成是否已发过终态事件（done 或 error 只发一次；turn_start 重置）
+            // 本轮生成是否已发过终态事件（done/error 去重；turn_start 重置；瞬时错误
+            // 自动重试后流式恢复（text_delta）也重置——回合仍需正常收尾补发 done）
             let mut terminal_emitted = false;
             // 当前 assistant 消息是否已流过文本增量（工具来回多段消息时分段用）
             let mut text_started = false;
@@ -597,6 +602,10 @@ impl AiManager {
                             Some("text_delta") => {
                                 if let Some(delta) = ae.get("delta").and_then(serde_json::Value::as_str) {
                                     text_started = true;
+                                    // 瞬时错误（限流/过载/5xx）后 pi 自动重试成功、流式恢复：
+                                    // 重置终态抑制，否则回合结束 agent_settled 不再发 done、
+                                    // 同回合后续失败也被去重吞掉，前端将永久卡在生成态
+                                    terminal_emitted = false;
                                     let _ = app2.emit(&event, json!({"type": "delta", "text": delta}));
                                 }
                             }
@@ -627,6 +636,18 @@ impl AiManager {
                             terminal_emitted = true;
                             let _ = app2.emit(&event, json!({"type": "done"}));
                         }
+                    }
+                    // 瞬时错误自动重试（pi retry.enabled 默认开：429/过载/5xx）。重试期间
+                    // 生成仍在进行（busy 回置，防止 ai_chat 误判空闲裸发 prompt 被拒）；
+                    // 转发为瞬时工具行，退避等待期间用户可见，不再只见一闪而过的错误气泡
+                    "auto_retry_start" => {
+                        busy2.store(true, Ordering::SeqCst);
+                        let attempt = ev.get("attempt").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        let max = ev.get("maxAttempts").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        let _ = app2.emit(
+                            &event,
+                            json!({"type": "tool", "tool": "自动重试", "label": format!("第{attempt}/{max}次，模型瞬时错误")}),
+                        );
                     }
                     // 工具活动：受控工具在 agent/yolo 下以动作卡（actionStart/actionEnd）呈现，
                     // 其余工具仍走瞬时小字行（tool）。
@@ -803,8 +824,13 @@ impl AiManager {
                             let _ = app2.emit(&event, json!({"type": "error", "message": emsg}));
                         }
                     }
+                    // 命令响应失败：只有 prompt 被拒（消息未进模型）才算对话错误；后台命令
+                    // （set_thinking_level 等）失败不得冒充对话错误——那会误置 terminal_emitted
+                    // 吞掉回合结束的 done，前端卡在生成态
                     "response" => {
-                        if ev.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+                        let command = ev.get("command").and_then(serde_json::Value::as_str).unwrap_or("prompt");
+                        if command == "prompt"
+                            && ev.get("success").and_then(serde_json::Value::as_bool) == Some(false)
                             && !terminal_emitted
                         {
                             terminal_emitted = true;
@@ -1766,14 +1792,23 @@ pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String
     let Some(proc) = procs.get_mut(&key) else {
         return Err("pi 进程未就绪".to_string());
     };
+    let mut aborted_prev = false;
     if proc.busy.swap(true, Ordering::SeqCst) {
         cancel_approvals(proc);
         let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
         w.write_all(b"{\"type\":\"abort\"}\n")
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
+        aborted_prev = true;
     }
-    // 用 JSON 序列化生成，勿手拼
-    let mut buf = serde_json::to_vec(&json!({"type": "prompt", "message": prompt}))
+    // 用 JSON 序列化生成，勿手拼。刚 abort 过时带 streamingBehavior=followUp：
+    // abort 清理流式状态可能未即时生效，agent 仍在流式期间时裸发 prompt 会被 RPC
+    // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同
+    let payload = if aborted_prev {
+        json!({"type": "prompt", "message": prompt, "streamingBehavior": "followUp"})
+    } else {
+        json!({"type": "prompt", "message": prompt})
+    };
+    let mut buf = serde_json::to_vec(&payload)
         .map_err(|e| e.to_string())?;
     buf.push(b'\n');
     proc.stdin

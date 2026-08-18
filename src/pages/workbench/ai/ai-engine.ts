@@ -30,6 +30,11 @@
  * - MutationObserver 容器移除守卫删除：React keep-alive 常驻挂载，卸载由 useEffect cleanup
  *   调 mountAiPanel 返回的清理函数完成；
  * - mountAiPanel(container) 返回清理函数（原为 void，靠 observer 触发 cleanup）。
+ * 瞬时错误自动重试：pi 默认对限流/过载瞬时错误自动重试，失败尝试的错误气泡会被重试
+ * 恢复的流式内容取代（delta 分支复活错误 pending）；重试以「自动重试」瞬时工具行提示，
+ * 回合结束仍会收到 done（ai.rs 在 delta 恢复时重置终态抑制）。停止键不等后端事件，
+ * 本地立即定稿（leaveSession 同语义），任何终止事件丢失都不会卡死输入区。
+ *
  * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_abort /
  *   ai_kill_project / ai_set_thinking / ai_respond_approval / ai_respond_db_request /
  *   ai_debug_info / set_ai_mode / get_state / save_settings / save_db_connection /
@@ -773,6 +778,9 @@ async function switchEffort(level: LlmConfig['effort']): Promise<void> {
 function handleEvent(key: string, ev: AiEvent): void {
   const sid = key.slice(key.indexOf(':') + 1);
   if (ev.type === 'delta') {
+    /* 瞬时错误（限流/过载）后 pi 自动重试成功、增量恢复：复用当前 pending（可能是
+       错误相）转回流式，错误气泡被内容取代；后端 delta 恢复时已重置终态抑制，
+       回合结束仍会收到 done（见 ai.rs 读取线程 text_delta 分支） */
     const cur = pendingBy.get(sid) ?? null;
     const p = cur ?? emptyPending();
     p.phase = 'stream';
@@ -908,7 +916,17 @@ function handleEvent(key: string, ev: AiEvent): void {
     finalize(sid);
   } else {
     console.error('[AI] 事件错误:', ev.message);
-    pendingBy.set(sid, { phase: 'error', text: '', error: ev.message, tools: [], actions: new Map() });
+    /* 保留本回合已积累的文本/工具行/动作卡：瞬时错误后 pi 自动重试成功时，后续 delta
+       会把错误气泡复活为流式（见 delta 分支），回合现场与动作卡审计（collectActions）
+       不应随错误气泡清空 */
+    const cur = pendingBy.get(sid) ?? null;
+    pendingBy.set(sid, {
+      phase: 'error',
+      text: cur?.phase === 'stream' ? cur.text : '',
+      error: ev.message,
+      tools: cur?.tools ?? [],
+      actions: cur?.actions ?? new Map(),
+    });
   }
   if (sid === activeSessionId) {
     renderHistory();
@@ -1831,9 +1849,13 @@ async function send(): Promise<void> {
   const sid = activeSessionId;
   const s = sessions.get(sid);
   if (!s) return;
-  // 生成中 → 停止
+  // 生成中 → 停止：本地立即定稿并中止后端（leaveSession 同语义：已生成文本落历史）。
+  // 不能只调 aiAbort 等后端终止事件：事件被吞（曾因瞬时错误自动重试后 done 受抑制）
+  // 会导致停止键无效、输入区永久卡在生成态
   if (isGenerating(sid)) {
-    void aiAbort(`${project.id}:${sid}`).catch(() => { /* 后端无进程时静默 */ });
+    leaveSession(sid);
+    renderHistory();
+    updateSendBtn();
     return;
   }
   const text = input.value.trim();
