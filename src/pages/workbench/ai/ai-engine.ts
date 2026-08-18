@@ -380,10 +380,23 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `删除${remote} ${String(args.path ?? '')}${server}`;
     case 'run_command':
       return String(args.intent ?? '');
-    case 'sftp_upload':
-      return `上传 ${String(args.localPath ?? '')} 到 ${String(args.remoteDir ?? '')}${args.overwrite ? '（覆盖同名）' : ''}`;
-    case 'sftp_download':
-      return `下载 ${String(args.remotePath ?? '')} 到 ${String(args.localDir ?? '')}`;
+    case 'sftp_upload': {
+      const items = Array.isArray(args.items) ? args.items : [];
+      if (items.length > 0) {
+        const first = (items[0] ?? {}) as Record<string, unknown>;
+        const overwrite = items.some((item) => (item as Record<string, unknown>)?.overwrite === true);
+        return `批量上传 ${items.length} 项${first.localPath ? `（首项：${String(first.localPath)}）` : ''} 到 ${String(first.remoteDir ?? '')}${overwrite ? '（含覆盖项）' : ''}${server}`;
+      }
+      return `上传 ${String(args.localPath ?? '')} 到 ${String(args.remoteDir ?? '')}${args.overwrite ? '（覆盖同名）' : ''}${server}`;
+    }
+    case 'sftp_download': {
+      const items = Array.isArray(args.items) ? args.items : [];
+      if (items.length > 0) {
+        const first = (items[0] ?? {}) as Record<string, unknown>;
+        return `批量下载 ${items.length} 项${first.remotePath ? `（首项：${String(first.remotePath)}）` : ''} 到 ${String(first.localDir ?? '')}${server}`;
+      }
+      return `下载 ${String(args.remotePath ?? '')} 到 ${String(args.localDir ?? '')}${server}`;
+    }
     case 'staging_list':
       return '查看当前会话文件暂存列表';
     case 'staging_diff':

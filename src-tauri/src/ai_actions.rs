@@ -38,6 +38,21 @@ const REMOTE_GREP_TIMEOUT_SECS: u64 = 30;
 /// 远端 glob 递归上限：深度 / 目录扫描数（防失控 walk）。
 const REMOTE_GLOB_MAX_DEPTH: usize = 12;
 const REMOTE_GLOB_MAX_DIRS: usize = 2000;
+/// 单次 AI SFTP 动作允许的根项数；目录内部递归不计入此项。
+pub(crate) const MAX_SFTP_BATCH_ITEMS: usize = 32;
+
+#[derive(Debug, Clone)]
+pub(crate) struct SftpUploadItem {
+    pub local_path: String,
+    pub remote_dir: String,
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SftpDownloadItem {
+    pub remote_path: String,
+    pub local_dir: String,
+}
 
 /// 判断 SFTP 错误是否为「文件不存在」（与 staging.rs 同语义）。
 fn is_no_such_file(e: &russh_sftp::client::error::Error) -> bool {
@@ -204,65 +219,14 @@ impl AiActions {
         overwrite: bool,
         impact: Option<ImpactPlan>,
     ) -> Result<String, String> {
-        if local_path.trim().is_empty() {
-            return Err("本地路径不能为空".to_string());
-        }
-        if remote_dir.trim().is_empty() {
-            return Err("远端目录不能为空".to_string());
-        }
-        let root = self.project_root(project_id)?;
-        self.ensure_ai_allowed(&server_id)?;
-        let local = self.resolve_inside(&root, Path::new(&local_path))?;
-        let md = std::fs::metadata(&local)
-            .map_err(|e| format!("读取本地 {} 失败：{e}", local.display()))?;
-        if !md.is_file() && !md.is_dir() {
-            return Err(format!("上传源既不是文件也不是目录：{}", local.display()));
-        }
-        // 自动备份：覆盖前快照最终远程目标
-        if self.staging.auto_backup_enabled() && overwrite {
-            match self.upload_targets(&local, &remote_dir, &server_id).await {
-                Ok(targets) => {
-                    for t in &targets {
-                        self.staging
-                            .ensure_snapshot(project_id, session_id, &server_id, t)
-                            .await?;
-                    }
-                }
-                Err(reason) => {
-                    // 审批阶段已确认「不保证完整备份」（agent 人工确认）→ 放行；
-                    // 否则（yolo / 未经过审批）拒绝，避免绕过保护
-                    let approved_unbounded = matches!(
-                        impact.as_ref().map(|p| p.effect),
-                        Some(Effect::Unbounded)
-                    );
-                    if !approved_unbounded {
-                        return Err(format!(
-                            "{reason}，已拒绝覆盖上传；请改用受管文件操作（如上传到新目录）或手动 SFTP"
-                        ));
-                    }
-                }
-            }
-        }
-        let sftp = self.ssh.open_sftp(&server_id).await?;
-        let landed = crate::sftp::upload_one(&sftp, &local, &remote_dir, overwrite).await?;
-        let full = format!(
-            "{}/{}",
-            remote_dir.trim_end_matches('/'),
-            landed
-        );
-        // 顶层落地名与本地文件名不同 = 远端已有同名 → 自动创建了副本（upload_one 返回的落地名）
-        let base_name = local
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        if !overwrite && landed != base_name {
-            Ok(format!("远端已存在同名文件，已创建副本：{full}（服务器 {server_id}）"))
-        } else if overwrite {
-            Ok(format!("上传完成（已覆盖远端同名文件）：{full}（服务器 {server_id}）"))
-        } else {
-            Ok(format!("上传完成：{full}（服务器 {server_id}）"))
-        }
+        self.sftp_upload_batch(
+            project_id,
+            session_id,
+            &server_id,
+            &[SftpUploadItem { local_path, remote_dir, overwrite }],
+            impact,
+        )
+        .await
     }
 
     /// 覆盖上传的最终远程目标清单：文件 → 单一目标；目录 → 递归枚举本地文件映射远端相对路径。
@@ -309,7 +273,7 @@ impl AiActions {
         Ok(out)
     }
 
-    /// SFTP 下载：本地目标目录必须在项目根内且**已存在**（AI 不自动创建目录）。
+    /// SFTP 下载单项：本地目标目录必须在项目根内且**已存在**（AI 不自动创建目录）。
     pub async fn sftp_download(
         &self,
         project_id: &str,
@@ -317,24 +281,111 @@ impl AiActions {
         remote_path: String,
         local_dir: String,
     ) -> Result<(), String> {
-        if remote_path.trim().is_empty() {
-            return Err("远端路径不能为空".to_string());
-        }
-        if local_dir.trim().is_empty() {
-            return Err("本地目录不能为空".to_string());
+        self.sftp_download_batch(project_id, &server_id, &[SftpDownloadItem { remote_path, local_dir }]).await.map(|_| ())
+    }
+
+    /// AI 批量上传：先完成全部覆盖目标的备份预检，再按顺序执行，返回逐项结果汇总。
+    pub(crate) async fn sftp_upload_batch(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        server_id: &str,
+        items: &[SftpUploadItem],
+        impact: Option<ImpactPlan>,
+    ) -> Result<String, String> {
+        if items.is_empty() || items.len() > MAX_SFTP_BATCH_ITEMS {
+            return Err(format!("SFTP 批量上传项数必须在 1–{MAX_SFTP_BATCH_ITEMS} 之间"));
         }
         let root = self.project_root(project_id)?;
-        self.ensure_ai_allowed(&server_id)?;
-        let dir = self.resolve_inside(&root, Path::new(&local_dir))?;
-        let md = std::fs::metadata(&dir)
-            .map_err(|e| format!("读取本地目录 {} 失败：{e}", dir.display()))?;
-        if !md.is_dir() {
-            return Err(format!("下载目标不是目录：{}", dir.display()));
+        self.ensure_ai_allowed(server_id)?;
+        let mut resolved = Vec::with_capacity(items.len());
+        let mut remote_dirs = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            if item.local_path.trim().is_empty() || item.remote_dir.trim().is_empty() {
+                return Err(format!("第 {} 项上传参数不能为空", index + 1));
+            }
+            let local = self.resolve_inside(&root, Path::new(&item.local_path))?;
+            let md = std::fs::metadata(&local)
+                .map_err(|e| format!("读取本地 {} 失败：{e}", local.display()))?;
+            if !md.is_file() && !md.is_dir() {
+                return Err(format!("第 {} 项上传源既不是文件也不是目录：{}", index + 1, local.display()));
+            }
+            resolved.push(local);
+            remote_dirs.push(self.resolve_remote_path(server_id, &item.remote_dir).await?);
         }
-        let sftp = self.ssh.open_sftp(&server_id).await?;
-        crate::sftp::download_one(&sftp, &remote_path, &dir)
-            .await
-            .map(|_| ())
+        if self.staging.auto_backup_enabled() {
+            for (index, item) in items.iter().enumerate() {
+                if !item.overwrite { continue; }
+                match self.upload_targets(&resolved[index], &remote_dirs[index], server_id).await {
+                    Ok(paths) => {
+                        for path in paths {
+                            self.staging.ensure_snapshot(project_id, session_id, server_id, &path).await?;
+                        }
+                    }
+                    Err(reason) => {
+                        let approved_unbounded = matches!(impact.as_ref().map(|p| p.effect), Some(Effect::Unbounded));
+                        if !approved_unbounded {
+                            return Err(format!("批量上传覆盖范围无法完整枚举：{reason}，已拒绝写入"));
+                        }
+                    }
+                }
+            }
+        }
+        let sftp = self.ssh.open_sftp(server_id).await?;
+        let mut failures = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if let Err(error) = crate::sftp::upload_one(&sftp, &resolved[index], &remote_dirs[index], item.overwrite).await {
+                failures.push(format!("第 {} 项失败：{}", index + 1, error));
+            }
+        }
+        let succeeded = items.len() - failures.len();
+        if failures.is_empty() {
+            Ok(format!("批量上传完成：成功 {succeeded} 项（服务器 {server_id}）"))
+        } else {
+            Err(format!("批量上传部分成功：成功 {succeeded} 项，失败 {} 项\n{}", failures.len(), failures.join("\n")))
+        }
+    }
+
+    /// AI 批量下载：每项独立校验本地目录并串行落地，返回逐项结果汇总。
+    pub(crate) async fn sftp_download_batch(
+        &self,
+        project_id: &str,
+        server_id: &str,
+        items: &[SftpDownloadItem],
+    ) -> Result<String, String> {
+        if items.is_empty() || items.len() > MAX_SFTP_BATCH_ITEMS {
+            return Err(format!("SFTP 批量下载项数必须在 1–{MAX_SFTP_BATCH_ITEMS} 之间"));
+        }
+        let root = self.project_root(project_id)?;
+        self.ensure_ai_allowed(server_id)?;
+        let mut dirs = Vec::with_capacity(items.len());
+        let mut remote_paths = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            if item.remote_path.trim().is_empty() || item.local_dir.trim().is_empty() {
+                return Err(format!("第 {} 项下载参数不能为空", index + 1));
+            }
+            let dir = self.resolve_inside(&root, Path::new(&item.local_dir))?;
+            let md = std::fs::metadata(&dir)
+                .map_err(|e| format!("读取本地目录 {} 失败：{e}", dir.display()))?;
+            if !md.is_dir() {
+                return Err(format!("第 {} 项下载目标不是目录：{}", index + 1, dir.display()));
+            }
+            dirs.push(dir);
+            remote_paths.push(self.resolve_remote_path(server_id, &item.remote_path).await?);
+        }
+        let sftp = self.ssh.open_sftp(server_id).await?;
+        let mut failures = Vec::new();
+        for (index, _item) in items.iter().enumerate() {
+            if let Err(error) = crate::sftp::download_one(&sftp, &remote_paths[index], &dirs[index]).await {
+                failures.push(format!("第 {} 项失败：{}", index + 1, error));
+            }
+        }
+        let succeeded = items.len() - failures.len();
+        if failures.is_empty() {
+            Ok(format!("批量下载完成：成功 {succeeded} 项（服务器 {server_id}）"))
+        } else {
+            Err(format!("批量下载部分成功：成功 {succeeded} 项，失败 {} 项\n{}", failures.len(), failures.join("\n")))
+        }
     }
 
     /// 解析远端 home（canonicalize(".")）：审批/执行两阶段共用的远程工作目录事实源。
@@ -722,9 +773,7 @@ impl AiActions {
         Ok(format!("已删除远程文件：{resolved}（服务器 {server_id}）"))
     }
 
-    /// 覆盖上传的影响计划（审批阶段计算，供合并/展示/执行确认）：
-    /// overwrite=false → none；文件覆盖 → bounded 单目标；目录覆盖 → bounded 枚举目标；
-    /// 枚举失败 → unbounded。
+    /// 覆盖上传的影响计划（审批阶段计算，供合并/展示/执行确认）。
     pub async fn upload_impact(
         &self,
         project_id: &str,
@@ -733,32 +782,45 @@ impl AiActions {
         remote_dir: &str,
         overwrite: bool,
     ) -> Result<ImpactPlan, String> {
-        if !overwrite {
-            return Ok(ImpactPlan::none("创建新副本，不覆盖已有文件"));
+        self.upload_impact_batch(project_id, server_id, &[SftpUploadItem {
+            local_path: local_path.to_string(),
+            remote_dir: remote_dir.to_string(),
+            overwrite,
+        }]).await
+    }
+
+    /// 批量上传的合并影响计划：所有覆盖项的远端目标必须完整枚举，否则为 unbounded。
+    pub(crate) async fn upload_impact_batch(
+        &self,
+        project_id: &str,
+        server_id: &str,
+        items: &[SftpUploadItem],
+    ) -> Result<ImpactPlan, String> {
+        if items.is_empty() || items.len() > MAX_SFTP_BATCH_ITEMS {
+            return Err(format!("SFTP 批量上传项数必须在 1–{MAX_SFTP_BATCH_ITEMS} 之间"));
         }
         let root = self.project_root(project_id)?;
-        let local = self.resolve_inside(&root, Path::new(local_path))?;
-        let md = std::fs::metadata(&local)
-            .map_err(|e| format!("读取本地 {} 失败：{e}", local.display()))?;
-        if !md.is_file() && !md.is_dir() {
-            return Ok(ImpactPlan::none("上传源既不是文件也不是目录"));
+        let mut changes = Vec::new();
+        for item in items {
+            if !item.overwrite { continue; }
+            let local = self.resolve_inside(&root, Path::new(&item.local_path))?;
+            let remote_dir = self.resolve_remote_path(server_id, &item.remote_dir).await?;
+            match self.upload_targets(&local, &remote_dir, server_id).await {
+                Ok(targets) => changes.extend(targets.into_iter().map(|path| crate::ai_impact::FileChange {
+                    operation: crate::ai_impact::Operation::Modify,
+                    path,
+                    destination: None,
+                })),
+                Err(reason) => return Ok(ImpactPlan::unbounded(&format!("{reason}；不保证完整备份"))),
+            }
         }
-        match self.upload_targets(&local, remote_dir, server_id).await {
-            Ok(targets) if !targets.is_empty() => Ok(ImpactPlan::bounded(
-                targets
-                    .into_iter()
-                    .map(|path| crate::ai_impact::FileChange {
-                        operation: crate::ai_impact::Operation::Modify,
-                        path,
-                        destination: None,
-                    })
-                    .collect(),
-                "覆盖上传目标已完整枚举",
-            )),
-            Ok(_) => Ok(ImpactPlan::none("覆盖上传目标为空")),
-            Err(reason) => Ok(ImpactPlan::unbounded(&format!("{reason}；不保证完整备份"))),
+        if changes.is_empty() {
+            Ok(ImpactPlan::none("批量上传均为新建副本，不覆盖已有文件"))
+        } else {
+            Ok(ImpactPlan::bounded(changes, "批量覆盖上传目标已完整枚举"))
         }
     }
+
 
     /// AI 查看当前会话暂存列表（只读工具；不经前端 Tauri 命令）。
     pub async fn staging_list(&self, project_id: &str, session_id: &str) -> Result<String, String> {
