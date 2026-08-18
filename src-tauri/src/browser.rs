@@ -341,25 +341,33 @@ impl BrowserManager {
         let method = method.to_string();
         let params_text = serde_json::to_string(&params)
             .map_err(|e| format!("序列化浏览器 CDP 参数失败: {e}"))?;
-        let sent = wv.with_webview(move |pw| unsafe {
-            use windows::core::{HSTRING, PCWSTR};
-            let Ok(core) = pw.controller().CoreWebView2() else {
-                let _ = tx.send(Err("浏览器 CDP 不可用".to_string()));
-                return;
-            };
-            let method = HSTRING::from(method);
-            let params = HSTRING::from(params_text);
-            let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(
-                Box::new(move |_err, result_json: String| {
-                    let _ = tx.send(Ok(result_json));
-                    Ok(())
-                }),
-            );
-            let _ = core.CallDevToolsProtocolMethod(
-                PCWSTR::from_raw(method.as_ptr()),
-                PCWSTR::from_raw(params.as_ptr()),
-                &handler,
-            );
+        let sent = wv.with_webview(move |pw| {
+            #[cfg(windows)]
+            unsafe {
+                use windows::core::{HSTRING, PCWSTR};
+                let Ok(core) = pw.controller().CoreWebView2() else {
+                    let _ = tx.send(Err("浏览器 CDP 不可用".to_string()));
+                    return;
+                };
+                let method = HSTRING::from(method);
+                let params = HSTRING::from(params_text);
+                let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(
+                    Box::new(move |_err, result_json: String| {
+                        let _ = tx.send(Ok(result_json));
+                        Ok(())
+                    }),
+                );
+                let _ = core.CallDevToolsProtocolMethod(
+                    PCWSTR::from_raw(method.as_ptr()),
+                    PCWSTR::from_raw(params.as_ptr()),
+                    &handler,
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                // CDP/WebView2 细节为 Windows 专属；macOS(WKWebView) 无此接口，按平台不支持回退
+                let _ = tx.send(Err("浏览器 CDP 仅支持 Windows".to_string()));
+            }
         });
         if let Err(e) = sent {
             return Err(format!("调用浏览器 CDP 失败: {e}"));
@@ -617,25 +625,32 @@ impl BrowserManager {
 
         // 页面回传通道：element（检查器选中）/ console（钩子）经 WebMessageReceived 进入
         let mgr_msg = Arc::clone(self);
-        let _ = wv.with_webview(move |pw| unsafe {
-            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
-            use windows::core::PWSTR;
-            use windows::Win32::System::Com::CoTaskMemFree;
-            let Ok(core) = pw.controller().CoreWebView2() else { return };
-            let handler = webview2_com::WebMessageReceivedEventHandler::create(Box::new(
-                move |_sender, args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
-                    let Some(args) = args else { return Ok(()) };
-                    let mut raw = PWSTR::null();
-                    if args.TryGetWebMessageAsString(&mut raw).is_ok() && !raw.is_null() {
-                        let msg = raw.to_string().unwrap_or_default();
-                        CoTaskMemFree(Some(raw.as_ptr().cast()));
-                        handle_page_message(&mgr_msg, &msg);
-                    }
-                    Ok(())
-                },
-            ));
-            let mut token = 0i64;
-            let _ = core.add_WebMessageReceived(&handler, &mut token);
+        let _ = wv.with_webview(move |pw| {
+            #[cfg(windows)]
+            unsafe {
+                use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
+                use windows::core::PWSTR;
+                use windows::Win32::System::Com::CoTaskMemFree;
+                let Ok(core) = pw.controller().CoreWebView2() else { return };
+                let handler = webview2_com::WebMessageReceivedEventHandler::create(Box::new(
+                    move |_sender, args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
+                        let Some(args) = args else { return Ok(()) };
+                        let mut raw = PWSTR::null();
+                        if args.TryGetWebMessageAsString(&mut raw).is_ok() && !raw.is_null() {
+                            let msg = raw.to_string().unwrap_or_default();
+                            CoTaskMemFree(Some(raw.as_ptr().cast()));
+                            handle_page_message(&mgr_msg, &msg);
+                        }
+                        Ok(())
+                    },
+                ));
+                let mut token = 0i64;
+                let _ = core.add_WebMessageReceived(&handler, &mut token);
+            }
+            #[cfg(not(windows))]
+            {
+                // WebMessageReceived 为 WebView2 专属；macOS(WKWebView) 无此回传通道
+            }
         });
 
         {
@@ -804,34 +819,41 @@ impl BrowserManager {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
-        let sent = wv.with_webview(move |pw| unsafe {
-            use windows::core::PCWSTR;
-            let Ok(core) = pw.controller().CoreWebView2() else {
-                return;
-            };
-            let method = windows::core::HSTRING::from("Page.captureScreenshot");
-            let params = windows::core::HSTRING::from(r#"{"format":"png"}"#);
-            let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(
-                Box::new(move |_err, result_json: String| {
-                    let out = (|| {
-                        let v: serde_json::Value = serde_json::from_str(&result_json)
-                            .map_err(|e| format!("截图结果解析失败: {e}"))?;
-                        let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                        if data.is_empty() {
-                            return Err("截图返回空数据（页面可能尚未渲染）".to_string());
-                        }
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
-                            .map_err(|e| format!("截图解码失败: {e}"))
-                    })();
-                    let _ = tx.send(out);
-                    Ok(())
-                }),
-            );
-            let _ = core.CallDevToolsProtocolMethod(
-                PCWSTR::from_raw(method.as_ptr()),
-                PCWSTR::from_raw(params.as_ptr()),
-                &handler,
-            );
+        let sent = wv.with_webview(move |pw| {
+            #[cfg(windows)]
+            unsafe {
+                use windows::core::PCWSTR;
+                let Ok(core) = pw.controller().CoreWebView2() else {
+                    return;
+                };
+                let method = windows::core::HSTRING::from("Page.captureScreenshot");
+                let params = windows::core::HSTRING::from(r#"{"format":"png"}"#);
+                let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(
+                    Box::new(move |_err, result_json: String| {
+                        let out = (|| {
+                            let v: serde_json::Value = serde_json::from_str(&result_json)
+                                .map_err(|e| format!("截图结果解析失败: {e}"))?;
+                            let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                            if data.is_empty() {
+                                return Err("截图返回空数据（页面可能尚未渲染）".to_string());
+                            }
+                            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+                                .map_err(|e| format!("截图解码失败: {e}"))
+                        })();
+                        let _ = tx.send(out);
+                        Ok(())
+                    }),
+                );
+                let _ = core.CallDevToolsProtocolMethod(
+                    PCWSTR::from_raw(method.as_ptr()),
+                    PCWSTR::from_raw(params.as_ptr()),
+                    &handler,
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = tx.send(Err("内置浏览器截图仅支持 Windows".to_string()));
+            }
         });
         let outcome = match sent {
             Err(e) => Err(format!("调用截图接口失败: {e}")),
