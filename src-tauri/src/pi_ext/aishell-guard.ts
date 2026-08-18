@@ -71,6 +71,8 @@ const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_downlo
  *  staging_list / staging_diff 只读、staging_add 主动备份（只读远端）/ staging_clear 只清
  *  无变更条目，均不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
 const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore"];
+/** 单次 AI SFTP 动作最多传输的根项数；目录内部递归仍由后端统一处理。 */
+const MAX_SFTP_BATCH_ITEMS = 32;
 
 /** db_query 只读首词（union 表，与 Rust ai_actions::is_db_read_only 语义一致，见 store.rs DbKind::default_read_commands）。
  *  guard 侧无法感知连接类型，故用并集静态分类：命中 → 读（放行）；未命中 → 写（agent 模式人工审批）。
@@ -132,6 +134,31 @@ const REMOTE_FIND_SCHEMA = Type.Object({
 	path: Type.Optional(Type.String({ description: "搜索起始目录（默认当前目录；远程缺省为服务器登录目录）" })),
 	limit: Type.Optional(Type.Number({ description: "最大结果数" })),
 	serverId: SERVER_ID_PARAM,
+});
+const SFTP_UPLOAD_ITEM_SCHEMA = Type.Object({
+	localPath: Type.String({ description: "本地源路径（项目目录内）" }),
+	remoteDir: Type.String({ description: "远端目标目录" }),
+	overwrite: Type.Optional(Type.Boolean({ description: "是否覆盖远端同名文件：true 覆盖；默认 false（重名自动创建副本）" })),
+});
+const SFTP_DOWNLOAD_ITEM_SCHEMA = Type.Object({
+	remotePath: Type.String({ description: "远端源路径" }),
+	localDir: Type.String({ description: "本地目标目录（项目目录内，必须已存在）" }),
+});
+// 注意：pi 工具注册器要求参数 schema 顶层必须有 `type:"object"`，因此批量形态
+// 不能写成 Type.Union（生成 anyOf、无顶层 type 会被 oai 工具 schema 校验拒绝）。
+// 单项字段与 items 并存于同一 Object，运行时按「items 存在 → 批量，否则 → 单项」区分。
+const SFTP_UPLOAD_SCHEMA = Type.Object({
+	serverId: Type.String({ description: "目标服务器 ID（批量时整批共用）" }),
+	localPath: Type.Optional(Type.String({ description: "本地源路径（项目目录内）；与 items 二选一" })),
+	remoteDir: Type.Optional(Type.String({ description: "远端目标目录；与 items 二选一" })),
+	overwrite: Type.Optional(Type.Boolean({ description: "是否覆盖远端同名文件：true 覆盖；默认 false（重名自动创建副本）" })),
+	items: Type.Optional(Type.Array(SFTP_UPLOAD_ITEM_SCHEMA, { minItems: 1, maxItems: MAX_SFTP_BATCH_ITEMS, description: "批量上传项（最多 32 项，优先于单项字段）；每项独立校验并返回结果" })),
+});
+const SFTP_DOWNLOAD_SCHEMA = Type.Object({
+	serverId: Type.String({ description: "源服务器 ID（批量时整批共用）" }),
+	remotePath: Type.Optional(Type.String({ description: "远端源路径；与 items 二选一" })),
+	localDir: Type.Optional(Type.String({ description: "本地目标目录（项目目录内，必须已存在）；与 items 二选一" })),
+	items: Type.Optional(Type.Array(SFTP_DOWNLOAD_ITEM_SCHEMA, { minItems: 1, maxItems: MAX_SFTP_BATCH_ITEMS, description: "批量下载项（最多 32 项，优先于单项字段）；每项独立校验并返回结果" })),
 });
 const REMOTE_GREP_SCHEMA = Type.Object({
 	pattern: Type.String({ description: "搜索模式（正则或字面量）" }),
@@ -252,18 +279,40 @@ export default function (pi: ExtensionAPI) {
 				const timeout = typeof input.timeoutSeconds === "number" ? input.timeoutSeconds : 10;
 				return { action: "run_command", intent, summary: `执行命令（${target}，超时 ${timeout} 秒）：${command}` };
 			}
-			case "sftp_upload":
-				return {
-					action: "sftp_upload",
-					intent: `上传 ${String(input.localPath || "")} 到 ${String(input.remoteDir || "")}${input.overwrite ? "（覆盖同名）" : ""}`,
-					summary: `SFTP 上传到服务器 ${String(input.serverId || "")}${input.overwrite ? "（覆盖远端同名文件）" : "（重名自动创建副本）"}`,
-				};
-			case "sftp_download":
-				return {
-					action: "sftp_download",
-					intent: `下载 ${String(input.remotePath || "")} 到 ${String(input.localDir || "")}`,
-					summary: `SFTP 下载自服务器 ${String(input.serverId || "")}`,
-				};
+				case "sftp_upload": {
+					const items = Array.isArray(input.items) ? input.items : [];
+					if (items.length > 0) {
+						const first = (items[0] || {}) as Record<string, unknown>;
+						const overwrite = items.some((item) => (item as Record<string, unknown>)?.overwrite === true);
+						return {
+							action: "sftp_upload",
+							intent: `批量上传 ${items.length} 项${first.localPath ? `（首项：${String(first.localPath)}）` : ""} 到 ${String(first.remoteDir || "")}${overwrite ? "（含覆盖项）" : ""}`,
+							summary: `SFTP 批量上传 ${items.length} 项到服务器 ${String(input.serverId || "")}；逐项返回成功或失败结果`,
+						};
+					}
+					return {
+						action: "sftp_upload",
+						intent: `上传 ${String(input.localPath || "")} 到 ${String(input.remoteDir || "")}${input.overwrite ? "（覆盖同名）" : ""}`,
+						summary: `SFTP 上传到服务器 ${String(input.serverId || "")}${input.overwrite ? "（覆盖远端同名文件）" : "（重名自动创建副本）"}`,
+					};
+				}
+				case "sftp_download": {
+					const items = Array.isArray(input.items) ? input.items : [];
+					if (items.length > 0) {
+						const first = (items[0] || {}) as Record<string, unknown>;
+						return {
+							action: "sftp_download",
+							intent: `批量下载 ${items.length} 项${first.remotePath ? `（首项：${String(first.remotePath)}）` : ""} 到 ${String(first.localDir || "")}`,
+							summary: `SFTP 批量下载 ${items.length} 项自服务器 ${String(input.serverId || "")}；逐项返回成功或失败结果`,
+						};
+					}
+					return {
+						action: "sftp_download",
+						intent: `下载 ${String(input.remotePath || "")} 到 ${String(input.localDir || "")}`,
+						summary: `SFTP 下载自服务器 ${String(input.serverId || "")}`,
+					};
+				}
+
 			case "db_query":
 				return {
 					action: "db_query",
@@ -397,32 +446,39 @@ export default function (pi: ExtensionAPI) {
 				}
 				return undefined;
 			}
-			case "sftp_upload": {
-				const serverId = typeof input.serverId === "string" ? input.serverId.trim() : "";
-				const localPath = typeof input.localPath === "string" ? input.localPath.trim() : "";
-				const remoteDir = typeof input.remoteDir === "string" ? input.remoteDir.trim() : "";
-				if (!serverId) return { block: true, reason: "sftp_upload: 缺少 serverId。" };
-				if (!localPath) return { block: true, reason: "sftp_upload: localPath 不能为空。" };
-				if (!remoteDir) return { block: true, reason: "sftp_upload: remoteDir 不能为空。" };
-				const p = path.resolve(cwd, localPath);
-				if (!inside(root, p.toLowerCase())) {
-					return { block: true, reason: `AIShell 权限边界:上传源必须在项目目录内(拒绝:${localPath})。` };
+				case "sftp_upload": {
+					const serverId = typeof input.serverId === "string" ? input.serverId.trim() : "";
+					if (!serverId) return { block: true, reason: "sftp_upload: 缺少 serverId。" };
+					const items = Array.isArray(input.items) ? input.items : [{ localPath: input.localPath, remoteDir: input.remoteDir, overwrite: input.overwrite }];
+					if (items.length === 0 || items.length > MAX_SFTP_BATCH_ITEMS) return { block: true, reason: `sftp_upload: items 必须包含 1–${MAX_SFTP_BATCH_ITEMS} 项。` };
+					for (const [index, raw] of items.entries()) {
+						const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+						const localPath = typeof item.localPath === "string" ? item.localPath.trim() : "";
+						const remoteDir = typeof item.remoteDir === "string" ? item.remoteDir.trim() : "";
+						if (!localPath) return { block: true, reason: `sftp_upload: 第 ${index + 1} 项 localPath 不能为空。` };
+						if (!remoteDir) return { block: true, reason: `sftp_upload: 第 ${index + 1} 项 remoteDir 不能为空。` };
+						const p = path.resolve(cwd, localPath);
+						if (!inside(root, p.toLowerCase())) return { block: true, reason: `AIShell 权限边界:第 ${index + 1} 项上传源必须在项目目录内(拒绝:${localPath})。` };
+					}
+					return undefined;
 				}
-				return undefined;
-			}
-			case "sftp_download": {
-				const serverId = typeof input.serverId === "string" ? input.serverId.trim() : "";
-				const remotePath = typeof input.remotePath === "string" ? input.remotePath.trim() : "";
-				const localDir = typeof input.localDir === "string" ? input.localDir.trim() : "";
-				if (!serverId) return { block: true, reason: "sftp_download: 缺少 serverId。" };
-				if (!remotePath) return { block: true, reason: "sftp_download: remotePath 不能为空。" };
-				if (!localDir) return { block: true, reason: "sftp_download: localDir 不能为空。" };
-				const p = path.resolve(cwd, localDir);
-				if (!inside(root, p.toLowerCase())) {
-					return { block: true, reason: `AIShell 权限边界:下载目标必须在项目目录内(拒绝:${localDir})。` };
+				case "sftp_download": {
+					const serverId = typeof input.serverId === "string" ? input.serverId.trim() : "";
+					if (!serverId) return { block: true, reason: "sftp_download: 缺少 serverId。" };
+					const items = Array.isArray(input.items) ? input.items : [{ remotePath: input.remotePath, localDir: input.localDir }];
+					if (items.length === 0 || items.length > MAX_SFTP_BATCH_ITEMS) return { block: true, reason: `sftp_download: items 必须包含 1–${MAX_SFTP_BATCH_ITEMS} 项。` };
+					for (const [index, raw] of items.entries()) {
+						const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+						const remotePath = typeof item.remotePath === "string" ? item.remotePath.trim() : "";
+						const localDir = typeof item.localDir === "string" ? item.localDir.trim() : "";
+						if (!remotePath) return { block: true, reason: `sftp_download: 第 ${index + 1} 项 remotePath 不能为空。` };
+						if (!localDir) return { block: true, reason: `sftp_download: 第 ${index + 1} 项 localDir 不能为空。` };
+						const p = path.resolve(cwd, localDir);
+						if (!inside(root, p.toLowerCase())) return { block: true, reason: `AIShell 权限边界:第 ${index + 1} 项下载目标必须在项目目录内(拒绝:${localDir})。` };
+					}
+					return undefined;
 				}
-				return undefined;
-			}
+
 			case "web_search":
 				// 只读网络调用，无文件路径语义（aishell-search.ts 注册）
 				return undefined;
@@ -927,28 +983,25 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "sftp_upload",
 		label: "SFTP Upload",
-		description:
-			"上传项目目录内的本地文件或目录到远程服务器的指定目录（默认重名自动创建副本并返回副本文件名；overwrite=true 时覆盖远端同名文件）。",
+			description:
+				"上传项目目录内的本地文件或目录到远程服务器的指定目录；支持单项字段或 items 数组批量上传（最多 32 项，串行执行并返回逐项结果；默认重名自动创建副本，overwrite=true 时覆盖远端同名文件）。",
+
 		promptSnippet: "上传文件到服务器",
 		promptGuidelines: [
-			"sftp_upload 的 localPath 必须是当前项目目录内的文件或目录；服务器受 AI 操作锁约束。",
-			"更新远端已有文件时传 overwrite=true 直接覆盖，否则会生成副本文件；结果会返回远端实际文件名，回复用户时如实引用。",
+				"单项调用时 localPath 必须是当前项目目录内的文件或目录；批量调用时 items 的每个 localPath 都必须在项目目录内，所有项共用 serverId。",
+				"更新远端已有文件时传 overwrite=true 直接覆盖，否则会生成副本文件；批量结果逐项返回，部分失败时如实说明，不能声称全部成功。",
+
 		],
-		parameters: Type.Object({
-			serverId: Type.String({ description: "目标服务器 ID" }),
-			localPath: Type.String({ description: "本地源路径（项目目录内）" }),
-			remoteDir: Type.String({ description: "远端目标目录" }),
-			overwrite: Type.Optional(
-				Type.Boolean({ description: "是否覆盖远端同名文件：true 覆盖；默认 false（重名自动创建副本）" }),
-			),
-		}),
+			parameters: SFTP_UPLOAD_SCHEMA,
+
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			return await rustAction(ctx, toolCallId, {
-				action: "sftp_upload",
-				serverId: params.serverId,
-				localPath: params.localPath,
-				remoteDir: params.remoteDir,
-				overwrite: params.overwrite === true,
+					action: "sftp_upload",
+					serverId: params.serverId,
+					...(Array.isArray(params.items)
+						? { items: params.items.map((item) => ({ ...item, overwrite: item.overwrite === true })) }
+						: { localPath: params.localPath, remoteDir: params.remoteDir, overwrite: params.overwrite === true }),
+
 			});
 		},
 	});
@@ -1056,22 +1109,24 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "sftp_download",
 		label: "SFTP Download",
-		description: "从远程服务器下载文件或目录到项目目录内的已有目录（重名自动改名）。",
+			description: "从远程服务器下载文件或目录到项目目录内的已有目录；支持单项字段或 items 数组批量下载（最多 32 项，串行执行并返回逐项结果，重名自动改名）。",
+
 		promptSnippet: "从服务器下载文件",
 		promptGuidelines: [
-			"sftp_download 的 localDir 必须是项目目录内已存在的目录；服务器受 AI 操作锁约束。",
+				"单项调用时 localDir 必须是项目目录内已存在的目录；批量调用时 items 的每个 localDir 都必须满足该边界，所有项共用 serverId。",
+				"批量下载逐项返回成功或失败结果，部分失败时如实说明，不能声称全部成功。",
+
 		],
-		parameters: Type.Object({
-			serverId: Type.String({ description: "源服务器 ID" }),
-			remotePath: Type.String({ description: "远端源路径" }),
-			localDir: Type.String({ description: "本地目标目录（项目目录内，必须已存在）" }),
-		}),
+			parameters: SFTP_DOWNLOAD_SCHEMA,
+
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			return await rustAction(ctx, toolCallId, {
-				action: "sftp_download",
-				serverId: params.serverId,
-				remotePath: params.remotePath,
-				localDir: params.localDir,
+					action: "sftp_download",
+					serverId: params.serverId,
+					...(Array.isArray(params.items)
+						? { items: params.items }
+						: { remotePath: params.remotePath, localDir: params.localDir }),
+
 			});
 		},
 	});

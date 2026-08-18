@@ -509,6 +509,14 @@ impl RemoteStaging {
                 }
             }
         }
+        self.emit_progress(&StagingProgress {
+            project_id: project_id.to_string(),
+            session_id: session_id.to_string(),
+            phase: "done".into(),
+            done: total,
+            total,
+            current_path: String::new(),
+        });
         Ok(out)
     }
 
@@ -593,11 +601,15 @@ impl RemoteStaging {
             }
         }
         self.write_manifest(project_id, session_id, &kept)?;
-        Ok(StagingClearOutcome {
-            removed,
-            kept,
-            errors,
-        })
+        self.emit_progress(&StagingProgress {
+            project_id: project_id.to_string(),
+            session_id: session_id.to_string(),
+            phase: "done".into(),
+            done: removed.len() + kept.len(),
+            total: removed.len() + kept.len(),
+            current_path: String::new(),
+        });
+        Ok(StagingClearOutcome { removed, kept, errors })
     }
 
     /// 列出某会话全部暂存条目（按暂存时间排序）。manifest 损坏 → 带路径错误。

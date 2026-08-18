@@ -9,6 +9,10 @@
 //!   - `{type:"approval",requestId,toolCallId,action,intent,summary}`
 //!   - `{type:"actionStart",toolCallId,tool,args}` / `{type:"actionEnd",toolCallId,tool,isError,result}`
 //!
+//! pi 对瞬时错误（限流/过载/5xx）默认自动重试（settings retry.enabled）：失败尝试的
+//! error 事件照常转发，重试以 `{type:"tool",tool:"自动重试"}` 瞬时行提示；重试成功后
+//! text_delta 会重置终态抑制，agent_settled 照常补发 done（前端流式不中断也不卡死）。
+//!
 //! 另发全局事件 `fs:changed` payload `{path}`：AI 的 write/edit 工具成功落盘后广播
 //! 规范化绝对路径，前端编辑器据此刷新已打开的对应文件（见 editor.ts）。
 //!
@@ -57,7 +61,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::ai_actions::AiActions;
+use crate::ai_actions::{AiActions, SftpDownloadItem, SftpUploadItem, MAX_SFTP_BATCH_ITEMS};
 use crate::ai_impact::{
     analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan,
 };
@@ -84,7 +88,7 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 你有执行权限（Agent 模式每次操作需用户批准；YOLO 模式自动执行，用户已显式授权）：
 - run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。默认 10 秒超时，可用 timeoutSeconds（1–3600 秒）覆盖；预计超过 10 秒的命令应主动设置合理超时。
 - list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
-- sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。
+- sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。每个工具既支持单项字段，也支持 `items` 数组一次串行处理最多 32 项；批量结果会逐项汇总，部分失败时必须如实说明，不得声称全部成功。
 - 远程文件读写：read/grep/find/ls/write/edit/delete_path 都支持可选 serverId 参数（先用 list_servers 确认 serverId；不传则操作本地项目目录）。远程文件的内容查看/修改**优先用这些工具**，不要用 run_command 的 cat/sed/echo/tee 等命令读写远程文件内容——基础工具的远程写入/删除会自动进入会话暂存（自动备份原始快照，可 diff/还原）；run_command 用于服务管理、进程、包管理等非文件内容操作。远程路径可用绝对路径（/ 开头）或相对服务器登录目录的相对路径；不支持盘符形态。
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
 - request_db_connection：当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时，调用该工具申请添加连接。把已知的连接信息填进参数（serverId 取自 list_servers；名称、类型、主机、端口、用户名、默认库），主机相对该服务器（数据库在服务器本机填 127.0.0.1）；申请理由（reason）用一句中文说明用途。用户会在审批对话框里补密码并勾选查询权限，批准后工具结果会直接返回 connectionId，用它继续 db_query；被拒绝时不要反复重试，向用户说明需要哪些信息或请其在「服务器设置-数据库连接」中手动配置。
@@ -192,7 +196,7 @@ fn payload_fingerprint(p: &serde_json::Value) -> String {
                 .unwrap_or_default()
         )
     } else if p.get("localPath").is_some() && p.get("remoteDir").is_some() {
-        // sftp_upload：服务器/本地源/远端目录/覆盖开关
+        // sftp_upload 单项：服务器/本地源/远端目录/覆盖开关
         format!(
             "sftp_upload|{}|{}|{}|{}",
             get("serverId"),
@@ -202,6 +206,26 @@ fn payload_fingerprint(p: &serde_json::Value) -> String {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         )
+    } else if p.get("remotePath").is_some() && p.get("localDir").is_some() {
+        // sftp_download 单项：服务器/远端源/本地目录
+        format!(
+            "sftp_download|{}|{}|{}",
+            get("serverId"),
+            get("remotePath"),
+            get("localDir")
+        )
+    } else if let Some(items) = p.get("items").and_then(serde_json::Value::as_array) {
+        // 批量 SFTP：保留数组顺序并覆盖所有业务字段，桥接字段不参与。
+        let normalized: Vec<serde_json::Value> = items.iter().map(|item| {
+            json!({
+                "localPath": item.get("localPath").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "remoteDir": item.get("remoteDir").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "remotePath": item.get("remotePath").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "localDir": item.get("localDir").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "overwrite": item.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            })
+        }).collect();
+        format!("sftp_batch|{}|{}", get("serverId"), serde_json::to_string(&normalized).unwrap_or_default())
     } else {
         p.to_string()
     };
@@ -655,7 +679,8 @@ impl AiManager {
             let mut pending_paths: HashMap<String, String> = HashMap::new();
             // 是否已收到过终止性事件（done/error）：正常收尾后退出不再报「异常退出」
             let mut settled = false;
-            // 本轮生成是否已发过终态事件（done 或 error 只发一次；turn_start 重置）
+            // 本轮生成是否已发过终态事件（done/error 去重；turn_start 重置；瞬时错误
+            // 自动重试后流式恢复（text_delta）也重置——回合仍需正常收尾补发 done）
             let mut terminal_emitted = false;
             // 当前 assistant 消息是否已流过文本增量（工具来回多段消息时分段用）
             let mut text_started = false;
@@ -686,8 +711,11 @@ impl AiManager {
                                 {
                                     text_started = true;
                                     turn_text.push_str(delta);
-                                    let _ =
-                                        app2.emit(&event, json!({"type": "delta", "text": delta}));
+                                    // 瞬时错误（限流/过载/5xx）后 pi 自动重试成功、流式恢复：
+                                    // 重置终态抑制，否则回合结束 agent_settled 不再发 done、
+                                    // 同回合后续失败也被去重吞掉，前端将永久卡在生成态
+                                    terminal_emitted = false;
+                                    let _ = app2.emit(&event, json!({"type": "delta", "text": delta}));
                                 }
                             }
                             // 生成出错（type=error 也在 message_update 信封里）
@@ -730,6 +758,18 @@ impl AiManager {
                             );
                             turn_text.clear();
                         }
+                    }
+                    // 瞬时错误自动重试（pi retry.enabled 默认开：429/过载/5xx）。重试期间
+                    // 生成仍在进行（busy 回置，防止 ai_chat 误判空闲裸发 prompt 被拒）；
+                    // 转发为瞬时工具行，退避等待期间用户可见，不再只见一闪而过的错误气泡
+                    "auto_retry_start" => {
+                        busy2.store(true, Ordering::SeqCst);
+                        let attempt = ev.get("attempt").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        let max = ev.get("maxAttempts").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        let _ = app2.emit(
+                            &event,
+                            json!({"type": "tool", "tool": "自动重试", "label": format!("第{attempt}/{max}次，模型瞬时错误")}),
+                        );
                     }
                     // 工具活动：受控工具在 agent/yolo 下以动作卡（actionStart/actionEnd）呈现，
                     // 其余工具仍走瞬时小字行（tool）。
@@ -784,14 +824,15 @@ impl AiManager {
                                 obj.remove("content");
                             }
                             // 影响计划登记（yolo 也走：执行时按确定性计划快照/拒绝 unbounded）：
-                            // run_command（仅远程）与 sftp_upload 在 AISHELL_ACTION 前需要
-                            // 会话级暂存信息；其余受控工具不涉及远程文件。
+                            // run_command（仅远程）与 SFTP 传输在 AISHELL_ACTION 前需要
+                            // 会话级参数绑定；上传还需要暂存信息，下载虽不改远端，仍需
+                            // 防止审批后替换本地/远端路径。
                             let target = args
                                 .get("target")
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("");
                             let is_remote_cmd = tool == "run_command" && target == "remote";
-                            if is_remote_cmd || tool == "sftp_upload" {
+                            if is_remote_cmd || tool == "sftp_upload" || tool == "sftp_download" {
                                 impact_tracker.insert(
                                     tool_call_id.clone(),
                                     ImpactEntry {
@@ -927,8 +968,13 @@ impl AiManager {
                             let _ = app2.emit(&event, json!({"type": "error", "message": emsg}));
                         }
                     }
+                    // 命令响应失败：只有 prompt 被拒（消息未进模型）才算对话错误；后台命令
+                    // （set_thinking_level 等）失败不得冒充对话错误——那会误置 terminal_emitted
+                    // 吞掉回合结束的 done，前端卡在生成态
                     "response" => {
-                        if ev.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+                        let command = ev.get("command").and_then(serde_json::Value::as_str).unwrap_or("prompt");
+                        if command == "prompt"
+                            && ev.get("success").and_then(serde_json::Value::as_bool) == Some(false)
                             && !terminal_emitted
                         {
                             terminal_emitted = true;
@@ -1415,24 +1461,24 @@ fn compute_approval_impact(
         }
         "sftp_upload" => {
             let server_id = strf("serverId");
-            let local_path = strf("localPath");
-            let remote_dir = strf("remoteDir");
-            let overwrite = entry
-                .payload
-                .get("overwrite")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let plan = runtime.block_on(actions.upload_impact(
-                project_id,
-                &server_id,
-                &local_path,
-                &remote_dir,
-                overwrite,
-            ));
+            let items = if let Some(raw_items) = entry.payload.get("items").and_then(serde_json::Value::as_array) {
+                raw_items.iter().map(|item| SftpUploadItem {
+                    local_path: item.get("localPath").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                    remote_dir: item.get("remoteDir").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                    overwrite: item.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                }).collect::<Vec<_>>()
+            } else {
+                vec![SftpUploadItem {
+                    local_path: strf("localPath"),
+                    remote_dir: strf("remoteDir"),
+                    overwrite: entry.payload.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                }]
+            };
+            let plan = runtime.block_on(actions.upload_impact_batch(project_id, &server_id, &items));
             match plan {
                 Ok(p) => (Some(p), None),
                 Err(e) => (
-                    Some(ImpactPlan::unbounded(&format!("无法枚举上传覆盖范围：{e}"))),
+                    Some(ImpactPlan::unbounded(&format!("无法枚举批量上传覆盖范围：{e}"))),
                     None,
                 ),
             }
@@ -1560,36 +1606,45 @@ async fn run_internal_action(
         }
         "sftp_upload" => {
             let server_id = str_field("serverId");
-            let local_path = str_field("localPath");
-            let remote_dir = str_field("remoteDir");
-            let overwrite = payload
-                .get("overwrite")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let items: Vec<SftpUploadItem> = if let Some(raw_items) = payload.get("items").and_then(serde_json::Value::as_array) {
+                if raw_items.is_empty() || raw_items.len() > MAX_SFTP_BATCH_ITEMS {
+                    return json!({"ok": false, "error": format!("SFTP 批量上传项数必须在 1–{MAX_SFTP_BATCH_ITEMS} 之间")});
+                }
+                raw_items.iter().map(|item| SftpUploadItem {
+                    local_path: item.get("localPath").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                    remote_dir: item.get("remoteDir").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                    overwrite: item.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                }).collect()
+            } else {
+                vec![SftpUploadItem {
+                    local_path: str_field("localPath"),
+                    remote_dir: str_field("remoteDir"),
+                    overwrite: payload.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                }]
+            };
             let plan = entry.as_ref().and_then(|e| e.plan.clone());
             actions
-                .sftp_upload(
-                    project_id,
-                    session_id,
-                    server_id.clone(),
-                    local_path.clone(),
-                    remote_dir.clone(),
-                    overwrite,
-                    plan,
-                )
+                .sftp_upload_batch(project_id, session_id, &server_id, &items, plan)
                 .await
                 .map(|text| json!({"ok": true, "text": text}))
         }
         "sftp_download" => {
             let server_id = str_field("serverId");
-            let remote_path = str_field("remotePath");
-            let local_dir = str_field("localDir");
+            let items: Vec<SftpDownloadItem> = if let Some(raw_items) = payload.get("items").and_then(serde_json::Value::as_array) {
+                if raw_items.is_empty() || raw_items.len() > MAX_SFTP_BATCH_ITEMS {
+                    return json!({"ok": false, "error": format!("SFTP 批量下载项数必须在 1–{MAX_SFTP_BATCH_ITEMS} 之间")});
+                }
+                raw_items.iter().map(|item| SftpDownloadItem {
+                    remote_path: item.get("remotePath").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                    local_dir: item.get("localDir").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                }).collect()
+            } else {
+                vec![SftpDownloadItem { remote_path: str_field("remotePath"), local_dir: str_field("localDir") }]
+            };
             actions
-                .sftp_download(project_id, server_id.clone(), remote_path.clone(), local_dir.clone())
+                .sftp_download_batch(project_id, &server_id, &items)
                 .await
-                .map(|_| {
-                    json!({"ok": true, "text": format!("下载完成：{remote_path} → {local_dir}（服务器 {server_id}）")})
-                })
+                .map(|text| json!({"ok": true, "text": text}))
         }
         // AI 暂存工具：只读列表/diff + 主动暂存/清理无变更 + 还原（force 恒 false）；接受绝不提供
         "staging_list" => actions
@@ -2041,14 +2096,23 @@ pub async fn ai_chat(
     let Some(proc) = procs.get_mut(&key) else {
         return Err("pi 进程未就绪".to_string());
     };
+    let mut aborted_prev = false;
     if proc.busy.swap(true, Ordering::SeqCst) {
         cancel_approvals(proc);
         let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
         w.write_all(b"{\"type\":\"abort\"}\n")
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
+        aborted_prev = true;
     }
-    // 用 JSON 序列化生成，勿手拼
-    let mut buf = serde_json::to_vec(&json!({"type": "prompt", "message": prompt}))
+    // 用 JSON 序列化生成，勿手拼。刚 abort 过时带 streamingBehavior=followUp：
+    // abort 清理流式状态可能未即时生效，agent 仍在流式期间时裸发 prompt 会被 RPC
+    // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同
+    let payload = if aborted_prev {
+        json!({"type": "prompt", "message": prompt, "streamingBehavior": "followUp"})
+    } else {
+        json!({"type": "prompt", "message": prompt})
+    };
+    let mut buf = serde_json::to_vec(&payload)
         .map_err(|e| e.to_string())?;
     buf.push(b'\n');
     // 记录本次脱敏后的 user prompt：回合结束时读取线程上报记忆沉淀用
@@ -2526,10 +2590,66 @@ mod tests {
             payload_fingerprint(&bridge_up)
         );
         let overwrite = json!({ "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp", "overwrite": true });
-        assert_ne!(
-            payload_fingerprint(&reg_up),
-            payload_fingerprint(&overwrite)
-        );
+        assert_ne!(payload_fingerprint(&reg_up), payload_fingerprint(&overwrite));
+        // 批量登记与动作桥只允许桥接字段变化；任一项路径或覆盖策略变化都必须改指纹。
+        let reg_batch = json!({
+            "serverId": "s",
+            "items": [
+                { "localPath": "a.txt", "remoteDir": "/tmp", "overwrite": false },
+                { "localPath": "b.txt", "remoteDir": "/tmp", "overwrite": true }
+            ]
+        });
+        let bridge_batch = json!({
+            "action": "sftp_upload", "sessionId": "x", "serverId": "s",
+            "items": [
+                { "localPath": "a.txt", "remoteDir": "/tmp" },
+                { "localPath": "b.txt", "remoteDir": "/tmp", "overwrite": true }
+            ]
+        });
+        assert_eq!(payload_fingerprint(&reg_batch), payload_fingerprint(&bridge_batch));
+        let tampered_batch = json!({
+            "serverId": "s",
+            "items": [
+                { "localPath": "a.txt", "remoteDir": "/tmp", "overwrite": false },
+                { "localPath": "c.txt", "remoteDir": "/tmp", "overwrite": true }
+            ]
+        });
+        assert_ne!(payload_fingerprint(&reg_batch), payload_fingerprint(&tampered_batch));
+        let reg_down = json!({
+            "serverId": "s",
+            "remotePath": "src/a.txt",
+            "localDir": "downloads"
+        });
+        let bridge_down = json!({
+            "action": "sftp_download",
+            "sessionId": "x",
+            "serverId": "s",
+            "remotePath": "src/a.txt",
+            "localDir": "downloads"
+        });
+        assert_eq!(payload_fingerprint(&reg_down), payload_fingerprint(&bridge_down));
+        let tampered_down = json!({
+            "serverId": "s",
+            "remotePath": "src/b.txt",
+            "localDir": "downloads"
+        });
+        assert_ne!(payload_fingerprint(&reg_down), payload_fingerprint(&tampered_down));
+        let reg_down_batch = json!({
+            "serverId": "s",
+            "items": [
+                { "remotePath": "src/a.txt", "localDir": "downloads" },
+                { "remotePath": "src/b.txt", "localDir": "out" }
+            ]
+        });
+        let bridge_down_batch = json!({
+            "action": "sftp_download",
+            "serverId": "s",
+            "items": [
+                { "remotePath": "src/a.txt", "localDir": "downloads" },
+                { "remotePath": "src/b.txt", "localDir": "out" }
+            ]
+        });
+        assert_eq!(payload_fingerprint(&reg_down_batch), payload_fingerprint(&bridge_down_batch));
     }
 
     #[test]

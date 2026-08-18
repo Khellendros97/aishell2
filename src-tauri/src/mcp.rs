@@ -656,7 +656,7 @@ impl McpCore {
         } else {
             remote_dir.clone()
         };
-        let landed = crate::sftp::upload_one(&sftp, &local, &remote, false).await?;
+        let landed = crate::sftp::upload_one(&sftp, &local, &remote, false, None).await?;
         Ok(format!(
             "上传完成：{}/{}（服务器 {server_id}；远端已存在同名时自动创建副本）",
             remote.trim_end_matches('/'),
@@ -679,10 +679,8 @@ impl McpCore {
             None => transfer,
         };
         let sftp = self.ssh.open_sftp(&server_id).await?;
-        let landed = crate::sftp::download_one(&sftp, &remote_path, &local_dir).await?;
-        Ok(format!(
-            "已下载到：{landed}（服务器 {server_id}；本地重名自动改名）"
-        ))
+        let landed = crate::sftp::download_one(&sftp, &remote_path, &local_dir, None).await?;
+        Ok(format!("已下载到：{landed}（服务器 {server_id}；本地重名自动改名）"))
     }
 
     async fn tool_sftp_rename(&self, args: &Value) -> Result<String, String> {

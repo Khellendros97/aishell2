@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { Server, SkillOrigin, SkillSummary } from '../../../types';
 import { browserEnsure, browserNavigate, browserPublishSkillhub, getState, skillDelete, skillPackUpload, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
-import { useWorkbench, wbEvents } from '../../../stores/workbench';
+import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, toast } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
@@ -281,11 +281,22 @@ function SkillCard({ d, onToggle, onDelete, onUpload, uploading, uploadBusy }: {
         <button className="icon-btn" title="上传到 Skill Hub" disabled={uploadBusy} onClick={() => onUpload(d)}>
           <Icon name={uploading ? 'loader' : 'upload'} />
         </button>
+        <button className="icon-btn" title="添加到 AI 对话" onClick={() => addSkillToChat(d)}><Icon name="chatPlus" /></button>
         <button className="icon-btn" title="编辑" disabled={uploading} onClick={() => openSkillModal(d)}><Icon name="pencil" /></button>
         <button className="icon-btn danger" title="删除" disabled={uploading} onClick={() => void onDelete(d)}><Icon name="trash" /></button>
       </div>
     </div>
   );
+}
+
+/** 把技能引用加入 AI 输入框（@skill:名称 标签，发送时展开名/来源/scope/描述，AI 可循此读取技能文件）；
+ *  AI 面板未挂载时提示。 */
+function addSkillToChat(d: SkillSummary): void {
+  if (wbHandles.ai?.addSkillRef) {
+    wbHandles.ai.addSkillRef({ name: d.name, origin: d.origin, scope: d.scope, description: d.description });
+  } else {
+    toast('AI 面板尚未就绪');
+  }
 }
 
 /* ---------- 面板主体 ---------- */

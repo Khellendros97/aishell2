@@ -2,6 +2,10 @@
    原「服务器配置」面板样式（服务器卡片 / 搜索 / 分组折叠 / 拖拽 / Xshell 导入）已随重构移除。 */
 .page-root { display: flex; flex-direction: column; height: 100vh; }
 
+/* 页面主体必须占据顶栏外的剩余高度并允许内部滚动：
+   body 全局 overflow:hidden，若 .settings-page 高度随内容撑开，内容区溢出视口且无处滚动 */
+.settings-page { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
 .settings-page #warn-banner {
   display: none; align-items: center; gap: 8px;
   margin: 0; padding: 8px 16px; font-size: 12.5px;

@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -318,9 +318,12 @@ export const stagingDiff = (projectId: string, sessionId: string, entryId: strin
 /** 清理无变更条目：远端现状与首次快照完全一致的条目直接接受清除，有变更/检查失败的保留 */
 export const stagingClear = (projectId: string, sessionId: string) =>
   call<StagingClearOutcome>('staging_clear', { projectId, sessionId });
-/** 暂存/清理的进度事件（staging.rs add_path 逐文件、clear_unchanged 逐条目发送；walk/stage/clear 阶段） */
+/** 暂存/清理的进度事件（staging.rs add_path 逐文件、clear_unchanged 逐条目发送；walk/stage/clear 阶段，done 结束） */
 export const onStagingProgress = (cb: (p: StagingProgress) => void): Promise<UnlistenFn> =>
   listen<StagingProgress>('staging:progress', (e) => cb(e.payload));
+/** SFTP 传输进度事件（sftp.rs sftp_upload/sftp_download 发送；bytes/files 阶段，done 结束） */
+export const onSftpProgress = (cb: (p: SftpProgress) => void): Promise<UnlistenFn> =>
+  listen<SftpProgress>('sftp:progress', (e) => cb(e.payload));
 
 /* ---------------- skills ---------------- */
 /** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */

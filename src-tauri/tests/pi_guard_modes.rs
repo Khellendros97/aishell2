@@ -211,6 +211,30 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
             );
 
             let req: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+            // 工具 schema 顶层类型校验（与真实 OpenAI 一致：parameters 必须是
+            // type:"object"，否则 400）。曾因 sftp 批量参数误用 Type.Union（生成 anyOf、
+            // 顶层 type:null）被真实 API 拒绝，这里把该约束固化为回归防护。
+            if let Some(arr) = req["tools"].as_array() {
+                for t in arr {
+                    if let Some(params) = t["function"]["parameters"].as_object() {
+                        let typ = params.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+                        if typ != "object" {
+                            let name = t["function"]["name"].as_str().unwrap_or("?");
+                            let body = format!(
+                                "{{\"error\":{{\"message\":\"Invalid schema for function '{}': schema must be a JSON Schema of 'type: \\\"object\\\"'\"}}}}",
+                                name
+                            );
+                            let header = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            stream.write_all(header.as_bytes()).await?;
+                            stream.flush().await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             let tools: Vec<String> = req["tools"]
                 .as_array()
                 .map(|arr| {
