@@ -15,6 +15,7 @@ pub mod ssh;
 pub mod staging;
 pub mod store;
 pub mod term;
+pub mod update;
 pub mod xshell;
 
 use std::path::PathBuf;
@@ -33,6 +34,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // 客户端自动更新（update.rs）：公钥经插件初始化注入（endpoints 运行期按
+        // AISHELL_SERVER_URL 拼接，不落在静态配置里）；JS 侧不走插件命令，无需 capability
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(update::UPDATER_PUBKEY)
+                .build(),
+        )
         // 内置浏览器本地 HTML 协议（browser.rs serve_local_html）：
         // 本地文件统一走 localhtml://，规避 file:// 空 host 触发的 wry ipc 处理器崩溃
         .register_uri_scheme_protocol("localhtml", |_ctx, request| {
@@ -141,6 +149,14 @@ pub fn run() {
                 mcp.sync().await;
             });
             term::set_debug_app(app.handle().clone());
+            // 客户端自动更新状态机（update.rs）：命令 + 事件 + 延迟后台检查（未注入
+            // AISHELL_SERVER_URL 的个人构建内部自动禁用）
+            let updater = Arc::new(update::UpdateManager::new(
+                app.handle().clone(),
+                config_dir.clone(),
+            ));
+            app.manage(updater.clone());
+            update::start_background(app.handle().clone());
             // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
             // 捆绑安装器。放后台线程并延迟触发：等主事件循环泵消息、主窗口显示后再弹框
             // （dialog 插件内部 run_on_main_thread 依赖主循环在运行）。
@@ -290,6 +306,10 @@ pub fn run() {
             browser::browser_set_inspect,
             browser::browser_open_devtools,
             browser::browser_publish_skillhub,
+            update::update_status,
+            update::update_check,
+            update::update_download,
+            update::update_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -360,6 +360,26 @@ export const skillHubDownload = (
   slug: string,
   version: string,
 ) => call<SkillSummary>('skillhub_download', { projectId, origin, namespace, slug, version });
+
+/* ---------------- update（客户端自动更新，Rust update.rs） ----------------
+   后端持有唯一更新任务；检查/下载不带任何用户 token，公钥内置于客户端。 */
+/** 当前更新状态快照（此后以 update:status-changed 事件为准） */
+export const updateStatus = () => call<UpdateStatus>('update_status');
+/** 手动检查更新；失败 reject 中文错误（后台检查失败只写 debug 日志不弹错） */
+export const updateCheck = () => call<UpdateStatus>('update_check');
+/** 下载并由 Tauri updater 验签；完成后 state=ready 并广播 update:ready */
+export const updateDownload = () => call<UpdateStatus>('update_download');
+/** 重启并安装（用户确认后）。Windows 上安装器拉起后应用即退出，本调用不会 resolve。 */
+export const updateInstall = () => call<void>('update_install');
+/** 状态切换（载荷 = UpdateStatus 全量快照） */
+export const onUpdateStatusChanged = (cb: (s: UpdateStatus) => void): Promise<UnlistenFn> =>
+  listen<UpdateStatus>('update:status-changed', (e) => cb(e.payload));
+/** 下载进度（downloaded 字节 / total 可选总量） */
+export const onUpdateDownloadProgress = (cb: (p: UpdateProgress) => void): Promise<UnlistenFn> =>
+  listen<UpdateProgress>('update:download-progress', (e) => cb(e.payload));
+/** 新版本就绪（提示用户「重启并更新」） */
+export const onUpdateReady = (cb: (info: UpdateReadyInfo) => void): Promise<UnlistenFn> =>
+  listen<UpdateReadyInfo>('update:ready', (e) => cb(e.payload));
 
 /* ---------------- misc ---------------- */
 export { open as openDialog } from '@tauri-apps/plugin-dialog';

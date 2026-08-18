@@ -1,8 +1,15 @@
 /* 账号页（#/account）—— 云服务三页导航：账号信息 / 用量报表 / 记忆宫殿。
    布局：左侧竖排导航（.account-nav）+ 右侧内容区（.account-view 多页切换）。 */
-.account-page #account-layout {
+.account-page {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  min-height: 100%;
+  flex-direction: column;
+}
+.account-page #account-layout {
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 
 /* ---------- 左侧导航 ---------- */
@@ -40,6 +47,7 @@
 .account-page .account-content {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   padding: 20px 28px;
   overflow-y: auto;
 }

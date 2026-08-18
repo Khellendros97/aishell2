@@ -10,6 +10,7 @@ import type { Window as TauriWindow } from '@tauri-apps/api/window';
 import { getVersion } from '@tauri-apps/api/app';
 import { setTheme, cloudStatus, onCloudChanged } from '../api';
 import type { CloudStatus } from '../types';
+import { onUpdateStatus } from '../updates';
 import { navigate } from '../router';
 import { applyTheme, currentTheme, onThemeChange } from '../theme';
 import { toast } from '../ui';
@@ -45,6 +46,8 @@ export function Topbar({ activePage, workbenchProjectId }: {
   const [theme, setThemeState] = useState(currentTheme());
   /* 账号角标(CR-2.4):托管模式 + 未登录(登录失效)时提示「重新登录」 */
   const [accountBadge, setAccountBadge] = useState(false);
+  /* 更新角标:发现新版本/下载中/已就绪时挂在「设置」按钮上(状态源 updates.ts 总线,不重复请求) */
+  const [updateBadge, setUpdateBadge] = useState(false);
 
   useEffect(() => {
     const sync = (s: CloudStatus): void => {
@@ -60,6 +63,13 @@ export function Topbar({ activePage, workbenchProjectId }: {
   useEffect(() => {
     // 版本号(tauri.conf.json version,异步填充;失败静默留空)
     getVersion().then(setVersion).catch(() => { /* 版本号获取失败不影响顶栏 */ });
+  }, []);
+
+  useEffect(() => {
+    // 更新状态角标:available/downloading/ready 亮起,进入设置页处理(详情在「关于与更新」)
+    return onUpdateStatus((s) => {
+      setUpdateBadge(s.enabled && ['available', 'downloading', 'ready'].includes(s.state));
+    });
   }, []);
 
   useEffect(() => {
@@ -98,7 +108,7 @@ export function Topbar({ activePage, workbenchProjectId }: {
       <div className="brand"><img className="logo" src={appLogoUrl} alt="AIShell" /><span>AIShell</span><span className="tb-version">{version ? `v${version}` : ''}</span></div>
       <div className="spacer"></div>
       <button className={`btn small${activePage === 'welcome' ? '' : ' ghost'}`} onClick={() => navigate('#/welcome')}>项目</button>
-      <button className={`btn small${activePage === 'settings' ? '' : ' ghost'}`} onClick={() => navigate('#/settings')}>设置</button>
+      <button className={`btn small${activePage === 'settings' ? '' : ' ghost'}`} onClick={() => navigate('#/settings')}>设置<span className="tb-badge" hidden={!updateBadge} title="有可用的应用更新"></span></button>
       <button
         className={`btn small tb-account${activePage === 'account' ? '' : ' ghost'}`}
         onClick={() => navigate('#/account')}

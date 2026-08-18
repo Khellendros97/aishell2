@@ -9,13 +9,15 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
-import type { AppState, CloudMode, CloudStatus, LlmConfig, Settings as AppSettings, Theme } from '../../types';
-import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, saveSettings, setMcpPort, setTheme } from '../../api';
+import type { AppState, CloudMode, CloudStatus, LlmConfig, Settings as AppSettings, Theme, UpdateStatus } from '../../types';
+import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, saveSettings, setMcpPort, setTheme, updateCheck, updateDownload, updateInstall } from '../../api';
 import { navigate } from '../../router';
-import { toast } from '../../ui';
+import { toast, confirmDialog } from '../../ui';
 import { Icon } from '../../shared/Icon';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../../theme';
+import { onUpdateStatus } from '../../updates';
+import { useWorkbench } from '../../stores/workbench';
 import '../settings.css';
 
 /** 表单字段（与旧版 f-* 元素一一对应；apiKey / braveKey 只存本次输入，加载时恒为空串） */
@@ -62,6 +64,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const [cloudMode, setCloudMode] = useState<CloudMode>('personal');
   const [cloudModels, setCloudModels] = useState<string[]>([]);
   const hosted = cloudMode === 'hosted';
+  /* 关于与更新：状态来自全局更新总线（Topbar 徽标同源，不重复检查） */
+  const [upd, setUpd] = useState<UpdateStatus | null>(null);
 
   /* reason=missing-config：顶部黄色提示条（同 .proto/settings.js） */
   const warnShown = params.get('reason') === 'missing-config';
@@ -128,6 +132,9 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     const offTheme = onThemeChange((t) => setFields((f) => ({ ...f, theme: t })));
     return offTheme;
   }, []);
+
+  /* 更新状态总线订阅（已有快照立即回调；卸载退订） */
+  useEffect(() => onUpdateStatus(setUpd), []);
 
   /* 托管/个人模式（CR-2.2）：账号页切换后本页表单形态即时刷新；
      同时刷新 dbRef（保存时 settings.cloud 原样带回，需最新值） */
@@ -211,6 +218,59 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     } catch (err) {
       toast(String(err), 'error');
     }
+  };
+
+  /* ---------- 关于与更新 ---------- */
+
+  const fmtTime = (ms?: number | null): string => (ms ? new Date(ms).toLocaleString() : '');
+  const fmtDate = (s?: string | null): string => {
+    if (!s) return '';
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? s : d.toLocaleString();
+  };
+  const fmtBytes = (n?: number | null): string =>
+    typeof n === 'number' && n > 0 ? `${(n / 1048576).toFixed(1)} MB` : '';
+
+  /** 检查结果行文案/配色（后端状态机的展示映射；错误信息后端已脱敏为中文） */
+  const updResult = (): { text: string; cls: string } => {
+    if (!upd) return { text: '加载中…', cls: 'mcp-status-line' };
+    const checked = upd.lastCheckedAt ? `（${fmtTime(upd.lastCheckedAt)} 检查）` : '';
+    switch (upd.state) {
+      case 'idle': return { text: '尚未检查更新', cls: 'mcp-status-line' };
+      case 'checking': return { text: '正在检查更新…', cls: 'mcp-status-line' };
+      case 'error': return { text: `检查失败：${upd.error ?? '未知错误'}`, cls: 'mcp-status-line err' };
+      case 'not_available': return { text: `已是最新版本${checked}`, cls: 'mcp-status-line ok' };
+      case 'downloading': return { text: `正在下载 v${upd.availableVersion ?? ''}…`, cls: 'mcp-status-line' };
+      case 'ready': return { text: `新版本 v${upd.availableVersion ?? ''} 已就绪，重启后生效`, cls: 'mcp-status-line ok' };
+      case 'installing': return { text: '正在安装更新，应用即将退出…', cls: 'mcp-status-line' };
+      case 'available': return upd.signatureMissing
+        ? { text: `发现新版本 v${upd.availableVersion ?? ''}（该版本未提供更新签名，需手动下载安装）`, cls: 'mcp-status-line err' }
+        : { text: `发现新版本 v${upd.availableVersion ?? ''}`, cls: 'mcp-status-line ok' };
+    }
+  };
+
+  const doCheckUpdate = async (): Promise<void> => {
+    try { await updateCheck(); } catch (err) { toast(String(err), 'error'); }
+  };
+
+  const doDownloadUpdate = async (): Promise<void> => {
+    try { await updateDownload(); } catch (err) { toast(String(err), 'error'); }
+  };
+
+  /** 重启并更新：先确认活动任务风险（终端/SSH/SFTP 会话会被断开），再交后端安装重启 */
+  const doInstallUpdate = async (): Promise<void> => {
+    const tabs = useWorkbench.getState().tabs;
+    const active = tabs.filter((t) => t.type === 'terminal' || t.type === 'sftp').length;
+    const ok = await confirmDialog({
+      title: '重启并更新',
+      message: active > 0
+        ? `更新将退出并重启应用，当前有 ${active} 个终端/SSH/SFTP 会话将被断开，未保存的编辑内容可能丢失。确定继续吗？`
+        : '更新将退出并重启应用，未保存的编辑内容可能丢失。确定继续吗？',
+      okText: '重启并更新',
+    });
+    if (!ok) return;
+    // Windows 上安装器拉起后应用即退出，本调用不会返回；失败（如版本被撤回）reject 中文错误
+    void updateInstall().catch((err) => toast(String(err), 'error'));
   };
 
   return (
@@ -429,6 +489,79 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 <label>服务状态</label>
                 <div id="mcp-status-line" className={mcpStatus.cls}>{mcpStatus.text}</div>
               </div>
+            </fieldset>
+            <fieldset className="llm-group" id="panel-about-update">
+              <legend>关于与更新</legend>
+              <div className="field">
+                <label>当前版本</label>
+                <div className="mcp-status-line" id="upd-current">
+                  AIShell v{upd?.currentVersion ?? '…'}（stable 频道）
+                </div>
+              </div>
+              {!upd ? (
+                <div className="field">
+                  <div className="mcp-status-line">正在获取更新状态…</div>
+                </div>
+              ) : !upd.enabled ? (
+                <div className="field">
+                  <div className="mcp-status-line">当前构建未接入云服务更新（个人构建不检查更新）</div>
+                </div>
+              ) : (
+                <>
+                  <div className="field">
+                    <label>检查结果</label>
+                    <div id="upd-result-line" className={updResult().cls}>{updResult().text}</div>
+                  </div>
+                  <div className="field">
+                    <label>&nbsp;</label>
+                    <button
+                      id="btn-update-check"
+                      className="btn small"
+                      disabled={['checking', 'downloading', 'installing'].includes(upd?.state ?? 'idle')}
+                      onClick={() => void doCheckUpdate()}
+                    >检查更新</button>
+                  </div>
+                  {upd?.availableVersion ? (
+                    <div className="upd-card">
+                      <div className="upd-version">
+                        v{upd.availableVersion}
+                        {upd.publishedAt ? <span className="upd-date">{fmtDate(upd.publishedAt)} 发布</span> : null}
+                        {upd.state === 'ready' && upd.progress ? <span className="upd-date">{fmtBytes(upd.progress.total ?? null)}</span> : null}
+                      </div>
+                      {upd.notes ? <pre className="upd-notes">{upd.notes}</pre> : null}
+                      {upd.state === 'downloading' && upd.progress ? (
+                        <div className="upd-progress">
+                          <div className="bar">
+                            <i style={{ width: upd.progress.total ? `${Math.min(100, (upd.progress.downloaded / upd.progress.total) * 100)}%` : '0%' }}></i>
+                          </div>
+                          <div className="text">
+                            {fmtBytes(upd.progress.downloaded)}
+                            {upd.progress.total ? ` / ${fmtBytes(upd.progress.total)}` : ''}
+                          </div>
+                        </div>
+                      ) : null}
+                      <div className="upd-actions">
+                        {upd.state === 'available' && !upd.signatureMissing ? (
+                          <button id="btn-update-download" className="btn small primary" onClick={() => void doDownloadUpdate()}>下载更新</button>
+                        ) : null}
+                        {upd.state === 'ready' ? (
+                          <button id="btn-update-install" className="btn small primary" onClick={() => void doInstallUpdate()}>重启并更新</button>
+                        ) : null}
+                        {upd.signatureMissing && upd.downloadUrl ? (
+                          <>
+                            <button
+                              id="btn-update-open-download"
+                              className="btn small"
+                              onClick={() => void openUrl(upd.downloadUrl!).catch((err) => toast(`无法打开下载页: ${String(err)}`, 'error'))}
+                            >打开下载页</button>
+                            <span className="hint">该版本未提供更新签名，不会标记为「安全可更新」，请在下载后手动安装</span>
+                          </>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : null}
+                </>
+              )}
             </fieldset>
             <div className="form-actions">
               <button id="btn-save-system" className="btn primary" onClick={() => void save()}>保存</button>

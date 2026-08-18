@@ -646,3 +646,48 @@ export interface StagingProgress {
   total: number;
   currentPath: string;
 }
+
+/* ---------------- 客户端自动更新（Rust update.rs，serde camelCase 对齐） ---------------- */
+
+/** 更新状态机（与 update.rs UpdateState serde snake_case 对齐） */
+export type UpdateState =
+  | 'idle'
+  | 'checking'
+  | 'not_available'
+  | 'available'
+  | 'downloading'
+  | 'ready'
+  | 'installing'
+  | 'error';
+
+/** 下载进度（update:download-progress 事件载荷） */
+export interface UpdateProgress {
+  downloaded: number;
+  total?: number | null;
+}
+
+/** update_status 返回值与 update:status-changed 事件载荷 */
+export interface UpdateStatus {
+  state: UpdateState;
+  currentVersion: string;
+  availableVersion?: string | null;
+  notes?: string | null;
+  publishedAt?: string | null;
+  progress?: UpdateProgress | null;
+  /** 最近检查时间（epoch 毫秒，前端按本地时区格式化） */
+  lastCheckedAt?: number | null;
+  error?: string | null;
+  /** 构建是否接入更新服务（未注入 AISHELL_SERVER_URL 的个人构建恒 false） */
+  enabled: boolean;
+  /** 无签名迁移期：manifest 有新版本但缺签名 → 只允许手动下载 */
+  signatureMissing: boolean;
+  /** 制品直链（公开 URL，无 token；「打开下载页」用） */
+  downloadUrl?: string | null;
+}
+
+/** update:ready 事件载荷（下载验签完成，提示用户重启生效） */
+export interface UpdateReadyInfo {
+  version: string;
+  notes?: string | null;
+  publishedAt?: string | null;
+}

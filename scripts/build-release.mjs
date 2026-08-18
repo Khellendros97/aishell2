@@ -58,7 +58,7 @@ if (missing.length > 0) {
     console.error(`  $env:${k} = "<值>"`);
   }
   console.error('[build-release] 或一次性写入用户环境变量：');
-  console.error('  setx AISHELL_SERVER_URL "http://218.75.75.93:18001/"');
+  console.error('  setx AISHELL_SERVER_URL "https://aishell.srun.com:18002"');
   console.error('  setx AISHELL_CLIENT_ID "<client_id>"');
   console.error('  setx AISHELL_CLIENT_SECRET "<client_secret>"');
   process.exit(1);
