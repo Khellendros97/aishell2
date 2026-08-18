@@ -235,7 +235,6 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     if (!iconEl) return;
     const p = iconEl.getAttribute('data-panel');
     const s = useWorkbench.getState();
-    if (p === 'ai') { s.setAiVisible(!s.aiVisible); return; }
     if (p === 'browser') {
       // 浏览器是中央标签页(非侧栏面板):固定 id 单实例,openTab 同 id 去重激活
       s.openTab({ id: 'browser', type: 'browser', title: '浏览器' });
@@ -288,7 +287,6 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
             <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
             <div className={`activity-icon${panel === 'skills' ? ' active' : ''}`} data-panel="skills" title="Skill"><Icon name="sparkles" /></div>
             <div className="activity-icon" data-panel="browser" title="浏览器(在标签页中打开)"><Icon name="globe" /></div>
-            <div className={`activity-icon ai-toggle${aiVisible ? ' active' : ''}`} data-panel="ai" title="AI 助手"><Icon name="bot" /></div>
             {avatar.visible ? (
               <div
                 className="activity-icon avatar-entry"

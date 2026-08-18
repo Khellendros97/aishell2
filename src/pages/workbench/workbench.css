@@ -21,8 +21,7 @@
 }
 .activity-icon:hover { color: var(--text-0); background: var(--bg-hover); }
 .activity-icon.active { color: var(--accent); border-left-color: var(--accent); border-radius: 0 var(--radius-m) var(--radius-m) 0; }
-.activity-icon.ai-toggle { margin-bottom: 0; }
-/* 云账号入口（CR-1.1b）：activity-bar 最后一个元素，margin-top:auto 贴底（AI 开关下方） */
+/* 云账号入口（CR-1.1b）：activity-bar 最后一个元素，margin-top:auto 贴底 */
 .activity-icon.avatar-entry { margin-top: auto; margin-bottom: 6px; }
 .activity-icon .avatar-img { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
 
