@@ -134,7 +134,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
             className={`input${invalid.name ? ' invalid' : ''}`}
             placeholder="例如：生产-Web-01"
             value={fields.name}
-            onInput={(e) => { setFields((f) => ({ ...f, name: e.currentTarget.value })); clearInvalid('name'); }}
+            onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, name: v })); clearInvalid('name'); }}
           />
         </div>
         <div className="field">
@@ -143,7 +143,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
             className={`input mono${invalid.host ? ' invalid' : ''}`}
             placeholder="例如：47.102.118.66"
             value={fields.host}
-            onInput={(e) => { setFields((f) => ({ ...f, host: e.currentTarget.value })); clearInvalid('host'); }}
+            onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, host: v })); clearInvalid('host'); }}
           />
         </div>
         <div className="field">
@@ -154,7 +154,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
             min={1}
             max={65535}
             value={fields.port}
-            onInput={(e) => { setFields((f) => ({ ...f, port: e.currentTarget.value })); clearInvalid('port'); }}
+            onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, port: v })); clearInvalid('port'); }}
           />
         </div>
         <div className="field">
@@ -162,7 +162,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           <select
             className="select"
             value={fields.auth}
-            onChange={(e) => setFields((f) => ({ ...f, auth: e.currentTarget.value as Server['authType'] }))}
+            onChange={(e) => { const v = e.currentTarget.value as Server['authType']; setFields((f) => ({ ...f, auth: v })); }}
           >
             <option value="password">账号密码</option>
             <option value="key">密钥</option>
@@ -174,7 +174,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
             className="input"
             placeholder="例如：deploy"
             value={fields.username}
-            onInput={(e) => setFields((f) => ({ ...f, username: e.currentTarget.value }))}
+            onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, username: v })); }}
           />
         </div>
         {/* 认证方式切换：仅显示对应密码 / 密钥路径字段（同侧栏原模态框 data-auth 约定） */}
@@ -186,7 +186,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
               type="password"
               placeholder="留空则不修改（已保存密码保持原值）"
               value={fields.password}
-              onInput={(e) => setFields((f) => ({ ...f, password: e.currentTarget.value }))}
+              onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, password: v })); }}
             />
           </div>
         ) : (
@@ -197,7 +197,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
                 className="input mono"
                 placeholder="C:\\Users\\demo\\.ssh\\id_ed25519"
                 value={fields.keyPath}
-                onInput={(e) => setFields((f) => ({ ...f, keyPath: e.currentTarget.value }))}
+                onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, keyPath: v })); }}
               />
               <button type="button" className="btn" title="选择密钥文件" onClick={() => void onBrowseKey()}>浏览…</button>
             </div>
