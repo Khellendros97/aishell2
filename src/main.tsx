@@ -12,6 +12,7 @@ import { initCommandPanel } from './command-panel';
 import { initDebug } from './debug';
 import { navigate } from './router';
 import { applyTheme } from './theme';
+import { ErrorBoundary } from './shared/ErrorBoundary';
 import App from './App';
 
 async function boot(): Promise<void> {
@@ -22,7 +23,7 @@ async function boot(): Promise<void> {
     try { ok = await isConfigComplete(); } catch { /* 后端未就绪时按缺配处理 */ }
     navigate(ok ? '#/welcome' : '#/settings?reason=missing-config');
   }
-  createRoot(document.getElementById('app')!).render(<App />);
+  createRoot(document.getElementById('app')!).render(<ErrorBoundary><App /></ErrorBoundary>);
 }
 
 /* OS 文件拖入的全局兜底:各面板自己的 drop handler 先行执行不受影响。 */

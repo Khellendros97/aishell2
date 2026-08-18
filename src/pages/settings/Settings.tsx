@@ -213,7 +213,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   className="input mono"
                   placeholder="D:\\AIShellWorkspace"
                   value={fields.workspace}
-                  onInput={(e) => setFields((f) => ({ ...f, workspace: e.currentTarget.value }))}
+                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, workspace: v })); }}
                 />
                 <button id="btn-browse-ws" className="btn small" onClick={() => void browseWorkspace()}>浏览…</button>
               </div>
@@ -228,7 +228,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   className="input"
                   placeholder="deepseek-v4-flash"
                   value={fields.modelId}
-                  onInput={(e) => setFields((f) => ({ ...f, modelId: e.currentTarget.value }))}
+                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
                 />
               </div>
               <div className="field">
@@ -238,7 +238,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   className="input mono"
                   placeholder="https://api.deepseek.com/v1"
                   value={fields.baseUrl}
-                  onInput={(e) => setFields((f) => ({ ...f, baseUrl: e.currentTarget.value }))}
+                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, baseUrl: v })); }}
                 />
               </div>
               <div className="field">
@@ -250,7 +250,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                     type={apiKeyVisible ? 'text' : 'password'}
                     placeholder="已保存则不显示，留空表示不修改"
                     value={fields.apiKey}
-                    onInput={(e) => setFields((f) => ({ ...f, apiKey: e.currentTarget.value }))}
+                    onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, apiKey: v })); }}
                   />
                   <button
                     id="btn-toggle-key"
@@ -271,7 +271,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   id="f-effort"
                   className="select"
                   value={fields.effort}
-                  onChange={(e) => setFields((f) => ({ ...f, effort: e.currentTarget.value as LlmConfig['effort'] }))}
+                  onChange={(e) => { const v = e.currentTarget.value as LlmConfig['effort']; setFields((f) => ({ ...f, effort: v })); }}
                 >
                   <option value="low">低</option>
                   <option value="high">高</option>
@@ -287,7 +287,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   id="f-search-enabled"
                   type="checkbox"
                   checked={fields.searchEnabled}
-                  onChange={(e) => setFields((f) => ({ ...f, searchEnabled: e.currentTarget.checked }))}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, searchEnabled: checked })); }}
                 />
                 <div className="hint">启用后 AI 助手可通过 Brave Search 获取最新信息（问时效性问题时自动使用）</div>
               </div>
@@ -300,7 +300,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                     type={braveKeyVisible ? 'text' : 'password'}
                     placeholder="已保存则不显示，留空表示不修改"
                     value={fields.braveKey}
-                    onInput={(e) => setFields((f) => ({ ...f, braveKey: e.currentTarget.value }))}
+                    onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, braveKey: v })); }}
                   />
                   <button
                     id="btn-toggle-brave"
@@ -324,7 +324,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   id="f-ai-workdir"
                   type="checkbox"
                   checked={fields.aiWorkdir}
-                  onChange={(e) => setFields((f) => ({ ...f, aiWorkdir: e.currentTarget.checked }))}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, aiWorkdir: checked })); }}
                 />
                 <div className="hint">开启后 AI 输入框显示固定工作区域标签（默认本地）：打开或切换到 SSH/本地终端时自动跟随；发送消息时把当前工作区域作为上下文提供给 AI 助手</div>
               </div>
@@ -337,7 +337,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   id="f-approval-mode"
                   className="select"
                   value={fields.approvalMode}
-                  onChange={(e) => setFields((f) => ({ ...f, approvalMode: e.currentTarget.value as AppSettings['approvalMode'] }))}
+                  onChange={(e) => { const v = e.currentTarget.value as AppSettings['approvalMode']; setFields((f) => ({ ...f, approvalMode: v })); }}
                 >
                   <option value="smart">智能审批</option>
                   <option value="all">全部审批</option>
@@ -353,7 +353,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   id="f-auto-backup"
                   type="checkbox"
                   checked={fields.autoBackup}
-                  onChange={(e) => setFields((f) => ({ ...f, autoBackup: e.currentTarget.checked }))}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, autoBackup: checked })); }}
                 />
                 <div className="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
               </div>
@@ -371,7 +371,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   max={65535}
                   placeholder="8945"
                   value={fields.mcpPort}
-                  onInput={(e) => setFields((f) => ({ ...f, mcpPort: e.currentTarget.value }))}
+                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, mcpPort: v })); }}
                 />
                 <div className="hint">仅监听本机回环 127.0.0.1，不对外网开放。每台服务器可在「服务器卡片 → 更多 → MCP」中单独启用并配置功能开关；启用后外部工具经 http://127.0.0.1:端口/mcp 接入（Bearer 令牌在服务器 MCP 设置中查看）</div>
               </div>

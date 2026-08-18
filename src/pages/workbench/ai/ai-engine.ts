@@ -2022,17 +2022,21 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
 function onPanelKeydown(e: KeyboardEvent): void {
   if (e.key !== 'c' && e.key !== 'C') return;
   if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
-  // 输入框有选区：默认复制行为即可
-  if (input.selectionStart !== input.selectionEnd) return;
+  // 消息区(或任意位置)有选中文本 → 显式复制该选区(优先于输入框选区与终端 ^C)
   const sel = window.getSelection();
-  const selText = sel ? sel.toString() : '';
+  const selText = sel ? sel.toString().trim() : '';
   if (selText) {
     e.preventDefault();
     e.stopPropagation();
-    void copyText(selText);
+    void copyText(selText).then(
+      () => toast('已复制到剪贴板', 'success'),
+      () => toast('复制到剪贴板失败', 'error'),
+    );
     return;
   }
-  // 输入框为空且终端是当前 tab：转发 ^C 给终端（旧 Tab.api 字段 → tabApis 注册表）
+  // 输入框有选区 → 不拦截,交给浏览器默认复制
+  if (input.selectionStart !== input.selectionEnd) return;
+  // 输入框为空且当前标签为终端 → 转发 ^C 给终端(旧 Tab.api 字段 → tabApis 注册表)
   if (input.value === '') {
     const active = getActiveTab(useWorkbench.getState());
     if (active && active.type === 'terminal') {
@@ -2065,22 +2069,39 @@ function bindEvents(): void {
     void refreshStagingNotice();
   };
   chat.addEventListener('click', onChatClick);
-  /* AI 对话容器右键菜单：打开当前会话文件暂存区（数量实时查询；只作用于当前 project+session） */
+  /* AI 对话容器右键菜单：复制选中内容/消息体 + 打开当前会话文件暂存区（数量实时查询；只作用于当前 project+session） */
   chat.addEventListener('contextmenu', (e) => {
     const pid = project?.id;
     const sid = activeSessionId;
     if (!pid || !sid) return;
     e.preventDefault();
     e.stopPropagation();
+    /* 复制目标：优先当前选区，否则右键命中的那条消息正文（.ai-text，卡片类消息回退整块文本） */
+    const selText = (window.getSelection()?.toString() ?? '').trim();
+    const msgEl = (e.target as HTMLElement).closest('.ai-msg') as HTMLElement | null;
+    const bodyText = (msgEl?.querySelector('.ai-text') as HTMLElement | null)?.textContent?.trim()
+      ?? msgEl?.textContent?.trim() ?? '';
+    const copyTarget = selText || bodyText;
+    const doCopy = (): void => {
+      if (!copyTarget) return;
+      void copyText(copyTarget).then(
+        () => toast('已复制到剪贴板', 'success'),
+        () => toast('复制到剪贴板失败', 'error'),
+      );
+    };
     const openStaging = openCurrentStaging;
     void stagingList(pid, sid)
       .then((entries) => {
         showContextMenu(e.clientX, e.clientY, [
+          { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
+          'sep',
           { label: `打开文件暂存区（${entries.length}）`, iconName: 'history', action: openStaging },
         ]);
       })
       .catch(() => {
         showContextMenu(e.clientX, e.clientY, [
+          { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
+          'sep',
           { label: '打开文件暂存区', iconName: 'history', action: openStaging },
         ]);
       });

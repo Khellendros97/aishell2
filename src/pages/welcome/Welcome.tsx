@@ -415,6 +415,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
         projects: prev.projects.map((p) => (p.id === proj.id ? updated : p)),
       }));
       closeModal();
+      notifyDataChanged();
       toast('已保存', 'success');
     } else {
       let finalPath: string;
@@ -438,8 +439,14 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
       }
       setDb((prev) => ({ ...prev, projects: [...prev.projects, proj] }));
       closeModal();
+      notifyDataChanged();
       toast('项目已创建', 'success');
     }
+  }
+
+  /** 后端数据变化广播：命令面板同款事件，通知保活的工作台（绑定服务器等）返回后刷新，避免列表过期 */
+  function notifyDataChanged(): void {
+    window.dispatchEvent(new CustomEvent('aishell:data-changed'));
   }
 
   /* ---------- 服务器多选列表（平铺，仅搜索过滤） ---------- */

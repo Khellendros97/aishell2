@@ -255,33 +255,33 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
             <div className="field">
               <label>名称<span className="req">*</span></label>
               <input className="input" value={form?.name ?? ''} placeholder="例如：计费库"
-                onChange={(e) => setForm((f) => (f ? { ...f, name: e.currentTarget.value } : f))} />
+                onChange={(e) => { const v = e.currentTarget.value; setForm((f) => (f ? { ...f, name: v } : f)); }} />
             </div>
             <div className="field">
               <label>主机<span className="req">*</span></label>
               <input className="input" value={form?.host ?? ''}
-                onChange={(e) => setForm((f) => (f ? { ...f, host: e.currentTarget.value } : f))} />
+                onChange={(e) => { const v = e.currentTarget.value; setForm((f) => (f ? { ...f, host: v } : f)); }} />
             </div>
             <div className="field">
               <label>端口<span className="req">*</span></label>
               <input className="input" type="number" value={form?.port ?? ''}
-                onChange={(e) => setForm((f) => (f ? { ...f, port: e.currentTarget.value } : f))} />
+                onChange={(e) => { const v = e.currentTarget.value; setForm((f) => (f ? { ...f, port: v } : f)); }} />
             </div>
             <div className={`field${isRedis ? ' hidden' : ''}`}>
               <label>用户名</label>
               <input className="input" value={form?.user ?? ''} placeholder="redis 可留空"
-                onChange={(e) => setForm((f) => (f ? { ...f, user: e.currentTarget.value } : f))} />
+                onChange={(e) => { const v = e.currentTarget.value; setForm((f) => (f ? { ...f, user: v } : f)); }} />
             </div>
             <div className="field">
               <label>密码</label>
               <input className="input mono" type="password" value={form?.password ?? ''}
                 placeholder={editingConn === null ? '必填' : '留空保持原密码'}
-                onChange={(e) => setForm((f) => (f ? { ...f, password: e.currentTarget.value } : f))} />
+                onChange={(e) => { const v = e.currentTarget.value; setForm((f) => (f ? { ...f, password: v } : f)); }} />
             </div>
             <div className={`field db-cmds-field${isRedis ? ' hidden' : ''}`}>
               <label>默认库</label>
               <input className="input" value={form?.database ?? ''} placeholder="mysql/clickhouse/postgres 用；redis 忽略"
-                onChange={(e) => setForm((f) => (f ? { ...f, database: e.currentTarget.value } : f))} />
+                onChange={(e) => { const v = e.currentTarget.value; setForm((f) => (f ? { ...f, database: v } : f)); }} />
             </div>
             <div className="field db-cmds-field">
               <label>AI 可用命令</label>
@@ -373,7 +373,20 @@ function ServersPanelBody(): JSX.Element {
   useEffect(() => {
     let alive = true;
     void getState()
-      .then((state) => { if (alive) setData({ servers: state.servers, mcpDevices: state.mcpDevices ?? {} }); })
+      .then((state) => {
+        if (!alive) return;
+        setData({ servers: state.servers, mcpDevices: state.mcpDevices ?? {} });
+        // 同步 store 项目快照:欢迎页等外部页面可能改过绑定,而 store 里的 project 是保活内存单例
+        // (bound 列表按 project.serverIds 过滤,不刷新则返回后仍按旧绑定渲染)
+        const s = useWorkbench.getState();
+        const p = s.project;
+        if (p) {
+          const latest = state.projects.find((x) => x.id === p.id) ?? null;
+          if (latest && latest.serverIds.join(',') !== p.serverIds.join(',')) {
+            s.setProject({ ...p, serverIds: latest.serverIds });
+          }
+        }
+      })
       .catch(() => { /* 后端未就绪时按空列表渲染 */ });
     return () => { alive = false; };
   }, [reloadKey]);
