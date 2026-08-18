@@ -3,7 +3,7 @@
 # 触发方式：
 #   workflow_dispatch            — 质量门 + 构建并保留 Actions Artifacts（内部验收包）；
 #                                  勾选 sign-updater 且已配置签名 Secret 时附带签名 updater 制品
-#   push cloud 分支              — 质量门 + 三平台可复现构建（不发布任何渠道）
+#   push srun-aishell-cloud 分支 — 质量门 + 三平台可复现构建（不发布任何渠道）
 #   push v* tag                  — 质量门 + 签名构建 + GitHub Release（人工下载）
 #                                  + 云服务更新 draft 上传（管理员在 ReleasePanel 核对后发布频道）
 #
@@ -26,7 +26,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: ['cloud']
+    branches: ['srun-aishell-cloud']
     tags: ['v*']
 
 # contents: write 供 softprops/action-gh-release 创建 release 并上传安装包
