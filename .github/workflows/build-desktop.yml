@@ -51,6 +51,10 @@ jobs:
 
       - run: npm ci
 
+      # quality 门同样要跑 cargo test：pi sidecar 不入库，缺了 tauri-build 会因
+      # resources/pi 不存在而失败。此处与 build 各腿一致地先拉取（幂等）。
+      - run: npm run fetch-pi
+
       # 版本一致性（tag 构建额外校验与 tag 相同；ref 经 env 传入避免 shell 注入）
       - name: 校验版本一致（含 tag）
         if: startsWith(github.ref, 'refs/tags/')
