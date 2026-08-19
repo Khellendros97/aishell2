@@ -323,9 +323,10 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
                       <input type="checkbox" aria-label={`选择 ${entry.remotePath}`} checked={sel}
                         onChange={(e) => {
                           const id = entry.entryId;
+                          const checked = e.currentTarget.checked;
                           setSelected((prev) => {
                             const next = new Set(prev);
-                            if (e.currentTarget.checked) next.add(id);
+                            if (checked) next.add(id);
                             else next.delete(id);
                             return next;
                           });
