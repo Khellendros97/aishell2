@@ -38,10 +38,11 @@ require_pkg windows-x86_64 "$WIN"
 require_pkg darwin-aarch64 "$MAC_ARM"
 require_pkg darwin-x86_64 "$MAC_X64"
 
-# 统一请求出口：--fail-with-body 让 4xx/5xx 的服务端中文错误直接进日志（令牌不回显）
+# 统一请求出口：--fail-with-body 让 4xx/5xx 的服务端中文错误直接进日志（令牌不回显）；
+# --connect-timeout/--max-time 防止服务端接受连接但不响应时 curl 无限挂起（曾卡住 40+ 分钟）
 api() {
   local method=$1 api_path=$2; shift 2
-  curl -sS --fail-with-body -X "$method" "$SERVER$api_path" \
+  curl -sS --connect-timeout 30 --max-time 900 --fail-with-body -X "$method" "$SERVER$api_path" \
     -H "Authorization: Bearer $TOKEN" "$@"
 }
 
