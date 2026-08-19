@@ -75,7 +75,7 @@ upload() {
 
 upload windows-x86_64 "$WIN"
 upload darwin-aarch64 "$MAC_ARM"
-upload darwin-x64 "$MAC_X64"
+upload darwin-x86_64 "$MAC_X64"
 
 # 3. complete：服务端校验三个 target 的制品/签名/SHA-256/大小齐全，缺一即拒绝
 api POST "/api/internal/updates/releases/$VERSION/complete" \
