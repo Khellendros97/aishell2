@@ -34,6 +34,12 @@
  * 恢复的流式内容取代（delta 分支复活错误 pending）；重试以「自动重试」瞬时工具行提示，
  * 回合结束仍会收到 done（ai.rs 在 delta 恢复时重置终态抑制）。停止键不等后端事件，
  * 本地立即定稿（leaveSession 同语义），任何终止事件丢失都不会卡死输入区。
+ * 流式渲染性能（曾因每个 delta 全量重建聊天区导致长对话整机卡顿）：delta 事件 rAF
+ *   合帧（schedulePendingRender），一帧至多增量更新一次流式气泡，历史节点不动；低频
+ *   事件（工具/审批/done）走 refreshActive 增量追加新消息节点；气泡内文本段按锚点
+ *   偏移缓存（segCache，段完成即命中）、段内 ``` 围栏 parts 前缀缓存（fixedParts，
+ *   每帧只重渲最后一个 part）、动作卡 DOM 按 toolCallId 复用（cardEls，低频事件重建
+ *   气泡时作废）。渲染产出与全量 innerHTML 版逐节点一致（同一 renderAI/renderActionCard）。
  *
  * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_abort /
  *   ai_kill_project / ai_set_thinking / ai_respond_approval / ai_respond_db_request /
@@ -449,6 +455,20 @@ let offStagingChanged: (() => void) | null = null;
 let offTabActivated: (() => void) | null = null;
 let stagingRefreshVersion = 0;
 
+/* ---------- 流式渲染增量缓存（见文件头「流式渲染性能」说明） ---------- */
+/** 已渲染历史消息节点（按消息下标缓存复用；消息只追加不插入，下标即稳定 key） */
+let msgEls: HTMLElement[] = [];
+/** 当前流式气泡元素（帧渲染整体替换，内部节点经缓存复用） */
+let pendingEl: HTMLElement | null = null;
+/** delta 合帧调度句柄（null = 无挂起帧；低频同步渲染前取消，避免旧帧覆盖新状态） */
+let rafId: number | null = null;
+/** 锚点段渲染缓存：段起始偏移 -> 段原文与顶级节点（段内容不变直接 append 复用，不入 DOM 解析） */
+const segCache = new Map<number, { text: string; nodes: HTMLElement[] }>();
+/** 活跃段内已定型 parts（``` 围栏闭合/新块开启后不再变）的渲染缓存，跨帧复用 */
+let fixedParts: Array<{ kind: string; lang: string; body: string; nodes: HTMLElement[] }> = [];
+/** 动作卡 DOM 缓存（toolCallId -> 元素）：delta 帧渲染间卡状态不变；低频事件重建气泡时作废 */
+const cardEls = new Map<string, HTMLElement>();
+
 let chat: HTMLElement;
 let sessionSelect: HTMLSelectElement;
 let newSessionBtn: HTMLButtonElement;
@@ -607,6 +627,12 @@ export function mountAiPanel(container: HTMLElement): () => void {
 function cleanup(): void {
   if (unmounted) return;
   unmounted = true;
+  cancelPendingRender();
+  pendingEl = null;
+  msgEls = [];
+  segCache.clear();
+  fixedParts = [];
+  cardEls.clear();
   if (panelRoot) { panelRoot.removeEventListener('keydown', onPanelKeydown, true); panelRoot = null; }
   if (unlisten) { unlisten(); unlisten = null; }
   if (offStagingChanged) { offStagingChanged(); offStagingChanged = null; }
@@ -942,8 +968,10 @@ function handleEvent(key: string, ev: AiEvent): void {
     });
   }
   if (sid === activeSessionId) {
-    renderHistory();
-    updateSendBtn();
+    /* delta 高频到达（每秒数十条）：rAF 合帧只增量更新流式气泡，历史节点不动；
+       其余事件低频，同步增量渲染（含 finalize 后追加定稿消息） */
+    if (ev.type === 'delta') schedulePendingRender();
+    else refreshActive();
   }
 }
 
@@ -1041,12 +1069,203 @@ function scrollBottom(): void {
 }
 
 function renderHistory(): void {
+  /* 全量重建（挂载/切会话/发送等低频路径）：重置全部增量缓存，
+     msgEls/pendingEl 重新登记（高频流式路径见 schedulePendingRender/refreshActive） */
+  cancelPendingRender();
   chat.innerHTML = '';
+  msgEls = [];
+  segCache.clear();
+  fixedParts = [];
+  cardEls.clear();
   const s = sessions.get(activeSessionId);
-  if (s) s.messages.forEach((m) => chat.appendChild(renderMessage(m, activeSessionId)));
+  if (s) {
+    s.messages.forEach((m) => {
+      const el = renderMessage(m, activeSessionId);
+      msgEls.push(el);
+      chat.appendChild(el);
+    });
+  }
+  pendingEl = null;
   const pend = pendingBy.get(activeSessionId) ?? null;
-  if (pend) chat.appendChild(renderPending(pend));
+  if (pend) replacePending(renderPending(pend));
   scrollBottom();
+}
+
+/** 取消挂起的流式帧渲染（低频同步渲染/全量重建前调用，避免旧帧覆盖新状态） */
+function cancelPendingRender(): void {
+  if (rafId != null) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+}
+
+/** delta 高频路径：rAF 合帧，一帧至多渲染一次流式气泡（历史节点不动；
+ *  窗口最小化等 rAF 暂停场景由 done 事件的同步渲染兜底最终状态） */
+function schedulePendingRender(): void {
+  if (rafId != null) return;
+  rafId = requestAnimationFrame(() => {
+    rafId = null;
+    if (unmounted || !chat.isConnected) return;
+    renderPendingBubble();
+    scrollBottom();
+    updateSendBtn();
+  });
+}
+
+/** 低频事件（工具/审批/分段/done/error）同步渲染：只追加新历史消息节点（finalize 定稿
+ *  push 的消息）+ 重建流式气泡，不再全量重建整个聊天区；历史节点跨渲染复用。 */
+function refreshActive(): void {
+  cancelPendingRender();
+  const s = sessions.get(activeSessionId);
+  if (s) {
+    while (msgEls.length < s.messages.length) {
+      const m = s.messages[msgEls.length];
+      const el = renderMessage(m, activeSessionId);
+      msgEls.push(el);
+      chat.insertBefore(el, pendingEl); // pendingEl 为 null 时等价 appendChild
+    }
+  }
+  /* 卡片状态可能已变（批准/执行/终态）：卡 DOM 缓存作废；文本段缓存保留
+     （低频事件不改文本内容，段校验失败也会自动全量重渲兜底） */
+  cardEls.clear();
+  const pend = pendingBy.get(activeSessionId) ?? null;
+  if (pend) replacePending(renderPending(pend));
+  else if (pendingEl) {
+    pendingEl.remove();
+    pendingEl = null;
+  }
+  scrollBottom();
+  updateSendBtn();
+}
+
+/** 替换/追加当前流式气泡节点 */
+function replacePending(el: HTMLElement): void {
+  if (pendingEl) pendingEl.replaceWith(el);
+  else chat.appendChild(el);
+  pendingEl = el;
+}
+
+/** 流式气泡渲染（rAF 帧路径）：stream 有文本走增量组装（段/卡缓存），其余相位
+ *  （typing/error/尚无文本）无高频变化，直接复用 innerHTML 全量版 renderPending。 */
+function renderPendingBubble(): void {
+  const p = pendingBy.get(activeSessionId) ?? null;
+  if (!p) {
+    if (pendingEl) {
+      pendingEl.remove();
+      pendingEl = null;
+    }
+    return;
+  }
+  if (p.phase !== 'stream' || !p.text) {
+    replacePending(renderPending(p));
+    return;
+  }
+  const wrap = document.createElement('div');
+  wrap.className = 'ai-msg ai';
+  const bubble = document.createElement('div');
+  bubble.className = 'ai-bubble';
+  for (const t of p.tools) {
+    const line = document.createElement('div');
+    line.className = 'ai-tool-line';
+    line.innerHTML = `${icon('wrench')}${escapeHtml(t)}`;
+    bubble.appendChild(line);
+  }
+  const textEl = document.createElement('div');
+  textEl.className = 'ai-text';
+  appendStreamBody(textEl, p);
+  bubble.appendChild(textEl);
+  wrap.appendChild(bubble);
+  replacePending(wrap);
+}
+
+/** 流式体增量组装（语义与 interleaveActions 字符串版逐条对齐）：锚点卡按 textLen 升序
+ *  穿插文本段，无锚点卡排文本末尾；全部卡无锚点时整组前置（与原 renderPending 一致）。
+ *  文本段经 appendSegNodes 复用缓存节点，卡片经 reuseCard 复用 DOM（append 移动）。 */
+function appendStreamBody(container: HTMLElement, p: Pending): void {
+  const cards = [...p.actions.values()];
+  const anchored = cards.some((c) => c.textLen != null);
+  if (!anchored) {
+    cards.forEach((c) => container.appendChild(reuseCard(c)));
+    if (p.text) appendSegNodes(container, p.text, 0);
+    return;
+  }
+  const sorted = cards.slice().sort((a, b) => (a.textLen ?? Infinity) - (b.textLen ?? Infinity));
+  let last = 0;
+  for (const c of sorted) {
+    const at = Math.min(c.textLen ?? p.text.length, p.text.length);
+    if (at > last) appendSegNodes(container, p.text.slice(last, at), last);
+    container.appendChild(reuseCard(c));
+    last = at;
+  }
+  if (last < p.text.length) appendSegNodes(container, p.text.slice(last), last);
+}
+
+/** 动作卡 DOM 复用：delta 帧渲染间卡状态不变，直接移动已有节点（低频事件重建
+ *  气泡时 cardEls 已清空，此处按需重建） */
+function reuseCard(a: ActionCard): HTMLElement {
+  let el = cardEls.get(a.toolCallId);
+  if (!el) {
+    const t = document.createElement('template');
+    t.innerHTML = renderActionCard(a);
+    el = t.content.firstElementChild as HTMLElement;
+    cardEls.set(a.toolCallId, el);
+  }
+  return el;
+}
+
+/** 锚点段渲染入容器：段内容未变直接复用缓存节点（append 移动，零解析）；
+ *  变化（尾段增长/锚点截断）则重渲并更新缓存 */
+function appendSegNodes(container: HTMLElement, segText: string, segStart: number): void {
+  const cached = segCache.get(segStart);
+  if (cached && cached.text === segText) {
+    cached.nodes.forEach((n) => container.appendChild(n));
+    return;
+  }
+  const nodes = renderSegNodes(segText);
+  segCache.set(segStart, { text: segText, nodes });
+  nodes.forEach((n) => container.appendChild(n));
+}
+
+/** 活跃段渲染（parts 前缀缓存）：``` 围栏闭合或新块开启后，之前的 parts 不再变化，
+ *  渲染结果与原文一起缓存（fixedParts），每帧只重切分 + 重渲最后一个 part。
+ *  前缀不匹配（段回退/锚点截断等罕见场景）时全量重渲并重建缓存，保证正确性。 */
+function renderSegNodes(segText: string): HTMLElement[] {
+  const parts = splitAI(segText);
+  let fixed = fixedParts;
+  if (fixed.length > Math.max(parts.length - 1, 0)) fixed = [];
+  for (let i = 0; i < fixed.length; i++) {
+    const f = fixed[i];
+    const cur = parts[i];
+    if (f.kind !== cur.kind || f.lang !== cur.lang || f.body !== cur.body) {
+      fixed = fixed.slice(0, i);
+      break;
+    }
+  }
+  const nodes: HTMLElement[] = [];
+  /* 校验通过的已定型 parts 节点直接复用（append 移动进本帧容器）——
+     此前遗漏此步导致围栏闭合后其之前的定型段从下一帧起消失 */
+  fixed.forEach((f) => nodes.push(...f.nodes));
+  const newFixed = fixed.slice();
+  for (let i = fixed.length; i < parts.length - 1; i++) {
+    const part = parts[i];
+    const partNodes = htmlToNodes(renderPart(part));
+    newFixed.push({ ...part, nodes: partNodes });
+    nodes.push(...partNodes);
+  }
+  fixedParts = newFixed;
+  if (parts.length > 0) nodes.push(...htmlToNodes(renderPart(parts[parts.length - 1])));
+  return nodes;
+}
+
+/** html 字符串 → 顶级元素数组（段/part 渲染结果转 DOM 节点，供跨帧复用） */
+function htmlToNodes(html: string): HTMLElement[] {
+  const t = document.createElement('template');
+  t.innerHTML = html;
+  const els: HTMLElement[] = [];
+  t.content.childNodes.forEach((n) => {
+    if (n.nodeType === Node.ELEMENT_NODE) els.push(n as HTMLElement);
+  });
+  return els;
 }
 
 /** 动作卡渲染：Agent 审批态带批准/拒绝按钮；执行中/终态/历史只读无按钮。
@@ -1273,8 +1492,9 @@ function escapeHtml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-/* fenced 块：```command → 命令卡；```text → 文本卡；其余 → 代码块 */
-function renderAI(text: string): string {
+/* fenced 块切分（renderAI 的解析步骤，流式增量渲染复用同一份逻辑保证产出一致）：
+   ```command → 命令卡；```text → 文本卡；其余 → 代码块；围栏外 → 段落 */
+function splitAI(text: string): Array<{ kind: string; lang: string; body: string }> {
   const parts: Array<{ kind: string; lang: string; body: string }> = [];
   const re = /```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)(?:```|$)/g;
   let last = 0;
@@ -1287,7 +1507,11 @@ function renderAI(text: string): string {
     last = re.lastIndex;
   }
   if (last < text.length) parts.push({ kind: 'para', lang: '', body: text.slice(last) });
-  return parts.map(renderPart).join('');
+  return parts;
+}
+
+function renderAI(text: string): string {
+  return splitAI(text).map(renderPart).join('');
 }
 
 /** 文本建议是否可视为单条 URL（http/https/file 开头且无空白 → 可一键内置浏览器打开） */
