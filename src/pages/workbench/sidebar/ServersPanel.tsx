@@ -293,13 +293,13 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
                       {g.commands.map((cmd) => (
                         <label className="db-cmd" key={cmd}>
                           <input type="checkbox" value={cmd} checked={checkedCommands.has(cmd)}
-                            onChange={(e) => setForm((f) => {
+                            onChange={(e) => { const checked = e.currentTarget.checked; setForm((f) => {
                               if (!f) return f;
                               const next = new Set(f.commands);
-                              if (e.currentTarget.checked) next.add(cmd);
+                              if (checked) next.add(cmd);
                               else next.delete(cmd);
                               return { ...f, commands: next };
-                            })} />
+                            }); }} />
                           {cmd}
                         </label>
                       ))}
@@ -313,13 +313,13 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
                       {form.extras.map((cmd) => (
                         <label className="db-cmd" key={cmd}>
                           <input type="checkbox" checked={checkedCommands.has(cmd)}
-                            onChange={(e) => setForm((f) => {
+                            onChange={(e) => { const checked = e.currentTarget.checked; setForm((f) => {
                               if (!f) return f;
                               const next = new Set(f.commands);
-                              if (e.currentTarget.checked) next.add(cmd);
+                              if (checked) next.add(cmd);
                               else next.delete(cmd);
                               return { ...f, commands: next };
-                            })} />
+                            }); }} />
                           {cmd}
                         </label>
                       ))}
