@@ -193,12 +193,18 @@ jobs:
       # 与 macOS 同一脚本：win32-x64 走 pi-windows-x64.zip + PowerShell 解压
       - run: npm run fetch-pi
 
+      # win-only（WIN_ONLY_RELEASE=true）强制走非签名路径：签名会设 TAURI_SIGNING_PRIVATE_KEY，
+      # 而一旦设置该密钥，tauri 会无视 createUpdaterArtifacts:false 强制打包 updater/msi，
+      # 预发布版本 0.5.3-a 仍报 msi 报错（本地无密钥时组合才通过）。
       - name: 是否签名 updater 制品
         shell: bash
         env:
           SIGN_INPUT: ${{ inputs.sign-updater }}
+          WO: ${{ vars.WIN_ONLY_RELEASE }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* || "$SIGN_INPUT" == "true" ]]; then
+          if [ "$WO" = "true" ]; then
+            echo "SIGN_UPDATER=false" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF" == refs/tags/* || "$SIGN_INPUT" == "true" ]]; then
             echo "SIGN_UPDATER=true" >> "$GITHUB_ENV"
           else
             echo "SIGN_UPDATER=false" >> "$GITHUB_ENV"
