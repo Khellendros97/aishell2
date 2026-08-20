@@ -618,6 +618,9 @@ pub struct ChatSession {
     pub id: String,
     pub title: String,
     pub messages: Vec<ChatMsg>,
+    /// 首条用户消息的自动标题任务是否已经尝试过；失败也不重试。
+    #[serde(default)]
+    pub auto_title_triggered: bool,
 }
 
 /// sessions: projectId -> Vec<ChatSession>
@@ -1449,10 +1452,69 @@ impl Store {
         self.with_state(|s| {
             let list = s.sessions.entry(project_id.to_string()).or_default();
             match list.iter_mut().find(|x| x.id == session.id) {
-                Some(slot) => *slot = session,
-                None => list.push(session),
+                Some(slot) => {
+                    // 标题领取状态只允许后端原子命令推进，普通前端 upsert 不可抢先置位。
+                    // 已领取后同样保留后端标题，避免旧前端快照覆盖异步生成结果。
+                    session.auto_title_triggered = slot.auto_title_triggered;
+                    if slot.auto_title_triggered {
+                        session.title = slot.title.clone();
+                    }
+                    *slot = session;
+                }
+                None => {
+                    // 新会话同样从未领取开始，普通前端 upsert 不可直接置位。
+                    session.auto_title_triggered = false;
+                    list.push(session);
+                }
             }
             Ok(())
+        })
+    }
+
+    /// 原子领取首条用户消息的标题任务：只要首条消息匹配且尚未领取就成功。
+    pub(crate) fn try_claim_session_title(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        first_message: &str,
+    ) -> Result<Option<String>, String> {
+        self.with_state(|s| {
+            let Some(session) = s.sessions.get_mut(project_id)
+                .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
+            else {
+                return Ok(None);
+            };
+            let Some(message) = session.messages.first() else {
+                return Ok(None);
+            };
+            if session.auto_title_triggered || message.role != "user" || message.content != first_message {
+                return Ok(None);
+            }
+            let expected_title = session.title.clone();
+            session.auto_title_triggered = true;
+            Ok(Some(expected_title))
+        })
+    }
+
+    /// 标题请求完成后，仅在会话仍使用对应临时标题时写回，避免覆盖用户已识别的会话。
+    pub(crate) fn update_session_title_if_expected(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        expected_titles: &[String],
+        title: &str,
+    ) -> Result<bool, String> {
+        self.with_state(|s| {
+            let Some(session) = s.sessions.get_mut(project_id)
+                .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
+            else {
+                return Ok(false);
+            };
+            if !expected_titles.iter().any(|expected| expected == &session.title) {
+                return Ok(false);
+            }
+            session.title = title.to_string();
+            Ok(true)
         })
     }
 
@@ -1979,6 +2041,21 @@ mod tests {
         dir
     }
 
+    fn test_chat_msg(role: &str, content: &str) -> ChatMsg {
+        ChatMsg {
+            role: role.to_string(),
+            content: content.to_string(),
+            snapshots: vec![],
+            file_refs: vec![],
+            server_refs: vec![],
+            path_refs: vec![],
+            browser_refs: vec![],
+            skill_refs: vec![],
+            actions: vec![],
+            ts: 1,
+        }
+    }
+
     fn sample_state() -> AppState {
         AppState {
             settings: Settings {
@@ -2038,6 +2115,7 @@ mod tests {
                     vec![ChatSession {
                         id: "sess-1".to_string(),
                         title: "会话一".to_string(),
+                        auto_title_triggered: false,
                         messages: vec![ChatMsg {
                             role: "user".to_string(),
                             content: "看看日志".to_string(),
@@ -3448,6 +3526,134 @@ mod tests {
     }
 
     #[test]
+    fn session_title_claim_allows_completed_assistant_message_and_is_once() {
+        let dir = temp_config_dir("session-title-claim");
+        let store = test_store(dir);
+        store
+            .session_upsert(
+                "proj-title",
+                ChatSession {
+                    id: "sess-title".to_string(),
+                    title: "临时标题".to_string(),
+                    messages: vec![
+                        test_chat_msg("user", "请检查部署状态"),
+                        test_chat_msg("assistant", "部署状态正常"),
+                    ],
+                    auto_title_triggered: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .try_claim_session_title("proj-title", "sess-title", "请检查部署状态")
+                .unwrap(),
+            Some("临时标题".to_string())
+        );
+        assert_eq!(
+            store
+                .try_claim_session_title("proj-title", "sess-title", "请检查部署状态")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_title_claim_requires_matching_first_user_message() {
+        let dir = temp_config_dir("session-title-first-message");
+        let store = test_store(dir);
+        store
+            .session_upsert(
+                "proj-title",
+                ChatSession {
+                    id: "sess-title".to_string(),
+                    title: "临时标题".to_string(),
+                    messages: vec![test_chat_msg("assistant", "先有回复")],
+                    auto_title_triggered: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .try_claim_session_title("proj-title", "sess-title", "首条用户消息")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_upsert_preserves_claimed_title_and_flag() {
+        let dir = temp_config_dir("session-title-upsert");
+        let store = test_store(dir);
+        let first = ChatSession {
+            id: "sess-title".to_string(),
+            title: "临时标题".to_string(),
+            messages: vec![test_chat_msg("user", "请检查部署状态")],
+            auto_title_triggered: false,
+        };
+        store.session_upsert("proj-title", first).unwrap();
+        assert_eq!(
+            store
+                .try_claim_session_title("proj-title", "sess-title", "请检查部署状态")
+                .unwrap(),
+            Some("临时标题".to_string())
+        );
+
+        store
+            .session_upsert(
+                "proj-title",
+                ChatSession {
+                    id: "sess-title".to_string(),
+                    title: "前端旧快照标题".to_string(),
+                    messages: vec![
+                        test_chat_msg("user", "请检查部署状态"),
+                        test_chat_msg("assistant", "已完成"),
+                    ],
+                    auto_title_triggered: false,
+                },
+            )
+            .unwrap();
+        let saved = store.sessions_get("proj-title").unwrap().pop().unwrap();
+        assert!(saved.auto_title_triggered);
+        assert_eq!(saved.title, "临时标题");
+    }
+
+    #[test]
+    fn session_title_update_uses_compare_and_swap_expected_title() {
+        let dir = temp_config_dir("session-title-cas");
+        let store = test_store(dir);
+        store
+            .session_upsert(
+                "proj-title",
+                ChatSession {
+                    id: "sess-title".to_string(),
+                    title: "临时标题".to_string(),
+                    messages: vec![test_chat_msg("user", "第一条")],
+                    auto_title_triggered: false,
+                },
+            )
+            .unwrap();
+
+        assert!(!store
+            .update_session_title_if_expected(
+                "proj-title",
+                "sess-title",
+                &["不是当前标题".to_string()],
+                "不应写入",
+            )
+            .unwrap());
+        assert!(store
+            .update_session_title_if_expected(
+                "proj-title",
+                "sess-title",
+                &["临时标题".to_string()],
+                "部署检查",
+            )
+            .unwrap());
+        assert_eq!(store.sessions_get("proj-title").unwrap()[0].title, "部署检查");
+    }
+
+    #[test]
     fn sessions_upsert_and_delete_project_cleanup() {
         let dir = temp_config_dir("sessions");
         let store = test_store(dir);
@@ -3455,6 +3661,7 @@ mod tests {
             id: "sess-x".to_string(),
             title: "T".to_string(),
             messages: vec![],
+            auto_title_triggered: false,
         };
         store.session_upsert("proj-x", sess.clone()).unwrap();
         // 同 id 更新不重复插入
@@ -3508,6 +3715,7 @@ mod tests {
         let sess = ChatSession {
             id: "sess-mask".to_string(),
             title: "T".to_string(),
+            auto_title_triggered: false,
             messages: vec![
                 msg(r#"db_password="hunter2""#),
                 ChatMsg {

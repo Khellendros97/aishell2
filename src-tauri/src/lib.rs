@@ -4,6 +4,7 @@ pub mod ai_impact;
 pub mod browser;
 pub mod mcp;
 pub mod redact;
+pub mod session_title;
 pub mod smart_approval;
 pub mod staging;
 #[cfg(windows)]
@@ -26,6 +27,17 @@ use tauri::Manager;
 #[tauri::command]
 fn open_devtools(win: tauri::WebviewWindow) {
     win.open_devtools();
+}
+
+/// 删除项目前先回收该项目全部 pi，避免项目记录清除后遗留后台进程。
+#[tauri::command(rename = "delete_project")]
+async fn delete_project_with_ai(
+    ai: tauri::State<'_, Arc<ai::AiManager>>,
+    store: tauri::State<'_, Arc<store::Store>>,
+    id: String,
+) -> Result<(), String> {
+    ai.kill_project(&id);
+    store::delete_project(store, id).await
 }
 
 pub fn run() {
@@ -175,7 +187,7 @@ pub fn run() {
             store::upsert_server,
             store::delete_server,
             store::upsert_project,
-            store::delete_project,
+            delete_project_with_ai,
             store::ensure_project_dirs,
             store::sessions_get,
             store::session_upsert,
@@ -242,6 +254,7 @@ pub fn run() {
             ai::set_ai_mode,
             ai::ai_respond_approval,
             ai::ai_respond_db_request,
+            session_title::ai_generate_session_title,
             staging::staging_add,
             staging::staging_list,
             staging::staging_snapshot_read,

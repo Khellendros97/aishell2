@@ -237,6 +237,8 @@ export interface ChatSession {
   id: string;
   title: string;
   messages: ChatMsg[];
+  /** 首条用户消息已触发自动标题；失败后也不重试，避免后续消息改写会话标题。 */
+  autoTitleTriggered?: boolean;
 }
 
 /** sessions: projectId -> ChatSession[] */

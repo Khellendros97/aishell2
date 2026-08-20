@@ -3,8 +3,8 @@
  * 对照 legacy/pages/workbench/ai.ts 逐行移植，逻辑/交互/DOM 类名/文案逐条一致
  * （.proto/workbench-ai.js 为交互规格；mock 回复换成 pi 子进程流式事件
  * ai:event:<key>，见 src/api.ts）。挂载时写 wbHandles.ai = { addSnapshot, addFileRef,
- * addServerRef, addPathRef, addBrowserRef, currentSessionId }，清理时置 null 并 aiKillProject 清理该项目
- * pi 进程。
+ * addServerRef, addPathRef, addBrowserRef, currentSessionId }，清理时仅回收当前面板 DOM 监听；
+ * 项目上下文与 AI 事件订阅在模块级保留，切换会话/项目不停止 pi 进程。
  * 基础工具远程化：actionStart 的 args 携带 serverId 表示远程 write/edit/delete_path（guard
  * 覆盖版工具经动作桥执行，见 aishell-guard.ts）；这类动作完成后额外广播 staging-changed
  * （远程写入/删除已进会话暂存自动备份），且不发 fs:changed（后端已按 serverId 跳过）。
@@ -44,7 +44,9 @@
  * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_abort /
  *   ai_kill_project / ai_set_thinking / ai_respond_approval / ai_respond_db_request /
  *   ai_debug_info / set_ai_mode / get_state / save_settings / save_db_connection /
- *   staging_list，事件 on_ai_event（ai:event:<key>）。
+ *   ai_generate_session_title（首条消息异步标题）/ staging_list，事件 on_ai_event（ai:event:<key>）。
+ *  AI 事件订阅按 projectId:sessionId 常驻在模块级项目上下文中：切换会话/项目只切换视图，
+ *  不退订、不 abort；卸载仅回收当前面板 DOM 监听，不杀项目 pi 进程。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -52,9 +54,10 @@ import MarkdownIt from 'markdown-it';
 import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon } from '../../../icons';
 import {
-  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, saveDbConnection, saveSettings,
+  aiAbort, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
   sessionUpsert, sessionsGet, setAiMode, stagingList,
   type AiEvent,
+  type AiSessionTitleEvent,
 } from '../../../api';
 import { getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
 import { addQuickCommandModal } from '../tabs/useTerminal';
@@ -69,7 +72,24 @@ const STYLE = `
   height: 40px; flex: none; display: flex; align-items: center; gap: 6px;
   padding: 0 8px; border-bottom: 1px solid var(--border);
 }
-#ai-session-bar .select { flex: 1; height: 26px; font-size: 12px; padding: 0 28px 0 8px; }
+#ai-session-picker { position: relative; flex: 1; min-width: 0; }
+#ai-session-select { width: 100%; height: 26px; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 8px; font-size: 12px; text-align: left; }
+#ai-session-select .ai-session-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#ai-session-select .ai-session-chevron { flex: none; }
+#ai-session-menu {
+  position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 4px); max-height: 240px; overflow-y: auto;
+  padding: 4px; background: var(--bg-1); border: 1px solid var(--border-strong); border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.28);
+}
+#ai-session-menu[hidden] { display: none; }
+.ai-session-option { width: 100%; min-height: 28px; display: flex; align-items: center; gap: 6px; border: 0; border-radius: 4px; padding: 4px 7px; color: var(--text-0); background: transparent; text-align: left; cursor: pointer; font-size: 12px; }
+.ai-session-option:hover, .ai-session-option:focus-visible { background: var(--bg-3); outline: none; }
+.ai-session-option .ai-session-title { min-width: 0; }
+.ai-session-option[aria-current="true"] { background: var(--accent-dim); }
+.ai-session-option .ai-session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-session-option .ai-session-loading { margin-left: auto; color: var(--accent); }
+.ai-session-loading .ic { width: 13px; height: 13px; animation: ai-session-spin .8s linear infinite; }
+@keyframes ai-session-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .ai-session-loading .ic { animation-duration: 1.8s; } }
 /* 思考强度快捷入口（输入区上方一行） */
 #ai-effort-bar {
   display: flex; align-items: center; gap: 6px;
@@ -425,11 +445,63 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
 
 const emptyPending = (): Pending => ({ phase: 'typing', text: '', tools: [], actions: new Map() });
 
+/** 首条消息的即时临时标题：模型标题回来前也不超过 20 个用户可见字符。 */
+function temporarySessionTitle(text: string, fallback: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return fallback;
+  if (typeof Intl.Segmenter === 'undefined') return Array.from(normalized).slice(0, 20).join('');
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  return Array.from(segmenter.segment(normalized), ({ segment }) => segment).slice(0, 20).join('');
+}
+
+/** session_upsert 的入参快照：后续流式事件继续修改内存对象时不影响排队中的写入。 */
+function cloneChatSession(s: ChatSession): ChatSession {
+  return {
+    id: s.id,
+    title: s.title,
+    autoTitleTriggered: s.autoTitleTriggered === true,
+    messages: s.messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      snapshots: m.snapshots.map((snap) => ({ ...snap })),
+      fileRefs: m.fileRefs.map((ref) => ({ ...ref })),
+      serverRefs: m.serverRefs.map((ref) => ({ ...ref })),
+      pathRefs: m.pathRefs.map((ref) => ({ ...ref })),
+      browserRefs: m.browserRefs.map((ref) => ({ ...ref })),
+      skillRefs: m.skillRefs.map((ref) => ({ ...ref, scope: [...ref.scope] })),
+      actions: m.actions.map((action) => ({ ...action })),
+      ts: m.ts,
+    })),
+  };
+}
+
+interface ProjectContext {
+  project: Project;
+  sessions: Map<string, ChatSession>;
+  pendingBy: Map<string, Pending | null>;
+  /** 用户手动展开的工具调用组（key = `<sid>:<消息ts>`） */
+  expandedGroups: Set<string>;
+  activeSessionId: string;
+  loaded: boolean;
+  loading: boolean;
+  loadPromise: Promise<void> | null;
+  loadGeneration: number;
+  /** 同一项目的每个会话只订阅一次；切换会话/项目不退订。 */
+  subscriptions: Map<string, UnlistenFn>;
+  subscribing: Set<string>;
+  /** 按 projectId:sessionId 串行化 session_upsert，确保快照按产生顺序落盘。 */
+  persistQueues: Map<string, Promise<void>>;
+}
+
+/** 项目上下文模块级常驻：工作台 React 面板重挂时只换视图，不丢历史、pending 或事件订阅。 */
+const projectContexts = new Map<string, ProjectContext>();
+let viewContext: ProjectContext | null = null;
+let eventContext: ProjectContext | null = null;
 let project: Project | null = null;
-const sessions = new Map<string, ChatSession>(); // id -> ChatSession（含历史）
-const pendingBy = new Map<string, Pending | null>(); // 会话 id -> 瞬时气泡状态
-/** 用户手动展开的工具调用组（key = `<sid>:<消息ts>`；renderHistory 全量重渲染时保持状态） */
-const expandedGroups = new Set<string>();
+/** 以下是当前视图上下文的别名，保留命令式引擎原有函数结构。 */
+let sessions = new Map<string, ChatSession>();
+let pendingBy = new Map<string, Pending | null>();
+let expandedGroups = new Set<string>();
 const snapshots = new Map<string, TermSnapshot>(); // 快照 id -> 全文（输入区 chip + 历史消息 chip 共用）
 const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编辑器选区，@文件名_起_止 标签）
 const serverRefs = new Map<string, ServerRef>(); // 服务器/本地引用 key -> 引用（key = serverId ?? 'local'，@remote:名称 / @local 标签）
@@ -445,12 +517,17 @@ let browserWorkarea = false;
 /** 工作区域固定标签 DOM（不可移除；clearChips 清空后由 renderWorkareaChip 重建） */
 let workareaChipEl: HTMLElement | null = null;
 let activeSessionId = '';
-let unlisten: UnlistenFn | null = null;
 let unmounted = false;
+let sessionMenuOpen = false;
+let offSessionOutside: (() => void) | null = null;
 /** AI 面板根容器（Ctrl+C 键盘策略监听用，卸载时移除） */
 let panelRoot: HTMLElement | null = null;
 let stagingNotice: HTMLButtonElement;
 let offStagingChanged: (() => void) | null = null;
+/** 全局标题事件只注册一次；发送前 await，避免首条命令先于 listener 发出。 */
+let sessionTitleListenerPromise: Promise<void> | null = null;
+/** listener 早于项目/会话加载完成时暂存事件，loadSessions 合并后回放。 */
+const pendingSessionTitleEvents = new Map<string, AiSessionTitleEvent[]>();
 /** store activeId 变化订阅（原 bus 'tab-activated'，清理时退订） */
 let offTabActivated: (() => void) | null = null;
 let stagingRefreshVersion = 0;
@@ -470,7 +547,8 @@ let fixedParts: Array<{ kind: string; lang: string; body: string; nodes: HTMLEle
 const cardEls = new Map<string, HTMLElement>();
 
 let chat: HTMLElement;
-let sessionSelect: HTMLSelectElement;
+let sessionSelect: HTMLButtonElement;
+let sessionMenu: HTMLElement;
 let newSessionBtn: HTMLButtonElement;
 let input: HTMLTextAreaElement;
 let sendBtn: HTMLButtonElement;
@@ -491,9 +569,11 @@ const EFFORT_LABEL: Record<LlmConfig['effort'], string> = { low: '低', high: '�
  * （Rust 同时向该项目存活 pi 进程热推 /aishell-mode），成功才更新内存项目。
  */
 async function switchMode(mode: AiMode): Promise<void> {
-  if (modeSaving || !project) return;
-  if (mode === project.aiMode) {
-    modeSelect.value = project.aiMode;
+  const ctx = viewContext;
+  const targetProject = ctx?.project;
+  if (modeSaving || !ctx || !targetProject) return;
+  if (mode === targetProject.aiMode) {
+    if (viewContext === ctx && !unmounted) modeSelect.value = targetProject.aiMode;
     return;
   }
   if (mode === 'yolo') {
@@ -504,23 +584,23 @@ async function switchMode(mode: AiMode): Promise<void> {
       okText: '仍要开启',
     });
     if (!ok) {
-      modeSelect.value = project.aiMode;
+      if (viewContext === ctx && !unmounted) modeSelect.value = targetProject.aiMode;
       return;
     }
   }
   modeSaving = true;
   try {
-    await setAiMode(project.id, mode);
+    await setAiMode(targetProject.id, mode);
     /* 跨「仅建议」边界（suggest ↔ agent/yolo）时，Rust 侧会重启该项目全部 pi 进程
        （--tools 与系统提示不同，热推无法变更模型可见工具集）；生成中的回合被打断，
        这里把所有会话的流式文本定稿并中止后端，UI 即时反映新模式。 */
-    const crossedSuggest = (project.aiMode === 'suggest') !== (mode === 'suggest');
-    project.aiMode = mode;
-    modeSelect.value = mode;
-    if (crossedSuggest) leaveAllSessions();
+    const crossedSuggest = (targetProject.aiMode === 'suggest') !== (mode === 'suggest');
+    targetProject.aiMode = mode;
+    if (viewContext === ctx && !unmounted) modeSelect.value = mode;
+    if (crossedSuggest) leaveAllSessions(ctx);
     toast(`AI 模式已切换为 ${MODE_LABEL[mode]}`, 'success');
   } catch (err) {
-    modeSelect.value = project.aiMode;
+    if (viewContext === ctx && !unmounted) modeSelect.value = targetProject.aiMode;
     toast(`切换 AI 模式失败：${String(err)}`, 'error');
   } finally {
     modeSaving = false;
@@ -528,15 +608,55 @@ async function switchMode(mode: AiMode): Promise<void> {
 }
 
 /* ---------- 面板挂载 / 卸载 ---------- */
+function getProjectContext(p: Project): ProjectContext {
+  const existing = projectContexts.get(p.id);
+  if (existing) {
+    existing.project = p;
+    return existing;
+  }
+  const created: ProjectContext = {
+    project: p,
+    sessions: new Map(),
+    pendingBy: new Map(),
+    expandedGroups: new Set(),
+    activeSessionId: '',
+    loaded: false,
+    loading: false,
+    loadPromise: null,
+    loadGeneration: 0,
+    subscriptions: new Map(),
+    subscribing: new Set(),
+    persistQueues: new Map(),
+  };
+  projectContexts.set(p.id, created);
+  return created;
+}
+
+function bindViewContext(ctx: ProjectContext): void {
+  viewContext = ctx;
+  project = ctx.project;
+  sessions = ctx.sessions;
+  pendingBy = ctx.pendingBy;
+  expandedGroups = ctx.expandedGroups;
+  activeSessionId = ctx.activeSessionId;
+}
+
+function saveViewContext(): void {
+  if (viewContext) viewContext.activeSessionId = activeSessionId;
+}
+
 export function mountAiPanel(container: HTMLElement): () => void {
-  project = useWorkbench.getState().project;
+  const nextProject = useWorkbench.getState().project;
+  if (!nextProject) {
+    toast('项目未加载', 'error');
+    return () => { /* 项目尚未加载，不创建引擎状态 */ };
+  }
+  const ctx = getProjectContext(nextProject);
+  bindViewContext(ctx);
   unmounted = false;
 
-  /* 会话与瞬时状态严格按项目隔离：工作台每次进入都会重新挂载本面板，
-     清空上一项目残留的会话/快照/引用/展开态，防止跨项目串数据（会话列表只含当前项目）。 */
-  sessions.clear();
-  pendingBy.clear();
-  expandedGroups.clear();
+  /* 输入引用属于当前面板，跨项目不串入下一个输入框；会话/流式状态属于项目上下文，
+     面板重挂或切项目时保留并继续接收事件。 */
   snapshots.clear();
   fileRefs.clear();
   serverRefs.clear();
@@ -547,7 +667,7 @@ export function mountAiPanel(container: HTMLElement): () => void {
   workareaRef = null;
   browserWorkarea = false;
   workareaChipEl = null;
-  activeSessionId = '';
+  activeSessionId = ctx.activeSessionId;
 
   const style = document.createElement('style');
   style.textContent = STYLE;
@@ -555,8 +675,13 @@ export function mountAiPanel(container: HTMLElement): () => void {
 
   container.innerHTML = `
     <div id="ai-session-bar">
-      <select id="ai-session-select" class="select" title="切换会话"></select>
-      <button id="ai-new-session" class="icon-btn" title="新建会话">${icon('plus')}</button>
+      <div id="ai-session-picker">
+        <button id="ai-session-select" class="select" type="button" aria-haspopup="listbox" aria-expanded="false" title="切换会话">
+          <span class="ai-session-current">加载会话中…</span>${icon('chevronDown')}
+        </button>
+        <div id="ai-session-menu" role="listbox" aria-label="AI 会话列表" hidden></div>
+      </div>
+      <button id="ai-new-session" class="icon-btn" type="button" title="新建会话">${icon('plus')}</button>
     </div>
     <div id="ai-chat"></div>
     <button id="ai-staging-notice" type="button">
@@ -586,7 +711,8 @@ export function mountAiPanel(container: HTMLElement): () => void {
 
   const el = (id: string) => container.querySelector<HTMLElement>(`#ai-${id}`)!;
   chat = el('chat');
-  sessionSelect = el('session-select') as HTMLSelectElement;
+  sessionSelect = el('session-select') as HTMLButtonElement;
+  sessionMenu = el('session-menu');
   newSessionBtn = el('new-session') as HTMLButtonElement;
   input = el('input') as HTMLTextAreaElement;
   sendBtn = el('send') as HTMLButtonElement;
@@ -611,6 +737,8 @@ export function mountAiPanel(container: HTMLElement): () => void {
   offStagingChanged = wbEvents.on('staging-changed', () => {
     if (!unmounted && container.isConnected) void refreshStagingNotice();
   });
+  /* 标题事件是全局单例订阅；先启动注册，send 首条消息时再 await 同一个 Promise。 */
+  void ensureSessionTitleListener().catch(() => { /* 发送流程仍可继续，标题命令失败不阻塞 ai_chat */ });
 
   // pi 运行时诊断输出到控制台（F12 可查），便于排查安装版「pi 运行时不存在」
   void aiDebugInfo().then((info) => console.log('[AI] pi 运行时诊断:\n' + info));
@@ -624,6 +752,50 @@ export function mountAiPanel(container: HTMLElement): () => void {
   return cleanup;
 }
 
+function ensureSessionTitleListener(): Promise<void> {
+  if (!sessionTitleListenerPromise) {
+    sessionTitleListenerPromise = onAiSessionTitle((ev) => handleSessionTitleEvent(ev)).then(() => undefined).catch((err) => {
+      sessionTitleListenerPromise = null;
+      console.error('[AI] 标题事件订阅失败:', err);
+      throw err;
+    });
+  }
+  return sessionTitleListenerPromise;
+}
+
+function handleSessionTitleEvent(ev: AiSessionTitleEvent): void {
+  const title = ev.title.trim();
+  if (!title) return;
+  const key = `${ev.projectId}:${ev.sessionId}`;
+  const ctx = projectContexts.get(ev.projectId);
+  const s = ctx?.sessions.get(ev.sessionId);
+  if (!ctx || !s) {
+    const queued = pendingSessionTitleEvents.get(key) ?? [];
+    queued.push({ ...ev, title });
+    pendingSessionTitleEvents.set(key, queued);
+    return;
+  }
+  applySessionTitleEvent(ctx, ev);
+}
+
+function applySessionTitleEvent(ctx: ProjectContext, ev: AiSessionTitleEvent): void {
+  const s = ctx.sessions.get(ev.sessionId);
+  if (!s || !ev.title.trim()) return;
+  s.title = ev.title.trim().slice(0, 40);
+  void persistSession(s, ctx);
+  if (viewContext === ctx && !unmounted) renderSessionBar();
+}
+
+function replayPendingSessionTitleEvents(ctx: ProjectContext): void {
+  for (const sid of ctx.sessions.keys()) {
+    const key = `${ctx.project.id}:${sid}`;
+    const queued = pendingSessionTitleEvents.get(key);
+    if (!queued) continue;
+    pendingSessionTitleEvents.delete(key);
+    for (const ev of queued) applySessionTitleEvent(ctx, ev);
+  }
+}
+
 function cleanup(): void {
   if (unmounted) return;
   unmounted = true;
@@ -633,12 +805,16 @@ function cleanup(): void {
   segCache.clear();
   fixedParts = [];
   cardEls.clear();
+  saveViewContext();
   if (panelRoot) { panelRoot.removeEventListener('keydown', onPanelKeydown, true); panelRoot = null; }
-  if (unlisten) { unlisten(); unlisten = null; }
+  closeSessionMenu();
+  if (offSessionOutside) { offSessionOutside(); offSessionOutside = null; }
   if (offStagingChanged) { offStagingChanged(); offStagingChanged = null; }
   if (offTabActivated) { offTabActivated(); offTabActivated = null; }
   if (wbHandles.ai === aiHandle) wbHandles.ai = null;
-  if (project) void aiKillProject(project.id).catch(() => { /* 进程清理失败可忽略 */ });
+  /* 不退订项目/会话事件，也不 aiAbort/aiKillProject；上下文继续接收并保存后台流。 */
+  viewContext = null;
+  project = null;
 }
 
 /* ---------- wbHandles.ai 句柄（终端模块添加快照 / 服务器引用 / 路径引用） ---------- */
@@ -706,14 +882,12 @@ const aiHandle = {
 
 /* ---------- 会话管理 ---------- */
 function newSession(): ChatSession {
-  const s: ChatSession = { id: uid('sess'), title: '新会话', messages: [] };
+  const s: ChatSession = { id: uid('sess'), title: '新会话', messages: [], autoTitleTriggered: false };
   sessions.set(s.id, s);
+  if (viewContext) void ensureSessionSubscription(viewContext, s.id);
   return s;
 }
 
-function currentKey(): string {
-  return project && activeSessionId ? `${project.id}:${activeSessionId}` : '';
-}
 function openCurrentStaging(): void {
   const pid = project?.id;
   const sid = activeSessionId;
@@ -746,36 +920,90 @@ async function refreshStagingNotice(): Promise<void> {
 }
 
 async function loadSessions(): Promise<void> {
-  if (!project) {
+  const ctx = viewContext;
+  if (!ctx || !project) {
     toast('项目未加载', 'error');
     return;
   }
-  try {
-    const list = await sessionsGet(project.id);
-    for (const s of list) sessions.set(s.id, s);
-    // Rust 按插入序返回（旧→新，session_upsert 原地更新不换位）：默认选最新的会话
-    if (list.length > 0) activeSessionId = list[list.length - 1].id;
-  } catch (err) {
-    toast(`会话加载失败：${String(err)}`, 'error');
+  if (ctx.loaded) {
+    ensureActiveSession(ctx);
+    replayPendingSessionTitleEvents(ctx);
+    renderSessionBar();
+    renderHistory();
+    updateSendBtn();
+    return;
   }
-  if (!activeSessionId || !sessions.has(activeSessionId)) {
-    activeSessionId = newSession().id;
+  if (ctx.loading && ctx.loadPromise) {
+    await ctx.loadPromise;
+    if (viewContext !== ctx || unmounted) return;
+    ensureActiveSession(ctx);
+    replayPendingSessionTitleEvents(ctx);
+    renderSessionBar();
+    renderHistory();
+    updateSendBtn();
+    return;
   }
-  await subscribe(currentKey());
+  ctx.loading = true;
+  const generation = ++ctx.loadGeneration;
+  const promise = sessionsGet(ctx.project.id).then((list) => {
+    if (ctx.loadGeneration !== generation) return;
+    for (const serverSession of list) {
+      const current = ctx.sessions.get(serverSession.id);
+      if (!current) {
+        ctx.sessions.set(serverSession.id, serverSession);
+        continue;
+      }
+      /* 合并服务端标题/领取标记，但保留前端正在生成的消息与 pending，避免
+         sessions_get 的旧快照覆盖首条消息或流式回合。 */
+      current.title = serverSession.title;
+      current.autoTitleTriggered = serverSession.autoTitleTriggered === true;
+    }
+    /* Rust 按插入序返回（旧→新），已有前端新会话不被异步加载覆盖。 */
+    if (!ctx.activeSessionId && list.length > 0) ctx.activeSessionId = list[list.length - 1].id;
+    ctx.loaded = true;
+    replayPendingSessionTitleEvents(ctx);
+    for (const s of ctx.sessions.values()) void ensureSessionSubscription(ctx, s.id);
+  }).catch((err) => {
+    if (ctx.loadGeneration === generation) toast(`会话加载失败：${String(err)}`, 'error');
+  }).finally(() => {
+    if (ctx.loadGeneration === generation) {
+      ctx.loading = false;
+      ctx.loadPromise = null;
+    }
+  });
+  ctx.loadPromise = promise;
+  await promise;
+  if (viewContext !== ctx || unmounted) return;
+  ensureActiveSession(ctx);
   renderSessionBar();
   renderHistory();
   updateSendBtn();
   void refreshStagingNotice();
 }
 
-async function subscribe(key: string): Promise<void> {
-  if (unlisten) { unlisten(); unlisten = null; }
-  if (!key) return;
-  try {
-    unlisten = await onAiEvent(key, (ev) => handleEvent(key, ev));
-  } catch (err) {
-    console.error('AI 事件订阅失败:', err);
+function ensureActiveSession(ctx: ProjectContext): void {
+  if (!ctx.activeSessionId || !ctx.sessions.has(ctx.activeSessionId)) {
+    const created: ChatSession = { id: uid('sess'), title: '新会话', messages: [], autoTitleTriggered: false };
+    ctx.sessions.set(created.id, created);
+    ctx.activeSessionId = created.id;
+    void ensureSessionSubscription(ctx, created.id);
   }
+  if (viewContext === ctx) activeSessionId = ctx.activeSessionId;
+}
+
+function ensureSessionSubscription(ctx: ProjectContext, sid: string): Promise<void> {
+  if (ctx.subscriptions.has(sid) || ctx.subscribing.has(sid)) return Promise.resolve();
+  if (!ctx.sessions.has(sid)) return Promise.resolve();
+  ctx.subscribing.add(sid);
+  const key = `${ctx.project.id}:${sid}`;
+  return onAiEvent(key, (ev) => handleEvent(ctx, sid, ev)).then((off) => {
+    ctx.subscribing.delete(sid);
+    if (ctx.subscriptions.has(sid)) off();
+    else ctx.subscriptions.set(sid, off);
+  }).catch((err) => {
+    ctx.subscribing.delete(sid);
+    console.error('AI 事件订阅失败:', err);
+  });
 }
 
 /** 读取思考强度/工作区域设置回显（后端 settings 为事实源） */
@@ -814,8 +1042,29 @@ async function switchEffort(level: LlmConfig['effort']): Promise<void> {
   }
 }
 
-function handleEvent(key: string, ev: AiEvent): void {
-  const sid = key.slice(key.indexOf(':') + 1);
+function handleEvent(ctx: ProjectContext, sid: string, ev: AiEvent): void {
+  /* 事件回调必须使用其订阅所属项目上下文；项目切换后仍可在后台定稿/落盘，
+     只有当前可见上下文才触碰 DOM。同步执行期间暂借旧引擎别名，结束后恢复。 */
+  const previous = { project, sessions, pendingBy, expandedGroups, activeSessionId, eventContext };
+  eventContext = ctx;
+  project = ctx.project;
+  sessions = ctx.sessions;
+  pendingBy = ctx.pendingBy;
+  expandedGroups = ctx.expandedGroups;
+  activeSessionId = viewContext === ctx ? ctx.activeSessionId : '';
+  try {
+    handleEventBody(sid, ev);
+  } finally {
+    project = previous.project;
+    sessions = previous.sessions;
+    pendingBy = previous.pendingBy;
+    expandedGroups = previous.expandedGroups;
+    activeSessionId = previous.activeSessionId;
+    eventContext = previous.eventContext;
+  }
+}
+
+function handleEventBody(sid: string, ev: AiEvent): void {
   if (ev.type === 'delta') {
     /* 瞬时错误（限流/过载）后 pi 自动重试成功、增量恢复：复用当前 pending（可能是
        错误相）转回流式，错误气泡被内容取代；后端 delta 恢复时已重置终态抑制，
@@ -866,7 +1115,7 @@ function handleEvent(key: string, ev: AiEvent): void {
     /* AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：弹确认框，
        不进动作卡；其余仍为 Agent 逐调用审批卡 */
     if (ev.action === 'request_agent_mode') {
-      void handleModeRequest(sid, ev);
+      void handleModeRequest(eventContext!, sid, ev);
     } else if (ev.action === 'request_db_connection') {
       /* AI 申请数据库连接：插入审批卡片（带 AI 填写的连接信息，只读展示），
          点【审批】打开审批对话框（见 openDbApproval）；关闭对话框不回执、可重开 */
@@ -967,11 +1216,12 @@ function handleEvent(key: string, ev: AiEvent): void {
       actions: cur?.actions ?? new Map(),
     });
   }
-  if (sid === activeSessionId) {
+  if (eventContext === viewContext && sid === activeSessionId && !unmounted) {
     /* delta 高频到达（每秒数十条）：rAF 合帧只增量更新流式气泡，历史节点不动；
-       其余事件低频，同步增量渲染（含 finalize 后追加定稿消息） */
+       其余事件低频，同步渲染（含 finalize 后追加定稿消息） */
     if (ev.type === 'delta') schedulePendingRender();
     else refreshActive();
+    renderSessionBar();
   }
 }
 
@@ -999,7 +1249,10 @@ function finalize(sid: string): void {
   const s = sessions.get(sid);
   const p = pendingBy.get(sid) ?? null;
   pendingBy.set(sid, null);
-  if (!s || !p || p.phase !== 'stream') return;
+  if (!s || !p || p.phase !== 'stream') {
+    if (s) persistSession(s);
+    return;
+  }
   const text = p.text.trim() ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
   s.messages.push({
     role: 'assistant',
@@ -1014,14 +1267,16 @@ function finalize(sid: string): void {
     ts: Date.now(),
   });
   persistSession(s);
+  if (sid === activeSessionId) renderSessionBar();
 }
 
-/** 离开一个正在生成的会话：中止后端并把手头文本定稿（切走后就收不到 done 事件了） */
-function leaveSession(sid: string): void {
-  const p = pendingBy.get(sid) ?? null;
-  pendingBy.set(sid, null);
+/** 显式停止当前会话：中止后端并把手头文本定稿；切换会话不调用此函数。 */
+function leaveSession(sid: string, ctx: ProjectContext | null = viewContext): void {
+  if (!ctx) return;
+  const p = ctx.pendingBy.get(sid) ?? null;
+  ctx.pendingBy.set(sid, null);
   if (p && p.phase === 'stream' && p.text) {
-    const s = sessions.get(sid);
+    const s = ctx.sessions.get(sid);
     if (s) {
       s.messages.push({
         role: 'assistant',
@@ -1035,32 +1290,94 @@ function leaveSession(sid: string): void {
         actions: collectActions(p),
         ts: Date.now(),
       });
-      persistSession(s);
+      void persistSession(s, ctx);
     }
   }
-  if (project) void aiAbort(`${project.id}:${sid}`).catch(() => { /* 后端无进程时静默 */ });
+  void aiAbort(`${ctx.project.id}:${sid}`).catch(() => { /* 后端无进程时静默 */ });
 }
 
 /** 模式切换跨「仅建议」边界时后端会重启本项目全部 pi 进程：把所有会话的生成中文本
  *  定稿并中止后端（与 leaveSession 同语义，逐会话处理） */
-function leaveAllSessions(): void {
-  [...sessions.keys()].forEach((sid) => leaveSession(sid));
+function leaveAllSessions(ctx: ProjectContext | null = viewContext): void {
+  if (!ctx) return;
+  [...ctx.sessions.keys()].forEach((sid) => leaveSession(sid, ctx));
 }
 
-function persistSession(s: ChatSession): void {
-  if (!project) return;
-  void sessionUpsert(project.id, s).catch((err) => toast(`会话保存失败：${String(err)}`, 'error'));
+function enqueueSessionSnapshot(target: ProjectContext, snapshot: ChatSession): Promise<void> {
+  const key = `${target.project.id}:${snapshot.id}`;
+  const previous = target.persistQueues.get(key) ?? Promise.resolve();
+  let current: Promise<void>;
+  current = previous
+    .catch(() => { /* 上一次失败不阻塞后续快照 */ })
+    .then(() => sessionUpsert(target.project.id, snapshot))
+    .catch((err) => {
+      if (!unmounted && viewContext === target) toast(`会话保存失败：${String(err)}`, 'error');
+      else console.error('[AI] 会话保存失败:', err);
+    })
+    .finally(() => {
+      if (target.persistQueues.get(key) === current) target.persistQueues.delete(key);
+    });
+  target.persistQueues.set(key, current);
+  return current;
+}
+
+function persistSession(s: ChatSession, ctx: ProjectContext | null = eventContext ?? viewContext): Promise<void> {
+  const target = ctx ?? eventContext ?? viewContext;
+  if (!target) return Promise.resolve();
+  return enqueueSessionSnapshot(target, cloneChatSession(s));
 }
 
 function renderSessionBar(): void {
-  sessionSelect.innerHTML = '';
+  const current = sessions.get(activeSessionId);
+  const label = sessionSelect.querySelector('.ai-session-current');
+  if (label) label.textContent = current?.title ?? (sessions.size ? '选择会话' : '加载会话中…');
+  sessionMenu.innerHTML = '';
   sessions.forEach((s) => {
-    const opt = document.createElement('option');
-    opt.value = s.id;
-    opt.textContent = s.title;
-    opt.selected = s.id === activeSessionId;
-    sessionSelect.appendChild(opt);
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.className = 'ai-session-option';
+    option.dataset.sessionId = s.id;
+    option.setAttribute('role', 'option');
+    option.setAttribute('aria-current', String(s.id === activeSessionId));
+    option.innerHTML = `<span class="ai-session-title">${escapeHtml(s.title)}</span>`;
+    if (isGenerating(s.id)) {
+      const loading = document.createElement('span');
+      loading.className = 'ai-session-loading';
+      loading.setAttribute('role', 'status');
+      loading.setAttribute('aria-label', '生成中');
+      loading.innerHTML = icon('loader');
+      option.appendChild(loading);
+    }
+    sessionMenu.appendChild(option);
   });
+  sessionSelect.setAttribute('aria-expanded', String(sessionMenuOpen));
+}
+
+function closeSessionMenu(): void {
+  sessionMenuOpen = false;
+  if (sessionMenu) sessionMenu.hidden = true;
+  if (sessionSelect) sessionSelect.setAttribute('aria-expanded', 'false');
+}
+
+function toggleSessionMenu(): void {
+  sessionMenuOpen = !sessionMenuOpen;
+  sessionMenu.hidden = !sessionMenuOpen;
+  sessionSelect.setAttribute('aria-expanded', String(sessionMenuOpen));
+  if (sessionMenuOpen) {
+    const current = sessionMenu.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(activeSessionId)}"]`);
+    current?.focus();
+  }
+}
+
+function selectSession(sid: string): void {
+  if (!sessions.has(sid)) return;
+  activeSessionId = sid;
+  saveViewContext();
+  closeSessionMenu();
+  renderSessionBar();
+  renderHistory();
+  updateSendBtn();
+  void refreshStagingNotice();
 }
 
 /* ---------- 聊天渲染 ---------- */
@@ -1566,7 +1883,14 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
  *  弹确认框展示申请理由；同意 → 先回复 pi（guard 拿到结果后本回合可继续），
  *  再走 switchMode 实时切换路径切到工作模式（跨边界会重启进程、定稿当前生成）；
  *  拒绝 → 仅回复 pi，保持仅建议模式。 */
-async function handleModeRequest(sid: string, ev: Extract<AiEvent, { type: 'approval' }>): Promise<void> {
+async function handleModeRequest(ctx: ProjectContext, sid: string, ev: Extract<AiEvent, { type: 'approval' }>): Promise<void> {
+  const previous = { project, sessions, pendingBy, expandedGroups, activeSessionId, eventContext };
+  eventContext = ctx;
+  project = ctx.project;
+  sessions = ctx.sessions;
+  pendingBy = ctx.pendingBy;
+  expandedGroups = ctx.expandedGroups;
+  activeSessionId = viewContext === ctx ? ctx.activeSessionId : '';
   if (!project) return;
   const ok = await confirmDialog({
     title: 'AI 申请切换到工作模式',
@@ -1587,6 +1911,12 @@ async function handleModeRequest(sid: string, ev: Extract<AiEvent, { type: 'appr
   } else {
     toast('已拒绝 AI 的工作模式申请', 'info');
   }
+  project = previous.project;
+  sessions = previous.sessions;
+  pendingBy = previous.pendingBy;
+  expandedGroups = previous.expandedGroups;
+  activeSessionId = previous.activeSessionId;
+  eventContext = previous.eventContext;
 }
 
 /** 模式切换后的自动续跑:以一条用户消息把「已同意,请继续」送进会话并提交 aiChat;
@@ -2103,10 +2433,13 @@ function isGenerating(sid: string): boolean {
 
 /* ---------- 发送与流式接收 ---------- */
 async function send(): Promise<void> {
-  if (!project) {
+  const ctx = viewContext;
+  const targetProject = project;
+  if (!ctx || !targetProject) {
     toast('项目未加载', 'error');
     return;
   }
+  const pid = targetProject.id;
   const sid = activeSessionId;
   const s = sessions.get(sid);
   if (!s) return;
@@ -2154,10 +2487,17 @@ async function send(): Promise<void> {
   });
   if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && skrefs.length === 0) return;
 
-  // 首条用户消息决定会话标题
-  if (s.messages.length === 0) s.title = text.slice(0, 20) || (brefs.length ? '页面元素引用' : skrefs.length ? '技能引用' : srefs.length || prefs.length ? '引用' : '文件引用');
+  // 只有新会话的第一条用户消息触发一次标题任务；后续消息永不自动改名。
+  const shouldGenerateTitle = s.messages.length === 0 && !s.autoTitleTriggered;
+  if (shouldGenerateTitle) {
+    s.title = temporarySessionTitle(
+      text,
+      brefs.length ? '页面元素引用' : skrefs.length ? '技能引用' : srefs.length || prefs.length ? '引用' : '文件引用',
+    );
+  }
 
   s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, skillRefs: skrefs, actions: [], ts: Date.now() });
+  if (shouldGenerateTitle) s.autoTitleTriggered = true;
   input.value = '';
   autoGrow();
   clearChips();
@@ -2165,17 +2505,37 @@ async function send(): Promise<void> {
   renderSessionBar();
   renderHistory();
   updateSendBtn();
-  persistSession(s);
+  /* 首条严格按「保存首条 user（auto=false）→领取标题任务→ai_chat」顺序执行。
+     标题命令只领取并异步启动后端模型请求，不等待模型 HTTP；命令失败也继续 ai_chat，
+     内存 autoTitleTriggered 已置 true，后续消息永不重试。 */
+  if (shouldGenerateTitle) {
+    const firstSnapshot = cloneChatSession(s);
+    firstSnapshot.autoTitleTriggered = false;
+    try {
+      await ensureSessionTitleListener();
+    } catch (err) {
+      console.error('[AI] 标题事件监听注册失败，继续发送:', err);
+    }
+    await enqueueSessionSnapshot(ctx, firstSnapshot);
+    try {
+      await aiGenerateSessionTitle(pid, sid, text, firstSnapshot.title);
+    } catch (err) {
+      console.error('[AI] 会话标题命令失败，继续发送:', err);
+    }
+  } else {
+    void persistSession(s, ctx);
+  }
 
   // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器/路径/技能引用说明（UI 气泡只显示 chip）
   const prompt = await buildPrompt(text, snaps, refs, srefs, prefs, brefs, skrefs);
-  aiChat(`${project.id}:${sid}`, prompt).catch((err: unknown) => {
+  aiChat(`${pid}:${sid}`, prompt).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
     console.error('[AI] ai_chat 失败:', err);
-    pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
-    if (sid === activeSessionId) {
+    ctx.pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
+    if (viewContext === ctx && !unmounted && sid === activeSessionId) {
       renderHistory();
       updateSendBtn();
+      renderSessionBar();
     }
   });
 }
@@ -2274,22 +2634,57 @@ function onPanelKeydown(e: KeyboardEvent): void {
   }
 }
 
+function onSessionOutside(e: MouseEvent): void {
+  if (!sessionMenuOpen) return;
+  const target = e.target as Node;
+  if (!sessionSelect.contains(target) && !sessionMenu.contains(target)) closeSessionMenu();
+}
+
+function onSessionDocumentKeydown(e: KeyboardEvent): void {
+  if (e.key === 'Escape' && sessionMenuOpen) {
+    closeSessionMenu();
+    sessionSelect.focus();
+  }
+}
+
 function bindEvents(): void {
-  sessionSelect.onchange = () => {
-    leaveSession(activeSessionId);
-    activeSessionId = sessionSelect.value;
-    void subscribe(currentKey());
-    renderHistory();
-    updateSendBtn();
-    void refreshStagingNotice();
+  sessionSelect.onclick = () => toggleSessionMenu();
+  sessionSelect.onkeydown = (e: KeyboardEvent) => {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (!sessionMenuOpen) toggleSessionMenu();
+    } else if (e.key === 'Escape') {
+      closeSessionMenu();
+    }
   };
+  sessionMenu.addEventListener('click', (e) => {
+    const option = (e.target as HTMLElement).closest('[data-session-id]') as HTMLElement | null;
+    if (option?.dataset.sessionId) selectSession(option.dataset.sessionId);
+  });
+  sessionMenu.addEventListener('keydown', (e: KeyboardEvent) => {
+    const option = (e.target as HTMLElement).closest('[data-session-id]') as HTMLElement | null;
+    if (!option) return;
+    const options = [...sessionMenu.querySelectorAll<HTMLElement>('[data-session-id]')];
+    const index = options.indexOf(option);
+    if (e.key === 'ArrowDown' && options.length) { e.preventDefault(); options[(index + 1) % options.length].focus(); }
+    else if (e.key === 'ArrowUp' && options.length) { e.preventDefault(); options[(index - 1 + options.length) % options.length].focus(); }
+    else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(option.dataset.sessionId ?? ''); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeSessionMenu(); sessionSelect.focus(); }
+  });
+  offSessionOutside = (): void => {
+    document.removeEventListener('mousedown', onSessionOutside, true);
+    document.removeEventListener('keydown', onSessionDocumentKeydown, true);
+  };
+  document.addEventListener('mousedown', onSessionOutside, true);
+  document.addEventListener('keydown', onSessionDocumentKeydown, true);
   newSessionBtn.onclick = () => {
-    leaveSession(activeSessionId);
-    activeSessionId = newSession().id;
+    const s = newSession();
+    activeSessionId = s.id;
+    saveViewContext();
+    closeSessionMenu();
     renderSessionBar();
     renderHistory();
     updateSendBtn();
-    void subscribe(currentKey());
     void refreshStagingNotice();
   };
   chat.addEventListener('click', onChatClick);

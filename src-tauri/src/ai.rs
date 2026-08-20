@@ -588,6 +588,9 @@ impl AiManager {
             // LF 是 pi RPC 协议唯一分隔符；BufRead::lines 按 \n 切行（并剥离 \r），勿换 U+2028 类切行器
             for line in reader.lines() {
                 let Ok(line) = line else { break };
+                if killed2.load(Ordering::SeqCst) {
+                    break;
+                }
                 let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue;
                 };
@@ -919,9 +922,16 @@ impl AiManager {
     fn kill_keys(&self, select: impl Fn(&str) -> bool) {
         let mut procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         let dead: Vec<String> = procs.keys().filter(|k| select(k)).cloned().collect();
+        // 停止前取消审批并标记终止，防止残留回执继续放行。
+        for key in &dead {
+            if let Some(proc) = procs.get_mut(key) {
+                cancel_approvals(proc);
+                proc.killed.store(true, Ordering::SeqCst);
+            }
+        }
+        // 保持进程表锁直到 wait 完成，避免 ai_chat 在停止和摘除之间重用旧进程。
         for key in dead {
             if let Some(mut proc) = procs.remove(&key) {
-                proc.killed.store(true, Ordering::SeqCst);
                 let _ = proc.child.kill();
                 let _ = proc.child.wait();
             }

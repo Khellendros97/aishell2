@@ -208,6 +208,17 @@ export type AiEvent =
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
 export const aiChat = (key: string, prompt: string) => call<void>('ai_chat', { key, prompt });
+/** 首条用户消息的异步会话标题生成；失败不影响 ai_chat，标题由前端先显示本地临时标题。 */
+export const aiGenerateSessionTitle = (projectId: string, sessionId: string, firstMessage: string, expectedTitle?: string) =>
+  call<void>('ai_generate_session_title', { projectId, sessionId, firstMessage, expectedTitle });
+export interface AiSessionTitleEvent {
+  projectId: string;
+  sessionId: string;
+  title: string;
+}
+/** 后端标题生成完成事件；监听是全局的，调用方按 projectId/sessionId 隔离。 */
+export const onAiSessionTitle = (cb: (ev: AiSessionTitleEvent) => void): Promise<UnlistenFn> =>
+  listen<AiSessionTitleEvent>('ai:session-title', (e) => cb(e.payload));
 export const aiAbort = (key: string) => call<void>('ai_abort', { key });
 /** pi 运行时诊断（候选路径命中情况 + 安装目录实际内容），供控制台输出排查安装版问题 */
 export const aiDebugInfo = () => call<string>('ai_debug_info');
