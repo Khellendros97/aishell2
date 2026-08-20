@@ -199,6 +199,19 @@ impl TermHandle {
     }
 }
 
+/// 返回字节串可安全整体送 UTF-8 解码的前缀长度：尾部是不完整多字节序列（error_len 为
+/// None）时截到字符边界，残字节由调用方留待与下一批数据拼接；确定的非法字节按 1 字节
+/// 切出交给 lossy 替换为 U+FFFD，保证每轮调用都有进展（不会卡死在同一错误位置）。
+fn utf8_safe_prefix_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => match e.error_len() {
+            None => e.valid_up_to(),
+            Some(_) => e.valid_up_to() + 1,
+        },
+    }
+}
+
 /* ---------------- 终端录制（tee 到 项目/.aishell/record/服务器-日期时间.log） ---------------- */
 
 /// ANSI 转义剥除状态机（跨分片：CSI/OSC/ESC 序列可能断开在两个 chunk 边界，
@@ -366,6 +379,13 @@ impl TermManager {
 
         let mut cmd = CommandBuilder::new(shell);
         cmd.args(["--login", "-i"]);
+        // GUI 启动环境缺 locale/TERM 兜底：C locale 下 zsh 会把中文路径渲染成八进制转义
+        #[cfg(not(windows))]
+        {
+            for (k, v) in shell_env_fallback() {
+                cmd.env(k, v);
+            }
+        }
         let dir = match cwd.as_deref() {
             Some(c) if !c.trim().is_empty() => PathBuf::from(c),
             _ => app.path().home_dir().map_err(|e| e.to_string())?,
@@ -407,15 +427,27 @@ impl TermManager {
             let id2 = id.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
+                // 多字节 UTF-8 字符可能断在 read 边界：carry 留住不完整尾字节与下一批拼接，
+                // 按块直接 lossy 会把断点字符替换成 U+FFFD（录制 tee 同样受损）
+                let mut carry: Vec<u8> = Vec::new();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let data = String::from_utf8_lossy(&buf[..n]).into_owned();
+                            carry.extend_from_slice(&buf[..n]);
+                            let keep = utf8_safe_prefix_len(&carry);
+                            let data = String::from_utf8_lossy(&carry[..keep]).into_owned();
+                            carry.drain(..keep);
                             mgr.tee_record(&id2, &data);
                             let _ = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
                         }
                     }
+                }
+                // 流结束（EOF/读错误）后残留的不完整序列按 lossy 冲出，不静默丢弃
+                if !carry.is_empty() {
+                    let data = String::from_utf8_lossy(&carry).into_owned();
+                    mgr.tee_record(&id2, &data);
+                    let _ = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
                 }
             });
         }
@@ -485,12 +517,17 @@ impl TermManager {
         tauri::async_runtime::spawn(async move {
             let mut read_half = read_half;
             let mut code: Option<i32> = None;
+            // 与本地读线程同型：多字节 UTF-8 字符可能断在 SSH 数据包边界，carry 跨包拼接
+            let mut carry: Vec<u8> = Vec::new();
             diag(&format!("read-task start id={id2}"));
             loop {
                 match read_half.wait().await {
                     Some(ChannelMsg::Data { data }) => {
                         diag(&format!("recv id={id2} data len={}", data.len()));
-                        let data = String::from_utf8_lossy(&data).into_owned();
+                        carry.extend_from_slice(&data);
+                        let keep = utf8_safe_prefix_len(&carry);
+                        let data = String::from_utf8_lossy(&carry[..keep]).into_owned();
+                        carry.drain(..keep);
                         mgr.tee_record(&id2, &data);
                         let r = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
                         if let Err(e) = r {
@@ -512,6 +549,12 @@ impl TermManager {
                         break;
                     }
                 }
+            }
+            // 通道结束：残留不完整序列按 lossy 冲出（与本地读线程同型）
+            if !carry.is_empty() {
+                let data = String::from_utf8_lossy(&carry).into_owned();
+                mgr.tee_record(&id2, &data);
+                let _ = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
             }
             // 仅当 map 里仍是本句柄才移除：同 id 重连后旧读任务的迟到清理不得误删新句柄
             mgr.map.lock().ok().and_then(|mut m| {
@@ -650,6 +693,44 @@ pub(crate) fn shell_missing_msg() -> String {
     "未找到可用 shell：$SHELL 未设置且 /bin/zsh、/bin/bash 均不存在".to_string()
 }
 
+/* ---------------- PTY 子进程环境兜底（GUI 启动缺 locale/TERM 修复） ---------------- */
+
+/// GUI 启动（Finder/Dock，launchd 环境）不带 LANG/LC_* 与 TERM：PTY 子 shell 落到 C locale
+/// 后，zsh 会把 prompt / ls 输出里的中文路径渲染成八进制转义（\350\257…）或问号，zle 粘贴
+/// 多字节文本也会被按单字节吃掉。从终端启动（tauri dev）时进程继承终端的 locale，开发
+/// 环境难以复现。返回兜底注入项；LANG/LC_ALL/LC_CTYPE 任一已设时不覆盖（尊重用户环境）。
+/// pub(crate)：ai_actions 的本地命令执行（--login -c 捕获输出）复用同一兜底。
+#[cfg(not(windows))]
+pub(crate) fn shell_env_fallback() -> Vec<(&'static str, &'static str)> {
+    fn non_empty(var: &str) -> bool {
+        match std::env::var(var) {
+            Ok(v) => !v.trim().is_empty(),
+            Err(_) => false,
+        }
+    }
+    let mut env = Vec::new();
+    if !(non_empty("LANG") || non_empty("LC_ALL") || non_empty("LC_CTYPE")) {
+        env.push(("LC_CTYPE", utf8_locale_value()));
+    }
+    if !non_empty("TERM") {
+        // 与 SSH request_pty（ssh.rs）申报的终端类型一致
+        env.push(("TERM", "xterm-256color"));
+    }
+    env
+}
+
+/// 兜底 locale 值：macOS 用系统特殊值 "UTF-8"（按用户区域映射为 UTF-8 codeset）；
+/// Linux 用 glibc 内置 "C.UTF-8"（老系统不识别时 setlocale 退回 C，不劣于现状）。
+#[cfg(all(not(windows), target_os = "macos"))]
+fn utf8_locale_value() -> &'static str {
+    "UTF-8"
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn utf8_locale_value() -> &'static str {
+    "C.UTF-8"
+}
+
 /* ---------------- Tauri 命令（注册由主 agent 集成） ---------------- */
 
 #[tauri::command]
@@ -784,5 +865,48 @@ mod tests {
         let p5 = s.strip("dow\u{7}done");
         assert_eq!(String::from_utf8(p4).unwrap(), "");
         assert_eq!(String::from_utf8(p5).unwrap(), "done");
+    }
+
+    /// utf8_safe_prefix_len：完整序列返回全长；尾部不完整多字节序列截到字符边界
+    /// （返回 0 表示整段留待下一批）；确定的非法字节按 1 字节切出，保证每轮有进展。
+    #[test]
+    fn utf8_prefix_len_boundaries() {
+        use super::utf8_safe_prefix_len;
+        assert_eq!(utf8_safe_prefix_len(b""), 0);
+        assert_eq!(utf8_safe_prefix_len(b"plain ascii"), b"plain ascii".len());
+        // "中" = E4 B8 AD
+        assert_eq!(utf8_safe_prefix_len(b"\xe4\xb8\xad"), 3);
+        assert_eq!(utf8_safe_prefix_len(b"\xe4"), 0);
+        assert_eq!(utf8_safe_prefix_len(b"\xe4\xb8"), 0);
+        // 前面有 ASCII 时只断出 ASCII 部分
+        assert_eq!(utf8_safe_prefix_len(b"a\xe4\xb8"), 1);
+        // 完整 "中" + 下一个字符的首字节：安全前缀 = 3，尾部 1 字节留待下一批
+        assert_eq!(utf8_safe_prefix_len(b"\xe4\xb8\xad\xe6"), 3);
+        // 确定非法字节（\xff）：安全前缀跨过它，本轮 lossy 出一个 U+FFFD
+        assert_eq!(utf8_safe_prefix_len(b"ab\xffcd"), 3);
+    }
+
+    /// 跨块流式解码对拍：4096 字节按块 + carry 拼接的还原结果与整体解码完全一致，
+    /// 不出现 U+FFFD（回归：本地/SSH 读循环按块 lossy 会把断在边界的多字节字符丢字）。
+    #[test]
+    fn utf8_stream_assemble_across_chunks() {
+        use super::utf8_safe_prefix_len;
+        // 35 字节/重复（11 个 3 字节汉字 + '/' + '\n'），4096 与 35 互质 → 各 chunk 边界
+        // 依次落在后续汉字的第 1/2/3 字节上，三种断开位置全覆盖
+        let text = "项目路径：公司测试环境/数据\n".repeat(600);
+        let bytes = text.as_bytes();
+        let mut carry: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let end = (pos + 4096).min(bytes.len());
+            carry.extend_from_slice(&bytes[pos..end]);
+            let keep = utf8_safe_prefix_len(&carry);
+            out.push_str(&String::from_utf8_lossy(&carry[..keep]));
+            carry.drain(..keep);
+            pos = end;
+        }
+        out.push_str(&String::from_utf8_lossy(&carry));
+        assert_eq!(out, text);
     }
 }
