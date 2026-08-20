@@ -482,6 +482,10 @@ export default function (pi: ExtensionAPI) {
 			case "web_search":
 				// 只读网络调用，无文件路径语义（aishell-search.ts 注册）
 				return undefined;
+			case "kb_search":
+				// 只读知识库检索（云平台只读中转，无文件路径语义；aishell-kb.ts 注册）。
+				// 参数校验（query/limit/workspace_id）由扩展自身 typebox schema 把关
+				return undefined;
 			case "list_servers":
 				// 只读查询：项目绑定的可操作服务器列表（无路径参数）
 				return undefined;
