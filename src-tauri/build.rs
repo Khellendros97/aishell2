@@ -35,12 +35,16 @@ fn main() {
         };
         // 0.5.2 的坑：CI 只注入了 SERVER_URL，client 凭据缺失被静默跳过，
         // 装机后才报「当前构建未配置云服务」。release 包三变量缺一即硬失败，
-        // 把问题拦在构建期（debug 仍允许缺省，本地未配时仅隐藏云功能）。
+        // 把问题拦在构建期；debug 允许缺省（CI 的 cargo test 无 dev.env，
+        // 本地未配时仅隐藏云功能）。
         let Some(v) = val else {
-            panic!(
-                "release 构建缺少 {var}：请通过环境变量或 {env_file} 提供 \
-                 （CI 需在仓库 Secrets 配置同名值并传入构建任务）"
-            );
+            if is_release {
+                panic!(
+                    "release 构建缺少 {var}：请通过环境变量或 {env_file} 提供 \
+                     （CI 需在仓库 Secrets 配置同名值并传入构建任务）"
+                );
+            }
+            continue;
         };
         println!("cargo:rustc-env={var}={v}");
     }
