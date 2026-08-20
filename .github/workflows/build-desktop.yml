@@ -2,7 +2,9 @@
 #
 # 触发方式：
 #   workflow_dispatch            — 质量门 + 构建并保留 Actions Artifacts（内部验收包）；
-#                                  勾选 sign-updater 且已配置签名 Secret 时附带签名 updater 制品
+#                                  勾选 sign-updater 且已配置签名 Secret 时附带签名 updater 制品；
+#                                  勾选 win-only 时跳过 macOS（私有仓 macOS runner 按 10 倍
+#                                  费率计费，测试期只验 Windows，通过后再全量跑）
 #   push srun-aishell-cloud 分支 — 质量门 + 三平台可复现构建（不发布任何渠道）
 #   push v* tag                  — 质量门 + 签名构建 + GitHub Release（人工下载）
 #                                  + 云服务更新 draft 上传（管理员在 ReleasePanel 核对后发布频道）
@@ -28,6 +30,10 @@ on:
     inputs:
       sign-updater:
         description: '生成签名 updater 制品（需已配置 TAURI_SIGNING_PRIVATE_KEY Secret）'
+        type: boolean
+        default: false
+      win-only:
+        description: '仅跑 Windows 构建（跳过 macOS，测试期省 10 倍费率的 mac 分钟数）'
         type: boolean
         default: false
   push:
@@ -79,6 +85,9 @@ jobs:
 
   build-macos:
     needs: quality
+    # win-only 仅来自 workflow_dispatch（测试验收）；push/tag 事件下 inputs.win-only
+    # 为空串（falsy），取反后恒真，照常执行。跳过的 job 对下游 needs 视为成功。
+    if: ${{ !inputs.win-only }}
     strategy:
       fail-fast: false
       matrix:
