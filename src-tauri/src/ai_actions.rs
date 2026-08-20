@@ -1230,6 +1230,14 @@ impl AiActions {
         cmd.args(["--login", "-c", command])
             .current_dir(root)
             .kill_on_drop(true);
+        // GUI 启动环境缺 locale 时同本地终端兜底：C locale 下 ls 等工具会把中文文件名
+        // 转义成八进制，AI 拿到的输出即乱码（见 term::shell_env_fallback）
+        #[cfg(not(windows))]
+        {
+            for (k, v) in crate::term::shell_env_fallback() {
+                cmd.env(k, v);
+            }
+        }
         // Windows 下隐藏 Git Bash 的临时控制台窗口（与 ai.rs 的 pi 启动一致）
         #[cfg(windows)]
         {
