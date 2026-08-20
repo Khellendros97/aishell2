@@ -109,7 +109,7 @@
 .skillhub-doc-section { display: flex; flex-direction: column; gap: 7px; }
 .skillhub-section-label { color: var(--text-1); font-size: 11px; font-weight: 600; }
 .skillhub-code-block, .skillhub-markdown-block { max-height: 250px; overflow: auto; padding: 13px; border: 1px solid var(--border); border-radius: 8px; color: #cbd5e1; background: #111522; font: 11px/1.6 var(--font-mono); white-space: pre-wrap; word-break: break-word; }
-.skillhub-markdown-block { max-height: 360px; color: var(--text-1); }
+.skillhub-markdown-block { max-height: 360px; color: #f5f7fa; }
 .skillhub-modal-foot { gap: 8px; }
 .skillhub-gradient-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border-color: transparent; color: #fff; background: linear-gradient(135deg, #4f46e5, #7c3aed 55%, #c026d3); box-shadow: 0 7px 17px rgba(99, 102, 241, .2); }
 .skillhub-gradient-btn:hover { color: #fff; border-color: transparent; background: linear-gradient(135deg, #6366f1, #8b5cf6 55%, #d946ef); }
