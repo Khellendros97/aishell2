@@ -93,7 +93,8 @@ jobs:
     #   2) 仓库变量 WIN_ONLY_RELEASE 为 'true' —— 允许 tag 发布也「只发 Win 包」：
     #      云服务 complete 校验要求 3 个 target 齐全，win-only 只能发 GitHub Release，
     #      本轮不上传云更新 draft（见 publish-update 门控）。
-    # 变量未设置时恒真照常执行；跳过的 job 对下游 needs 视为成功。
+    # 变量未设置时恒真照常执行。注意：本 job 被跳过时，依赖它的 publish-*
+    # 默认会被级联跳过（不是「视为成功」），publish-release 已用 result 条件显式处理。
     if: ${{ !(vars.WIN_ONLY_RELEASE == 'true' || inputs.win-only == 'true') }}
     strategy:
       fail-fast: false
@@ -249,7 +250,10 @@ jobs:
   # 汇总发版：三腿产物收齐后单点创建 Release（避免双腿并发建 release 的 body 竞争）
   publish-release:
     needs: [build-macos, build-windows]
-    if: startsWith(github.ref, 'refs/tags/')
+    # win-only（build-macos 被跳过）时，GH Actions 会把「跳过的 needs job」级联跳过
+    # 本 job（默认 if 下直接不建 Release）。不能改用 always()（build-windows 失败也会建）。
+    # 精确条件：win 构建成功 且 mac 构建成功或跳过。
+    if: ${{ startsWith(github.ref, 'refs/tags/') && !cancelled() && needs.build-windows.result == 'success' && (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
