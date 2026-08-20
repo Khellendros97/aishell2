@@ -204,9 +204,22 @@ jobs:
             echo "SIGN_UPDATER=false" >> "$GITHUB_ENV"
           fi
 
+      # win-only（WIN_ONLY_RELEASE=true）且版本为预发布（如 0.5.3-a）时，tauri bundler
+      # 对 msi 目标报「pre-release identifier must be numeric-only」。win-only 只产 NSIS
+      # 安装包（删 msi）；全量发布（变量未设）维持 msi+nsis。NSIS 的 DisplayVersion
+      # 接受任意字符串，pre 段不受此限。
+      - name: win-only 是否仅 NSIS（msi 拒绝预发布版本）
+        shell: bash
+        env:
+          WO: ${{ vars.WIN_ONLY_RELEASE }}
+        run: |
+          if [ "$WO" = "true" ]; then
+            echo 'BUNDLE_OVERRIDE=--config {"bundle":{"targets":["nsis"]}}' >> "$GITHUB_ENV"
+          fi
+
       - name: 构建（签名 updater 制品）
         if: env.SIGN_UPDATER == 'true'
-        run: npm run tauri -- build
+        run: npm run tauri -- build $BUNDLE_OVERRIDE
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -214,7 +227,7 @@ jobs:
       - name: 构建（跳过 updater 制品）
         if: env.SIGN_UPDATER != 'true'
         shell: bash
-        run: npm run tauri -- build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: npm run tauri -- build --config '{"bundle":{"createUpdaterArtifacts":false}}' $BUNDLE_OVERRIDE
 
       - uses: actions/upload-artifact@v4
         with:
