@@ -34,6 +34,8 @@ interface SysFields {
   approvalMode: AppSettings['approvalMode'];
   autoBackup: boolean;
   mcpPort: string;
+  kbAutoInject: boolean;
+  kbInjectCount: string;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -41,6 +43,7 @@ const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '',
+  kbAutoInject: false, kbInjectCount: '5',
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -102,6 +105,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       approvalMode: s.settings.approvalMode ?? 'smart',
       autoBackup: s.settings.autoBackupRemoteFiles ?? true,
       mcpPort: String(s.mcp?.port ?? 8945),
+      kbAutoInject: s.settings.knowledge?.autoInject ?? true,
+      kbInjectCount: String(s.settings.knowledge?.injectCount ?? 5),
     });
     void refreshMcpStatus();
   };
@@ -187,6 +192,12 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       mcpPortRef.current?.focus();
       return;
     }
+    /* 自动注入条数：1–20（与前端数字输入上下界、后端序列化一致） */
+    const kbInjectCount = Number(fields.kbInjectCount);
+    if (!Number.isInteger(kbInjectCount) || kbInjectCount < 1 || kbInjectCount > 20) {
+      toast('自动注入条数必须在 1–20 之间', 'error');
+      return;
+    }
     const hosted = cloudMode === 'hosted';
     const llm: LlmConfig = {
       modelId: fields.modelId.trim(),
@@ -208,6 +219,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       approvalMode: fields.approvalMode,
       cloud: dbRef.current?.settings.cloud ?? { mode: 'personal', user: null, capabilities: null },
       autoBackupRemoteFiles: fields.autoBackup,
+      knowledge: { autoInject: fields.kbAutoInject, injectCount: kbInjectCount },
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -424,6 +436,37 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                     免费额度 2000 次/月，<a href="https://api-dashboard.search.brave.com/app/keys" data-open-url="https://api-dashboard.search.brave.com/app/keys" onClick={onOpenUrl}>获取 Brave Search API Key</a>
                   </div>
                 </div>
+              )}
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>知识库</legend>
+              <div className="field">
+                <label>开启知识库自动注入</label>
+                <input
+                  id="f-kb-auto-inject"
+                  type="checkbox"
+                  checked={fields.kbAutoInject}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, kbAutoInject: checked })); }}
+                />
+                <div className="hint">开启自动注入会降低 AI 响应速度</div>
+              </div>
+              <div className="field">
+                <label>自动注入条数</label>
+                <input
+                  id="f-kb-inject-count"
+                  className="input mono"
+                  type="number"
+                  min={1}
+                  max={20}
+                  placeholder="5"
+                  value={fields.kbInjectCount}
+                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, kbInjectCount: v })); }}
+                />
+              </div>
+              {hosted ? (
+                <div className="hint">开启后发消息前自动检索企业知识库，把相关度最高的对应条数命中注入到 AI 上下文中；AI 助手亦可随时主动调用知识库检索工具</div>
+              ) : (
+                <div className="hint" id="cloud-hosted-kb-note">知识库由公司服务器提供，需登录云服务后使用</div>
               )}
             </fieldset>
             <fieldset className="llm-group">

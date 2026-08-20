@@ -124,6 +124,10 @@ const GUARD_EXT: &str = include_str!("pi_ext/aishell-guard.ts");
 /// 联网搜索扩展源码（web_search 工具，Brave Search；spawn 时重写进 agent_dir）。
 const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 
+/// 知识库检索扩展源码（kb_search 工具，云平台只读中转；spawn 时重写进 agent_dir）。
+/// 托管模式且平台启用 knowledge 能力时挂载，不受自动注入开关影响（自动注入是前置客户端检索）。
+const KB_EXT: &str = include_str!("pi_ext/aishell-kb.ts");
+
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
 const BASE_TOOLS: &str =
@@ -531,6 +535,9 @@ impl AiManager {
         // 联网搜索扩展落盘（enabled 开关决定是否挂载，与 key 是否配置无关）
         let search_path = self.agent_dir.join("aishell-search.ts");
         std::fs::write(&search_path, SEARCH_EXT).map_err(|e| format!("写入搜索扩展失败: {e}"))?;
+        // 知识库检索扩展落盘（托管且 knowledge 能力时挂载，与 auto_inject 无关）
+        let kb_path = self.agent_dir.join("aishell-kb.ts");
+        std::fs::write(&kb_path, KB_EXT).map_err(|e| format!("写入知识库扩展失败: {e}"))?;
         // 搜索能力：托管模式以服务端能力清单为准（CR-4.3）；个人模式按本地设置。
         // 搜索 key 未配置时不注入 env：工具仍挂载，调用时由扩展返回中文引导错误
         let (search_enabled, brave_key) = if hosted {
@@ -542,6 +549,16 @@ impl AiManager {
                 self.store.read_secret("brave:apikey").ok(),
             )
         };
+        // 知识库能力：仅托管模式，以服务端能力清单为准；本地无知识库，故个人模式不挂载。
+        // 按需求「无论是否开启自动注入，始终给 AI 助手提供知识库检索工具」——只要托管且平台
+        // 启用了 knowledge 能力即挂载，auto_inject 开关不影响挂载；云端需刷新能力清单使标记生效。
+        let kb_enabled = hosted
+            && self
+                .store
+                .cloud_profile()
+                .1
+                .map(|c| c.knowledge)
+                .unwrap_or(false);
 
         // 初始工具集按模式下发（agent/yolo 直接启用变更工具，避免依赖扩展加载期 setActiveTools）；
         // 热切换仍由 /aishell-mode 命令 + 扩展 applyToolset 增量同步。
@@ -554,6 +571,9 @@ impl AiManager {
         };
         if search_enabled {
             tools.push_str(",web_search");
+        }
+        if kb_enabled {
+            tools.push_str(",kb_search");
         }
 
         // 会话持久化（每 key 固定路径）：pi 自动把对话条目落盘到此 jsonl；
@@ -579,8 +599,11 @@ impl AiManager {
         .args(["--no-extensions", "--extension"])
         .arg(&guard_path)
         .args(["--extension"])
-        .arg(&search_path)
-        .args(["--no-approve", "--session"])
+        .arg(&search_path);
+        if kb_enabled {
+            cmd.args(["--extension"]).arg(&kb_path);
+        }
+        cmd.args(["--no-approve", "--session"])
         .arg(&session_path)
         .args([
             "--no-context-files",
@@ -625,6 +648,13 @@ impl AiManager {
                 cmd.env("AISHELL_SEARCH_URL", format!("{server}/api/proxy/search"));
             }
             cmd.env("AISHELL_SEARCH_TOKEN", &api_key);
+            // 知识库扩展读 $AISHELL_KB_URL + $AISHELL_KB_TOKEN（仅 knowledge 能力时注入）
+            if kb_enabled {
+                if let Some(server) = crate::cloud::server_url() {
+                    cmd.env("AISHELL_KB_URL", format!("{server}/api/kb/search"));
+                }
+                cmd.env("AISHELL_KB_TOKEN", &api_key);
+            }
         } else {
             cmd.env("DEEPSEEK_API_KEY", &api_key);
             if let Some(key) = brave_key {

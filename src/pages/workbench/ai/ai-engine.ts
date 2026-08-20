@@ -49,10 +49,10 @@
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
+import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, KbHit, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon } from '../../../icons';
 import {
-  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, saveDbConnection, saveSettings,
+  aiAbort, aiChat, aiDebugInfo, aiKillProject, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, kbSearch, onAiEvent, saveDbConnection, saveSettings,
   sessionUpsert, sessionsGet, setAiMode, stagingList,
   type AiEvent,
 } from '../../../api';
@@ -438,6 +438,10 @@ const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key 
 const skillRefs = new Map<string, SkillRef>(); // 技能引用 key -> 引用（key = `${origin}:${name}`，@skill:名称 标签）
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
+/** 知识库自动注入（Settings.knowledge.autoInject）：发消息前自动把相关度最高的前 N 条命中注入用户输入；只受开关影响，不影响 kb_search 工具挂载 */
+let kbAutoInject = false;
+/** 知识库自动注入条数（Settings.knowledge.injectCount，1–20） */
+let kbInjectCount = 5;
 /** 当前 AI 工作区域（默认本地；随激活终端/浏览器标签自动切换） */
 let workareaRef: ServerRef | null = null;
 /** 当前浏览器工作区域不使用服务器引用，单独记录以便发送时注入明确上下文。 */
@@ -784,6 +788,8 @@ async function loadEffort(): Promise<void> {
     const st = await getState();
     effortSelect.value = st.settings.llm.effort || 'low';
     autoSwitchAiWorkdir = !!st.settings.autoSwitchAiWorkdir;
+    kbAutoInject = st.settings.knowledge?.autoInject ?? true;
+    kbInjectCount = st.settings.knowledge?.injectCount ?? 5;
   } catch {
     /* 读取失败保持默认 low / 开启（与 Settings 默认一致） */
   }
@@ -2189,8 +2195,13 @@ async function send(): Promise<void> {
  */
 async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[], brefs: BrowserRef[], skrefs: SkillRef[]): Promise<string> {
   let servers: Server[] = [];
+  /* 自动注入只在托管模式且平台启用了 knowledge 能力时执行（后端命令在个人模式会报错，静默降级） */
+  let kbKnown = false;
   try {
-    servers = (await getState()).servers;
+    const st = await getState();
+    servers = st.servers;
+    // 知识库仅在公司云（托管模式）且平台启用了 knowledge 能力时可用，与后端挂载逻辑一致
+    kbKnown = !!st.settings.cloud?.capabilities?.knowledge;
   } catch {
     /* 后端未就绪时仅用名称 */
   }
@@ -2222,7 +2233,7 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
     parts.push(r.serverId === null ? '[引用: 本地终端]' : remoteText(r));
   }
   const refText = parts.map((p) => `\n\n${p}`).join('');
-  return text
+  const base = text
     + snaps.map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`).join('')
     + refs.map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`).join('')
     + prefs.map((r) => {
@@ -2236,6 +2247,29 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
     + skrefs.map((r) =>
       `\n\n[技能引用 @skill:${r.name}]\n名称: ${r.name}（${r.origin === 'global' ? '全局' : '项目'}）\nscope: ${r.scope.join(', ') || '-'}\n描述: ${r.description}`).join('')
     + refText;
+  // 知识库自动注入：开启且用户输入了文本时，用用户原文检索并把相关度最高的前 N 条命中前置到 prompt；
+  // 检索失败（未登录/知识库不可用/网络）静默降级，不阻断对话
+  if (kbAutoInject && kbKnown && text.trim()) {
+    try {
+      const hits = await kbSearch(text.trim(), kbInjectCount);
+      if (hits.length) return `${buildKbBlock(hits)}\n\n${base}`;
+    } catch {
+      /* 自动注入失败静默降级 */
+    }
+  }
+  return base;
+}
+
+/** 把知识库命中拼成「[知识库参考]」上下文块：按相关度降序取前 N 条，每条附来源与截断摘要。 */
+function buildKbBlock(hits: KbHit[]): string {
+  const n = Math.max(1, Math.min(20, kbInjectCount));
+  const top = [...hits].sort((a, b) => b.score - a.score).slice(0, n);
+  const lines = top.map((h, i) => {
+    const source = h.heading_path ? `${h.document_title}（${h.heading_path}）` : (h.document_title || '知识库');
+    const sum = (h.content_preview || h.snippet || '').slice(0, 500);
+    return `${i + 1}. [${source}]（相关度 ${h.score.toFixed(0)}）\n   ${sum}`;
+  });
+  return `[知识库参考]\n${lines.join('\n')}`;
 }
 
 /* ---------- 事件绑定 ---------- */

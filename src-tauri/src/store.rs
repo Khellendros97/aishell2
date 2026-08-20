@@ -89,6 +89,34 @@ pub struct SearchConfig {
     pub enabled: bool,
 }
 
+/// 知识库配置（云端只读中转，见开放 API 文档 §4）。
+/// 无论 auto_inject 是否开启，托管模式都会挂载 kb_search 工具；auto_inject 只控制
+/// 发消息前是否把分数最高的前 N 条命中注入用户输入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeConfig {
+    /// 是否开启知识库自动注入（开启会降低 AI 响应速度）。
+    #[serde(default = "default_true")]
+    pub auto_inject: bool,
+    /// 自动注入的命中条数（1–20）。
+    #[serde(default = "default_kb_inject_count")]
+    pub inject_count: u32,
+}
+
+/// 自动注入默认条数（1–20，与前端数字输入上下界一致）。
+fn default_kb_inject_count() -> u32 {
+    5
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        KnowledgeConfig {
+            auto_inject: default_true(),
+            inject_count: default_kb_inject_count(),
+        }
+    }
+}
+
 /// 云服务接入模式：hosted = 公司服务器托管；personal = 本地自配密钥。
 /// 未登录默认 personal；登录成功后自动切 hosted（CR-2.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -169,6 +197,9 @@ pub struct Settings {
     /// 旧配置无此字段时按开启处理（默认开启）
     #[serde(default = "default_true")]
     pub auto_backup_remote_files: bool,
+    /// 知识库配置（云端只读中转）；旧配置无此字段时按默认开启自动注入处理
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -188,6 +219,7 @@ impl Default for Settings {
                 capabilities: None,
             },
             auto_backup_remote_files: true,
+            knowledge: KnowledgeConfig::default(),
         }
     }
 }
@@ -2201,6 +2233,7 @@ mod tests {
                     capabilities: None,
                 },
                 auto_backup_remote_files: true,
+                knowledge: KnowledgeConfig::default(),
             },
             servers: vec![
                 Server {
@@ -4052,6 +4085,7 @@ mod tests {
                         capabilities: None,
                     },
                     auto_backup_remote_files: true,
+                    knowledge: KnowledgeConfig::default(),
                 },
                 Some("sk-test-key"),
                 None,
@@ -4243,6 +4277,7 @@ mod tests {
                         capabilities: None,
                     },
                     auto_backup_remote_files: true,
+                    knowledge: KnowledgeConfig::default(),
                 },
                 None,
                 Some("bsk-1"),
@@ -4285,6 +4320,9 @@ mod tests {
         // 旧配置无 approvalMode 字段 → 默认智能审批（无感升级，且默认不扩大打扰）
         assert_eq!(s.approval_mode, ApprovalMode::Smart);
         assert_eq!(s.approval_mode.as_str(), "smart");
+        // 旧配置无 knowledge 字段 → 默认开启自动注入、注入 5 条（无感升级）
+        assert!(s.knowledge.auto_inject);
+        assert_eq!(s.knowledge.inject_count, 5);
     }
 
     #[test]

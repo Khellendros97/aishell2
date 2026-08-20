@@ -13,11 +13,38 @@ export interface SearchConfig {
   enabled: boolean;
 }
 
+/** 知识库配置（云端只读中转，开放 API 文档 §4）：autoInject 只控制「发消息前自动把分数最高的前 N 条命中注入用户输入」；
+ *  kb_search 工具挂载不受它影响（托管模式且平台启用 knowledge 能力时始终提供给 AI 助手）。 */
+export interface KnowledgeConfig {
+  /** 是否开启知识库自动注入（开启会降低 AI 响应速度） */
+  autoInject: boolean;
+  /** 自动注入的命中条数（1–20） */
+  injectCount: number;
+}
+
+/** 知识库语义检索命中（开放 API 文档 §4.1，响应为顶层命中数组）。字段为上游原生 snake_case
+ *  （KbHit 是云平台只读透传结构，未做 camelCase 重命名，故此处保持 snake_case 与 Rust 对齐）。 */
+export interface KbHit {
+  chunk_id: number | null;
+  document_id: number | null;
+  document_title: string;
+  heading_path: string;
+  score: number;
+  snippet: string;
+  content_preview: string;
+  content: string;
+  workspace_id: number | null;
+  workspace_name: string;
+  retrieval_type: string;
+}
+
 export interface Settings {
   workspaceDir: string | null;
   llm: LlmConfig;
   /** 联网搜索配置；旧配置无此字段时按关闭处理 */
   search: SearchConfig;
+  /** 知识库配置；旧配置无此字段时按默认开启自动注入处理 */
+  knowledge: KnowledgeConfig;
   theme: Theme;
   /** 自动切换 AI 工作区域：开启后 AI 输入框显示固定工作区域标签，随激活终端自动切换；旧配置无此字段按开启 */
   autoSwitchAiWorkdir: boolean;

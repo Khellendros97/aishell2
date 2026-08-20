@@ -51,6 +51,7 @@ const EMPTY_STATE: AppState = {
     approvalMode: 'smart',
     cloud: { mode: 'personal', user: null, capabilities: null },
     autoBackupRemoteFiles: true,
+    knowledge: { autoInject: true, injectCount: 5 },
   },
   servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},

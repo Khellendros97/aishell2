@@ -810,6 +810,25 @@ pub struct MemoryHit {
     pub score: f64,
 }
 
+/// 知识库语义检索命中（开放 API 文档 §4.1，响应为顶层命中数组）：
+/// 平台对企业知识库做只读透传，字段为上游原生结构（snake_case），客户端按需取用；
+/// 缺失字段一律兜底（防御上游结构变动）。注意：上游字段是 snake_case，故不做 camelCase 重命名。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct KbHit {
+    pub chunk_id: Option<i64>,
+    pub document_id: Option<i64>,
+    pub document_title: String,
+    pub heading_path: String,
+    pub score: f64,
+    pub snippet: String,
+    pub content_preview: String,
+    pub content: String,
+    pub workspace_id: Option<i64>,
+    pub workspace_name: String,
+    pub retrieval_type: String,
+}
+
 // ---------------------------------------------------------------- Tauri commands
 
 /// 发起登录：生成 state、启动本地回调监听，返回授权 URL（前端 openUrl 打开系统浏览器）。
@@ -1294,6 +1313,35 @@ pub async fn memory_search(
     serde_json::from_value(hits).map_err(|e| format!("解析记忆检索结果失败: {e}"))
 }
 
+/// 知识库语义检索（GET /api/kb/search，开放 API 文档 §4.1）：零凭证只读透传，
+/// 响应为**顶层命中数组**（非 OpenAI/搜索适配层结构）。命中带相关度 score，客户端
+/// 可按需截取前 N 条注入。知识库由公司服务器提供：未登录/未启用 knowledge 时返回中文错误。
+/// 本命令供前端「自动注入」客户端检索用；AI 助手工具侧的 kb_search 走 pi 扩展（见 ai.rs）。
+#[tauri::command]
+pub async fn kb_search(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    query: String,
+    limit: Option<u32>,
+    workspace_id: Option<i64>,
+) -> Result<Vec<KbHit>, String> {
+    let mut q: Vec<(&str, String)> = vec![("q", query)];
+    if let Some(l) = limit {
+        q.push(("limit", l.to_string()));
+    }
+    if let Some(w) = workspace_id {
+        q.push(("workspace_id", w.to_string()));
+    }
+    let v = cloud_api_request(&cloud, &store, reqwest::Method::GET, "/api/kb/search", &q, None).await?;
+    // 上游返回 null / 缺省时兜底为空数组
+    let arr = if v.is_null() {
+        serde_json::json!([])
+    } else {
+        v
+    };
+    serde_json::from_value(arr).map_err(|e| format!("解析知识库检索结果失败: {e}"))
+}
+
 /// 个人卡片提升为共享（POST /api/memories/{id}/promote）：仅创建者本人可调；
 /// 原文保留不被改写，原个人卡片消失、共享空间出现新 id 的共享卡片（服务端写审计）。
 /// 返回新的共享卡片 id。
@@ -1551,6 +1599,40 @@ mod tests {
         assert_eq!(h.card.content, "Redis 密码在配置中心");
         assert_eq!(h.card.source, "auto");
         assert!((h.score - 0.334).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kb_hit_parses_document_sample_and_tolerates_missing_fields() {
+        // 开放 API 文档 §4.1 命中数组元素（含 mark 高亮 snippet / content_preview）
+        let json = r#"{
+          "chunk_id": 84785, "document_id": 1674,
+          "document_title": "04-deployment-guide.md",
+          "heading_path": "部署说明 / 部署步骤 / 3. 启动服务（按顺序）",
+          "score": 994, "snippet": "…含 <mark> 高亮的检索上下文片段…",
+          "content_preview": "…", "content": "…",
+          "workspace_id": 35, "workspace_name": "srun3-platform",
+          "retrieval_type": "hybrid"
+        }"#;
+        let h: KbHit = serde_json::from_str(json).unwrap();
+        assert_eq!(h.chunk_id, Some(84785));
+        assert_eq!(h.document_title, "04-deployment-guide.md");
+        assert!(h.heading_path.contains("部署步骤"));
+        assert_eq!(h.workspace_name, "srun3-platform");
+        assert_eq!(h.retrieval_type, "hybrid");
+        // 缺失可选字段兜底（防御上游结构变动）
+        let sparse = r#"{"score": 1.5, "document_title": "t.md"}"#;
+        let s: KbHit = serde_json::from_str(sparse).unwrap();
+        assert_eq!(s.document_title, "t.md");
+        assert_eq!(s.workspace_name, "");
+    }
+
+    #[test]
+    fn kb_hit_array_parses_top_level() {
+        // 响应为顶层命中数组（非 { results: [] } 包装）
+        let json = r#"[{"score": 9.0, "document_title": "a.md"}, {"score": 8.0}]"#;
+        let hits: Vec<KbHit> = serde_json::from_str(json).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].document_title, "a.md");
     }
 
     #[test]

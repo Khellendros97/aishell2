@@ -287,6 +287,7 @@ pub fn run() {
             cloud::memory_history,
             cloud::memory_search,
             cloud::memory_promote,
+            cloud::kb_search,
             ai::ai_respond_db_request,
             staging::staging_add,
             staging::staging_list,

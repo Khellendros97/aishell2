@@ -61,7 +61,7 @@ OpenAI 兼容格式，请求体**原样透传**到模型上游（仅注入服务
 | 400 | 缺 `model` / 请求体非 JSON |
 | 401 | 未认证或 access_token 失效（用 refresh 轮换后重试） |
 | 403 | 账号被禁用 |
-| 429 | 达到上游配额（见 §5） |
+| 429 | 达到上游配额（见 §6） |
 | 502 | 模型上游暂时不可用 |
 | 503 | 模型已停用 / 上游无可用 Key |
 
@@ -116,19 +116,127 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 - 国内部署推荐 `bocha`（博查）：Brave API 在部分网络不可达；微软 Bing Search API v7 已于 2025-08 退役，不再可用；
 - 客户端按 §3.2 的实际响应结构解析即可；如需博查专有请求参数（`freshness`、`summary` 等），联系服务端在适配层补充映射后再使用。
 
-## 4. 会话与用户接口
+## 4. 知识库（只读中转）
+
+> 平台对企业知识库（自建 RAG）的开放读接口做**只读透传**（zero-credential：上游读接口匿名可访问，平台不保管也不透传任何知识库凭证）。响应为上游原生 JSON（**不是** OpenAI/搜索适配层结构），由客户端自行编排，例如把命中片段拼进 LLM 请求的 `system` 上下文。
+>
+> **平台不做服务端知识库注入**：客户端（含 `kb_search` 等工具）与「对话测试」工作台均通过下述接口自行检索；工作台「对话测试」会在**前端**把命中拼成 `system` 消息再发给 LLM（受系统设置「知识库注入」开关控制，默认开启）。管理端在「系统设置-知识库服务地址」配置上游地址。
+>
+> 所有 `/api/kb/*` 需登录（Bearer 或 Cookie）。未配置知识库地址 → `503`；上游不可达或返回错误 → `502`；上游状态码与响应体透传。
+
+### 4.1 语义检索 `GET /api/kb/search`
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `q` | 是 | 检索关键词（缺失时由上游决定，网关不校验） |
+| `limit` | 否 | 返回条数 |
+| `workspace_id` | 否 | 限定单个工作区；缺省为跨所有启用工作区全局检索 |
+
+响应：**命中数组**（透传上游），单个元素：
+
+```json
+[
+  {
+    "chunk_id": 84785,
+    "document_id": 1674,
+    "document_title": "04-deployment-guide.md",
+    "heading_path": "部署说明 / 部署步骤 / 3. 启动服务（按顺序）",
+    "score": 994,
+    "snippet": "…（含 <mark> 高亮的检索上下文片段）",
+    "content_preview": "…",
+    "content": "…",
+    "workspace_id": 35,
+    "workspace_name": "srun3-platform",
+    "product_key": "srun3-platform",
+    "product_name": "Srun3 平台",
+    "product_type": "product_docs",
+    "retrieval_type": "hybrid",
+    "placeholder_penalized": false
+  }
+]
+```
+
+- `retrieval_type`：`hybrid`（语义+关键词混合）/ `keyword`（关键词）；
+- 注入时可优先取 `document_title` / `heading_path` 作来源、`content_preview`/`snippet` 作摘要，控制上下文长度。
+
+### 4.2 工作区清单 `GET /api/kb/workspaces`
+
+响应：**工作区数组**（透传上游），常用字段：
+
+| 字段 | 说明 |
+|---|---|
+| `id` / `name` | 工作区 ID / 名称（`id` 用于 `workspace_id`） |
+| `workspace_type` | 类型（如 `inbox`/`product_docs`/`topic_docs`） |
+| `product_key` / `product_name` | 关联产品标识 / 名称 |
+| `description` | 描述 |
+| `enabled` | 是否启用 |
+| `canonical_doc_count` / `document_count` | 权威/累计文档数 |
+| `created_at` / `updated_at` | 创建 / 更新时间 |
+
+> 数组元素包含较多产品架构字段（`owner_*`、`upstream_systems`、`runtime_stack` 等），客户端按需取用即可。
+
+### 4.3 已审核 FAQ `GET /api/kb/faq`
+
+| 参数 | 说明 |
+|---|---|
+| `query` | 选填，关键词过滤 |
+| `workspace_id` | 选填，限定工作区 |
+| `limit` / `offset` | 选填，分页 |
+
+响应（透传上游）：
+
+```json
+{
+  "items": [
+    {
+      "id": 1111,
+      "workspace_id": 48,
+      "workspace_name": "srun4k",
+      "question": "这个产品是做什么的？",
+      "answer": "Srun Portal 认证相关产品资料…",
+      "tags": [],
+      "source_file": "11-faq.md",
+      "confidence": 0.85,
+      "review_status": "auto_accepted",
+      "evidence_refs": [ { "type": "source_file", "source_file": "11-faq.md" } ],
+      "updated_at": "2026-08-07T07:53:36.513101"
+    }
+  ],
+  "limit": 3,
+  "offset": 0
+}
+```
+
+### 4.4 管理员配置 `GET|PUT /api/admin/settings/knowledge`
+
+（管理员鉴权，客户端不可用。）
+
+- `GET` → `{ "baseUrl": "http://10.10.1.89:8002" }`；
+- `PUT`，body `{ "baseUrl": "…" }`；空串关闭知识库功能，响应回显规范化后的 `baseUrl`。
+
+### 4.5 错误
+
+| HTTP | 场景 |
+|---|---|
+| 401 | 未认证或 access_token 失效 |
+| 502 | 知识库上游不可达 / 返回错误 |
+| 503 | 知识库服务未配置 |
+
+上游 4xx/5xx 与响应体**原样透传**（如缺失 `q` 等参数由其上游决定）。
+
+## 5. 会话与用户接口
 
 | 方法/路径 | 鉴权 | 说明 |
 |---|---|---|
 | `GET /api/health` | 无 | 健康检查，返回 `{"status":"ok"}` |
-| `GET /api/auth/me` | Bearer/Cookie | 当前用户 + 平台能力清单：`{"user":{…},"capabilities":{…}}`（见 §4.2） |
+| `GET /api/auth/me` | Bearer/Cookie | 当前用户 + 平台能力清单：`{"user":{…},"capabilities":{…}}`（见 §5.2） |
 | `POST /api/auth/refresh` | Cookie/body | 轮换令牌：body `{"refreshToken":"…"}` 或携带 Cookie；响应 `{"user":…,"expiresIn":7200}`，新令牌写入 Cookie |
 | `POST /api/auth/logout` | Cookie/body | 吊销 refresh token 并清 Cookie，返回 204 |
-| `GET /api/usage` | Bearer/Cookie | **个人用量报表**：仅统计当前用户本人（见 §4.1） |
+| `GET /api/usage` | Bearer/Cookie | **个人用量报表**：仅统计当前用户本人（见 §5.1） |
 
 > 说明：客户端推荐用 OAuth 令牌端点续期（`/oauth/token` 的 `grant_type=refresh_token`，见 OAuth2 接入文档 §4.3）；`/api/auth/refresh` 为同源会话接口，二者签发的令牌同源等价，二选一即可。`/api/auth/login` 仅限管理员账号，员工客户端一律走 OAuth 授权流程。
 
-### 4.1 个人用量 `GET /api/usage`
+### 5.1 个人用量 `GET /api/usage`
 
 参数与聚合口径与管理端用量一致，但 `userId` 参数**强制忽略**（服务端固定按当前令牌用户统计），客户端无法越权查询他人数据。
 
@@ -163,9 +271,9 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 
 - `summary` 不含 `activeUsers`（个人报表无此维度）；
 - `daily` 按查询天数补齐为连续日期（无调用的日期为 0）；
-- 计量口径：LLM 按 token 数、搜索按请求次数，UTC 自然日（与 §5 配额口径一致）。
+- 计量口径：LLM 按 token 数、搜索按请求次数，UTC 自然日（与 §6 配额口径一致）。
 
-### 4.2 能力清单（me 响应中的 capabilities）
+### 5.2 能力清单（me 响应中的 capabilities）
 
 客户端托管模式据此渲染模型下拉、搜索开关等（对应 CR-2.2 / CR-4.3）：
 
@@ -182,9 +290,9 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 
 - `models`：服务端**已启用**的 LLM 模型列表（上游 `model_id`），随上游配置实时变化；
 - `search`：是否存在启用的搜索上游；
-- `knowledge`：知识库服务尚未开放，恒为 `false`（开放后客户端再按 `true` 挂载 `kb_search` 工具，CR-5.1）。
+- `knowledge`：知识库只读中转是否已配置 —— 管理端「系统设置-知识库服务地址」或引导环境变量 `KNOWLEDGE_BASE_BASE_URL` 任一非空即为 `true`（语义与 §4 一致）。置 `true` 后客户端可按 CR-5.1 挂载 `kb_search`；注意当前实际接口为 **GET 透传**（§4.1），调用形态与历史需求中规划的 `POST /api/kb/search {query,topK}` 不同，挂载前需与服务端对齐。
 
-## 5. 配额（429）语义
+## 6. 配额（429）语义
 
 配额在服务端按**上游**配置，客户端不可见具体值：
 
@@ -195,7 +303,7 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 
 按自然日（UTC）重置。客户端收到 429 应原样展示服务端中文错误，不自动重试。
 
-## 6. 客户端接入要点（对照 CR-3 / CR-4）
+## 7. 客户端接入要点（对照 CR-3 / CR-4）
 
 1. **baseUrl 拼接**（CR-3.1）：`write_models_json` 的 provider 段写 `{ baseUrl: "<serverUrl>/api/proxy/llm/v1", apiKey: "$AISHELL_CLOUD_TOKEN" }`，spawn 时注入当前 access_token——与 §2 端点一致（`/api/proxy/llm/v1/chat/completions`）；
 2. **搜索注入**（CR-4.1）：`AISHELL_SEARCH_URL=<serverUrl>/api/proxy/search`，token 同样经 env 注入；
@@ -203,8 +311,9 @@ curl -X POST https://cloud.example.com/api/proxy/search \
 4. **请求前续期**：spawn/发起请求前按 CR-1.6 用 refresh_token 确保 access_token 未过期，避免请求中途 401；
 5. 所有代理接口的 `model`/`q` 参数校验均在服务端完成，客户端无需预检；
 6. **记忆沉淀元数据**：LLM 请求顶层传 `sessionId`（会话标识）与 `projectName`（项目名），服务端据此按会话聚合自动沉淀记忆（8 条/2000 字/闲置 5 分钟触发），并写入卡片标签与元数据便于追溯；**不带 `sessionId` 的请求不触发自动沉淀**。若客户端无法修改 LLM 请求体（pi coding agent 等封装）或希望对话结束立即沉淀，调用 `POST /api/memories/sediment` 上报对话历史（详见《记忆卡片 API 文档》§10）。
+7. **知识库自行编排**（CR-5）：客户端（或 AI 扩展的 `kb_search` 工具）经 §4 接口检索知识库，把命中片段拼入 LLM 请求的 `system` 上下文或直接引用来源。平台**不在服务端注入**知识库，命中结构为上游原生 JSON（见 §4.1）；`POST /api/kb/search`、`/api/kb/list` 为历史需求文档中的规划形态，当前实现以 §4 的 GET 透传为准。
 
-## 7. 快速验证（curl）
+## 8. 快速验证（curl）
 
 ```bash
 BASE=https://cloud.example.com
@@ -226,4 +335,11 @@ curl "$BASE/api/proxy/search?q=hello" -H "Authorization: Bearer $TOKEN"
 
 # 个人用量报表
 curl "$BASE/api/usage?days=14" -H "Authorization: Bearer $TOKEN"
+
+# 知识库语义检索
+curl "$BASE/api/kb/search?q=部署&limit=5" -H "Authorization: Bearer $TOKEN"
+
+# 知识库工作区列表 / FAQ
+curl "$BASE/api/kb/workspaces" -H "Authorization: Bearer $TOKEN"
+curl "$BASE/api/kb/faq?limit=5" -H "Authorization: Bearer $TOKEN"
 ```

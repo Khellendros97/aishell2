@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
+  AiMode, AppState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingContent, StagingDiff, SshExecResult, Theme, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult, BrowserEvent, BrowserState, StagingClearOutcome, StagingProgress,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -266,6 +266,10 @@ export const memorySearch = (query: string, topK?: number, scope?: MemoryScope) 
   call<MemoryHit[]>('memory_search', { query, topK: topK ?? null, scope: scope ?? '' });
 /** 个人卡片提升为共享（POST /api/memories/{id}/promote）；返回新共享卡片 id */
 export const memoryPromote = (id: string) => call<string>('memory_promote', { id });
+/** 知识库语义检索（GET /api/kb/search，开放 API 文档 §4.1）：只读透传，命中带相关度 score
+ *  供前端「自动注入」客户端检索用；AI 工具侧的 kb_search 走 pi 扩展。 */
+export const kbSearch = (query: string, limit?: number, workspaceId?: number | null) =>
+  call<KbHit[]>('kb_search', { query, limit: limit ?? null, workspaceId: workspaceId ?? null });
 /* ---------------- browser（内置浏览器子 webview，Rust browser.rs） ----------------
    面板占位 div 经 ResizeObserver 同步位置尺寸；element 事件携带检查器选中的元素引用。 */
 /** 懒创建子 webview（全局单实例），返回 url/title/inspect 供面板恢复 */
