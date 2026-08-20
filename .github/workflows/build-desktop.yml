@@ -8,6 +8,9 @@
 #   push srun-aishell-cloud 分支 — 质量门 + 三平台可复现构建（不发布任何渠道）
 #   push v* tag                  — 质量门 + 签名构建 + GitHub Release（人工下载）
 #                                  + 云服务更新 draft 上传（管理员在 ReleasePanel 核对后发布频道）
+#   仓库变量 WIN_ONLY_RELEASE='true' 时，workflow_dispatch 与 tag 发布都只跑 Windows：
+#   跳过 macOS、GitHub Release 只挂 win 安装包、不上传云更新 draft（complete 需 3 target）。
+#   发完置回/删除该变量即可恢复全量发布。
 #
 # tag 构建前置（缺失时签名步骤会以明确错误失败）：
 #   Secrets: TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD（updater 签名）
@@ -85,9 +88,13 @@ jobs:
 
   build-macos:
     needs: quality
-    # win-only 仅来自 workflow_dispatch（测试验收）；push/tag 事件下 inputs.win-only
-    # 为空串（falsy），取反后恒真，照常执行。跳过的 job 对下游 needs 视为成功。
-    if: ${{ !inputs.win-only }}
+    # 跳过 macOS 的两种情形：
+    #   1) workflow_dispatch 勾选 win-only（测试验收，省 10 倍费率的 mac 分钟数）
+    #   2) 仓库变量 WIN_ONLY_RELEASE 为 'true' —— 允许 tag 发布也「只发 Win 包」：
+    #      云服务 complete 校验要求 3 个 target 齐全，win-only 只能发 GitHub Release，
+    #      本轮不上传云更新 draft（见 publish-update 门控）。
+    # 变量未设置时恒真照常执行；跳过的 job 对下游 needs 视为成功。
+    if: ${{ !(vars.WIN_ONLY_RELEASE == 'true' || inputs.win-only == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -232,11 +239,13 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # fail 关闭：win-only(tag 设 WIN_ONLY_RELEASE=true)时只有 msi/exe、无 dmg；
+          # 全量发布时 dmg/msi/exe 均存在，关闭无副作用。
           files: |
             dist/**/*.dmg
             dist/**/*.msi
             dist/**/*.exe
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           body: |
             ## 下载
 
@@ -264,7 +273,9 @@ jobs:
   # complete 通过后等待管理员在 ReleasePanel 核对并发布频道。仅 tag 触发。
   publish-update:
     needs: [build-macos, build-windows]
-    if: startsWith(github.ref, 'refs/tags/')
+    # win-only（WIN_ONLY_RELEASE=true）时不上传云更新 draft：云服务 complete 校验要求
+    # 3 个 target（win + darwin×2）齐全，只传 Windows 会被服务端拒绝。
+    if: ${{ startsWith(github.ref, 'refs/tags/') && vars.WIN_ONLY_RELEASE != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
