@@ -14,19 +14,25 @@
 import { useEffect, useRef } from 'react';
 import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
+import { useWorkbench } from '../../../stores/workbench';
 import { mountExplorer, revealLocalPath, startInlineInput, refreshAll } from './explorer/explorer';
 import './explorer.css';
 
 export { revealLocalPath };
 
-/** 面板主体:挂载独立容器(mountExplorer 的 container),卸载清理由 useEffect return 承担 */
+/** 面板主体:挂载独立容器(mountExplorer 的 container),卸载清理由 useEffect return 承担。
+ *  与 AiPanel 同语义的 project 门控:explorer 强依赖 project.path,而 Workbench 异步装载
+ *  项目(先渲染侧栏后 setProject)。若 project 就绪前挂载引擎,首次 render 会读到
+ *  project==null 而误显示「未设置本地路径」;用 hasProject 订阅在该时刻之后才挂载,
+ *  setProject 完成即自动 mount 并正确渲染(切面板重挂亦可覆写)。 */
 function ExplorerPanelBody(): JSX.Element {
   const rootRef = useRef<HTMLDivElement>(null);
+  const hasProject = useWorkbench((s) => s.project != null);
   useEffect(() => {
     const el = rootRef.current;
-    if (!el) return;
+    if (!el || !hasProject) return;
     return mountExplorer(el);
-  }, []);
+  }, [hasProject]);
   /* 容器复刻 .wbs-panel-root 的滚动/flex 语义(legacy 的 container 即 panelRoot,
      render 依赖 container.scrollTop 做滚动位置保持) */
   return (
