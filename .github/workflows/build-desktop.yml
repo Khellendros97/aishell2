@@ -205,17 +205,18 @@ jobs:
           fi
 
       # win-only（WIN_ONLY_RELEASE=true）且版本为预发布（如 0.5.3-a）时，tauri bundler
-      # 对 msi 目标报「pre-release identifier must be numeric-only」。用 --bundles nsis
-      # 直接限定打包器为一等参数（覆盖 bundle.targets 在本 tauri 版本下未拦住 msi，
-      # 实测仍会尝试打包 msi）。NSIS 的 DisplayVersion 接受任意字符串，pre 段不受此限；
-      # 全量发布（变量未设）维持 msi+nsis。
+      # 对 msi 目标报「pre-release identifier must be numeric-only」。且签名/updater 路径
+      # 下 tauri 会无视 --bundles nsis 强制追加 msi 打包器（实测），故需同时关闭
+      # createUpdaterArtifacts 再限定 NSIS——win-only 不上传云 draft、本就不需要 updater
+      # 制品。该组合已本地验证：只产 NSIS setup.exe、不触发 wix/msi。
+      # 全量发布（变量未设）维持 msi+nsis、保留 updater 制品。
       - name: win-only 是否仅 NSIS（msi 拒绝预发布版本）
         shell: bash
         env:
           WO: ${{ vars.WIN_ONLY_RELEASE }}
         run: |
           if [ "$WO" = "true" ]; then
-            echo 'BUNDLE_OVERRIDE=--bundles nsis' >> "$GITHUB_ENV"
+            echo 'BUNDLE_OVERRIDE=--bundles nsis --config {"bundle":{"createUpdaterArtifacts":false}}' >> "$GITHUB_ENV"
           fi
 
       - name: 构建（签名 updater 制品）
