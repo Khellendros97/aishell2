@@ -12,6 +12,11 @@
 #            AISHELL_UPDATE_SERVER_URL / AISHELL_UPDATE_PUBLISH_TOKEN（云服务上传）
 #   三处版本号一致且与 tag 相同（quality 任务 check-versions 强校验）
 #
+# 云服务 OAuth 注入（所有 release 构建都需要，含分支 push 路径）：
+#   Secrets: AISHELL_CLIENT_ID / AISHELL_CLIENT_SECRET —— build.rs 经 option_env! 内嵌
+#   二进制；缺失时 build.rs 直接 panic（0.5.2 曾静默出无云功能的包，装机后才发现）。
+#   AISHELL_SERVER_URL 非敏感，直接明文写在构建任务的 env 里。
+#
 # 平台代码签名（未做，如实告知用户）：
 # - macOS 首次打开报「已损坏」：xattr -dr com.apple.quarantine /Applications/AIShell.app
 # - Windows SmartScreen 拦截：点「更多信息 → 仍要运行」
@@ -89,6 +94,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       AISHELL_SERVER_URL: https://aishell.srun.com:18002
+      AISHELL_CLIENT_ID: ${{ secrets.AISHELL_CLIENT_ID }}
+      AISHELL_CLIENT_SECRET: ${{ secrets.AISHELL_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@v4
 
@@ -150,6 +157,8 @@ jobs:
     runs-on: windows-latest
     env:
       AISHELL_SERVER_URL: https://aishell.srun.com:18002
+      AISHELL_CLIENT_ID: ${{ secrets.AISHELL_CLIENT_ID }}
+      AISHELL_CLIENT_SECRET: ${{ secrets.AISHELL_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@v4
 

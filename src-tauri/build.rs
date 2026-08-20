@@ -6,7 +6,7 @@ fn main() {
     // 取值顺序：
     //   debug 构建（tauri dev）  → dev.env（开发配置优先，避免用户环境中的生产地址污染本地登录）
     //   release 构建（tauri build）→ 环境变量 → release.env
-    // 两者都缺失 → 云功能隐藏。
+    // 两者都缺失 → 云功能隐藏（仅 debug；release 缺失直接 panic，见下方门禁）。
     // client_secret 内嵌二进制是 PKCE 上线前的过渡（服务端暂未实现 PKCE，
     // 见 docs/AIShell云服务-OAuth2接入文档.md §7）；换构建 = 换凭据，客户端无修改入口。
     // 两个 env 文件都声明 rerun-if-changed：改文件后增量构建必须重新注入（坑：不声明则复用旧值）
@@ -33,9 +33,16 @@ fn main() {
         } else {
             from_file.or(from_env)
         };
-        if let Some(v) = val {
-            println!("cargo:rustc-env={var}={v}");
-        }
+        // 0.5.2 的坑：CI 只注入了 SERVER_URL，client 凭据缺失被静默跳过，
+        // 装机后才报「当前构建未配置云服务」。release 包三变量缺一即硬失败，
+        // 把问题拦在构建期（debug 仍允许缺省，本地未配时仅隐藏云功能）。
+        let Some(v) = val else {
+            panic!(
+                "release 构建缺少 {var}：请通过环境变量或 {env_file} 提供 \
+                 （CI 需在仓库 Secrets 配置同名值并传入构建任务）"
+            );
+        };
+        println!("cargo:rustc-env={var}={v}");
     }
     tauri_build::build()
 }
