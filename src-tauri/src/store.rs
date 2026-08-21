@@ -566,6 +566,8 @@ pub struct BrowserRef {
     pub url: String,
     pub title: String,
     /// 元素完整 outerHTML（注入脚本已截 20000 字符）
+    /// 前端/注入脚本全程用 outerHTML，rename + alias 兼容可能已落盘的 outerHtml
+    #[serde(rename = "outerHTML", alias = "outerHtml")]
     pub outer_html: String,
     pub ts: i64,
 }
