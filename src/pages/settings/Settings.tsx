@@ -4,6 +4,8 @@
  * 密码与 apiKey 表单留空提交 null（后端保持原值），显示位不打回明文；
  * 浏览按钮走 @tauri-apps/plugin-dialog（openDialog）；hint 外链经 @tauri-apps/plugin-opener 外部浏览器打开。
  * DOM id/class 与旧版一致，settings.css 直接复用；顶栏由 App.tsx 提供，本组件不渲染 Topbar。
+ * 2026-08 起按用户要求新增左侧分类导航（外观/功能特性/API 接口，SETTINGS_NAV 三页），
+ * 字段状态共享一份 SysFields，三页的保存按钮等价（整表单提交），此布局无 proto 对照。
  * 历史说明：原「服务器配置」面板（服务器卡片/搜索/分组/拖拽/模态/从 Xshell 导入）已随
  * 项目-服务器单维度重构移除；xshell 导入已移至欢迎页按目录自动建项目，服务器在项目语义下管理。
  */
@@ -13,6 +15,7 @@ import type { AppState, LlmConfig, Settings as AppSettings, Theme } from '../../
 import { getMcpStatus, getState, openDialog, saveSettings, setMcpPort, setTheme } from '../../api';
 import { toast } from '../../ui';
 import { Icon } from '../../shared/Icon';
+import type { IconName } from '../../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../../theme';
 import '../settings.css';
@@ -46,6 +49,15 @@ interface McpStatusLine {
   cls: string;
 }
 
+/** 左侧导航分类：功能特性 / 外观 / API 接口（MCP 是 AIShell 作为服务端供外部工具接入，归功能特性） */
+type SettingsPage = 'features' | 'appearance' | 'api';
+
+const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
+  { id: 'features', label: '功能特性', icon: 'zap' },
+  { id: 'appearance', label: '外观', icon: 'monitor' },
+  { id: 'api', label: 'API 接口', icon: 'plug' },
+];
+
 export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   /* 后端状态快照（get_state / aishell:data-changed 刷新）；表单字段独立于它：
      刷新只更新快照不覆盖用户正在编辑的输入（同旧版 onDataChanged 语义） */
@@ -54,6 +66,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const mcpPortRef = useRef<HTMLInputElement>(null);
 
   const [fields, setFields] = useState<SysFields>(EMPTY_FIELDS);
+  const [page, setPage] = useState<SettingsPage>('features');
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [braveKeyVisible, setBraveKeyVisible] = useState(false);
   const [mcpStatus, setMcpStatus] = useState<McpStatusLine>({ text: '加载中…', cls: 'mcp-status-line' });
@@ -150,6 +163,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     const workspaceDir = fields.workspace.trim();
     if (!workspaceDir) {
       toast('请填写 Workspace 目录', 'error');
+      setPage('features');
       workspaceRef.current?.focus();
       return;
     }
@@ -158,6 +172,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     const mcpPort = Number(fields.mcpPort);
     if (!Number.isInteger(mcpPort) || mcpPort < 1024 || mcpPort > 65535) {
       toast('MCP 端口必须在 1024–65535 之间', 'error');
+      setPage('features');
       mcpPortRef.current?.focus();
       return;
     }
@@ -193,9 +208,21 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
         <Icon name="alert" /> 缺少必要配置，请先完成系统设置
       </div>
       <div id="settings-layout">
+        <nav id="settings-nav">
+          {SETTINGS_NAV.map((item) => (
+            <button
+              key={item.id}
+              className={`settings-nav-item${page === item.id ? ' active' : ''}`}
+              onClick={() => setPage(item.id)}
+            >
+              <Icon name={item.icon} /> {item.label}
+            </button>
+          ))}
+        </nav>
         <main id="settings-content">
-          <section id="panel-system" className="settings-panel">
-            <div className="panel-head"><div className="panel-title">系统设置</div></div>
+          {page === 'appearance' && (
+          <section id="panel-appearance" className="settings-panel">
+            <div className="panel-head"><div className="panel-title">外观</div></div>
             <div className="field">
               <label>界面主题</label>
               <select id="f-theme" className="select" value={fields.theme} onChange={onThemeSelect}>
@@ -204,6 +231,14 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
               </select>
               <div className="hint">选择后立即生效；顶栏 ☀/☾ 按钮亦可快捷切换</div>
             </div>
+            <div className="form-actions">
+              <button id="btn-save-system" className="btn primary" onClick={() => void save()}>保存</button>
+            </div>
+          </section>
+          )}
+          {page === 'features' && (
+          <section id="panel-features" className="settings-panel">
+            <div className="panel-head"><div className="panel-title">功能特性</div></div>
             <div className="field">
               <label>Workspace 目录<span className="req">*</span></label>
               <div className="input-row">
@@ -219,6 +254,78 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
               </div>
               <div className="hint">项目默认创建目录</div>
             </div>
+            <fieldset className="llm-group">
+              <legend>AI 工作区域</legend>
+              <div className="field">
+                <label>自动切换 AI 工作区域</label>
+                <input
+                  id="f-ai-workdir"
+                  type="checkbox"
+                  checked={fields.aiWorkdir}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, aiWorkdir: checked })); }}
+                />
+                <div className="hint">开启后 AI 输入框显示固定工作区域标签（默认本地）：打开或切换到 SSH/本地终端时自动跟随；发送消息时把当前工作区域作为上下文提供给 AI 助手</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>AI 审批</legend>
+              <div className="field">
+                <label>审批模式</label>
+                <select
+                  id="f-approval-mode"
+                  className="select"
+                  value={fields.approvalMode}
+                  onChange={(e) => { const v = e.currentTarget.value as AppSettings['approvalMode']; setFields((f) => ({ ...f, approvalMode: v })); }}
+                >
+                  <option value="smart">智能审批</option>
+                  <option value="all">全部审批</option>
+                </select>
+                <div className="hint">智能审批：AI 操作先由大模型判定，非危险操作（常规读写、查询、构建等）自动放行并展示「已智能放行」；删除、服务启停、格式化等危险操作仍需人工确认。全部审批：每次操作都需人工确认</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>远程文件备份</legend>
+              <div className="field">
+                <label>自动备份远程文件</label>
+                <input
+                  id="f-auto-backup"
+                  type="checkbox"
+                  checked={fields.autoBackup}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, autoBackup: checked })); }}
+                />
+                <div className="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>MCP 服务（外部 agent 工具接入）</legend>
+              <div className="field">
+                <label>监听端口</label>
+                <input
+                  id="f-mcp-port"
+                  ref={mcpPortRef}
+                  className="input mono"
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  placeholder="8945"
+                  value={fields.mcpPort}
+                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, mcpPort: v })); }}
+                />
+                <div className="hint">仅监听本机回环 127.0.0.1，不对外网开放。每台服务器可在「服务器卡片 → 更多 → MCP」中单独启用并配置功能开关；启用后外部工具经 http://127.0.0.1:端口/mcp 接入（Bearer 令牌在服务器 MCP 设置中查看）</div>
+              </div>
+              <div className="field">
+                <label>服务状态</label>
+                <div id="mcp-status-line" className={mcpStatus.cls}>{mcpStatus.text}</div>
+              </div>
+            </fieldset>
+            <div className="form-actions">
+              <button className="btn primary" onClick={() => void save()}>保存</button>
+            </div>
+          </section>
+          )}
+          {page === 'api' && (
+          <section id="panel-api" className="settings-panel">
+            <div className="panel-head"><div className="panel-title">API 接口</div></div>
             <fieldset className="llm-group">
               <legend>大模型配置</legend>
               <div className="field">
@@ -316,74 +423,11 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 </div>
               </div>
             </fieldset>
-            <fieldset className="llm-group">
-              <legend>AI 工作区域</legend>
-              <div className="field">
-                <label>自动切换 AI 工作区域</label>
-                <input
-                  id="f-ai-workdir"
-                  type="checkbox"
-                  checked={fields.aiWorkdir}
-                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, aiWorkdir: checked })); }}
-                />
-                <div className="hint">开启后 AI 输入框显示固定工作区域标签（默认本地）：打开或切换到 SSH/本地终端时自动跟随；发送消息时把当前工作区域作为上下文提供给 AI 助手</div>
-              </div>
-            </fieldset>
-            <fieldset className="llm-group">
-              <legend>AI 审批</legend>
-              <div className="field">
-                <label>审批模式</label>
-                <select
-                  id="f-approval-mode"
-                  className="select"
-                  value={fields.approvalMode}
-                  onChange={(e) => { const v = e.currentTarget.value as AppSettings['approvalMode']; setFields((f) => ({ ...f, approvalMode: v })); }}
-                >
-                  <option value="smart">智能审批</option>
-                  <option value="all">全部审批</option>
-                </select>
-                <div className="hint">智能审批：AI 操作先由大模型判定，非危险操作（常规读写、查询、构建等）自动放行并展示「已智能放行」；删除、服务启停、格式化等危险操作仍需人工确认。全部审批：每次操作都需人工确认</div>
-              </div>
-            </fieldset>
-            <fieldset className="llm-group">
-              <legend>远程文件备份</legend>
-              <div className="field">
-                <label>自动备份远程文件</label>
-                <input
-                  id="f-auto-backup"
-                  type="checkbox"
-                  checked={fields.autoBackup}
-                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, autoBackup: checked })); }}
-                />
-                <div className="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
-              </div>
-            </fieldset>
-            <fieldset className="llm-group">
-              <legend>MCP 服务（外部 agent 工具接入）</legend>
-              <div className="field">
-                <label>监听端口</label>
-                <input
-                  id="f-mcp-port"
-                  ref={mcpPortRef}
-                  className="input mono"
-                  type="number"
-                  min={1024}
-                  max={65535}
-                  placeholder="8945"
-                  value={fields.mcpPort}
-                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, mcpPort: v })); }}
-                />
-                <div className="hint">仅监听本机回环 127.0.0.1，不对外网开放。每台服务器可在「服务器卡片 → 更多 → MCP」中单独启用并配置功能开关；启用后外部工具经 http://127.0.0.1:端口/mcp 接入（Bearer 令牌在服务器 MCP 设置中查看）</div>
-              </div>
-              <div className="field">
-                <label>服务状态</label>
-                <div id="mcp-status-line" className={mcpStatus.cls}>{mcpStatus.text}</div>
-              </div>
-            </fieldset>
             <div className="form-actions">
-              <button id="btn-save-system" className="btn primary" onClick={() => void save()}>保存</button>
+              <button className="btn primary" onClick={() => void save()}>保存</button>
             </div>
           </section>
+          )}
         </main>
       </div>
     </div>
