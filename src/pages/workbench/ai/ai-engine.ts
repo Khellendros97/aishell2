@@ -360,6 +360,19 @@ interface ActionCard {
   result?: string;
   /** 动作开始时已生成文本长度(text 内时序锚点,渲染时把卡片穿插到该位置) */
   textLen?: number;
+  /** 创建序号（同 textLen 锚点的工具行/动作卡按到达先后排序；瞬时字段，不落盘） */
+  seq?: number;
+}
+
+/** 非受控工具活动行（瞬时展示，不落盘）：textLen 为发生时已生成文本长度，渲染时按时序穿插 */
+interface ToolLine {
+  label: string;
+  /** 相邻同行折叠计数（显示为 ×N） */
+  count: number;
+  /** 发生时 p.text 长度（穿插锚点） */
+  textLen: number;
+  /** 到达序号（同锚点排序用） */
+  seq: number;
 }
 
 /** 生成中/错误气泡的瞬时状态（不进 ChatSession.messages，不落盘）；tools 为工具活动行（同上） */
@@ -367,7 +380,7 @@ interface Pending {
   phase: 'typing' | 'stream' | 'error';
   text: string;
   error?: string;
-  tools: string[];
+  tools: ToolLine[];
   /** 受控工具动作卡（本轮可观察审计，finalize 时随消息持久化） */
   actions: Map<string, ActionCard>;
 }
@@ -545,6 +558,8 @@ const segCache = new Map<number, { text: string; nodes: HTMLElement[] }>();
 let fixedParts: Array<{ kind: string; lang: string; body: string; nodes: HTMLElement[] }> = [];
 /** 动作卡 DOM 缓存（toolCallId -> 元素）：delta 帧渲染间卡状态不变；低频事件重建气泡时作废 */
 const cardEls = new Map<string, HTMLElement>();
+/** 工具行/动作卡创建序号：同 textLen 锚点的条目按到达先后排序（模块级单调递增即可，排序都在单个 pending 内） */
+let toolSeq = 0;
 
 let chat: HTMLElement;
 let sessionSelect: HTMLButtonElement;
@@ -1075,18 +1090,16 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     p.text += ev.text;
     pendingBy.set(sid, p);
   } else if (ev.type === 'tool') {
-    /* 工具活动行：瞬时展示，不进历史；相邻重复行折叠为 ×N */
+    /* 工具活动行：瞬时展示，不进历史；锚定到发生时已生成文本位置（时序穿插），
+       相邻重复行折叠为 ×N（锚点保留首次发生位置） */
     const cur = pendingBy.get(sid) ?? null;
     const p = cur ?? emptyPending();
     const label = ev.label ? `${ev.tool} ${ev.label}` : ev.tool;
     const last = p.tools[p.tools.length - 1];
-    const m = last?.match(/^(.*) ×(\d+)$/);
-    if (last === label) {
-      p.tools[p.tools.length - 1] = `${label} ×2`;
-    } else if (m && m[1] === label) {
-      p.tools[p.tools.length - 1] = `${label} ×${Number(m[2]) + 1}`;
+    if (last && last.label === label) {
+      last.count += 1;
     } else {
-      p.tools.push(label);
+      p.tools.push({ label, count: 1, textLen: p.text.length, seq: ++toolSeq });
     }
     pendingBy.set(sid, p);
   } else if (ev.type === 'actionStart') {
@@ -1109,6 +1122,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
       impact: existing?.impact,
       status: project?.aiMode === 'agent' ? 'approving' : 'running',
       textLen: existing?.textLen ?? p.text.length,
+      seq: existing?.seq ?? ++toolSeq,
     });
     pendingBy.set(sid, p);
   } else if (ev.type === 'approval') {
@@ -1131,6 +1145,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
         requestId: ev.requestId,
         status: 'approving',
         textLen: existing?.textLen ?? p.text.length,
+        seq: existing?.seq ?? ++toolSeq,
       });
       pendingBy.set(sid, p);
     } else if (ev.smart) {
@@ -1149,6 +1164,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
         status: 'smart',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
+        seq: existing?.seq ?? ++toolSeq,
       });
       pendingBy.set(sid, p);
     } else {
@@ -1168,6 +1184,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
         status: existing?.status === 'running' ? 'running' : 'approving',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
+        seq: existing?.seq ?? ++toolSeq,
       });
       pendingBy.set(sid, p);
     }
@@ -1481,12 +1498,6 @@ function renderPendingBubble(): void {
   wrap.className = 'ai-msg ai';
   const bubble = document.createElement('div');
   bubble.className = 'ai-bubble';
-  for (const t of p.tools) {
-    const line = document.createElement('div');
-    line.className = 'ai-tool-line';
-    line.innerHTML = `${icon('wrench')}${escapeHtml(t)}`;
-    bubble.appendChild(line);
-  }
   const textEl = document.createElement('div');
   textEl.className = 'ai-text';
   appendStreamBody(textEl, p);
@@ -1495,26 +1506,48 @@ function renderPendingBubble(): void {
   replacePending(wrap);
 }
 
-/** 流式体增量组装（语义与 interleaveActions 字符串版逐条对齐）：锚点卡按 textLen 升序
- *  穿插文本段，无锚点卡排文本末尾；全部卡无锚点时整组前置（与原 renderPending 一致）。
+/** 工具行/动作卡统一为时序条目：按 textLen 锚点穿插进文本，同锚点按到达序号排序 */
+interface StreamItem {
+  el?: HTMLElement;
+  html?: string;
+  textLen?: number;
+  seq?: number;
+}
+
+/** 流式体增量组装（语义与 interleaveActions 字符串版逐条对齐）：锚点条目（动作卡 +
+ *  工具行）按 textLen 升序、同锚点按 seq 穿插文本段，无锚点条目排文本末尾；全部条目
+ *  无锚点时整组前置（与原 renderPending 一致，typing 相位尚无文本时即此形态）。
  *  文本段经 appendSegNodes 复用缓存节点，卡片经 reuseCard 复用 DOM（append 移动）。 */
 function appendStreamBody(container: HTMLElement, p: Pending): void {
-  const cards = [...p.actions.values()];
-  const anchored = cards.some((c) => c.textLen != null);
+  const items: StreamItem[] = [
+    ...p.tools.map((t) => ({ el: toolLineEl(t), textLen: t.textLen, seq: t.seq })),
+    ...[...p.actions.values()].map((c) => ({ el: reuseCard(c), textLen: c.textLen, seq: c.seq })),
+  ];
+  const anchored = items.some((i) => i.textLen != null);
   if (!anchored) {
-    cards.forEach((c) => container.appendChild(reuseCard(c)));
+    items.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    items.forEach((i) => container.appendChild(i.el!));
     if (p.text) appendSegNodes(container, p.text, 0);
     return;
   }
-  const sorted = cards.slice().sort((a, b) => (a.textLen ?? Infinity) - (b.textLen ?? Infinity));
+  const sorted = items.slice().sort((a, b) =>
+    (a.textLen ?? Infinity) - (b.textLen ?? Infinity) || (a.seq ?? 0) - (b.seq ?? 0));
   let last = 0;
-  for (const c of sorted) {
-    const at = Math.min(c.textLen ?? p.text.length, p.text.length);
+  for (const i of sorted) {
+    const at = Math.min(i.textLen ?? p.text.length, p.text.length);
     if (at > last) appendSegNodes(container, p.text.slice(last, at), last);
-    container.appendChild(reuseCard(c));
+    container.appendChild(i.el!);
     last = at;
   }
   if (last < p.text.length) appendSegNodes(container, p.text.slice(last), last);
+}
+
+/** 工具行元素（每帧重建：数量少、无内部状态；相邻重复折叠为 ×N 后缀） */
+function toolLineEl(t: ToolLine): HTMLElement {
+  const line = document.createElement('div');
+  line.className = 'ai-tool-line';
+  line.innerHTML = `${icon('wrench')}${escapeHtml(t.label)}${t.count > 1 ? ` ×${t.count}` : ''}`;
+  return line;
 }
 
 /** 动作卡 DOM 复用：delta 帧渲染间卡状态不变，直接移动已有节点（低频事件重建
@@ -1764,36 +1797,46 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
 function renderPending(p: Pending): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'ai-msg ai';
-  const toolLines = p.tools.map((t) => `<div class="ai-tool-line">${icon('wrench')}${escapeHtml(t)}</div>`).join('');
-  const actionCards = [...p.actions.values()].map((a) => renderActionCard(a)).join('');
+  const toolLineHtml = (t: ToolLine): string =>
+    `<div class="ai-tool-line">${icon('wrench')}${escapeHtml(t.label)}${t.count > 1 ? ` ×${t.count}` : ''}</div>`;
+  /* 工具行与动作卡合并为时序条目（同锚点/无文本时按到达序号排序） */
+  const items: StreamItem[] = [
+    ...p.tools.map((t) => ({ html: toolLineHtml(t), textLen: t.textLen, seq: t.seq })),
+    ...[...p.actions.values()].map((a) => ({ html: renderActionCard(a), textLen: a.textLen, seq: a.seq })),
+  ];
   if (p.phase === 'typing' || (p.phase === 'stream' && !p.text)) {
+    const headItems = items.slice().sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+      .map((i) => i.html).join('');
     wrap.innerHTML =
-      `<div class="ai-bubble">${toolLines}${actionCards}` +
+      `<div class="ai-bubble">${headItems}` +
       '<span class="ai-typing"><span class="ai-typing-label">正在输入</span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span></span></div>';
   } else if (p.phase === 'error') {
     wrap.innerHTML = `<div class="ai-bubble error"><div class="ai-text">${escapeHtml(p.error ?? '')}</div></div>`;
   } else {
-    /* 流式:动作卡按 textLen 锚点穿插进已生成文本(与历史时序排版同规则) */
-    const cards = [...p.actions.values()].map((a) => ({ html: renderActionCard(a), textLen: a.textLen }));
-    const body = cards.some((c) => c.textLen != null)
-      ? interleaveActions(p.text, cards)
-      : `${actionCards}${renderAI(p.text)}`;
-    wrap.innerHTML = `<div class="ai-bubble">${toolLines}<div class="ai-text">${body}</div></div>`;
+    /* 流式:工具行/动作卡按 textLen 锚点穿插进已生成文本(与历史时序排版同规则);
+       全部无锚点时整组前置(尚无文本即发生工具调用的形态) */
+    const anchored = items.some((i) => i.textLen != null);
+    const body = anchored
+      ? interleaveActions(p.text, items)
+      : `${items.map((i) => i.html).join('')}${renderAI(p.text)}`;
+    wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${body}</div></div>`;
   }
   return wrap;
 }
 
-/** 把动作卡按 textLen 锚点穿插进文本:时间顺序排版(文本段 → 动作卡 → 文本段);
- *  无锚点的卡按序排在文本末尾(兼容旧记录)。锚点是 content 的字符偏移,
- *  text 只增不减故偏移稳定;锚点恰好落在 ``` 围栏中间的概率极低(工具边界即文本分段点)。 */
-function interleaveActions(text: string, cards: Array<{ html: string; textLen?: number }>): string {
-  const sorted = [...cards].sort((a, b) => (a.textLen ?? Infinity) - (b.textLen ?? Infinity));
+/** 把工具行/动作卡按 textLen 锚点穿插进文本:时间顺序排版(文本段 → 条目 → 文本段),
+ *  同锚点条目按 seq(到达序号)排序;无锚点的条目按序排在文本末尾(兼容旧记录)。锚点是
+ *  content 的字符偏移,text 只增不减故偏移稳定;锚点恰好落在 ``` 围栏中间的概率极低
+ *  (工具边界即文本分段点)。 */
+function interleaveActions(text: string, cards: StreamItem[]): string {
+  const sorted = [...cards].sort((a, b) =>
+    (a.textLen ?? Infinity) - (b.textLen ?? Infinity) || (a.seq ?? 0) - (b.seq ?? 0));
   let out = '';
   let last = 0;
   for (const c of sorted) {
     const at = Math.min(c.textLen ?? text.length, text.length);
     if (at > last) out += renderAI(text.slice(last, at));
-    out += c.html;
+    out += c.html ?? '';
     last = at;
   }
   if (last < text.length) out += renderAI(text.slice(last));
