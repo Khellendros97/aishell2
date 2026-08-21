@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similar::{Algorithm, ChangeTag, TextDiff};
 use tauri::State;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
@@ -767,45 +768,23 @@ impl RemoteStaging {
             (Some(s), Some(c)) => {
                 let a: Vec<String> = s.lines().map(str::to_string).collect();
                 let b: Vec<String> = c.lines().map(str::to_string).collect();
-                match diff_lines(&a, &b) {
-                    Some((left, right)) => {
-                        let known = self.store.known_secrets();
-                        let redact = |v: &mut Vec<DiffLine>| {
-                            for l in v.iter_mut() {
-                                let (masked, _) = crate::redact::redact_secrets(&l.text, &known);
-                                l.text = masked;
-                            }
-                        };
-                        let (mut left, mut right) = (left, right);
-                        redact(&mut left);
-                        redact(&mut right);
-                        Ok(StagingDiff {
-                            left,
-                            right,
-                            meta: None,
-                            snapshot_absent,
-                            current_absent,
-                        })
+                let (mut left, mut right) = diff_lines(&a, &b);
+                let known = self.store.known_secrets();
+                let redact = |lines: &mut Vec<DiffLine>| {
+                    for line in lines.iter_mut() {
+                        let (masked, _) = crate::redact::redact_secrets(&line.text, &known);
+                        line.text = masked;
                     }
-                    None => Ok(StagingDiff {
-                        left: Vec::new(),
-                        right: Vec::new(),
-                        meta: Some(DiffMeta {
-                            snapshot: StagingMeta {
-                                sha256: entry.sha256.clone(),
-                                size: entry.size,
-                                mtime: entry.mtime,
-                            },
-                            current: StagingMeta {
-                                sha256: current.meta.as_ref().and_then(|m| m.sha256.clone()),
-                                size: current.meta.as_ref().and_then(|m| m.size),
-                                mtime: current.meta.as_ref().and_then(|m| m.mtime),
-                            },
-                        }),
-                        snapshot_absent,
-                        current_absent,
-                    }),
-                }
+                };
+                redact(&mut left);
+                redact(&mut right);
+                Ok(StagingDiff {
+                    left,
+                    right,
+                    meta: None,
+                    snapshot_absent,
+                    current_absent,
+                })
             }
             _ => {
                 // 快照侧 meta 从条目取（快照不常驻内存，meta 只含 hash/size/mtime，无原文）
@@ -1086,86 +1065,26 @@ async fn restore_conflict(
     }
 }
 
-/// 行级 diff：公共前后缀裁剪 + 中段 LCS（上限 2000 行/侧，超出返回 None → 元数据对比）。
+/// 行级 diff：Patience 算法适合以稳定上下文行为锚点的代码文件，且不按行数降级为元数据。
 /// 返回 (左侧行, 右侧行)：left 的 kind ∈ {del, ctx}，right 的 kind ∈ {add, ctx}。
-fn diff_lines(a: &[String], b: &[String]) -> Option<(Vec<DiffLine>, Vec<DiffLine>)> {
-    const LINE_CAP: usize = 2000;
-    if a.len() > LINE_CAP || b.len() > LINE_CAP {
-        return None;
-    }
-    // 公共前缀/后缀裁剪
-    let mut pre = 0;
-    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
-        pre += 1;
-    }
-    let mut suf = 0;
-    while suf < a.len() - pre && suf < b.len() - pre && a[a.len() - 1 - suf] == b[b.len() - 1 - suf] {
-        suf += 1;
-    }
-    let mid_a = &a[pre..a.len() - suf];
-    let mid_b = &b[pre..b.len() - suf];
-    let (mid_left, mid_right) = lcs_diff(mid_a, mid_b);
-    let mut left: Vec<DiffLine> = Vec::with_capacity(pre + mid_left.len() + suf);
-    let mut right: Vec<DiffLine> = Vec::with_capacity(pre + mid_right.len() + suf);
-    for line in a.iter().take(pre) {
-        left.push(DiffLine { kind: "ctx".into(), text: line.clone() });
-        right.push(DiffLine { kind: "ctx".into(), text: line.clone() });
-    }
-    left.extend(mid_left);
-    right.extend(mid_right);
-    for line in a.iter().rev().take(suf).rev() {
-        left.push(DiffLine { kind: "ctx".into(), text: line.clone() });
-        right.push(DiffLine { kind: "ctx".into(), text: line.clone() });
-    }
-    Some((left, right))
-}
-
-/// LCS 行 diff（DP，行数 ≤ 2000 保证内存有界；返回对齐后的左右行）。
-fn lcs_diff(a: &[String], b: &[String]) -> (Vec<DiffLine>, Vec<DiffLine>) {
-    let (n, m) = (a.len(), b.len());
-    if n == 0 {
-        let right = b.iter().map(|t| DiffLine { kind: "add".into(), text: t.clone() }).collect();
-        return (Vec::new(), right);
-    }
-    if m == 0 {
-        let left = a.iter().map(|t| DiffLine { kind: "del".into(), text: t.clone() }).collect();
-        return (left, Vec::new());
-    }
-    // dp[i][j] = LCS(a[i..], b[j..])，倒推
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
+fn diff_lines(a: &[String], b: &[String]) -> (Vec<DiffLine>, Vec<DiffLine>) {
+    let old = a.join("\n");
+    let new = b.join("\n");
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .diff_lines(&old, &new);
     let mut left = Vec::new();
     let mut right = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < n && j < m {
-        if a[i] == b[j] {
-            left.push(DiffLine { kind: "ctx".into(), text: a[i].clone() });
-            right.push(DiffLine { kind: "ctx".into(), text: b[j].clone() });
-            i += 1;
-            j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
-            left.push(DiffLine { kind: "del".into(), text: a[i].clone() });
-            i += 1;
-        } else {
-            right.push(DiffLine { kind: "add".into(), text: b[j].clone() });
-            j += 1;
+    for change in diff.iter_all_changes() {
+        let text = change.value().strip_suffix('\n').unwrap_or(change.value()).to_string();
+        match change.tag() {
+            ChangeTag::Equal => {
+                left.push(DiffLine { kind: "ctx".into(), text: text.clone() });
+                right.push(DiffLine { kind: "ctx".into(), text });
+            }
+            ChangeTag::Delete => left.push(DiffLine { kind: "del".into(), text }),
+            ChangeTag::Insert => right.push(DiffLine { kind: "add".into(), text }),
         }
-    }
-    while i < n {
-        left.push(DiffLine { kind: "del".into(), text: a[i].clone() });
-        i += 1;
-    }
-    while j < m {
-        right.push(DiffLine { kind: "add".into(), text: b[j].clone() });
-        j += 1;
     }
     (left, right)
 }
@@ -1447,10 +1366,10 @@ mod tests {
     }
 
     #[test]
-    fn diff_lines_prefix_suffix_and_lcs() {
+    fn diff_lines_handles_small_and_large_files() {
         let a = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
         let b = vec!["a".to_string(), "x".to_string(), "c".to_string(), "d".to_string()];
-        let (left, right) = diff_lines(&a, &b).unwrap();
+        let (left, right) = diff_lines(&a, &b);
         // a: ctx a, del b, ctx c, ctx d
         assert_eq!(left[0].kind, "ctx");
         assert_eq!(left[1].kind, "del");
@@ -1458,20 +1377,28 @@ mod tests {
         assert_eq!(right[1].kind, "add");
         assert_eq!(right[1].text, "x");
         // 全删
-        let (left, right) = diff_lines(&["a".to_string()], &[]).unwrap();
+        let (left, right) = diff_lines(&["a".to_string()], &[]);
         assert_eq!(left[0].kind, "del");
         assert!(right.is_empty());
         // 全增
-        let (left, right) = diff_lines(&[], &["a".to_string()]).unwrap();
+        let (left, right) = diff_lines(&[], &["a".to_string()]);
         assert!(left.is_empty());
         assert_eq!(right[0].kind, "add");
         // 相同
-        let (left, right) = diff_lines(&["a".to_string()], &["a".to_string()]).unwrap();
+        let (left, right) = diff_lines(&["a".to_string()], &["a".to_string()]);
         assert_eq!(left.len(), 1);
         assert_eq!(right.len(), 1);
-        // 超大 → None（元数据对比）
-        let big: Vec<String> = (0..2500).map(|i| format!("line{i}")).collect();
-        assert!(diff_lines(&big, &big).is_none());
+
+        // 多千行代码文件仍返回文本 diff，不再降级为元数据。
+        let large_a: Vec<String> = (0..8_000).map(|i| format!("fn line_{i}() {{}}")).collect();
+        let mut large_b = large_a.clone();
+        large_b[3_000] = "fn line_3000() { changed(); }".to_string();
+        large_b.insert(6_000, "fn inserted() {}".to_string());
+        let (left, right) = diff_lines(&large_a, &large_b);
+        assert_eq!(left.iter().filter(|line| line.kind == "del").count(), 1);
+        assert_eq!(right.iter().filter(|line| line.kind == "add").count(), 2);
+        assert_eq!(left.iter().filter(|line| line.kind == "ctx").count(), 7_999);
+        assert_eq!(right.iter().filter(|line| line.kind == "ctx").count(), 7_999);
     }
 
     #[test]
