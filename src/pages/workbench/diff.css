@@ -21,6 +21,11 @@
   gap: 6px;
 }
 .sd-title svg { flex: none; }
+.sd-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 .sd-meta {
   flex: none;
   display: flex;
@@ -43,9 +48,11 @@
 .sd-badge-del { color: var(--red); border-color: var(--red); }
 .sd-body {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 10px 12px;
 }
+.sd-body.text-diff { overflow: hidden; }
 .sd-loading { color: var(--text-2); font-size: 12px; padding: 20px 4px; }
 .sd-loading.error { color: var(--red); white-space: pre-wrap; }
 .sd-binary-note {
@@ -77,9 +84,10 @@
 .sd-meta-row code { color: var(--text-0); }
 .sd-sides {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px;
   height: 100%;
+  min-height: 0;
 }
 .sd-side {
   display: flex;
@@ -103,9 +111,38 @@
   background: var(--bg-3);
 }
 .sd-side-head svg { width: 12px; height: 12px; flex: none; }
-.sd-side-editor { flex: 1; overflow: auto; min-height: 0; }
+.sd-side-editor { flex: 1; overflow: hidden; min-height: 0; }
 .sd-side-editor .cm-editor { height: 100%; }
-.sd-side-editor .cm-scroller { font-family: var(--font-mono); font-size: 12px; }
-/* diff 行高亮：删除（左）/ 新增（右） */
+.sd-side-editor .cm-scroller {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow: auto;
+}
+/* diff 行高亮：删除（左）/ 新增（右）/ 对齐占位（较短一侧） */
 .sd-side-editor .cm-line.sd-line-del { background: rgba(220, 60, 60, 0.16); }
 .sd-side-editor .cm-line.sd-line-add { background: rgba(60, 180, 100, 0.16); }
+.sd-side-editor .cm-line.sd-line-gap {
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 4px,
+    rgba(127, 127, 127, 0.06) 4px,
+    rgba(127, 127, 127, 0.06) 8px
+  );
+}
+.sd-fold-button {
+  display: block;
+  width: 100%;
+  min-height: 100%;
+  border: 0;
+  padding: 0 8px;
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-3));
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+}
+.sd-fold-button:hover {
+  color: var(--text-0);
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-3));
+}

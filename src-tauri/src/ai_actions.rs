@@ -24,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::ai_impact::{analyze_remote_command, Effect, ImpactPlan};
 use crate::ssh::SshManager;
-use crate::staging::{RemoteStaging, StagedState};
+use crate::staging::{DiffLine, RemoteStaging, StagedState};
 use crate::store::{DbKind, Store};
 
 const DEFAULT_RUN_COMMAND_TIMEOUT_SECS: u64 = 10;
@@ -876,21 +876,23 @@ impl AiActions {
                 fmt(&c.sha256, &c.size, &c.mtime)
             ));
         }
-        let mut lines = Vec::new();
+        let mut notes = Vec::new();
         if d.snapshot_absent {
-            lines.push("（原始状态：文件不存在——首次修改前为空）".to_string());
+            notes.push("原始状态：文件不存在——首次修改前为空");
         }
         if d.current_absent {
-            lines.push("（当前：远端文件已不存在）".to_string());
+            notes.push("当前状态：远端文件已不存在");
         }
-        for l in &d.left {
-            lines.push(format!("{} {}", if l.kind == "del" { "-" } else { " " }, l.text));
+        let mut output = format!("暂存条目 {entry_id} unified diff（仅差异块，每块保留前后 3 行上下文）");
+        if !notes.is_empty() {
+            output.push_str("\n（");
+            output.push_str(&notes.join("；"));
+            output.push('）');
         }
-        lines.push("─".repeat(40));
-        for l in &d.right {
-            lines.push(format!("{} {}", if l.kind == "add" { "+" } else { " " }, l.text));
-        }
-        Ok(format!("暂存条目 {entry_id} diff（上：首次快照；下：当前）：\n{}", lines.join("\n")))
+        output.push('\n');
+        let remaining = AI_RESULT_CAP.saturating_sub(output.chars().count());
+        output.push_str(&render_staging_hunks(&d.left, &d.right, remaining));
+        Ok(output)
     }
 
     /// AI 还原某条目（force 恒 false：外部修改冲突如实报告，不静默覆盖）。
@@ -1221,6 +1223,176 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+const STAGING_DIFF_CONTEXT: usize = 3;
+const STAGING_TRUNCATION_HINT: &str = "…（输出已截断；可用 read/grep 查看对应路径附近内容）";
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+struct StagingHunkLine<'a> {
+    tag: char,
+    text: &'a str,
+    old_before: usize,
+    new_before: usize,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+}
+
+fn aligned_staging_lines<'a>(left: &'a [DiffLine], right: &'a [DiffLine]) -> Vec<StagingHunkLine<'a>> {
+    let mut lines = Vec::with_capacity(left.len() + right.len());
+    let (mut left_index, mut right_index) = (0usize, 0usize);
+    let (mut old_line, mut new_line) = (1usize, 1usize);
+    while left_index < left.len() || right_index < right.len() {
+        if left.get(left_index).is_some_and(|line| line.kind == "ctx")
+            && right.get(right_index).is_some_and(|line| line.kind == "ctx")
+        {
+            lines.push(StagingHunkLine {
+                tag: ' ',
+                text: &left[left_index].text,
+                old_before: old_line - 1,
+                new_before: new_line - 1,
+                old_line: Some(old_line),
+                new_line: Some(new_line),
+            });
+            left_index += 1;
+            right_index += 1;
+            old_line += 1;
+            new_line += 1;
+            continue;
+        }
+        while left_index < left.len() && left[left_index].kind != "ctx" {
+            lines.push(StagingHunkLine {
+                tag: '-',
+                text: &left[left_index].text,
+                old_before: old_line - 1,
+                new_before: new_line - 1,
+                old_line: Some(old_line),
+                new_line: None,
+            });
+            left_index += 1;
+            old_line += 1;
+        }
+        while right_index < right.len() && right[right_index].kind != "ctx" {
+            lines.push(StagingHunkLine {
+                tag: '+',
+                text: &right[right_index].text,
+                old_before: old_line - 1,
+                new_before: new_line - 1,
+                old_line: None,
+                new_line: Some(new_line),
+            });
+            right_index += 1;
+            new_line += 1;
+        }
+    }
+    lines
+}
+
+fn staging_hunk_ranges(lines: &[StagingHunkLine<'_>]) -> Vec<std::ops::Range<usize>> {
+    let changes: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.tag != ' ').then_some(index))
+        .collect();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for change in changes {
+        let mut start = change;
+        let mut context = 0;
+        while start > 0 && context < STAGING_DIFF_CONTEXT {
+            start -= 1;
+            if lines[start].tag == ' ' {
+                context += 1;
+            }
+        }
+        let mut end = change + 1;
+        context = 0;
+        while end < lines.len() && context < STAGING_DIFF_CONTEXT {
+            if lines[end].tag == ' ' {
+                context += 1;
+            }
+            end += 1;
+        }
+        if let Some(last) = ranges.last_mut().filter(|last| start <= last.end) {
+            last.end = last.end.max(end);
+        } else {
+            ranges.push(start..end);
+        }
+    }
+    ranges
+}
+
+fn format_staging_hunk(lines: &[StagingHunkLine<'_>], range: std::ops::Range<usize>) -> String {
+    let slice = &lines[range];
+    let old_count = slice.iter().filter(|line| line.old_line.is_some()).count();
+    let new_count = slice.iter().filter(|line| line.new_line.is_some()).count();
+    let old_start = slice.iter().find_map(|line| line.old_line).unwrap_or(slice[0].old_before);
+    let new_start = slice.iter().find_map(|line| line.new_line).unwrap_or(slice[0].new_before);
+    let mut output = format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n");
+    for line in slice {
+        output.push(line.tag);
+        output.push_str(line.text);
+        output.push('\n');
+    }
+    output
+}
+
+/// AI 专用 unified diff：直接消费脱敏后的差异标记，避免脱敏值相同导致变更消失。
+fn render_staging_hunks(left: &[DiffLine], right: &[DiffLine], char_limit: usize) -> String {
+    let lines = aligned_staging_lines(left, right);
+    let hunks: Vec<String> = staging_hunk_ranges(&lines)
+        .into_iter()
+        .map(|range| format_staging_hunk(&lines, range))
+        .collect();
+    if hunks.is_empty() {
+        return "无文本差异。".to_string();
+    }
+
+    let full_header = format!("共 {} 个差异块，已返回全部差异块：\n", hunks.len());
+    let full_body = hunks.join("\n");
+    if full_header.chars().count() + full_body.chars().count() <= char_limit {
+        return full_header + &full_body;
+    }
+
+    let mut complete = Vec::new();
+    for hunk in &hunks {
+        let next_count = complete.len() + 1;
+        let header = format!("共 {} 个差异块，已返回 {next_count} 个完整差异块：\n", hunks.len());
+        let mut candidate = complete.join("\n");
+        if !candidate.is_empty() {
+            candidate.push('\n');
+        }
+        candidate.push_str(hunk);
+        let needed = header.chars().count()
+            + candidate.chars().count()
+            + 1
+            + STAGING_TRUNCATION_HINT.chars().count();
+        if needed > char_limit {
+            break;
+        }
+        complete.push(hunk.as_str());
+    }
+
+    let header = format!(
+        "共 {} 个差异块，已返回 {} 个完整差异块：\n",
+        hunks.len(),
+        complete.len()
+    );
+    let mut output = header;
+    if complete.is_empty() {
+        let reserve = 1 + STAGING_TRUNCATION_HINT.chars().count();
+        output.push_str(&truncate_chars(
+            &hunks[0],
+            char_limit.saturating_sub(output.chars().count() + reserve),
+        ));
+    } else {
+        output.push_str(&complete.join("\n"));
+    }
+    output.push('\n');
+    output.push_str(STAGING_TRUNCATION_HINT);
+    truncate_chars(&output, char_limit)
+}
+
 /// 暂存时间展示（本地时间 HH:MM:SS）。
 fn format_staged_ts(ts: i64) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1488,6 +1660,31 @@ pub fn is_db_read_only(kind: DbKind, command: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn test_diff_lines(old: &str, new: &str) -> (Vec<DiffLine>, Vec<DiffLine>) {
+        let diff = similar::TextDiff::configure()
+            .algorithm(similar::Algorithm::Patience)
+            .diff_lines(old, new);
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for change in diff.iter_all_changes() {
+            let text = change.value().strip_suffix('\n').unwrap_or(change.value()).to_string();
+            match change.tag() {
+                similar::ChangeTag::Equal => {
+                    left.push(DiffLine { kind: "ctx".into(), text: text.clone() });
+                    right.push(DiffLine { kind: "ctx".into(), text });
+                }
+                similar::ChangeTag::Delete => left.push(DiffLine { kind: "del".into(), text }),
+                similar::ChangeTag::Insert => right.push(DiffLine { kind: "add".into(), text }),
+            }
+        }
+        (left, right)
+    }
+
+    fn render_test_hunks(old: &str, new: &str, char_limit: usize) -> String {
+        let (left, right) = test_diff_lines(old, new);
+        render_staging_hunks(&left, &right, char_limit)
+    }
+
     /// 测试用 AiActions：临时暂存根 + test_store（不碰真实 keyring / Store::new）。
     fn test_actions(store: Arc<Store>) -> AiActions {
         let dir = std::env::temp_dir().join(format!(
@@ -1499,6 +1696,62 @@ mod tests {
         let staging = Arc::new(RemoteStaging::new(dir, Arc::clone(&ssh), Arc::clone(&store)));
         // 浏览器管理器无 AppHandle（未 set_app）时 webview 懒创建会报中文错误，不影响其余动作
         AiActions::new(store, ssh, staging, Arc::new(crate::browser::BrowserManager::new()))
+    }
+
+    #[test]
+    fn staging_hunks_only_include_changes_and_context() {
+        let old = (1..=30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut new_lines = (1..=30).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        new_lines[14] = "line 15 changed".to_string();
+        let rendered = render_test_hunks(&old, &new_lines.join("\n"), AI_RESULT_CAP);
+        assert!(rendered.contains("共 1 个差异块，已返回全部差异块"));
+        assert!(rendered.contains("@@ -12,7 +12,7 @@"));
+        assert!(rendered.contains("-line 15"));
+        assert!(rendered.contains("+line 15 changed"));
+        assert!(rendered.contains(" line 12"));
+        assert!(rendered.contains(" line 18"));
+        assert!(!rendered.contains(" line 1\n"));
+        assert!(!rendered.contains(" line 30"));
+    }
+
+    #[test]
+    fn staging_hunks_merge_nearby_changes_and_split_distant_ones() {
+        let old = (1..=40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut nearby = (1..=40).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        nearby[9] = "changed 10".to_string();
+        nearby[15] = "changed 16".to_string();
+        let merged = render_test_hunks(&old, &nearby.join("\n"), AI_RESULT_CAP);
+        assert!(merged.contains("共 1 个差异块"));
+
+        let mut distant = (1..=40).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        distant[4] = "changed 5".to_string();
+        distant[24] = "changed 25".to_string();
+        let split = render_test_hunks(&old, &distant.join("\n"), AI_RESULT_CAP);
+        assert!(split.contains("共 2 个差异块"));
+    }
+
+    #[test]
+    fn staging_hunks_handle_add_delete_unchanged_and_unicode_truncation() {
+        let added = render_test_hunks("", "甲\n乙", AI_RESULT_CAP);
+        assert!(added.contains("@@ -0,0 +1,2 @@"));
+        assert!(added.contains("+甲\n+乙"));
+        let deleted = render_test_hunks("甲\n乙", "", AI_RESULT_CAP);
+        assert!(deleted.contains("@@ -1,2 +0,0 @@"));
+        assert!(deleted.contains("-甲\n-乙"));
+        assert_eq!(render_test_hunks("相同", "相同", AI_RESULT_CAP), "无文本差异。");
+
+        let long = "甲".repeat(1_000);
+        let truncated = render_test_hunks("旧", &long, 120);
+        assert!(truncated.chars().count() <= 120);
+        assert!(truncated.contains("输出已截断"));
+
+        // 两侧脱敏后文本相同，也必须保留原始 del/add 标记，不能误判为无差异。
+        let masked = "***已脱敏***".to_string();
+        let left = vec![DiffLine { kind: "del".into(), text: masked.clone() }];
+        let right = vec![DiffLine { kind: "add".into(), text: masked }];
+        let rendered = render_staging_hunks(&left, &right, AI_RESULT_CAP);
+        assert!(rendered.contains("-***已脱敏***"));
+        assert!(rendered.contains("+***已脱敏***"));
     }
 
     #[test]

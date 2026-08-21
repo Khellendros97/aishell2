@@ -87,12 +87,16 @@ export function reconfigureTheme(view: EditorView): void {
 
 /** 只读 CodeMirror 视图(staging diff 等只读展示用):复用编辑器主题与基础扩展,不可编辑。
  *  同 legacy editor.ts 的 createReadonlyView;主题随全局切换自动跟随(由调用方订阅 onThemeChange)。 */
-export function createReadonlyView(parent: HTMLElement, doc: string): EditorView {
+export function createReadonlyView(
+  parent: HTMLElement,
+  doc: string,
+  formatLineNumber: (lineNo: number) => string = String,
+): EditorView {
   return new EditorView({
     state: EditorState.create({
       doc,
       extensions: [
-        lineNumbers(),
+        lineNumbers({ formatNumber: formatLineNumber }),
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         cmTheme.of(cmThemeExt()),
