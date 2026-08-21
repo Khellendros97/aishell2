@@ -484,6 +484,8 @@ impl AiManager {
         let session_path = session_dir.join(format!("{project_id}__{session_id}.jsonl"));
 
         let mut cmd = Command::new(&pi_bin);
+        // trace 用副本：tools 在下方 .arg(tools) 处被移动
+        let tools_desc = tools.clone();
         cmd.args([
             "--mode",
             "rpc",
@@ -554,6 +556,23 @@ impl AiManager {
         ));
         let stdout = child.stdout.take().ok_or_else(|| "pi 进程 stdout 不可用".to_string())?;
 
+        // trace：提示词注入全量记录（系统提示词/技能作用域/目录/模式/模型/工具集）
+        crate::trace::log(key, "prompt_inject", json!({
+            "kind": "spawn",
+            "detail": format!(
+                "模式={} 模型={} 思考强度={} 工作目录={}\n工具集: {}\n启用技能: {}\n技能目录: {}\n全局技能目录: {}\n系统提示词:\n{}",
+                mode.as_str(),
+                cfg.model_id,
+                effort,
+                cwd,
+                tools_desc,
+                loaded.final_list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "),
+                skill_dirs.join(", "),
+                global_skills.join(", "),
+                system_prompt,
+            ),
+        }));
+
         let busy = Arc::new(AtomicBool::new(false));
         let killed = Arc::new(AtomicBool::new(false));
         let approvals: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -582,6 +601,10 @@ impl AiManager {
             let mut terminal_emitted = false;
             // 当前 assistant 消息是否已流过文本增量（工具来回多段消息时分段用）
             let mut text_started = false;
+            // trace：tool_execution_start/end 配对起点（toolCallId → (工具, args, 起始ms)）
+            let mut tool_starts: HashMap<String, (String, String, u64)> = HashMap::new();
+            // trace：本回合助手输出聚合缓冲（done/终态错误/进程退出时落一条 assistant_output）
+            let mut output_buf = String::new();
             // 内部动作需要 async 执行：懒建 tokio runtime（进程内动作次数极少）
             let mut rt: Option<tokio::runtime::Runtime> = None;
             let reader = BufReader::new(stdout);
@@ -592,8 +615,15 @@ impl AiManager {
                     break;
                 }
                 let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    // trace：非 JSON 行也记录（异常输出往往是排查线索）
+                    crate::trace::log(&key2, "pi_event", json!({"raw": line.as_str()}));
                     continue;
                 };
+                // trace：pi 事件流记录（增量类 text_delta/thinking_delta/toolcall_delta 高频刷屏，
+                // 过滤不记——文本由 assistant_output 聚合落盘覆盖，思维链本就只留长度无独立价值）
+                if !is_trace_flood_event(&ev) {
+                    crate::trace::log(&key2, "pi_event", json!({"raw": line.as_str()}));
+                }
                 let Some(ty) = ev.get("type").and_then(serde_json::Value::as_str) else {
                     continue;
                 };
@@ -605,6 +635,7 @@ impl AiManager {
                             Some("text_delta") => {
                                 if let Some(delta) = ae.get("delta").and_then(serde_json::Value::as_str) {
                                     text_started = true;
+                                    output_buf.push_str(delta);
                                     // 瞬时错误（限流/过载/5xx）后 pi 自动重试成功、流式恢复：
                                     // 重置终态抑制，否则回合结束 agent_settled 不再发 done、
                                     // 同回合后续失败也被去重吞掉，前端将永久卡在生成态
@@ -619,6 +650,7 @@ impl AiManager {
                                 }
                                 terminal_emitted = true;
                                 settled = true;
+                                trace_flush_output(&key2, &mut output_buf);
                                 busy2.store(false, Ordering::SeqCst);
                                 let msg = ae
                                     .get("message")
@@ -634,6 +666,7 @@ impl AiManager {
                     "agent_settled" => {
                         settled = true;
                         text_started = false;
+                        trace_flush_output(&key2, &mut output_buf);
                         busy2.store(false, Ordering::SeqCst);
                         if !terminal_emitted {
                             terminal_emitted = true;
@@ -656,6 +689,22 @@ impl AiManager {
                     // 其余工具仍走瞬时小字行（tool）。
                     "tool_execution_start" => {
                         let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        // trace：工具调用起点登记（start/end 配对算耗时；args 剥 content）
+                        {
+                            let trace_id = ev
+                                .get("toolCallId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let mut trace_args = ev.get("args").cloned().unwrap_or_else(|| json!({}));
+                            if let Some(obj) = trace_args.as_object_mut() {
+                                obj.remove("content");
+                            }
+                            tool_starts.insert(
+                                trace_id,
+                                (tool.to_string(), trace_args.to_string(), crate::trace::now_ms()),
+                            );
+                        }
                         // write/edit 的目标路径（相对项目根）先登记：end 成功时据此广播 fs:changed。
                         // 远程模式（args 带 serverId）跳过：改的是远端文件，不发本地 fs:changed
                         //（前端凭 args.serverId 区分并改发 staging-changed）。
@@ -738,6 +787,38 @@ impl AiManager {
                     }
                     "tool_execution_end" => {
                         let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        // trace：start/end 配对落一条 tool_call（状态 + 耗时 + 参数/结果全文）
+                        {
+                            let trace_id = ev
+                                .get("toolCallId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some((t, args, start)) = tool_starts.remove(&trace_id) {
+                                let is_err = ev
+                                    .get("isError")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false);
+                                let result_text = ev
+                                    .get("result")
+                                    .and_then(|r| r.get("content"))
+                                    .and_then(|c| c.as_array())
+                                    .and_then(|arr| arr.first())
+                                    .and_then(|b| b.get("text"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .or_else(|| ev.get("errorMessage").and_then(serde_json::Value::as_str))
+                                    .unwrap_or("")
+                                    .to_string();
+                                crate::trace::log(&key2, "tool_call", json!({
+                                    "tool": t,
+                                    "toolCallId": trace_id,
+                                    "status": if is_err { "error" } else { "success" },
+                                    "durationMs": crate::trace::now_ms().saturating_sub(start),
+                                    "args": args,
+                                    "result": result_text,
+                                }));
+                            }
+                        }
                         // AI 写文件成功落盘 → 全局广播，前端刷新已打开的对应编辑器标签
                         if (tool == "write" || tool == "edit")
                             && !ev.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false)
@@ -798,6 +879,7 @@ impl AiManager {
                         if stop == Some("error") {
                             terminal_emitted = true;
                             settled = true;
+                            trace_flush_output(&key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let emsg = msg
                                 .and_then(|m| m.get("errorMessage"))
@@ -819,6 +901,7 @@ impl AiManager {
                         if stop == Some("error") {
                             terminal_emitted = true;
                             settled = true;
+                            trace_flush_output(&key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let emsg = msg
                                 .and_then(|m| m.get("errorMessage"))
@@ -838,6 +921,7 @@ impl AiManager {
                         {
                             terminal_emitted = true;
                             settled = true;
+                            trace_flush_output(&key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let _ = app2.emit(&event, json!({"type": "error", "message": err_message(&ev)}));
                         }
@@ -868,6 +952,7 @@ impl AiManager {
                             if ae.get("type").and_then(serde_json::Value::as_str) == Some("error") {
                                 terminal_emitted = true;
                                 settled = true;
+                                trace_flush_output(&key2, &mut output_buf);
                                 busy2.store(false, Ordering::SeqCst);
                                 let msg = ae
                                     .get("message")
@@ -881,6 +966,7 @@ impl AiManager {
                 }
             }
             // stdout 关闭：进程退出或管道破裂
+            trace_flush_output(&key2, &mut output_buf);
             busy2.store(false, Ordering::SeqCst);
             if !settled && !killed2.load(Ordering::SeqCst) {
                 let _ = app2.emit(&event, json!({"type": "error", "message": "pi 进程异常退出"}));
@@ -946,6 +1032,29 @@ impl Drop for AiManager {
 }
 
 /// 处理 pi 发来的 extension_ui_request（审批转发 + 内部动作桥）。
+/// trace：回合终态（done/error/进程退出）落一条聚合的完整助手输出。
+fn trace_flush_output(key: &str, buf: &mut String) {
+    if !buf.is_empty() {
+        crate::trace::log(key, "assistant_output", json!({"text": buf.as_str()}));
+        buf.clear();
+    }
+}
+
+/// trace 写盘前过滤的高频增量事件：文本/思维链/工具参数分片（刷屏且无独立调试价值，
+/// 文本增量由 assistant_output 聚合覆盖）。
+fn is_trace_flood_event(ev: &serde_json::Value) -> bool {
+    if ev.get("type").and_then(serde_json::Value::as_str) != Some("message_update") {
+        return false;
+    }
+    matches!(
+        ev.get("assistantMessageEvent")
+            .and_then(|a| a.get("type"))
+            .and_then(serde_json::Value::as_str),
+        Some("text_delta" | "thinking_delta" | "toolcall_delta")
+    )
+}
+
+/// 处理 pi 发来的 extension_ui_request（审批转发 + 内部动作桥）。
 #[allow(clippy::too_many_arguments)]
 fn handle_extension_ui_request(
     ev: &serde_json::Value,
@@ -965,6 +1074,7 @@ fn handle_extension_ui_request(
     };
     let method = ev.get("method").and_then(serde_json::Value::as_str).unwrap_or("");
     let title = ev.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+    let trace_key = format!("{project_id}:{session_id}");
 
     if method == "input" && title.starts_with("AISHELL_ACTION:") {
         // 内部动作：执行并回写结果（不透传前端）。
@@ -990,7 +1100,36 @@ fn handle_extension_ui_request(
             impact_tracker,
             &payload,
         ));
+        // trace：门禁动作桥执行结果（含参数/指纹不一致的拒绝；结果全文已在 tool_call 类记录，这里截断防爆）
+        {
+            let ok = result.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let action_name = payload.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+            let outcome = if ok {
+                let text = result.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
+                format!("ok=true 结果: {}", text.chars().take(4000).collect::<String>())
+            } else {
+                format!(
+                    "ok=false 错误: {}",
+                    result.get("error").and_then(serde_json::Value::as_str).unwrap_or("")
+                )
+            };
+            crate::trace::log(&trace_key, "guard", json!({
+                "kind": "action",
+                "detail": format!("动作={action_name} toolCallId={tool_call_id} {outcome}"),
+            }));
+        }
         write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}));
+    } else if method == "input" && title.starts_with("AISHELL_TRACE:") {
+        // guard 扩展 trace 上报（validate 门禁拒绝等 Rust 侧不可见的事件）：直接落日志，回写空串
+        let info: serde_json::Value = ev
+            .get("placeholder")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| json!({}));
+        let kind = info.get("kind").and_then(serde_json::Value::as_str).unwrap_or("guard");
+        let detail = info.get("detail").and_then(serde_json::Value::as_str).unwrap_or("");
+        crate::trace::log(&trace_key, "guard", json!({"kind": kind, "detail": detail}));
+        write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": ""}));
     } else if method == "confirm" && title.starts_with("AISHELL_MODE_REQUEST:") {
         // AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：
         // 与审批同通道转发前端（action=request_agent_mode），前端确认后经
@@ -1005,6 +1144,10 @@ fn handle_extension_ui_request(
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
             .and_then(|v| v.get("reason").and_then(serde_json::Value::as_str).map(str::to_string))
             .unwrap_or_default();
+        crate::trace::log(&trace_key, "guard", json!({
+            "kind": "mode_request",
+            "detail": format!("AI 申请切换到工作模式: {reason}"),
+        }));
         let _ = app2.emit(
             event,
             json!({
@@ -1047,6 +1190,10 @@ fn handle_extension_ui_request(
             .unwrap_or("")
             .to_string();
         let connection = info.get("connection").cloned().unwrap_or_else(|| json!({}));
+        crate::trace::log(&trace_key, "guard", json!({
+            "kind": "db_request",
+            "detail": format!("动作={action} 意图={intent} 摘要={summary}"),
+        }));
         let _ = app2.emit(
             event,
             json!({
@@ -1072,6 +1219,10 @@ fn handle_extension_ui_request(
         let action = info.get("action").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let intent = info.get("intent").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
         let summary = info.get("summary").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        crate::trace::log(&trace_key, "guard", json!({
+            "kind": "approval_request",
+            "detail": format!("动作={action} 意图={intent} 摘要={summary}"),
+        }));
 
         // 自动备份开关（决定是否做影响分析与快照）
         let auto_backup = store2.settings().auto_backup_remote_files;
@@ -1153,6 +1304,10 @@ fn handle_extension_ui_request(
                         .unwrap_or(false);
                     // 非危险且影响可控（或未启用影响分析）：直接放行
                     if !out.dangerous && !merged_unbounded {
+                        crate::trace::log(&trace_key, "guard", json!({
+                            "kind": "smart_approval",
+                            "detail": format!("智能审批放行（{action}）: {}", out.reason),
+                        }));
                         write_stdin_json(
                             stdin2,
                             &json!({"type": "extension_ui_response", "id": id, "confirmed": true}),
@@ -1194,7 +1349,8 @@ fn handle_extension_ui_request(
                         }
                     }
                 }
-                // 判定失败：回退人工审批（危险方向保守；失败原因透传前端卡片便于排查）
+                // 判定失败：回退人工审批（危险方向保守；失败原因透传前端卡片便于排查；
+                // trace 由下方 flagged_reason 统一记「转人工」，这里不重复记）
                 Err(e) => {
                     flagged_reason = Some(format!("智能审批判定失败，已转人工（{e}）"));
                     // 确定性计划照常落盘（人工确认后执行时消费）
@@ -1214,6 +1370,13 @@ fn handle_extension_ui_request(
             }
         }
 
+        // 智能审批判危险/影响不可控的拦截理由（全部审批模式 None，不重复记日志）
+        if let Some(reason) = &flagged_reason {
+            crate::trace::log(&trace_key, "guard", json!({
+                "kind": "smart_approval",
+                "detail": format!("智能审批转人工（{action}）: {reason}"),
+            }));
+        }
         if let Ok(mut map) = approvals2.lock() {
             map.insert(id.clone(), tool_call_id.clone());
         }
@@ -1810,6 +1973,12 @@ pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
         aborted_prev = true;
     }
+    // trace：用户输入（脱敏后最终 prompt，含前端 buildPrompt 展开的引用注入全文）
+    crate::trace::log(&key, "user_input", json!({
+        "prompt": prompt.as_str(),
+        "redacted": redacted,
+        "abortedPrev": aborted_prev,
+    }));
     // 用 JSON 序列化生成，勿手拼。刚 abort 过时带 streamingBehavior=followUp：
     // abort 清理流式状态可能未即时生效，agent 仍在流式期间时裸发 prompt 会被 RPC
     // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同
@@ -1944,10 +2113,15 @@ pub async fn ai_respond_approval(
         return Err("pi 进程不存在".to_string());
     };
     let mut approvals = proc.approvals.lock().map_err(|e| e.to_string())?;
-    let Some(_tool_call_id) = approvals.remove(&request_id) else {
+    let Some(tool_call_id) = approvals.remove(&request_id) else {
         return Err("审批请求已过期或不存在".to_string());
     };
     drop(approvals);
+    // trace：用户审批决定
+    crate::trace::log(&key, "guard", json!({
+        "kind": "approval_decision",
+        "detail": format!("toolCallId={} 决定={}", tool_call_id, if confirmed { "批准" } else { "拒绝" }),
+    }));
     let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
     let mut buf = serde_json::to_vec(&json!({
         "type": "extension_ui_response",

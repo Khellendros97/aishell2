@@ -55,7 +55,7 @@ import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession
 import { icon } from '../../../icons';
 import {
   aiAbort, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
-  sessionUpsert, sessionsGet, setAiMode, stagingList,
+  sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
 } from '../../../api';
@@ -2709,19 +2709,29 @@ function bindEvents(): void {
       );
     };
     const openStaging = openCurrentStaging;
-    void stagingList(pid, sid)
-      .then((entries) => {
+    /* 追溯：trace 开启时打开当前会话的 trace 标签页（中央标签，同 id 去重复用） */
+    const openTrace = (): void => {
+      const title = sessions.get(sid)?.title ?? sid;
+      useWorkbench.getState().openTab({
+        id: `trace:${sid}`,
+        type: 'trace',
+        title: `追溯 · ${title}`,
+        data: { projectId: pid, sessionId: sid, sessionTitle: title },
+      });
+    };
+    /* 暂存区数量与 trace 开关实时查询（各自失败互不影响） */
+    void Promise.all([
+      stagingList(pid, sid).catch(() => null),
+      traceStatus().catch(() => false),
+    ])
+      .then(([entries, traceOn]) => {
         showContextMenu(e.clientX, e.clientY, [
           { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
           'sep',
-          { label: `打开文件暂存区（${entries.length}）`, iconName: 'history', action: openStaging },
-        ]);
-      })
-      .catch(() => {
-        showContextMenu(e.clientX, e.clientY, [
-          { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
-          'sep',
-          { label: '打开文件暂存区', iconName: 'history', action: openStaging },
+          entries
+            ? { label: `打开文件暂存区（${entries.length}）`, iconName: 'history', action: openStaging }
+            : { label: '打开文件暂存区', iconName: 'history', action: openStaging },
+          ...(traceOn ? ['sep' as const, { label: '追溯', iconName: 'search' as const, action: openTrace }] : []),
         ]);
       });
   });

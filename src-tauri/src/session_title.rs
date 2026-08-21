@@ -40,6 +40,7 @@ pub(crate) fn clean_title(raw: &str) -> Option<String> {
 }
 
 /// 发起一次标题生成。所有失败路径静默结束，API Key 永不进入错误文本或事件。
+/// trace（title_gen 类）：记录请求/各失败阶段/成功标题与耗时（不经 pi 的直连 LLM 调用）。
 async fn generate_title(
     store: Arc<Store>,
     app: AppHandle,
@@ -48,13 +49,21 @@ async fn generate_title(
     first_message: String,
     expected_titles: Vec<String>,
 ) {
+    let trace_key = format!("{project_id}:{session_id}");
+    let started = std::time::Instant::now();
     if first_message.len() > MAX_FIRST_MESSAGE_BYTES {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "skip", "detail": "首条消息超长，跳过标题生成"}));
         return;
     }
     let Ok(api_key) = store.read_secret("llm:apikey") else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "读取 LLM API Key 失败"}));
         return;
     };
     let cfg = store.llm_config();
+    crate::trace::log(&trace_key, "title_gen", json!({
+        "kind": "request",
+        "detail": format!("模型={} 首条消息: {}", cfg.model_id, first_message),
+    }));
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = json!({
         "model": cfg.model_id,
@@ -66,6 +75,7 @@ async fn generate_title(
         "max_tokens": 32,
     });
     let Ok(client) = reqwest::Client::builder().timeout(TITLE_TIMEOUT).build() else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "创建 HTTP 客户端失败"}));
         return;
     };
     let Ok(response) = client
@@ -75,25 +85,39 @@ async fn generate_title(
         .send()
         .await
     else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "请求失败（网络/超时）"}));
         return;
     };
     if !response.status().is_success() {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": format!("HTTP {}", response.status())}));
         return;
     }
     let Ok(data) = response.json::<serde_json::Value>().await else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "响应 JSON 解析失败"}));
         return;
     };
     let Some(raw_title) = data["choices"][0]["message"]["content"].as_str() else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "响应缺少标题内容"}));
         return;
     };
     let Some(title) = clean_title(raw_title) else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "模型输出清洗后为空"}));
         return;
     };
     let Ok(updated) =
         store.update_session_title_if_expected(&project_id, &session_id, &expected_titles, &title)
     else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "标题落盘失败"}));
         return;
     };
+    crate::trace::log(&trace_key, "title_gen", json!({
+        "kind": "result",
+        "detail": if updated {
+            format!("标题: {title} 耗时 {}ms", started.elapsed().as_millis())
+        } else {
+            format!("标题已被用户修改，放弃覆盖（模型给出: {title}）")
+        },
+    }));
     if updated {
         // 事件只包含会话标识与标题，不包含用户消息或任何凭据；前端可据此刷新本地会话。
         let _ = app.emit(

@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingProgress, SshExecResult, Theme, XshellImportResult,
+  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -237,6 +237,20 @@ export const aiRespondDbRequest = (key: string, requestId: string, response: { a
   call<void>('ai_respond_db_request', { key, requestId, response: JSON.stringify(response) });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
+
+/* ---------------- AI 会话 trace（Rust trace.rs） ----------------
+   开关持久化在 AppState.traceEnabled（命令面板 `trace on/off`）；日志按会话分文件落盘
+   （<config>/ai-trace/<日期>/<项目>__<会话>.jsonl），7 天过期由后端定时清理。
+   trace_export 由后端做裁剪：成功的工具调用只留名称/状态/耗时，助手输出截断 1024 字素。 */
+/** trace 开关状态（右键「追溯」菜单显隐用） */
+export const traceStatus = () => call<boolean>('trace_status');
+export const traceSetEnabled = (enabled: boolean) => call<void>('trace_set_enabled', { enabled });
+/** 读取当前会话全部 trace（跨日期目录拼接，单文件最多回读尾部 2MB） */
+export const traceRead = (key: string) => call<TraceEntry[]>('trace_read', { key });
+/** 导出当前会话 trace（应用裁剪规则）到用户选定路径；返回导出行数 */
+export const traceExport = (path: string, key: string) => call<number>('trace_export', { path, key });
+/** 清空当前会话 trace（全部日期文件） */
+export const traceClear = (key: string) => call<void>('trace_clear', { key });
 
 /* ---------------- browser（内置浏览器子 webview，Rust browser.rs） ----------------
    面板占位 div 经 ResizeObserver 同步位置尺寸；element 事件携带检查器选中的元素引用。 */

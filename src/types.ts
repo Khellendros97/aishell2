@@ -268,6 +268,15 @@ export interface AppState {
   mcpDevices: Record<string, McpDeviceConfig>;
   /** 已完成内置技能播种的 workspace（规范化路径）；旧配置无此字段为空数组 */
   seededSkillWorkspaces: string[];
+  /** AI 会话 trace 日志开关（命令面板 `trace on/off`）；旧配置无此字段按关闭 */
+  traceEnabled: boolean;
+}
+
+/** AI 会话 trace 条目（trace.rs TraceEntry serde camelCase 对齐）：text 为后端已格式化的单行展示文本 */
+export interface TraceEntry {
+  ts: number;
+  cat: string;
+  text: string;
 }
 
 export interface FsEntry {

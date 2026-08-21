@@ -667,6 +667,10 @@ pub struct AppState {
     /// 用户删除/修改内置技能后不会被同一 workspace 的重启/保存设置流程复活。
     #[serde(default)]
     pub seeded_skill_workspaces: Vec<String>,
+    /// AI 会话 trace 日志开关（命令面板 `trace on/off`，见 trace.rs）；旧配置无此字段按关闭。
+    /// 放在 AppState 顶层而非 Settings：设置页保存时整体提交 Settings 表单，表单无此字段会被覆盖。
+    #[serde(default)]
+    pub trace_enabled: bool,
 }
 
 /// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
@@ -1580,6 +1584,22 @@ impl Store {
         self.settings().approval_mode
     }
 
+    /// AI 会话 trace 日志开关（trace.rs init 读取初值）。
+    pub fn trace_enabled(&self) -> bool {
+        let Ok(guard) = self.state.lock() else {
+            return false;
+        };
+        guard.trace_enabled
+    }
+
+    /// 原子落盘 trace 开关（trace_set_enabled 命令；运行时标志由 trace.rs 自置）。
+    pub fn set_trace_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.with_state(|s| {
+            s.trace_enabled = enabled;
+            Ok(())
+        })
+    }
+
     /// 当前全局设置（clone）。
     pub fn settings(&self) -> Settings {
         let guard = self
@@ -2198,6 +2218,7 @@ mod tests {
             },
             // 与 settings.workspace_dir 一致：reload 时视为已播种（不创建 D:\AIShellWorkspace，不破坏往返相等）
             seeded_skill_workspaces: vec!["D:\\AIShellWorkspace".to_string()],
+            trace_enabled: false,
         }
     }
 
