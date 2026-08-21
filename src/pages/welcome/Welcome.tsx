@@ -56,6 +56,7 @@ const EMPTY_STATE: AppState = {
   servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
   seededSkillWorkspaces: [],
+  traceEnabled: false,
 };
 
 /**

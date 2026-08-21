@@ -1,0 +1,129 @@
+/* AI 会话 trace 标签页（TraceTab.tsx）：工具栏 + 日志列表 + 底部计数。
+   类别着色：user_input=accent，assistant_output=主文本，tool_call=绿/红(成败见文本)，
+   guard=黄，prompt_inject/title_gen=紫，pi_event=弱化。 */
+
+.trace-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-0);
+  color: var(--text-0);
+  font-size: 12px;
+}
+
+.trace-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+
+.trace-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.trace-off-hint {
+  color: var(--yellow);
+  white-space: nowrap;
+}
+
+.trace-spacer {
+  flex: 1;
+}
+
+.trace-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.trace-search svg {
+  position: absolute;
+  left: 8px;
+  width: 13px;
+  height: 13px;
+  color: var(--text-2);
+  pointer-events: none;
+}
+
+.trace-search .input {
+  padding-left: 26px;
+  width: 200px;
+}
+
+.trace-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 0;
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.trace-line {
+  display: flex;
+  gap: 8px;
+  padding: 1px 10px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.trace-line:hover {
+  background: var(--bg-hover);
+}
+
+.trace-ts {
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.trace-cat {
+  flex-shrink: 0;
+  min-width: 110px;
+  color: var(--text-2);
+}
+
+.trace-cat-user_input .trace-cat,
+.trace-cat-user_input .trace-text {
+  color: var(--accent);
+}
+
+.trace-cat-tool_call .trace-cat,
+.trace-cat-tool_call .trace-text {
+  color: var(--green, #4ec98a);
+}
+
+.trace-cat-guard .trace-cat,
+.trace-cat-guard .trace-text {
+  color: var(--yellow);
+}
+
+.trace-cat-prompt_inject .trace-cat,
+.trace-cat-prompt_inject .trace-text,
+.trace-cat-title_gen .trace-cat,
+.trace-cat-title_gen .trace-text {
+  color: var(--purple);
+}
+
+.trace-cat-pi_event .trace-text {
+  color: var(--text-1);
+}
+
+.trace-empty {
+  padding: 40px 0;
+  text-align: center;
+  color: var(--text-2);
+}
+
+.trace-status {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-2);
+}

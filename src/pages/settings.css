@@ -16,6 +16,21 @@
 
 .settings-page #settings-layout { flex: 1; min-height: 0; display: flex; }
 
+/* 左侧分类导航 */
+.settings-page #settings-nav {
+  flex: none; width: 176px; padding: 20px 12px;
+  display: flex; flex-direction: column; gap: 4px;
+  background: var(--bg-1); border-right: 1px solid var(--border);
+}
+.settings-page .settings-nav-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; padding: 8px 12px;
+  background: none; border: none; border-radius: var(--radius-s);
+  font-size: 13px; color: var(--text-1); text-align: left; cursor: pointer;
+}
+.settings-page .settings-nav-item:hover { background: var(--bg-hover); }
+.settings-page .settings-nav-item.active { background: var(--accent-dim); color: var(--accent); }
+
 /* 内容区 */
 .settings-page #settings-content { flex: 1; min-width: 0; overflow-y: auto; background: var(--bg-0); padding: 24px 28px; }
 .settings-page .settings-panel { max-width: 860px; }

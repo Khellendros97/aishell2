@@ -606,6 +606,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/* ---------- 工具调用钩子：路径/参数校验 + Agent 逐调用审批 ---------- */
+	/** trace 上报（validate 门禁拒绝等 Rust 侧不可见事件）：经 AISHELL_TRACE 桥落日志，失败静默。 */
+	function traceReport(ctx: Parameters<typeof pi.on>[1], toolCallId: string, kind: string, detail: string): void {
+		void ctx.ui.input("AISHELL_TRACE:" + toolCallId, JSON.stringify({ kind, detail: detail.slice(0, 2000) })).catch(() => {});
+	}
 	async function approve(ctx: Parameters<typeof pi.on>[1], tool: string, input: Record<string, unknown>, toolCallId: string): Promise<boolean> {
 		const info = approvalInfo(tool, input);
 		let ok = false;
@@ -621,7 +625,10 @@ export default function (pi: ExtensionAPI) {
 		const tool = event.toolName;
 		const input = event.input as Record<string, unknown>;
 		const blocked = validate(tool, input);
-		if (blocked) return blocked;
+		if (blocked) {
+			traceReport(ctx, event.toolCallId, "validate_block", `工具=${tool} 参数=${JSON.stringify(input)} 原因=${blocked.reason}`);
+			return blocked;
+		}
 		if (mode === "agent") {
 			if (CONTROLLED_TOOLS.includes(tool)) {
 				if (!(await approve(ctx, tool, input, event.toolCallId))) {

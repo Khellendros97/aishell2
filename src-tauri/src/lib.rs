@@ -4,6 +4,7 @@ pub mod ai_impact;
 pub mod browser;
 pub mod cloud;
 pub mod fsops;
+pub mod session_title;
 #[cfg(windows)]
 pub mod gitinstall;
 pub mod mcp;
@@ -16,6 +17,7 @@ pub mod staging;
 pub mod store;
 pub mod term;
 pub mod update;
+pub mod trace;
 pub mod xshell;
 
 use std::path::PathBuf;
@@ -28,6 +30,17 @@ use tauri::Manager;
 #[tauri::command]
 fn open_devtools(win: tauri::WebviewWindow) {
     win.open_devtools();
+}
+
+/// 删除项目前先回收该项目全部 pi，避免项目记录清除后遗留后台进程。
+#[tauri::command(rename = "delete_project")]
+async fn delete_project_with_ai(
+    ai: tauri::State<'_, Arc<ai::AiManager>>,
+    store: tauri::State<'_, Arc<store::Store>>,
+    id: String,
+) -> Result<(), String> {
+    ai.kill_project(&id);
+    store::delete_project(store, id).await
 }
 
 pub fn run() {
@@ -128,6 +141,8 @@ pub fn run() {
                 ssh.clone(),
                 staging.clone(),
             ));
+            // AI 会话 trace：注入日志目录与持久化开关初值（需在 manage(store) 移动前读取）
+            trace::init(config_dir.join("ai-trace"), store.trace_enabled());
             app.manage(store);
             app.manage(ssh);
             app.manage(terms);
@@ -157,6 +172,8 @@ pub fn run() {
             ));
             app.manage(updater.clone());
             update::start_background(app.handle().clone());
+            // AI 会话 trace：启动 7 天过期清理任务（启动即清一次 + 每 24h）
+            trace::spawn_cleanup_task();
             // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
             // 捆绑安装器。放后台线程并延迟触发：等主事件循环泵消息、主窗口显示后再弹框
             // （dialog 插件内部 run_on_main_thread 依赖主循环在运行）。
@@ -203,7 +220,7 @@ pub fn run() {
             store::upsert_server,
             store::delete_server,
             store::upsert_project,
-            store::delete_project,
+            delete_project_with_ai,
             store::ensure_project_dirs,
             store::sessions_get,
             store::session_upsert,
@@ -289,6 +306,12 @@ pub fn run() {
             cloud::memory_promote,
             cloud::kb_search,
             ai::ai_respond_db_request,
+            session_title::ai_generate_session_title,
+            trace::trace_status,
+            trace::trace_set_enabled,
+            trace::trace_read,
+            trace::trace_export,
+            trace::trace_clear,
             staging::staging_add,
             staging::staging_list,
             staging::staging_snapshot_read,

@@ -4,7 +4,7 @@
  * 命令执行导致数据变化时广播 `aishell:data-changed`（CustomEvent），
  * 各页面监听后重新拉取状态渲染（settings / welcome / 侧栏 servers）。
  */
-import { clearAllServers } from './api';
+import { clearAllServers, traceSetEnabled } from './api';
 import { confirmDialog, toast } from './ui';
 import { icon } from './icons';
 import { toggleDebugPanel } from './debug';
@@ -22,6 +22,18 @@ const COMMANDS: PanelCommand[] = [
     desc: '打开/关闭 Debug 日志面板（终端事件流实时输出，支持暂停/清空/复制/导出）',
     match: (t) => t.length === 1 && t[0] === 'debug',
     run: () => toggleDebugPanel(),
+  },
+  {
+    usage: 'trace on',
+    desc: '开启 AI 会话 trace（逐会话记录用户输入/pi 事件流/工具调用/门禁/标题生成，保留 7 天；AI 对话区右键「追溯」查看）',
+    match: (t) => t.length === 2 && t[0] === 'trace' && t[1] === 'on',
+    run: () => setTrace(true),
+  },
+  {
+    usage: 'trace off',
+    desc: '关闭 AI 会话 trace（历史日志保留，到期自动清理）',
+    match: (t) => t.length === 2 && t[0] === 'trace' && t[1] === 'off',
+    run: () => setTrace(false),
   },
   {
     usage: 'server config clear',
@@ -50,6 +62,17 @@ const COMMANDS: PanelCommand[] = [
 let panelEl: HTMLElement | null = null;
 let inputEl: HTMLInputElement | null = null;
 let errorEl: HTMLElement | null = null;
+
+/** trace on/off 共用：开关落库（AppState.traceEnabled）后广播 data-changed 刷新 AI 右键菜单 */
+async function setTrace(enabled: boolean): Promise<void> {
+  try {
+    await traceSetEnabled(enabled);
+    toast(enabled ? '已开启 AI 会话 trace' : '已关闭 AI 会话 trace', 'success');
+    window.dispatchEvent(new CustomEvent('aishell:data-changed'));
+  } catch (err) {
+    toast(`trace 开关失败: ${String(err)}`, 'error');
+  }
+}
 
 /** 应用入口调用一次：挂载面板 DOM 与 Ctrl+T / Esc / 外部点击交互 */
 export function initCommandPanel(): void {
