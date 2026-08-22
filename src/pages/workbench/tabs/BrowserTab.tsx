@@ -1,10 +1,11 @@
 /**
- * 浏览器标签页(React 薄壳,全新功能,无 .proto 对照)。命令式引擎在 ./browser-engine.ts,
- * 后端接口点:browser_* 命令 + browser:event 事件(Rust browser.rs),详见引擎头部注释。
- * keep-alive 契约(见 registry.ts):本组件常驻挂载、active 只切显隐——
- * active 变化时仅调 setTabActive 切换子 webview 显隐与 rect 同步;
- * 标签关闭(卸载)才隐藏 webview(webview 本体在 Rust 侧全局保留,再开同 id 标签恢复)。
- * 全局限定单实例:打开入口用固定 tab id 'browser',openTab 同 id 去重激活。
+ * 浏览器标签页（React 薄壳，全新功能，无 .proto 对照）。命令式引擎在 ./browser-engine.ts，
+ * 后端接口点：browser_* 命令（带 viewId，Rust browser.rs）+ browser:event 事件，详见引擎头部注释。
+ * keep-alive 契约（见 registry.ts）：本组件常驻挂载、active 只切显隐——
+ * active 变化时仅调 setTabActive 切换子 webview 显隐与 rect 同步；
+ * 标签关闭（卸载）才隐藏 webview（各页面 webview 在 Rust 侧全局保留，再开同 id 标签恢复）。
+ * 工作台标签页单实例：打开入口用固定 tab id 'browser'，openTab 同 id 去重激活；
+ * 多「页面」在标签内部管理（右侧标签页侧边栏，默认折叠），每页对应一个子 webview。
  */
 import { useEffect, useRef } from 'react';
 import type { TabProps } from '../../../stores/workbench';

@@ -42,6 +42,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 - **SSH 连接复用**:终端和 SFTP 共用 `ssh.rs` 的 `SshManager`(每 serverId 一条连接),断开在 `SshManager::disconnect`。
 - **命令区块追踪**:终端没有 OSC 133,区块边界靠前端输入行缓冲近似(见 tabs/useTerminal.ts `cleanBlockLines` 提示符清洗,含 `[user@host ~]$` SSH 风格)。
 - **AI 输出协议**:pi 的系统提示词约定 ```command 围栏 = 可粘贴终端的命令卡、```text 围栏 = 可插入输入框的文本卡;改提示词或渲染器要两边(ai.rs / ai/ai-engine.ts)同步。
+- **AI 输入区引用 tag**:contenteditable 内嵌原子 chip,content 落盘保留 token(`@term:<id>`、`@file:名` 等);新增引用类型要同步 `chipToken`(发送侧 token 生成)与 `buildMessageTokens`(历史侧 token 还原),两处不一致历史消息会回退纯文本。
+- **内置浏览器多页面**:browser.rs 按 viewId 持有多个子 webview(标签栏每页一个,右侧页面栏默认折叠),browser_* 命令/事件全带 viewId;AI 四件套目标视图 = 可视页面 → 最近浏览页面 → 专用 "ai" 页面(`ai_target`)。
 
 ## 代码风格
 
