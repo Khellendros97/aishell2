@@ -333,7 +333,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 <input
                   id="f-model-id"
                   className="input"
-                  placeholder="deepseek-v4-flash"
+                  placeholder="deepseek-v4-flash-vision-exp"
                   value={fields.modelId}
                   onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
                 />

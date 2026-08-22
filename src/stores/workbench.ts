@@ -62,6 +62,8 @@ export interface AiHandle {
   addBrowserRef?(ref: BrowserRef): void;
   /** 技能引用(@skill:名称 标签,发送时展开名/来源/scope/描述) */
   addSkillRef?(ref: SkillRef): void;
+  /** 图片附件(explorer/SFTP 右键「添加到对话」对图片文件的入口;物化与上限校验在引擎内) */
+  addImageRef?(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void;
   /** 当前 AI 会话 ID;会话尚未加载时返回 null。 */
   currentSessionId?(): string | null;
 }

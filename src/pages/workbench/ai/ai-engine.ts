@@ -12,9 +12,12 @@
  * （只读展示 AI 填写的连接信息）→ 点【审批】打开审批对话框（./AiDbApproval，用户只填密码 +
  * 勾查询权限）→ 通过先 saveDbConnection 落库再 aiRespondDbRequest 回执 connectionId；
  * 关闭对话框不回执，卡片可重开。
- * 输入区 chip 五类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端
+ * 输入区 chip 六类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端
  * 引用 @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名、
- * 浏览器元素引用 @browser:#id 或标签名（发送时展开为说明文本/元素 HTML 拼进 prompt）；
+ * 浏览器元素引用 @browser:#id 或标签名（发送时展开为说明文本/元素 HTML 拼进 prompt）、
+ * 图片附件缩略图 chip（粘贴剪贴板 / explorer/SFTP 拖入 / 右键「添加到对话」，
+ * 经 ai_attach_images 物化到 <project>/.aishell/ai-images/，发送时不进 prompt 而是随
+ * ai_chat 的 images 参数经 pi RPC images 字段传给多模态模型；单条 ≤9 张、单张 ≤10MB）；
  * Settings.autoSwitchAiWorkdir 开启时输入区固定显示
  * 工作区域标签，随激活终端自动切换并作为当前目标上下文带入。
  * AI 回复中的链接：普通点击在内置浏览器标签页打开（browser_navigate + openTab('browser')），
@@ -44,22 +47,23 @@
  * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_abort /
  *   ai_kill_project / ai_set_thinking / ai_respond_approval / ai_respond_db_request /
  *   ai_debug_info / set_ai_mode / get_state / save_settings / save_db_connection /
- *   ai_generate_session_title（首条消息异步标题）/ staging_list，事件 on_ai_event（ai:event:<key>）。
+ *   ai_generate_session_title（首条消息异步标题）/ staging_list /
+ *   ai_attach_images（图片附件物化）/ ai_read_image（缩略图/预览回读），事件 on_ai_event（ai:event:<key>）。
  *  AI 事件订阅按 projectId:sessionId 常驻在模块级项目上下文中：切换会话/项目只切换视图，
  *  不退订、不 abort；卸载仅回收当前面板 DOM 监听，不杀项目 pi 进程。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
+import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon } from '../../../icons';
 import {
-  aiAbort, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
+  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
   sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
 } from '../../../api';
-import { getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
+import { DND_MIME, getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
 import { addQuickCommandModal } from '../tabs/useTerminal';
 import { hideProgress } from '../statusbar-progress';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../../ui';
@@ -317,6 +321,41 @@ const STYLE = `
   margin-top: 10px; font-size: 11.5px; color: var(--yellow); line-height: 1.5;
 }
 .db-approval-warn svg { flex: none; width: 12px; height: 12px; margin-top: 2px; }
+/* 图片附件：输入区 chip 缩略图（22px）与历史消息缩略图行（110px，点开大图）。
+   缩略图容器固定尺寸，加载中显示浅色占位，失败红边显示文件名。 */
+.ai-img-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px 2px 3px; }
+.ai-img-chip .ai-img-name { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-img-chip-thumb {
+  width: 22px; height: 22px; flex: none; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 4px; border: 1px solid var(--border); background: var(--bg-3);
+  font-size: 0; color: transparent;
+}
+.ai-img-chip-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ai-msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.ai-img-thumb {
+  width: 110px; height: 110px; padding: 0; overflow: hidden; cursor: zoom-in;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-3);
+  font-size: 10.5px; color: var(--text-2); text-align: center; line-height: 1.3;
+  transition: border-color 0.12s;
+}
+.ai-img-thumb:hover { border-color: var(--accent); }
+.ai-img-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ai-img-thumb.ai-img-error, .ai-img-chip-thumb.ai-img-error { border-color: var(--red); }
+/* 图片预览对话框：等比缩放居中，超大图不撑破 modal */
+.ai-img-view {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 160px; max-height: 68vh; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-1);
+  color: var(--text-2); font-size: 12px;
+}
+.ai-img-view img { max-width: 100%; max-height: 68vh; object-fit: contain; display: block; }
+/* 输入区拖拽图片高亮 */
+#ai-input-area.ai-drag-over {
+  outline: 1.5px dashed var(--accent); outline-offset: -3px;
+  border-radius: 6px; background: var(--accent-dim);
+}
 `;
 
 /* ---------- Markdown 渲染（AI 回复正文；html:false 转义原始 HTML 防 XSS，breaks 保留单换行） ---------- */
@@ -482,6 +521,7 @@ function cloneChatSession(s: ChatSession): ChatSession {
       pathRefs: m.pathRefs.map((ref) => ({ ...ref })),
       browserRefs: m.browserRefs.map((ref) => ({ ...ref })),
       skillRefs: m.skillRefs.map((ref) => ({ ...ref, scope: [...ref.scope] })),
+      imageRefs: (m.imageRefs ?? []).map((ref) => ({ ...ref })),
       actions: m.actions.map((action) => ({ ...action })),
       ts: m.ts,
     })),
@@ -521,6 +561,36 @@ const serverRefs = new Map<string, ServerRef>(); // 服务器/本地引用 key -
 const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -> 引用（@file:文件名 / @path:目录名 标签）
 const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key -> 引用（key = `${name}:${ts}`，@browser:名称 标签）
 const skillRefs = new Map<string, SkillRef>(); // 技能引用 key -> 引用（key = `${origin}:${name}`，@skill:名称 标签）
+const imageRefs = new Map<string, ImageRef>(); // 图片附件 id -> 引用（输入区 chip + 历史消息缩略图共用）
+/** 落盘图片回读缓存（path -> base64；null = 读取失败）。有界 FIFO，避免多图会话内存膨胀。 */
+const imageCache = new Map<string, { mime: string; data: string } | null>();
+const IMAGE_CACHE_MAX = 16;
+/** 单条消息图片上限（DeepSeek 官方 600 张/请求 48MiB，产品侧收敛到 9 张；单张 10MB 由后端 attach 校验） */
+const MAX_ATTACH_IMAGES = 9;
+/** 图片扩展名粗筛（能否作为附件以粘贴/拖入与右键入口为准；实际格式由后端魔数嗅探判定） */
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)$/i;
+
+/** 回读落盘图片（带缓存）；失败缓存 null（文件被移动/删除的场景重试也无益）。 */
+async function loadImageData(path: string): Promise<{ mime: string; data: string } | null> {
+  if (imageCache.has(path)) return imageCache.get(path) ?? null;
+  let out: { mime: string; data: string } | null = null;
+  try {
+    out = await aiReadImage(path);
+  } catch {
+    out = null;
+  }
+  imageCache.set(path, out);
+  if (imageCache.size > IMAGE_CACHE_MAX) {
+    const oldest = imageCache.keys().next().value;
+    if (oldest !== undefined && oldest !== path) imageCache.delete(oldest);
+  }
+  return out;
+}
+
+/** 模型是否支持图片输入（启发式与 Rust ai.rs models_json_for 一致：模型 id 小写含 "vision"）。 */
+function supportsVisionModel(modelId: string): boolean {
+  return modelId.toLowerCase().includes('vision');
+}
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
 /** 当前 AI 工作区域（默认本地；随激活终端/浏览器标签自动切换） */
@@ -719,7 +789,7 @@ export function mountAiPanel(container: HTMLElement): () => void {
       </div>
       <div id="ai-chip-row"></div>
       <div id="ai-input-row">
-        <textarea id="ai-input" placeholder="向 AI 提问，Enter 发送，Shift+Enter 换行"></textarea>
+        <textarea id="ai-input" placeholder="向 AI 提问，Enter 发送，Shift+Enter 换行；可粘贴或拖入图片"></textarea>
         <button id="ai-send" class="btn primary" title="发送 (Enter)">发送</button>
       </div>
     </div>`;
@@ -889,6 +959,16 @@ const aiHandle = {
     }
     skillRefs.set(key, ref);
     addSkillRefChip(ref, key);
+  },
+  /** 图片附件（explorer/SFTP 右键「添加到对话」对图片文件的入口）：
+   *  物化由 attachImages 统一完成（vision 门槛 / 数量上限 / 后端嗅探都在那里） */
+  addImageRef(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void {
+    if (!ref || typeof ref.path !== 'string' || !ref.path.trim()) return;
+    void attachImages([
+      ref.source === 'remote'
+        ? { source: 'remote', serverId: ref.serverId ?? '', path: ref.path }
+        : { source: 'local', path: ref.path },
+    ]);
   },
   currentSessionId(): string | null {
     return activeSessionId || null;
@@ -1740,6 +1820,7 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
     m.snapshots.forEach((snap) => snapshots.set(snap.id, snap));
     m.fileRefs.forEach((ref) => fileRefs.set(ref.id, ref));
     (m.browserRefs ?? []).forEach((r) => browserRefs.set(`${r.name}:${r.ts}`, r));
+    (m.imageRefs ?? []).forEach((r) => imageRefs.set(r.id, r));
     const chips = [
       ...m.snapshots.map((snap) =>
         `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(snap.id)}" title="点击查看快照全文">@terminal_${escapeHtml(snap.id)}</span>`,
@@ -1765,9 +1846,16 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
         `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(skillRefKey(r))}" data-kind="skill" title="技能引用「${escapeHtml(r.name)}」（${r.origin === 'global' ? '全局' : '项目'}）">@skill:${escapeHtml(r.name)}</span>`,
       ),
     ].join('');
+    /* 图片附件：文字下方缩略图行（点击弹大图；加载失败红边显示文件名） */
+    const imgsHtml = (m.imageRefs ?? [])
+      .map((r) =>
+        `<button type="button" class="ai-img-thumb" data-snap-id="${escapeHtml(r.id)}" data-kind="image" data-img-path="${escapeHtml(r.path)}" data-img-name="${escapeHtml(r.name)}" title="${escapeHtml(r.name)} · 点击查看大图">${escapeHtml(r.name)}</button>`,
+      )
+      .join('');
     wrap.innerHTML =
       `<div class="ai-bubble">${chips ? `<div class="ai-msg-chips">${chips}</div>` : ''}` +
-      `<div class="ai-text">${escapeHtml(m.content)}</div></div>`;
+      `<div class="ai-text">${escapeHtml(m.content)}</div>${imgsHtml ? `<div class="ai-msg-images">${imgsHtml}</div>` : ''}</div>`;
+    wrap.querySelectorAll('.ai-img-thumb').forEach((el) => hydrateImageThumb(el as HTMLElement));
   } else {
     wrap.className = 'ai-msg ai';
     /* 时序排版:有 textLen 锚点的动作卡穿插进 content 对应位置(文本段→卡→文本段);
@@ -2186,6 +2274,7 @@ function onChatClick(e: MouseEvent): void {
     if (chip.dataset.kind === 'server' || chip.dataset.kind === 'path') return; // 服务器/路径引用无详情弹窗
     if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(id));
     else if (chip.dataset.kind === 'browser') openBrowserRefModal(browserRefs.get(id));
+    else if (chip.dataset.kind === 'image') openImageModal(imageRefs.get(id));
     else openSnapModal(snapshots.get(id));
   }
 }
@@ -2274,6 +2363,81 @@ function addSkillRefChip(ref: SkillRef, key: string): void {
   chipRow.appendChild(c);
 }
 
+/** 缩略图容器填充：加载中占位（固定尺寸），成功替换为 <img>，失败红边显示文件名 */
+function hydrateImageThumb(el: HTMLElement): void {
+  const path = el.dataset.imgPath ?? '';
+  const name = el.dataset.imgName ?? '图片';
+  void loadImageData(path).then((out) => {
+    if (!el.isConnected) return;
+    if (!out) {
+      el.classList.add('ai-img-error');
+      el.textContent = name;
+      return;
+    }
+    const img = document.createElement('img');
+    img.src = `data:${out.mime};base64,${out.data}`;
+    img.alt = name;
+    el.replaceChildren(img);
+  });
+}
+
+/** 图片附件 chip：缩略图 + 名称，点击预览大图，✕ 移除 */
+function addImageRefChip(ref: ImageRef): void {
+  const c = document.createElement('span');
+  c.className = 'tag blue ai-snap-chip ai-img-chip';
+  c.dataset.id = ref.id;
+  c.dataset.kind = 'image';
+  c.title = `图片附件「${ref.name}」，点击预览，✕ 移除`;
+  c.innerHTML =
+    `<span class="ai-img-chip-thumb" data-img-path="${escapeHtml(ref.path)}" data-img-name="${escapeHtml(ref.name)}"></span>` +
+    `<span class="ai-img-name">${escapeHtml(ref.name)}</span><span class="ai-chip-x" title="移除">${icon('x')}</span>`;
+  chipRow.appendChild(c);
+  hydrateImageThumb(c.querySelector('.ai-img-chip-thumb') as HTMLElement);
+}
+
+/** 图片附件详情：来源/大小说明 + 大图（等比缩放，超大图不撑破 modal） */
+function openImageModal(ref: ImageRef | undefined): void {
+  if (!ref) return;
+  const originText =
+    ref.source === 'remote'
+      ? `远程 · ${ref.originPath ?? ''}`
+      : ref.source === 'local'
+        ? `本地 · ${ref.originPath ?? ''}`
+        : '剪贴板粘贴';
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = `
+    <div class="modal" style="width:720px">
+      <div class="modal-head"><h3>图片 · ${escapeHtml(ref.name)}</h3><button class="icon-btn ai-modal-x" title="关闭">${icon('x')}</button></div>
+      <div class="modal-body">
+        <div class="ai-snap-command mono">${escapeHtml(originText)} · ${(ref.size / 1024).toFixed(0)} KB · ${escapeHtml(ref.mime)}</div>
+        <div class="ai-img-view">加载中…</div>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  requestAnimationFrame(() => mask.classList.add('open'));
+  const close = (): void => {
+    mask.classList.remove('open');
+    setTimeout(() => mask.remove(), 160);
+  };
+  (mask.querySelector('.ai-modal-x') as HTMLButtonElement).onclick = close;
+  mask.addEventListener('mousedown', (e) => {
+    if (e.target === mask) close();
+  });
+  const box = mask.querySelector('.ai-img-view') as HTMLElement;
+  void loadImageData(ref.path).then((out) => {
+    if (!box.isConnected) return;
+    if (!out) {
+      box.textContent = '图片加载失败（文件可能已被移动或删除）';
+      return;
+    }
+    const img = document.createElement('img');
+    img.src = `data:${out.mime};base64,${out.data}`;
+    img.alt = ref.name;
+    box.replaceChildren(img);
+  });
+}
+
 const clearChips = (): void => {
   chipRow.innerHTML = '';
   /* 状态 Map 必须与 chip DOM 同步清空:此前只清 DOM,serverRefs 等残留导致
@@ -2284,6 +2448,7 @@ const clearChips = (): void => {
   pathRefs.clear();
   browserRefs.clear();
   skillRefs.clear();
+  imageRefs.clear();
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
 };
 
@@ -2374,12 +2539,14 @@ function onChipRowClick(e: MouseEvent): void {
     else if (chip.dataset.kind === 'path') pathRefs.delete(chip.dataset.id ?? '');
     else if (chip.dataset.kind === 'browser') browserRefs.delete(chip.dataset.id ?? '');
     else if (chip.dataset.kind === 'skill') skillRefs.delete(chip.dataset.id ?? '');
+    else if (chip.dataset.kind === 'image') imageRefs.delete(chip.dataset.id ?? '');
     chip.remove();
     return;
   }
   if (chip.dataset.kind === 'server' || chip.dataset.kind === 'path') return; // 服务器/路径引用无详情弹窗
   if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(chip.dataset.id ?? ''));
   else if (chip.dataset.kind === 'browser') openBrowserRefModal(browserRefs.get(chip.dataset.id ?? ''));
+  else if (chip.dataset.kind === 'image') openImageModal(imageRefs.get(chip.dataset.id ?? ''));
   else openSnapModal(snapshots.get(chip.dataset.id ?? ''));
 }
 
@@ -2458,6 +2625,139 @@ function openBrowserRefModal(ref: BrowserRef | undefined): void {
 }
 
 /* ---------- 输入区 ---------- */
+
+/** 图片附件统一入口：数量上限 → vision 模型门槛 → 后端物化（嗅探+落盘）→ 输入区出 chip。
+ *  粘贴剪贴板 / explorer、SFTP 拖拽与右键添加共用；失败整批 toast（后端任一项失败即报错）。 */
+async function attachImages(items: AttachImageItem[]): Promise<void> {
+  if (!items.length) return;
+  const ctx = viewContext;
+  const proj = project;
+  if (!ctx || !proj) {
+    toast('项目未加载', 'error');
+    return;
+  }
+  if (imageRefs.size + items.length > MAX_ATTACH_IMAGES) {
+    toast(`单条消息最多附加 ${MAX_ATTACH_IMAGES} 张图片`, 'error');
+    return;
+  }
+  try {
+    const st = await getState();
+    if (!supportsVisionModel(st.settings.llm.modelId)) {
+      toast('当前模型不支持图片，请先在设置中切换为 vision 模型', 'error');
+      return;
+    }
+  } catch {
+    /* 后端未就绪时放行，由 ai_attach_images / 发送侧兜底报错 */
+  }
+  let attached;
+  try {
+    attached = await aiAttachImages(proj.id, items);
+  } catch (err) {
+    toast(String(err), 'error');
+    return;
+  }
+  items.forEach((item, i) => {
+    const a = attached[i];
+    if (!a) return;
+    const ref: ImageRef = {
+      id: uid('img'),
+      source: item.source,
+      name: a.name,
+      mime: a.mime,
+      path: a.path,
+      originPath: item.source === 'clipboard' ? undefined : item.path,
+      serverId: item.source === 'remote' ? item.serverId : null,
+      size: a.size,
+      ts: Date.now(),
+    };
+    imageRefs.set(ref.id, ref);
+    addImageRefChip(ref);
+  });
+}
+
+/** File -> 不带 dataURL 前缀的 base64（FileReader，与 explorer OS 导入同模式） */
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const s = String(reader.result ?? '');
+      resolve(s.slice(s.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(new Error(`读取 ${file.name} 失败`));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** 从剪贴板/拖拽 DataTransfer 提取图片文件（粘贴多张与资源管理器多选复制都走这里；按名称去重） */
+function extractImageFiles(dt: DataTransfer | null): File[] {
+  if (!dt) return [];
+  const seen = new Set<string>();
+  const out: File[] = [];
+  const push = (f: File | null): void => {
+    if (!f) return;
+    const isImage = f.type.startsWith('image/') || IMAGE_EXT_RE.test(f.name);
+    if (!isImage || seen.has(f.name + f.size)) return;
+    seen.add(f.name + f.size);
+    out.push(f);
+  };
+  if (dt.items) {
+    for (const item of Array.from(dt.items)) {
+      if (item.kind === 'file') push(item.getAsFile());
+    }
+  } else {
+    Array.from(dt.files).forEach(push);
+  }
+  return out;
+}
+
+/** 输入框粘贴：含图片文件时拦截默认行为并转为附件（一次可多张）；纯文本粘贴不受影响 */
+function onInputPaste(e: ClipboardEvent): void {
+  const files = extractImageFiles(e.clipboardData);
+  if (!files.length) return;
+  e.preventDefault();
+  void Promise.all(files.map(async (f) => ({ source: 'clipboard' as const, name: f.name, data: await readFileAsBase64(f) })))
+    .then(attachImages)
+    .catch((err) => toast(String(err), 'error'));
+}
+
+/** 输入区拖放：①应用内 explorer/SFTP 拖拽载荷（DND_MIME，图片扩展名）②OS 文件拖入。
+ *  两者都不是时不拦截（保留文本拖放等默认行为）。 */
+function onInputAreaDrop(e: DragEvent): void {
+  const area = e.currentTarget as HTMLElement;
+  area.classList.remove('ai-drag-over');
+  const dt = e.dataTransfer;
+  if (!dt) return;
+  const raw = dt.getData(DND_MIME);
+  if (raw) {
+    try {
+      const p = JSON.parse(raw) as { source: 'local' | 'remote'; path: string; name: string; isDir: boolean; serverId?: string };
+      e.preventDefault();
+      if (p.isDir) {
+        toast('目录不能作为图片附件');
+        return;
+      }
+      if (!IMAGE_EXT_RE.test(p.name)) {
+        toast('仅支持 PNG / JPEG / GIF / WebP 图片');
+        return;
+      }
+      void attachImages([
+        p.source === 'remote'
+          ? { source: 'remote', serverId: p.serverId ?? '', path: p.path }
+          : { source: 'local', path: p.path },
+      ]);
+      return;
+    } catch {
+      /* 载荷损坏按 OS 文件分支处理 */
+    }
+  }
+  const files = extractImageFiles(dt);
+  if (!files.length) return;
+  e.preventDefault();
+  void Promise.all(files.map(async (f) => ({ source: 'clipboard' as const, name: f.name, data: await readFileAsBase64(f) })))
+    .then(attachImages)
+    .catch((err) => toast(String(err), 'error'));
+}
+
 function autoGrow(): void {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 120) + 'px';
@@ -2502,6 +2802,7 @@ async function send(): Promise<void> {
   const prefs: PathRef[] = [];
   const brefs: BrowserRef[] = [];
   const skrefs: SkillRef[] = [];
+  const imgs: ImageRef[] = [];
   // 固定工作区域引用最先（开启自动切换时）；浏览器工作区不携带上一终端引用
   if (autoSwitchAiWorkdir && !browserWorkarea && workareaRef) srefs.push(workareaRef);
   chipRow.querySelectorAll('.ai-snap-chip').forEach((c) => {
@@ -2526,20 +2827,31 @@ async function send(): Promise<void> {
     } else if (kind === 'skill') {
       const r = skillRefs.get(id);
       if (r) skrefs.push(r);
+    } else if (kind === 'image') {
+      const r = imageRefs.get(id);
+      if (r) imgs.push(r);
     }
   });
-  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && skrefs.length === 0) return;
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && skrefs.length === 0 && imgs.length === 0) return;
 
   // 只有新会话的第一条用户消息触发一次标题任务；后续消息永不自动改名。
   const shouldGenerateTitle = s.messages.length === 0 && !s.autoTitleTriggered;
   if (shouldGenerateTitle) {
     s.title = temporarySessionTitle(
       text,
-      brefs.length ? '页面元素引用' : skrefs.length ? '技能引用' : srefs.length || prefs.length ? '引用' : '文件引用',
+      !text && imgs.length
+        ? '图片消息'
+        : brefs.length
+          ? '页面元素引用'
+          : skrefs.length
+            ? '技能引用'
+            : srefs.length || prefs.length
+              ? '引用'
+              : '文件引用',
     );
   }
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, skillRefs: skrefs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, skillRefs: skrefs, imageRefs: imgs, actions: [], ts: Date.now() });
   if (shouldGenerateTitle) s.autoTitleTriggered = true;
   input.value = '';
   autoGrow();
@@ -2570,8 +2882,20 @@ async function send(): Promise<void> {
   }
 
   // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器/路径/技能引用说明（UI 气泡只显示 chip）
-  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs, brefs, skrefs);
-  aiChat(`${pid}:${sid}`, prompt).catch((err: unknown) => {
+  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs, brefs, skrefs, imgs);
+  // 图片本体不进 prompt：经 ai_chat 的 images 参数走 pi RPC images 字段（多模态 user 消息）。
+  // 回读失败的图片跳过并提示（落盘副本被移动/删除的极端场景），不阻塞整条消息。
+  const loaded = await Promise.all(
+    imgs.map(async (r) => {
+      const out = await loadImageData(r.path);
+      return out ? { mimeType: out.mime, data: out.data } : null;
+    }),
+  );
+  const images = loaded.filter((x): x is { mimeType: string; data: string } => x !== null);
+  if (images.length < imgs.length) {
+    toast(`${imgs.length - images.length} 张图片读取失败，已跳过`, 'error');
+  }
+  aiChat(`${pid}:${sid}`, prompt, images.length ? images : undefined).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
     console.error('[AI] ai_chat 失败:', err);
     ctx.pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
@@ -2588,9 +2912,10 @@ async function send(): Promise<void> {
  * 固定工作区域（开启自动切换时 srefs[0]）作为「当前工作区域」上下文说明，
  * 远程引用附 user@host:port 便于 AI 选择命令目标（后端 run_command 的 target 由 AI 工具参数决定）；
  * 路径引用只带完整路径不带文件内容；浏览器元素引用展开为页面信息 + 元素完整 HTML；
- * 技能引用展开为名称/来源/scope/描述（AI 可循技能目录读取 SKILL.md 后按技能工作）。
+ * 技能引用展开为名称/来源/scope/描述（AI 可循技能目录读取 SKILL.md 后按技能工作）；
+ * 图片附件只附一行文件名清单（图片本体经 ai_chat 的 images 参数传给多模态模型，不进 prompt）。
  */
-async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[], brefs: BrowserRef[], skrefs: SkillRef[]): Promise<string> {
+async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[], brefs: BrowserRef[], skrefs: SkillRef[], imgs: ImageRef[]): Promise<string> {
   let servers: Server[] = [];
   try {
     servers = (await getState()).servers;
@@ -2638,6 +2963,7 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
       `\n\n[浏览器元素引用 @browser:${r.name}]\n页面: ${r.title || '（无标题）'} (${r.url})\n元素 HTML:\n${r.outerHTML.slice(0, 8000)}`).join('')
     + skrefs.map((r) =>
       `\n\n[技能引用 @skill:${r.name}]\n名称: ${r.name}（${r.origin === 'global' ? '全局' : '项目'}）\nscope: ${r.scope.join(', ') || '-'}\n描述: ${r.description}`).join('')
+    + (imgs.length ? `\n\n[已附加 ${imgs.length} 张图片: ${imgs.map((r) => r.name).join(', ')}]` : '')
     + refText;
 }
 
@@ -2781,6 +3107,23 @@ function bindEvents(): void {
   stagingNotice.addEventListener('click', openCurrentStaging);
   chipRow.addEventListener('click', onChipRowClick);
   input.addEventListener('input', autoGrow);
+  /* 粘贴图片：拦截含图片文件的粘贴转为附件（一次可多张），纯文本粘贴不受影响 */
+  input.addEventListener('paste', onInputPaste);
+  /* 拖入图片：应用内 explorer/SFTP 拖拽载荷 + OS 文件（dragDropEnabled:false 下 HTML5 DnD 可用）。
+     dragover 必须 preventDefault 才能接收 drop；dragleave 在离开整个输入区时才撤高亮（越过子元素会连发） */
+  const inputArea = input.closest<HTMLElement>('#ai-input-area');
+  if (inputArea) {
+    inputArea.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      inputArea.classList.add('ai-drag-over');
+    });
+    inputArea.addEventListener('dragleave', (e) => {
+      if (!e.relatedTarget || !inputArea.contains(e.relatedTarget as Node)) {
+        inputArea.classList.remove('ai-drag-over');
+      }
+    });
+    inputArea.addEventListener('drop', onInputAreaDrop);
+  }
   input.addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();

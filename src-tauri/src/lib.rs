@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod ai_actions;
+pub mod ai_images;
 pub mod ai_impact;
 pub mod browser;
 pub mod mcp;
@@ -256,6 +257,8 @@ pub fn run() {
             ai::ai_debug_info,
             ai::ai_kill_project,
             ai::ai_set_thinking,
+            ai_images::ai_attach_images,
+            ai_images::ai_read_image,
             ai::set_ai_mode,
             ai::ai_respond_approval,
             ai::ai_respond_db_request,
