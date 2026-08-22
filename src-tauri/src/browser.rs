@@ -1,17 +1,21 @@
-//! 内置浏览器：主窗口内嵌子 webview（WebView2），供侧栏浏览器面板与 AI 浏览器工具共用（共享单实例）。
+//! 内置浏览器：主窗口内嵌多个子 webview（WebView2），供浏览器标签页（多页面）与 AI 浏览器工具共用。
 //! 契约（与 src/api.ts / browser-engine.ts 严格对齐）：
+//! - 每个「页面」对应一个子 webview，viewId 由前端生成（p1/p2/…），webview label = `browser-<viewId>`；
 //! - 命令 `browser_ensure` / `browser_set_rect` / `browser_set_visible` / `browser_navigate` /
-//!   `browser_back` / `browser_forward` / `browser_reload` / `browser_set_inspect` / `browser_open_devtools`；
-//! - 事件 `browser:event` payload `{ kind: 'url'|'title'|'element'|'ai-navigate', ... }`；
-//! - AI 动作桥（ai.rs run_internal_action）：browser_open / browser_read / browser_console / browser_screenshot。
+//!   `browser_back` / `browser_forward` / `browser_reload` / `browser_set_inspect` /
+//!   `browser_open_devtools` / `browser_close_view`（除 close_view 外均带 viewId 参数）；
+//! - 事件 `browser:event` payload `{ kind: 'url'|'title'|'element'|'ai-navigate', viewId, ... }`；
+//! - AI 动作桥（ai.rs run_internal_action）：browser_open / browser_read / browser_console / browser_screenshot，
+//!   目标视图 = 当前用户可视页面 → 用户最近浏览过的页面 → 专用 "ai" 页面（延续旧单实例的共享语义）。
 //!
 //! 页面 → Rust 回传走 WebView2 原生 `window.chrome.webview.postMessage`（WebMessageReceived），
 //! 对任意来源（含 file://）可用、不依赖 tauri capability。
-//! 子 webview 全局单实例、跨面板切换与跨项目保留；位置由前端 BrowserPanel 的占位 div
-//! 经 ResizeObserver 同步（逻辑坐标 —— 主 webview 铺满无边框窗口，与窗口坐标 1:1）。
+//! 各页面 webview 由 Rust 持有（跨标签关闭/跨项目保留，前端关闭页面才经 close_view 释放）；
+//! 位置由前端 BrowserPanel 的占位 div 经 ResizeObserver 同步（逻辑坐标 —— 主 webview 铺满
+//! 无边框窗口，与窗口坐标 1:1），仅活跃页面同步 rect，非活跃页面一律隐藏。
 //! 注意：Windows 上同步命令/事件处理器里创建 webview 会死锁（tauri 已知问题），触碰 webview 的命令一律 async。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,8 +29,10 @@ use tauri::{
 };
 use tokio::sync::{oneshot, watch};
 
-/// 子 webview 标签（区别于主窗口 "main"；不进 capability，页面无 IPC 权限，回传走 WebMessage）。
-const BROWSER_LABEL: &str = "browser";
+/// 子 webview label 前缀（区别于主窗口 "main"；不进 capability，页面无 IPC 权限，回传走 WebMessage）。
+const BROWSER_LABEL_PREFIX: &str = "browser";
+/// AI 专用兜底视图 id：无可视页面且用户从未浏览过任何页面时，AI 工具使用的隐藏视图。
+const AI_VIEW_ID: &str = "ai";
 /// console 环形缓冲上限（AI browser_console 每次最多取 200 条）
 const CONSOLE_CAP: usize = 500;
 /// 截图保留张数上限（<workspace>/.aishell/tmp/screenshot，超出删最旧）
@@ -60,7 +66,7 @@ pub struct ConsoleEntry {
     pub ts: u64,
 }
 
-/// browser_ensure 返回值：面板重挂时恢复地址栏/标题/检查模式状态。
+/// browser_ensure 返回值：页面重挂时恢复地址栏/标题/检查模式状态。
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserState {
@@ -69,22 +75,27 @@ pub struct BrowserState {
     pub inspect: bool,
 }
 
-struct BrowserInner {
+/// 单个浏览器页面的状态与子 webview（页面 = 前端标签栏的一项）。
+struct BrowserView {
     webview: Option<Webview<Wry>>,
     inspect: bool,
     url: String,
     title: String,
     console: VecDeque<ConsoleEntry>,
-    /// webview 当前是否对用户可见（面板激活且无遮罩时前端置 true；截图后台渲染据此恢复）
+    /// webview 当前是否对用户可见（活跃页面且无遮罩时前端置 true；截图后台渲染据此恢复）
     shown: bool,
-    /// 面板占位区域最近一次同步的逻辑矩形 (x, y, w, h)
+    /// 页面占位区域最近一次同步的逻辑矩形 (x, y, w, h)
     rect: (f64, f64, f64, f64),
+    /// 页面加载完成计数（on_page_load Finished 时 +1；browser_open 用 watch 等待）
+    load_tx: watch::Sender<u64>,
 }
 
 pub struct BrowserManager {
-    inner: Mutex<BrowserInner>,
-    /// 页面加载完成计数（on_page_load Finished 时 +1；browser_open 用 watch 等待）
-    load_tx: watch::Sender<u64>,
+    /// viewId → 页面状态
+    views: Mutex<HashMap<String, BrowserView>>,
+    /// 用户最近一次可见的视图 id（browser_set_visible(true) 时记录）：
+    /// AI 工具在无可视页面时复用它，延续旧单实例「AI 与用户共用同一 webview」的语义。
+    last_user_view: Mutex<Option<String>>,
 }
 
 impl Default for BrowserManager {
@@ -93,36 +104,60 @@ impl Default for BrowserManager {
     }
 }
 
+/// viewId → webview label。viewId 由前端生成（p1/p2/…），仅允许字母数字与 `-_`：
+/// label 非法字符会让 add_child 失败或产生意外行为，提前给出可执行报错。
+fn view_label(view_id: &str) -> Result<String, String> {
+    if view_id.is_empty()
+        || !view_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("非法的浏览器页面 id: {view_id}"));
+    }
+    Ok(format!("{BROWSER_LABEL_PREFIX}-{view_id}"))
+}
+
 impl BrowserManager {
     pub fn new() -> Self {
-        let (load_tx, _) = watch::channel(0u64);
         Self {
-            inner: Mutex::new(BrowserInner {
-                webview: None,
-                inspect: false,
-                url: String::new(),
-                title: String::new(),
-                console: VecDeque::new(),
-                shown: false,
-                rect: (0.0, 0.0, 1280.0, 800.0),
-            }),
-            load_tx,
+            views: Mutex::new(HashMap::new()),
+            last_user_view: Mutex::new(None),
         }
     }
 
-    fn webview(&self) -> Result<Webview<Wry>, String> {
-        self.inner
+    fn webview_of(&self, view_id: &str) -> Result<Webview<Wry>, String> {
+        self.views
             .lock()
             .unwrap()
-            .webview
-            .clone()
-            .ok_or_else(|| "浏览器尚未创建".to_string())
+            .get(view_id)
+            .and_then(|v| v.webview.clone())
+            .ok_or_else(|| format!("浏览器页面尚未打开: {view_id}"))
     }
 
-    /// 懒创建子 webview（已存在直接返回）。初始离屏 + 隐藏：
-    /// 面板挂载后 set_rect 归位；AI 后台使用时离屏渲染（截图不闪屏）。
-    pub async fn ensure(self: &Arc<Self>) -> Result<(), String> {
-        if self.inner.lock().unwrap().webview.is_some() {
+    /// AI 工具目标视图：当前用户可视的页面 → 用户最近浏览过的页面 → 专用 "ai" 页面。
+    /// 旧单实例时代 AI 直接复用用户 webview，这里延续同一语义：用户正看/最近看的页面优先，
+    /// 全新会话（用户从未打开过页面）才落到独立隐藏的 ai 页面。
+    fn ai_target(&self) -> String {
+        {
+            let views = self.views.lock().unwrap();
+            if let Some((id, _)) = views.iter().find(|(_, v)| v.shown) {
+                return id.clone();
+            }
+        }
+        let last = self.last_user_view.lock().unwrap().clone();
+        if let Some(id) = last {
+            if self.views.lock().unwrap().contains_key(&id) {
+                return id;
+            }
+        }
+        AI_VIEW_ID.to_string()
+    }
+
+    /// 懒创建某页面的子 webview（已存在直接返回）。初始离屏 + 隐藏：
+    /// 页面挂载后 set_rect 归位；AI 后台使用时离屏渲染（截图不闪屏）。
+    pub async fn ensure(self: &Arc<Self>, view_id: &str) -> Result<(), String> {
+        let label = view_label(view_id)?;
+        if self.views.lock().unwrap().contains_key(view_id) {
             return Ok(());
         }
         let handle = app_handle().ok_or_else(|| "浏览器未初始化（应用句柄缺失）".to_string())?;
@@ -133,8 +168,11 @@ impl BrowserManager {
         let mgr_load = Arc::clone(self);
         let mgr_title = Arc::clone(self);
         let mgr_nav = Arc::clone(self);
+        let view_id_nav = view_id.to_string();
+        let view_id_load = view_id.to_string();
+        let view_id_title = view_id.to_string();
         let builder = WebviewBuilder::new(
-            BROWSER_LABEL,
+            label,
             WebviewUrl::External(Url::parse("about:blank").map_err(|e| format!("初始地址非法: {e}"))?),
         )
         .initialization_script(INSPECTOR_JS)
@@ -146,7 +184,13 @@ impl BrowserManager {
             if url.scheme() == "file" && url.host_str().is_none() {
                 let decoded = percent_decode(url.path()).trim_start_matches('/').to_string();
                 if let Ok(rewritten) = local_file_url(Path::new(&decoded)) {
-                    if let Some(wv) = mgr_nav.inner.lock().unwrap().webview.clone() {
+                    if let Some(wv) = mgr_nav
+                        .views
+                        .lock()
+                        .unwrap()
+                        .get(&view_id_nav)
+                        .and_then(|v| v.webview.clone())
+                    {
                         let _ = wv.navigate(rewritten);
                     }
                 }
@@ -158,21 +202,30 @@ impl BrowserManager {
             let url = payload.url().to_string();
             let finished = matches!(payload.event(), PageLoadEvent::Finished);
             let (inspect, wv) = {
-                let mut inner = mgr_load.inner.lock().unwrap();
-                inner.url = url.clone();
+                let mut views = mgr_load.views.lock().unwrap();
+                let Some(v) = views.get_mut(&view_id_load) else { return };
+                v.url = url.clone();
                 if finished {
-                    inner.console.clear();
+                    v.console.clear();
                 }
-                (inner.inspect, inner.webview.clone())
+                (v.inspect, v.webview.clone())
             };
             if let Some(a) = app_handle() {
-                let _ = a.emit("browser:event", json!({ "kind": "url", "url": display_url(&url) }));
+                let _ = a.emit(
+                    "browser:event",
+                    json!({ "kind": "url", "viewId": view_id_load, "url": display_url(&url) }),
+                );
             }
             if finished {
-                mgr_load.load_tx.send_if_modified(|v| {
-                    *v += 1;
-                    true
-                });
+                {
+                    let views = mgr_load.views.lock().unwrap();
+                    if let Some(v) = views.get(&view_id_load) {
+                        v.load_tx.send_if_modified(|val| {
+                            *val += 1;
+                            true
+                        });
+                    }
+                }
                 // 检查模式跨导航保持：新页面重新激活检查器
                 if inspect {
                     if let Some(wv) = wv {
@@ -182,9 +235,16 @@ impl BrowserManager {
             }
         })
         .on_document_title_changed(move |_wv, title| {
-            mgr_title.inner.lock().unwrap().title = title.clone();
+            {
+                let mut views = mgr_title.views.lock().unwrap();
+                let Some(v) = views.get_mut(&view_id_title) else { return };
+                v.title = title.clone();
+            }
             if let Some(a) = app_handle() {
-                let _ = a.emit("browser:event", json!({ "kind": "title", "title": title }));
+                let _ = a.emit(
+                    "browser:event",
+                    json!({ "kind": "title", "viewId": view_id_title, "title": title }),
+                );
             }
         });
 
@@ -195,6 +255,7 @@ impl BrowserManager {
 
         // 页面回传通道：element（检查器选中）/ console（钩子）经 WebMessageReceived 进入
         let mgr_msg = Arc::clone(self);
+        let view_id_msg = view_id.to_string();
         let _ = wv.with_webview(move |pw| unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
             use windows::core::PWSTR;
@@ -207,7 +268,7 @@ impl BrowserManager {
                     if args.TryGetWebMessageAsString(&mut raw).is_ok() && !raw.is_null() {
                         let msg = raw.to_string().unwrap_or_default();
                         CoTaskMemFree(Some(raw.as_ptr().cast()));
-                        handle_page_message(&mgr_msg, &msg);
+                        handle_page_message(&mgr_msg, &view_id_msg, &msg);
                     }
                     Ok(())
                 },
@@ -217,57 +278,91 @@ impl BrowserManager {
         });
 
         {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.webview.is_some() {
+            let mut views = self.views.lock().unwrap();
+            if views.contains_key(view_id) {
                 // 并发 ensure 竞态：后建者直接丢弃
                 let _ = wv.close();
                 return Ok(());
             }
-            inner.webview = Some(wv);
+            views.insert(
+                view_id.to_string(),
+                BrowserView {
+                    webview: Some(wv),
+                    inspect: false,
+                    url: String::new(),
+                    title: String::new(),
+                    console: VecDeque::new(),
+                    shown: false,
+                    rect: (0.0, 0.0, 1280.0, 800.0),
+                    load_tx: watch::channel(0u64).0,
+                },
+            );
         }
         Ok(())
     }
 
-    /// 归一化并导航（用户地址栏 / AI 工具共用核心）；返回归一化 URL。
-    fn navigate_str(&self, input: &str) -> Result<String, String> {
+    /// 归一化并导航某页面（用户地址栏共用核心）；返回归一化 URL。
+    fn navigate_str(&self, view_id: &str, input: &str) -> Result<String, String> {
         let url = normalize_input(input)?;
-        let wv = self.webview()?;
+        let wv = self.webview_of(view_id)?;
         wv.navigate(url.clone())
             .map_err(|e| format!("导航失败: {e}"))?;
         {
-            let mut inner = self.inner.lock().unwrap();
-            inner.url = url.to_string();
-            inner.console.clear();
+            let mut views = self.views.lock().unwrap();
+            let Some(v) = views.get_mut(view_id) else {
+                return Err(format!("浏览器页面尚未打开: {view_id}"));
+            };
+            v.url = url.to_string();
+            v.console.clear();
         }
         Ok(display_url(url.as_str()))
     }
 
     /// AI 动作 browser_open：后台导航（不切面板、不抢焦点），等页面加载完成（≤15s）。
-    /// 共享单实例语义：面板正停留在浏览器时 emit ai-navigate，前端 toast 提示页面被替换。
+    /// 目标页面用户正在观看时 emit ai-navigate，前端 toast 提示页面被替换。
     pub async fn open_for_ai(self: &Arc<Self>, input: &str) -> Result<String, String> {
-        self.ensure().await?;
+        let view_id = self.ai_target();
+        self.ensure(&view_id).await?;
         let url = normalize_input(input)?;
-        let before = *self.load_tx.borrow();
-        let shown = self.inner.lock().unwrap().shown;
-        let wv = self.webview()?;
+        let (before, shown) = {
+            let views = self.views.lock().unwrap();
+            let Some(v) = views.get(&view_id) else {
+                return Err(format!("浏览器页面尚未打开: {view_id}"));
+            };
+            let before = *v.load_tx.borrow();
+            (before, v.shown)
+        };
+        let wv = self.webview_of(&view_id)?;
         wv.navigate(url.clone())
             .map_err(|e| format!("导航失败: {e}"))?;
         {
-            let mut inner = self.inner.lock().unwrap();
-            inner.url = url.to_string();
-            inner.console.clear();
+            let mut views = self.views.lock().unwrap();
+            let Some(v) = views.get_mut(&view_id) else {
+                return Err(format!("浏览器页面尚未打开: {view_id}"));
+            };
+            v.url = url.to_string();
+            v.console.clear();
         }
         if let Some(a) = app_handle() {
-            let _ = a.emit("browser:event", json!({ "kind": "url", "url": display_url(url.as_str()) }));
+            let _ = a.emit(
+                "browser:event",
+                json!({ "kind": "url", "viewId": view_id, "url": display_url(url.as_str()) }),
+            );
             if shown {
                 let _ = a.emit(
                     "browser:event",
-                    json!({ "kind": "ai-navigate", "url": display_url(url.as_str()) }),
+                    json!({ "kind": "ai-navigate", "viewId": view_id, "url": display_url(url.as_str()) }),
                 );
             }
         }
-        // 等待加载完成（watch 计数增长）；超时不报错，返回当前状态并注明
-        let mut rx = self.load_tx.subscribe();
+        // 等待加载完成（该页面 watch 计数增长）；超时不报错，返回当前状态并注明
+        let mut rx = {
+            let views = self.views.lock().unwrap();
+            let Some(v) = views.get(&view_id) else {
+                return Err(format!("浏览器页面尚未打开: {view_id}"));
+            };
+            v.load_tx.subscribe()
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut loaded = *rx.borrow_and_update() > before;
         while !loaded {
@@ -280,8 +375,11 @@ impl BrowserManager {
             loaded = *rx.borrow_and_update() > before;
         }
         let (url_s, title) = {
-            let i = self.inner.lock().unwrap();
-            (i.url.clone(), i.title.clone())
+            let i = self.views.lock().unwrap();
+            let Some(v) = i.get(&view_id) else {
+                return Err(format!("浏览器页面尚未打开: {view_id}"));
+            };
+            (v.url.clone(), v.title.clone())
         };
         Ok(format!(
             "已打开: {}\n页面标题: {title}\n加载状态: {}",
@@ -293,7 +391,8 @@ impl BrowserManager {
     /// AI 动作 browser_read：无 selector 读 body innerText（截 10000 字符）；
     /// 给 selector 返回首个匹配元素 outerHTML（截 20000）—— 与 @browser: 元素引用呼应。
     pub async fn read_page(&self, selector: Option<&str>) -> Result<String, String> {
-        let wv = self.webview()?;
+        let view_id = self.ai_target();
+        let wv = self.webview_of(&view_id)?;
         let js = match selector {
             Some(sel) if !sel.trim().is_empty() => {
                 let sel_lit = serde_json::to_string(sel).unwrap_or_default();
@@ -335,9 +434,13 @@ impl BrowserManager {
         }
     }
 
-    /// AI 动作 browser_console：最近 limit 条（默认 200）console 日志。
+    /// AI 动作 browser_console：目标页面最近 limit 条（默认 200）console 日志。
     pub fn console_text(&self, limit: Option<usize>) -> String {
-        let inner = self.inner.lock().unwrap();
+        let view_id = self.ai_target();
+        let views = self.views.lock().unwrap();
+        let Some(inner) = views.get(&view_id) else {
+            return "（暂无 console 输出）".to_string();
+        };
         let limit = limit.unwrap_or(200).min(inner.console.len());
         let lines: Vec<String> = inner
             .console
@@ -357,11 +460,15 @@ impl BrowserManager {
     /// `<workspace>/.aishell/tmp/screenshot/<ms>.png`，仅保留最新 20 张，返回文件路径。
     /// 隐藏态先临时显示并移到屏幕外（离屏渲染，用户不可见），截完恢复。
     pub async fn screenshot(self: &Arc<Self>, project_path: &Path) -> Result<String, String> {
-        self.ensure().await?;
-        let wv = self.webview()?;
+        let view_id = self.ai_target();
+        self.ensure(&view_id).await?;
+        let wv = self.webview_of(&view_id)?;
         let (was_shown, rect) = {
-            let i = self.inner.lock().unwrap();
-            (i.shown, i.rect)
+            let views = self.views.lock().unwrap();
+            let Some(v) = views.get(&view_id) else {
+                return Err(format!("浏览器页面尚未打开: {view_id}"));
+            };
+            (v.shown, v.rect)
         };
         if !was_shown {
             let _ = wv.show();
@@ -415,11 +522,22 @@ impl BrowserManager {
         let bytes = outcome?;
         save_screenshot(project_path, &bytes)
     }
+
+    /// 前端关闭页面：释放该页面 webview 并丢弃状态（活跃视图由前端先切换）。
+    pub fn close_view(&self, view_id: &str) -> Result<(), String> {
+        let removed = self.views.lock().unwrap().remove(view_id);
+        if let Some(v) = removed {
+            if let Some(wv) = v.webview {
+                wv.close().map_err(|e| format!("关闭浏览器页面失败: {e}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /* ---------------- 页面消息（WebMessageReceived）分发 ---------------- */
 
-fn handle_page_message(mgr: &BrowserManager, msg: &str) {
+fn handle_page_message(mgr: &BrowserManager, view_id: &str, msg: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) else { return };
     match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
         "console" => {
@@ -428,11 +546,13 @@ fn handle_page_message(mgr: &BrowserManager, msg: &str) {
                 text: v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                 ts: v.get("ts").and_then(|x| x.as_u64()).unwrap_or_else(now_ms),
             };
-            let mut inner = mgr.inner.lock().unwrap();
-            if inner.console.len() >= CONSOLE_CAP {
-                inner.console.pop_front();
+            let mut views = mgr.views.lock().unwrap();
+            if let Some(inner) = views.get_mut(view_id) {
+                if inner.console.len() >= CONSOLE_CAP {
+                    inner.console.pop_front();
+                }
+                inner.console.push_back(entry);
             }
-            inner.console.push_back(entry);
         }
         "element" => {
             let mut v = v;
@@ -443,6 +563,7 @@ fn handle_page_message(mgr: &BrowserManager, msg: &str) {
             if let Some(u) = v.get("url").and_then(|x| x.as_str()) {
                 v["url"] = json!(display_url(u));
             }
+            v["viewId"] = json!(view_id);
             if let Some(a) = app_handle() {
                 let _ = a.emit("browser:event", v);
             }
@@ -621,27 +742,39 @@ fn save_screenshot(project_path: &Path, bytes: &[u8]) -> Result<String, String> 
 /* ---------------- 前端命令（一律 async：Windows 同步路径创建/触碰 webview 会死锁） ---------------- */
 
 #[tauri::command]
-pub async fn browser_ensure(mgr: State<'_, Arc<BrowserManager>>) -> Result<BrowserState, String> {
-    mgr.ensure().await?;
-    let i = mgr.inner.lock().unwrap();
+pub async fn browser_ensure(
+    mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
+) -> Result<BrowserState, String> {
+    mgr.ensure(&view_id).await?;
+    let views = mgr.views.lock().unwrap();
+    let Some(v) = views.get(&view_id) else {
+        return Err(format!("浏览器页面尚未打开: {view_id}"));
+    };
     Ok(BrowserState {
-        url: display_url(&i.url),
-        title: i.title.clone(),
-        inspect: i.inspect,
+        url: display_url(&v.url),
+        title: v.title.clone(),
+        inspect: v.inspect,
     })
 }
 
 #[tauri::command]
 pub async fn browser_set_rect(
     mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
     x: f64,
     y: f64,
     w: f64,
     h: f64,
 ) -> Result<(), String> {
     let (w, h) = (w.max(1.0), h.max(1.0));
-    let wv = mgr.webview()?;
-    mgr.inner.lock().unwrap().rect = (x, y, w, h);
+    let wv = mgr.webview_of(&view_id)?;
+    {
+        let mut views = mgr.views.lock().unwrap();
+        if let Some(v) = views.get_mut(&view_id) {
+            v.rect = (x, y, w, h);
+        }
+    }
     wv.set_position(LogicalPosition::new(x, y))
         .map_err(|e| format!("同步浏览器位置失败: {e}"))?;
     wv.set_size(LogicalSize::new(w, h))
@@ -652,10 +785,19 @@ pub async fn browser_set_rect(
 #[tauri::command]
 pub async fn browser_set_visible(
     mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
     visible: bool,
 ) -> Result<(), String> {
-    let wv = mgr.webview()?;
-    mgr.inner.lock().unwrap().shown = visible;
+    let wv = mgr.webview_of(&view_id)?;
+    {
+        let mut views = mgr.views.lock().unwrap();
+        if let Some(v) = views.get_mut(&view_id) {
+            v.shown = visible;
+        }
+    }
+    if visible {
+        *mgr.last_user_view.lock().unwrap() = Some(view_id);
+    }
     let r = if visible { wv.show() } else { wv.hide() };
     r.map_err(|e| format!("切换浏览器显示失败: {e}"))
 }
@@ -663,28 +805,38 @@ pub async fn browser_set_visible(
 #[tauri::command]
 pub async fn browser_navigate(
     mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
     input: String,
 ) -> Result<String, String> {
-    mgr.navigate_str(&input)
+    mgr.navigate_str(&view_id, &input)
 }
 
 #[tauri::command]
-pub async fn browser_back(mgr: State<'_, Arc<BrowserManager>>) -> Result<(), String> {
-    mgr.webview()?
+pub async fn browser_back(
+    mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
+) -> Result<(), String> {
+    mgr.webview_of(&view_id)?
         .eval("history.back();")
         .map_err(|e| format!("后退失败: {e}"))
 }
 
 #[tauri::command]
-pub async fn browser_forward(mgr: State<'_, Arc<BrowserManager>>) -> Result<(), String> {
-    mgr.webview()?
+pub async fn browser_forward(
+    mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
+) -> Result<(), String> {
+    mgr.webview_of(&view_id)?
         .eval("history.forward();")
         .map_err(|e| format!("前进失败: {e}"))
 }
 
 #[tauri::command]
-pub async fn browser_reload(mgr: State<'_, Arc<BrowserManager>>) -> Result<(), String> {
-    mgr.webview()?
+pub async fn browser_reload(
+    mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
+) -> Result<(), String> {
+    mgr.webview_of(&view_id)?
         .reload()
         .map_err(|e| format!("刷新失败: {e}"))
 }
@@ -692,24 +844,42 @@ pub async fn browser_reload(mgr: State<'_, Arc<BrowserManager>>) -> Result<(), S
 #[tauri::command]
 pub async fn browser_set_inspect(
     mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    mgr.inner.lock().unwrap().inspect = enabled;
+    {
+        let mut views = mgr.views.lock().unwrap();
+        if let Some(v) = views.get_mut(&view_id) {
+            v.inspect = enabled;
+        }
+    }
     let js = if enabled {
         "window.__aishellInspector && window.__aishellInspector.enable();"
     } else {
         "window.__aishellInspector && window.__aishellInspector.disable();"
     };
-    mgr.webview()?
+    mgr.webview_of(&view_id)?
         .eval(js)
         .map_err(|e| format!("切换检查模式失败: {e}"))
 }
 
 #[tauri::command]
-pub async fn browser_open_devtools(mgr: State<'_, Arc<BrowserManager>>) -> Result<(), String> {
-    let wv = mgr.webview()?;
+pub async fn browser_open_devtools(
+    mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
+) -> Result<(), String> {
+    let wv = mgr.webview_of(&view_id)?;
     wv.open_devtools();
     Ok(())
+}
+
+/// 关闭页面：释放该页面的子 webview 与状态（前端标签栏页面删除时调用）。
+#[tauri::command]
+pub async fn browser_close_view(
+    mgr: State<'_, Arc<BrowserManager>>,
+    view_id: String,
+) -> Result<(), String> {
+    mgr.close_view(&view_id)
 }
 
 /* ---------------- 注入脚本：console 钩子（常开）+ 检查元素（休眠态，Rust eval 激活） ---------------- */
@@ -828,6 +998,62 @@ const INSPECTOR_JS: &str = r##"(function () {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_label_validates_id() {
+        assert_eq!(view_label("p1").unwrap(), "browser-p1");
+        assert_eq!(view_label("a-b_C2").unwrap(), "browser-a-b_C2");
+        // 空 id / 含路径分隔符或特殊字符（会破坏 webview label）给出中文报错
+        for bad in ["", "p 1", "p/1", "p\\1", "浏览器"] {
+            assert!(view_label(bad).is_err(), "应拒绝非法 id: {bad}");
+        }
+    }
+
+    #[test]
+    fn ai_target_prefers_visible_then_last_user() {
+        let mgr = BrowserManager::new();
+        // 无任何页面 → 专用 ai 页面
+        assert_eq!(mgr.ai_target(), AI_VIEW_ID);
+        // 用户浏览过 p1（已关闭）→ 不存在时仍回退 ai
+        *mgr.last_user_view.lock().unwrap() = Some("p1".to_string());
+        assert_eq!(mgr.ai_target(), AI_VIEW_ID);
+        // 用户浏览过 p1（仍存在，不可见）→ 复用最近浏览页面（旧单实例共享语义）
+        {
+            let mut views = mgr.views.lock().unwrap();
+            views.insert(
+                "p1".to_string(),
+                BrowserView {
+                    webview: None,
+                    inspect: false,
+                    url: String::new(),
+                    title: String::new(),
+                    console: VecDeque::new(),
+                    shown: false,
+                    rect: (0.0, 0.0, 0.0, 0.0),
+                    load_tx: watch::channel(0u64).0,
+                },
+            );
+        }
+        assert_eq!(mgr.ai_target(), "p1");
+        // p2 可见 → 当前可视页面优先
+        {
+            let mut views = mgr.views.lock().unwrap();
+            views.insert(
+                "p2".to_string(),
+                BrowserView {
+                    webview: None,
+                    inspect: false,
+                    url: String::new(),
+                    title: String::new(),
+                    console: VecDeque::new(),
+                    shown: true,
+                    rect: (0.0, 0.0, 0.0, 0.0),
+                    load_tx: watch::channel(0u64).0,
+                },
+            );
+        }
+        assert_eq!(mgr.ai_target(), "p2");
+    }
 
     #[test]
     fn normalize_completes_scheme() {

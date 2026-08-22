@@ -590,6 +590,16 @@ pub struct SkillRef {
     pub description: String,
 }
 
+/// 浏览器页面引用：UI 以 @page:页面标题 标签呈现，发送时展开页面标题与地址
+/// （页面正文由 AI 自行用 browser_read / browser_screenshot 读取）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPageRef {
+    pub url: String,
+    pub title: String,
+    pub ts: i64,
+}
+
 /// 图片附件引用：UI 以缩略图呈现，发送时随 prompt 经 pi RPC images 字段传给多模态模型。
 /// path 指向落盘副本（<project>/.aishell/ai-images/，attach 时由后端物化），
 /// aishell.json 只存路径不存 base64（该文件整体原子重写，塞图会膨胀）。
@@ -631,6 +641,9 @@ pub struct ChatMsg {
     /// 内置浏览器元素引用（@browser:{#id 或标签名} 标签，发送时展开页面信息 + 元素 HTML）；旧会话无此字段时按空处理
     #[serde(default)]
     pub browser_refs: Vec<BrowserRef>,
+    /// 浏览器页面引用（@page:页面标题 标签，发送时展开页面地址与标题）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub browser_page_refs: Vec<BrowserPageRef>,
     /// 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话无此字段时按空处理
     #[serde(default)]
     pub skill_refs: Vec<SkillRef>,
@@ -2107,6 +2120,7 @@ mod tests {
             server_refs: vec![],
             path_refs: vec![],
             browser_refs: vec![],
+            browser_page_refs: vec![],
             skill_refs: vec![],
             image_refs: vec![],
             actions: vec![],
@@ -2208,6 +2222,11 @@ mod tests {
                                 title: "登录".to_string(),
                                 outer_html: r#"<button id="login-btn">登录</button>"#.to_string(),
                                 ts: 1_752_000_000_002,
+                            }],
+                            browser_page_refs: vec![BrowserPageRef {
+                                url: "http://localhtml.localhost/C:/x/console.html".to_string(),
+                                title: "控制台".to_string(),
+                                ts: 1_752_000_000_004,
                             }],
                             skill_refs: vec![SkillRef {
                                 name: "code-review".to_string(),
@@ -3777,6 +3796,7 @@ mod tests {
             server_refs: vec![],
             path_refs: vec![],
             browser_refs: vec![],
+            browser_page_refs: vec![],
             skill_refs: vec![],
             image_refs: vec![],
             actions: vec![],
@@ -3797,6 +3817,7 @@ mod tests {
                     server_refs: vec![],
                     path_refs: vec![],
                     browser_refs: vec![],
+                    browser_page_refs: vec![],
                     skill_refs: vec![],
                     image_refs: vec![],
                     actions: vec![AiActionRecord {
@@ -3933,6 +3954,26 @@ mod tests {
         assert!(msg.file_refs.is_empty(), "旧数据应兼容为空引用列表");
         assert!(msg.server_refs.is_empty(), "旧数据应兼容为空服务器引用列表");
         assert!(msg.path_refs.is_empty(), "旧数据应兼容为空路径引用列表");
+        assert!(msg.browser_refs.is_empty(), "旧数据应兼容为空浏览器元素引用列表");
+        assert!(msg.browser_page_refs.is_empty(), "旧数据应兼容为空浏览器页面引用列表");
+    }
+
+    #[test]
+    fn chat_msg_browser_page_refs_roundtrip_camel_case() {
+        // 新增的浏览器页面引用字段按 camelCase 往返（与前端 ChatMsg.browserPageRefs 对齐）
+        let m = ChatMsg {
+            browser_page_refs: vec![BrowserPageRef {
+                url: "http://localhtml.localhost/C:/x/console.html".to_string(),
+                title: "控制台".to_string(),
+                ts: 1_752_000_000_002,
+            }],
+            ..test_chat_msg("user", "看看 @page:控制台")
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"browserPageRefs\""), "序列化应为 camelCase: {json}");
+        let back: ChatMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.browser_page_refs.len(), 1);
+        assert_eq!(back.browser_page_refs[0].title, "控制台");
     }
 
     #[test]
