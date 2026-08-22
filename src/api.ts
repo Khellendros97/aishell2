@@ -260,25 +260,28 @@ export const traceExport = (path: string, key: string) => call<number>('trace_ex
 /** 清空当前会话 trace（全部日期文件） */
 export const traceClear = (key: string) => call<void>('trace_clear', { key });
 
-/* ---------------- browser（内置浏览器子 webview，Rust browser.rs） ----------------
-   面板占位 div 经 ResizeObserver 同步位置尺寸；element 事件携带检查器选中的元素引用。 */
-/** 懒创建子 webview（全局单实例），返回 url/title/inspect 供面板恢复 */
-export const browserEnsure = () => call<BrowserState>('browser_ensure');
-export const browserSetRect = (x: number, y: number, w: number, h: number) =>
-  call<void>('browser_set_rect', { x, y, w, h });
-/** webview 显隐（面板激活 && 无全屏遮罩 的合成结果由前端计算后传入） */
-export const browserSetVisible = (visible: boolean) =>
-  call<void>('browser_set_visible', { visible });
+/* ---------------- browser（内置浏览器多页面子 webview，Rust browser.rs） ----------------
+   每个「页面」一个子 webview（viewId 由前端生成 p1/p2/…）；占位 div 经 ResizeObserver
+   同步位置尺寸（仅活跃页面）；element 事件携带检查器选中的元素引用（均带 viewId）。 */
+/** 懒创建该页面的子 webview，返回 url/title/inspect 供页面状态恢复 */
+export const browserEnsure = (viewId: string) => call<BrowserState>('browser_ensure', { viewId });
+export const browserSetRect = (viewId: string, x: number, y: number, w: number, h: number) =>
+  call<void>('browser_set_rect', { viewId, x, y, w, h });
+/** webview 显隐（活跃页面 && 标签激活 && 无全屏遮罩 的合成结果由前端计算后传入） */
+export const browserSetVisible = (viewId: string, visible: boolean) =>
+  call<void>('browser_set_visible', { viewId, visible });
 /** 地址栏导航：本地路径（盘符/UNC）→ file://，无协议补 https://；返回归一化后的 URL */
-export const browserNavigate = (input: string) =>
-  call<string>('browser_navigate', { input });
-export const browserBack = () => call<void>('browser_back');
-export const browserForward = () => call<void>('browser_forward');
-export const browserReload = () => call<void>('browser_reload');
+export const browserNavigate = (viewId: string, input: string) =>
+  call<string>('browser_navigate', { viewId, input });
+export const browserBack = (viewId: string) => call<void>('browser_back', { viewId });
+export const browserForward = (viewId: string) => call<void>('browser_forward', { viewId });
+export const browserReload = (viewId: string) => call<void>('browser_reload', { viewId });
 /** 检查元素模式开关（点击元素 → browser:event element → AI 引用 chip） */
-export const browserSetInspect = (enabled: boolean) =>
-  call<void>('browser_set_inspect', { enabled });
-export const browserOpenDevtools = () => call<void>('browser_open_devtools');
+export const browserSetInspect = (viewId: string, enabled: boolean) =>
+  call<void>('browser_set_inspect', { viewId, enabled });
+export const browserOpenDevtools = (viewId: string) => call<void>('browser_open_devtools', { viewId });
+/** 关闭页面：释放该页面的子 webview 与 Rust 侧状态 */
+export const browserCloseView = (viewId: string) => call<void>('browser_close_view', { viewId });
 export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
   listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
 

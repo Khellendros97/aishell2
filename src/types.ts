@@ -195,6 +195,14 @@ export interface SkillRef {
   description: string;
 }
 
+/** 浏览器页面引用：UI 以 @page:页面标题 标签呈现，发送时展开页面标题与地址
+ *  （页面正文由 AI 自行用 browser_read / browser_screenshot 读取） */
+export interface BrowserPageRef {
+  url: string;
+  title: string;
+  ts: number;
+}
+
 /** 图片附件：UI 以缩略图呈现，发送时经 ai_chat 的 images 参数（pi RPC images 字段）传给多模态模型 */
 export interface ImageRef {
   id: string;
@@ -232,9 +240,11 @@ export interface ReadImageOut {
   data: string;
 }
 
-/** browser:event 事件 payload（Rust browser.rs 发射） */
+/** browser:event 事件 payload（Rust browser.rs 发射）；viewId 标记来源页面（多页面模型） */
 export interface BrowserEvent {
   kind: 'url' | 'title' | 'element' | 'ai-navigate';
+  /** 来源页面 id（Rust 侧 viewId） */
+  viewId?: string;
   url?: string;
   title?: string;
   /** kind=element 时的元素引用字段（与 BrowserRef 对齐） */
@@ -263,6 +273,8 @@ export interface ChatMsg {
   pathRefs: PathRef[];
   /** 内置浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；旧会话为空 */
   browserRefs: BrowserRef[];
+  /** 浏览器页面引用（@page:页面标题 标签，发送时展开页面地址与标题）；旧会话为空 */
+  browserPageRefs?: BrowserPageRef[];
   /** 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话为空 */
   skillRefs: SkillRef[];
   /** 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话为空 */

@@ -112,8 +112,8 @@ pub fn run() {
                 }
                 s
             };
-            // 内置浏览器（主窗口内嵌子 webview，懒创建）：先注入 AppHandle（事件发射/建视图用），
-            // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一实例（共享单实例语义）
+            // 内置浏览器（主窗口内嵌多子 webview，按页面懒创建）：先注入 AppHandle（事件发射/建视图用），
+            // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一管理器（多页面共享）
             browser::set_app(app.handle().clone());
             let browser = Arc::new(browser::BrowserManager::new());
             let ai = Arc::new(ai::AiManager::new(
@@ -286,6 +286,7 @@ pub fn run() {
             browser::browser_reload,
             browser::browser_set_inspect,
             browser::browser_open_devtools,
+            browser::browser_close_view,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
