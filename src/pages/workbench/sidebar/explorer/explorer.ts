@@ -458,8 +458,18 @@ async function showProperties(node: TreeNode): Promise<void> {
   requestAnimationFrame(() => mask.classList.add('open'));
 }
 
-/** 把文件/目录路径引用加入 AI 输入框(@file:文件名 / @path:目录名 标签,见 core.ts AiHandle.addPathRef);面板未挂载时提示 */
+/** 把文件/目录路径引用加入 AI 输入框(@file:文件名 / @path:目录名 标签,见 core.ts AiHandle.addPathRef);
+ *  图片文件走图片附件(addImageRef:物化后随消息传图,而非只带路径);面板未挂载时提示 */
 function addPathToChat(path: string, isDir: boolean): void {
+  const name = path.split('/').filter(Boolean).pop() ?? '';
+  if (!isDir && /\.(png|jpe?g|gif|webp)$/i.test(name)) {
+    if (wbHandles.ai?.addImageRef) {
+      wbHandles.ai.addImageRef({ source: 'local', path });
+    } else {
+      toast('AI 面板尚未就绪');
+    }
+    return;
+  }
   if (wbHandles.ai?.addPathRef) {
     wbHandles.ai.addPathRef({ path, isDir });
   } else {

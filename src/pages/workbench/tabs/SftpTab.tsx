@@ -1042,8 +1042,18 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
 }
 
 /** 把远端文件/目录路径引用加入 AI 输入框(@file:文件名 / @path:目录名 标签,发送时带服务器上下文);
- *  见 core.ts AiHandle.addPathRef;AI 面板未挂载时提示 */
+ *  见 core.ts AiHandle.addPathRef;图片文件走图片附件(addImageRef:SFTP 读回本地物化后随消息传图);
+ *  AI 面板未挂载时提示 */
 function addSftpPathToChat(st: SftpTabState, path: string, isDir: boolean): void {
+  const name = path.split('/').filter(Boolean).pop() ?? '';
+  if (!isDir && /\.(png|jpe?g|gif|webp)$/i.test(name)) {
+    if (wbHandles.ai?.addImageRef) {
+      wbHandles.ai.addImageRef({ source: 'remote', path, serverId: st.serverId });
+    } else {
+      toast('AI 面板尚未就绪');
+    }
+    return;
+  }
   if (wbHandles.ai?.addPathRef) {
     wbHandles.ai.addPathRef({ path, isDir, serverId: st.serverId });
   } else {

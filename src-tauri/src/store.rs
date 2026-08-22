@@ -52,10 +52,13 @@ pub struct LlmConfig {
     pub effort: Effort,
 }
 
+/// 上一代默认模型；配置里仍为此值时加载迁移为当前默认（用户自定义模型名不动）。
+pub const LEGACY_DEFAULT_MODEL_ID: &str = "deepseek-v4-flash";
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            model_id: "deepseek-v4-flash".to_string(),
+            model_id: "deepseek-v4-flash-vision-exp".to_string(),
             base_url: "https://api.deepseek.com/v1".to_string(),
             effort: Effort::Low,
         }
@@ -587,6 +590,29 @@ pub struct SkillRef {
     pub description: String,
 }
 
+/// 图片附件引用：UI 以缩略图呈现，发送时随 prompt 经 pi RPC images 字段传给多模态模型。
+/// path 指向落盘副本（<project>/.aishell/ai-images/，attach 时由后端物化），
+/// aishell.json 只存路径不存 base64（该文件整体原子重写，塞图会膨胀）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRef {
+    pub id: String,
+    /// local | remote | clipboard（附件来源，仅用于展示与排查）
+    pub source: String,
+    pub name: String,
+    pub mime: String,
+    /// 落盘副本绝对路径（ai_read_image 回读用）
+    pub path: String,
+    /// 来源原始路径（local/remote 来源保留，clipboard 无）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_path: Option<String>,
+    /// remote 来源时的目标服务器；其余 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+    pub size: i64,
+    pub ts: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMsg {
@@ -608,6 +634,9 @@ pub struct ChatMsg {
     /// 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话无此字段时按空处理
     #[serde(default)]
     pub skill_refs: Vec<SkillRef>,
+    /// 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub image_refs: Vec<ImageRef>,
     /// AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话按空。
     #[serde(default)]
     pub actions: Vec<AiActionRecord>,
@@ -902,10 +931,16 @@ impl Store {
         };
         // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
         // 加载时按现行规则清洗，有变更立即原子写回。
+        // 同时做默认模型迁移：配置里还是上一代默认值时升级为当前默认（vision 模型），
+        // 用户显式改过的其他模型名不受影响。
         let known = store.known_secrets();
         let dirty = {
             let mut guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
             let mut dirty = false;
+            if guard.settings.llm.model_id == LEGACY_DEFAULT_MODEL_ID {
+                guard.settings.llm.model_id = LlmConfig::default().model_id;
+                dirty = true;
+            }
             for sess in guard.sessions.values_mut().flatten() {
                 if redact_session(sess, &known) {
                     dirty = true;
@@ -2073,6 +2108,7 @@ mod tests {
             path_refs: vec![],
             browser_refs: vec![],
             skill_refs: vec![],
+            image_refs: vec![],
             actions: vec![],
             ts: 1,
         }
@@ -2179,6 +2215,17 @@ mod tests {
                                 scope: vec!["all".to_string()],
                                 description: "代码审查".to_string(),
                             }],
+                            image_refs: vec![ImageRef {
+                                id: "img-1".to_string(),
+                                source: "clipboard".to_string(),
+                                name: "截图.png".to_string(),
+                                mime: "image/png".to_string(),
+                                path: "D:/demo/.aishell/ai-images/1752000000000_截图.png".to_string(),
+                                origin_path: None,
+                                server_id: None,
+                                size: 4096,
+                                ts: 1_752_000_000_003,
+                            }],
                             actions: vec![AiActionRecord {
                                 tool_call_id: "call-1".to_string(),
                                 tool: "run_command".to_string(),
@@ -2270,7 +2317,7 @@ mod tests {
         let store = test_store(dir);
         let guard = store.state.lock().unwrap();
         assert_eq!(guard.settings.workspace_dir, None);
-        assert_eq!(guard.settings.llm.model_id, "deepseek-v4-flash");
+        assert_eq!(guard.settings.llm.model_id, "deepseek-v4-flash-vision-exp");
         assert_eq!(guard.settings.llm.base_url, "https://api.deepseek.com/v1");
         assert_eq!(guard.settings.llm.effort, Effort::Low);
         assert!(guard.servers.is_empty());
@@ -3731,6 +3778,7 @@ mod tests {
             path_refs: vec![],
             browser_refs: vec![],
             skill_refs: vec![],
+            image_refs: vec![],
             actions: vec![],
             ts: 1,
         };
@@ -3750,6 +3798,7 @@ mod tests {
                     path_refs: vec![],
                     browser_refs: vec![],
                     skill_refs: vec![],
+                    image_refs: vec![],
                     actions: vec![AiActionRecord {
                         tool_call_id: "call-1".to_string(),
                         tool: "run_command".to_string(),
@@ -4644,6 +4693,54 @@ mod tests {
         // 中文清单
         let labels = on.enabled_labels();
         assert_eq!(labels, vec!["执行命令", "数据库查询"]);
+    }
+
+    /// 默认模型迁移：配置里仍是上一代默认值时加载即升级；用户自定义模型名不动。
+    #[test]
+    fn legacy_default_model_migrates_to_vision() {
+        let dir = temp_config_dir("model-migrate");
+        let llm = |id: &str| {
+            format!(r#"{{"modelId":"{id}","baseUrl":"https://api.deepseek.com/v1","effort":"low"}}"#)
+        };
+        // 旧默认 → 升级并写回
+        fs::write(
+            dir.join("aishell.json"),
+            format!(r#"{{"settings":{{"workspaceDir":null,"llm":{},"search":{{"enabled":false}},"theme":"dark"}},"servers":[],"projects":[],"sessions":{{}},"projectFolders":[],"commandFolders":[],"uiExpanded":{{}},"sftpHistory":{{}},"sftpFavorites":{{}},"dbConnections":{{}}}}"#, llm(LEGACY_DEFAULT_MODEL_ID)),
+        )
+        .unwrap();
+        let store = test_store(dir.clone());
+        assert_eq!(
+            store.settings().llm.model_id,
+            LlmConfig::default().model_id,
+            "旧默认值应升级为当前默认"
+        );
+        drop(store);
+        let raw = fs::read_to_string(dir.join("aishell.json")).unwrap();
+        assert!(raw.contains("deepseek-v4-flash-vision-exp"), "迁移应写回配置文件");
+
+        // 自定义模型名 → 不动
+        fs::write(
+            dir.join("aishell.json"),
+            format!(r#"{{"settings":{{"workspaceDir":null,"llm":{},"search":{{"enabled":false}},"theme":"dark"}},"servers":[],"projects":[],"sessions":{{}},"projectFolders":[],"commandFolders":[],"uiExpanded":{{}},"sftpHistory":{{}},"sftpFavorites":{{}},"dbConnections":{{}}}}"#, llm("deepseek-reasoner")),
+        )
+        .unwrap();
+        let store = test_store(dir.clone());
+        assert_eq!(store.settings().llm.model_id, "deepseek-reasoner", "自定义模型名不应被迁移");
+    }
+
+    /// 旧会话消息无 imageRefs 字段按空解析；带 imageRefs 的消息往返不丢字段。
+    #[test]
+    fn chat_msg_image_refs_compat_roundtrip() {
+        let old = r#"{"role":"user","content":"看图","snapshots":[],"fileRefs":[],"serverRefs":[],"pathRefs":[],"browserRefs":[],"skillRefs":[],"actions":[],"ts":1}"#;
+        let msg: ChatMsg = serde_json::from_str(old).unwrap();
+        assert!(msg.image_refs.is_empty(), "旧会话无 imageRefs 应按空解析");
+
+        let with_img = r#"{"role":"user","content":"看图","snapshots":[],"fileRefs":[],"serverRefs":[],"pathRefs":[],"browserRefs":[],"skillRefs":[],"imageRefs":[{"id":"img-1","source":"remote","name":"a.png","mime":"image/png","path":"C:/x/.aishell/ai-images/1_a.png","originPath":"/srv/a.png","serverId":"srv-1","size":10,"ts":2}],"actions":[],"ts":1}"#;
+        let msg: ChatMsg = serde_json::from_str(with_img).unwrap();
+        assert_eq!(msg.image_refs.len(), 1);
+        assert_eq!(msg.image_refs[0].server_id.as_deref(), Some("srv-1"));
+        let back = serde_json::to_string(&msg).unwrap();
+        assert!(back.contains("\"imageRefs\":"), "序列化应保留 camelCase 字段名");
     }
 
 }
