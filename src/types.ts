@@ -460,12 +460,24 @@ export interface StagingClearOutcome {
   errors: string[];
 }
 
-/** 递归暂存目录 / 清理的进度（staging:progress 事件；与 staging.rs StagingProgress serde camelCase 对齐） */
+/** staging_export 结果 —— 与 staging.rs StagingExportOutcome serde camelCase 对齐 */
+export interface StagingExportOutcome {
+  /** 成功导出的条目数 */
+  exported: number;
+  /** 导出后已接受清除的条目数（accept=true 时） */
+  accepted: number;
+  /** 失败说明（对应条目保留在暂存区） */
+  errors: string[];
+  /** 导出目标（本地绝对路径或远端路径；远程批量按服务器分组可能多个） */
+  targets: string[];
+}
+
+/** 递归暂存目录 / 清理 / 导出的进度（staging:progress 事件；与 staging.rs StagingProgress serde camelCase 对齐） */
 export interface StagingProgress {
   projectId: string;
   sessionId: string;
-  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目；done = 操作完成（隐藏进度） */
-  phase: 'walk' | 'stage' | 'clear' | 'done';
+  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目；export = 逐条导出备份；done = 操作完成（隐藏进度） */
+  phase: 'walk' | 'stage' | 'clear' | 'export' | 'done';
   done: number;
   total: number;
   currentPath: string;
