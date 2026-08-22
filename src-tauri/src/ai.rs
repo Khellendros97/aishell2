@@ -334,6 +334,36 @@ struct LoadedSkills {
     global_root: PathBuf,
 }
 
+/// 构造 pi 的 models.json 内容（providers.deepseek + 单模型）。
+/// reasoning：v4 系列与 reasoner 支持思考档位，deepseek-chat 等旧模型不支持（pi 会强制 thinking off）。
+/// input：vision 模型声明图片输入能力（pi 默认 input=["text"]，不声明时 RPC images 会被拒）；
+/// 启发式与前端 ai-engine.ts supportsVision 保持一致（模型 id 小写含 "vision"）。
+fn models_json_for(cfg: &crate::store::LlmConfig) -> serde_json::Value {
+    let model_id = &cfg.model_id;
+    let id_lower = model_id.to_lowercase();
+    let reasoning = id_lower.contains("reasoner") || id_lower.contains("v4");
+    let input_images = id_lower.contains("vision");
+    let mut model = json!({
+        "id": model_id,
+        "name": model_id,
+        "reasoning": reasoning,
+        "contextWindow": 64000,
+    });
+    if input_images {
+        model["input"] = json!(["text", "image"]);
+    }
+    json!({
+        "providers": {
+            "deepseek": {
+                "baseUrl": cfg.base_url.trim_end_matches('/'),
+                "api": "openai-completions",
+                "apiKey": "$DEEPSEEK_API_KEY",
+                "models": [model],
+            }
+        }
+    })
+}
+
 impl AiManager {
     pub fn new(
         store: Arc<Store>,
@@ -384,28 +414,7 @@ impl AiManager {
 
     /// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
     fn write_models_json(&self) -> Result<(), String> {
-        let cfg = self.store.llm_config();
-        let model_id = &cfg.model_id;
-        // v4 系列与 reasoner 支持思考档位；deepseek-chat 等旧模型不支持（pi 会强制 thinking off）
-        let reasoning = {
-            let id = model_id.to_lowercase();
-            id.contains("reasoner") || id.contains("v4")
-        };
-        let models = json!({
-            "providers": {
-                "deepseek": {
-                    "baseUrl": cfg.base_url.trim_end_matches('/'),
-                    "api": "openai-completions",
-                    "apiKey": "$DEEPSEEK_API_KEY",
-                    "models": [{
-                        "id": model_id,
-                        "name": model_id,
-                        "reasoning": reasoning,
-                        "contextWindow": 64000,
-                    }],
-                }
-            }
-        });
+        let models = models_json_for(&self.store.llm_config());
         std::fs::create_dir_all(&self.agent_dir)
             .map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
         let text = serde_json::to_string_pretty(&models).map_err(|e| e.to_string())?;
@@ -1918,9 +1927,25 @@ fn err_message(ev: &serde_json::Value) -> String {
     }
 }
 
+/// 随 prompt 一起发给 pi 的图片（pi RPC images 字段，pi 侧转 OpenAI image_url 块）。
+/// data 为不带 dataURL 前缀的 base64；mime 仅接受 image/png|jpeg|gif|webp（attach 时已嗅探）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptImage {
+    pub mime_type: String,
+    pub data: String,
+}
+
 /// 发送一条 prompt：进程不存在则先 spawn；上一轮未完成（busy）先取消审批并写 abort 再发。
+/// images：随消息附带的多模态图片（可选），经 pi RPC images 字段进入 user 消息。
 #[tauri::command]
-pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String, prompt: String) -> Result<(), String> {
+pub async fn ai_chat(
+    mgr: State<'_, Arc<AiManager>>,
+    app: AppHandle,
+    key: String,
+    prompt: String,
+    images: Option<Vec<PromptImage>>,
+) -> Result<(), String> {
     let project_id = key
         .split_once(':')
         .map(|(p, _)| p.to_string())
@@ -1973,20 +1998,36 @@ pub async fn ai_chat(mgr: State<'_, Arc<AiManager>>, app: AppHandle, key: String
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
         aborted_prev = true;
     }
-    // trace：用户输入（脱敏后最终 prompt，含前端 buildPrompt 展开的引用注入全文）
+    // pi RPC ImageContent：{"type":"image","data":"<base64>","mimeType":"..."}。
+    // 前端已按 attach 时的嗅探结果传 mime，这里不再重复校验内容。
+    let images_json: Vec<serde_json::Value> = images
+        .unwrap_or_default()
+        .into_iter()
+        .map(|img| json!({"type": "image", "data": img.data, "mimeType": img.mime_type}))
+        .collect();
+    // trace：用户输入（脱敏后最终 prompt，含前端 buildPrompt 展开的引用注入全文）；
+    // 图片只记 mime 与字节数，不落 base64（体积大且无排查价值）
     crate::trace::log(&key, "user_input", json!({
         "prompt": prompt.as_str(),
         "redacted": redacted,
         "abortedPrev": aborted_prev,
+        "images": images_json.iter().map(|img| json!({
+            "mimeType": img["mimeType"],
+            "bytes": img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0),
+        })).collect::<Vec<_>>(),
     }));
     // 用 JSON 序列化生成，勿手拼。刚 abort 过时带 streamingBehavior=followUp：
     // abort 清理流式状态可能未即时生效，agent 仍在流式期间时裸发 prompt 会被 RPC
-    // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同
-    let payload = if aborted_prev {
+    // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同。
+    // images 为空时不带该字段（与旧 payload 逐字节一致，便于对照 trace）。
+    let mut payload = if aborted_prev {
         json!({"type": "prompt", "message": prompt, "streamingBehavior": "followUp"})
     } else {
         json!({"type": "prompt", "message": prompt})
     };
+    if !images_json.is_empty() {
+        payload["images"] = json!(images_json);
+    }
     let mut buf = serde_json::to_vec(&payload)
         .map_err(|e| e.to_string())?;
     buf.push(b'\n');
@@ -2429,5 +2470,31 @@ mod tests {
         let key2 = "proj-1";
         let s2 = key2.split_once(':').map(|(_, s)| s).unwrap_or("default");
         assert_eq!(s2, "default");
+    }
+
+    /// models.json：vision 模型声明 input=["text","image"]，非 vision 模型不带该字段；
+    /// apiKey 永远是 $DEEPSEEK_API_KEY 占位（真实密钥只经环境变量进 pi）。
+    #[test]
+    fn models_json_declares_image_input_for_vision_models() {
+        let vision = models_json_for(&crate::store::LlmConfig {
+            model_id: "deepseek-v4-flash-vision-exp".to_string(),
+            base_url: "https://api.deepseek.com/v1/".to_string(),
+            effort: crate::store::Effort::Low,
+        });
+        let model = &vision["providers"]["deepseek"]["models"][0];
+        assert_eq!(model["input"], json!(["text", "image"]), "vision 模型应声明图片输入");
+        assert_eq!(model["id"], "deepseek-v4-flash-vision-exp");
+        assert_eq!(vision["providers"]["deepseek"]["baseUrl"], "https://api.deepseek.com/v1", "尾部斜杠应去除");
+        assert_eq!(vision["providers"]["deepseek"]["apiKey"], "$DEEPSEEK_API_KEY");
+
+        let text_only = models_json_for(&crate::store::LlmConfig {
+            model_id: "deepseek-chat".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            effort: crate::store::Effort::Low,
+        });
+        let model = &text_only["providers"]["deepseek"]["models"][0];
+        assert!(model.get("input").is_none(), "非 vision 模型不应带 input 字段");
+        assert_eq!(model["reasoning"], false, "deepseek-chat 不支持思考档位");
+        assert_eq!(vision["providers"]["deepseek"]["models"][0]["reasoning"], true, "v4 系列支持思考档位");
     }
 }

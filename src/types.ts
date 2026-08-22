@@ -195,6 +195,43 @@ export interface SkillRef {
   description: string;
 }
 
+/** 图片附件：UI 以缩略图呈现，发送时经 ai_chat 的 images 参数（pi RPC images 字段）传给多模态模型 */
+export interface ImageRef {
+  id: string;
+  /** local | remote | clipboard（附件来源） */
+  source: 'local' | 'remote' | 'clipboard';
+  name: string;
+  mime: string;
+  /** 后端物化副本绝对路径（ai_read_image 回读用，永不指向原图） */
+  path: string;
+  /** 来源原始路径（local/remote 附件保留，clipboard 无） */
+  originPath?: string;
+  /** remote 来源时的目标服务器 ID */
+  serverId?: string | null;
+  size: number;
+  ts: number;
+}
+
+/** ai_attach_images 单项入参：source 标记来源（与 Rust AttachImageIn 的 serde tag 对齐） */
+export type AttachImageItem =
+  | { source: 'local'; path: string }
+  | { source: 'remote'; serverId: string; path: string }
+  | { source: 'clipboard'; name: string; data: string };
+
+/** ai_attach_images 返回：落盘副本信息（前端补 id/source 等组成 ImageRef） */
+export interface AttachedImage {
+  name: string;
+  mime: string;
+  path: string;
+  size: number;
+}
+
+/** ai_read_image 返回：data 为不带 dataURL 前缀的 base64 */
+export interface ReadImageOut {
+  mime: string;
+  data: string;
+}
+
 /** browser:event 事件 payload（Rust browser.rs 发射） */
 export interface BrowserEvent {
   kind: 'url' | 'title' | 'element' | 'ai-navigate';
@@ -228,6 +265,8 @@ export interface ChatMsg {
   browserRefs: BrowserRef[];
   /** 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话为空 */
   skillRefs: SkillRef[];
+  /** 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话为空 */
+  imageRefs?: ImageRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
   actions: AiActionRecord[];
   ts: number;

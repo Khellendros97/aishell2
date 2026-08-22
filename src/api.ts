@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
+  AiMode, AppState, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -206,8 +206,16 @@ export type AiEvent =
       connection?: { serverId: string; name: string; kind: DbKind; host: string; port?: number; user?: string; database?: string } }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
-/** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
-export const aiChat = (key: string, prompt: string) => call<void>('ai_chat', { key, prompt });
+/** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发。
+ *  images：随消息附带的多模态图片（mime + 不带 dataURL 前缀的 base64），经 pi RPC images 字段进入 user 消息。 */
+export const aiChat = (key: string, prompt: string, images?: Array<{ mimeType: string; data: string }>) =>
+  call<void>('ai_chat', { key, prompt, images });
+/** 图片附件物化：按来源（本地/远程/剪贴板 base64）读取、魔数嗅探后落到 <project>/.aishell/ai-images/，
+ *  返回落盘副本信息；整批任一失败报错。 */
+export const aiAttachImages = (projectId: string, items: AttachImageItem[]) =>
+  call<AttachedImage[]>('ai_attach_images', { projectId, items });
+/** 回读落盘图片为 base64（缩略图/预览用）。 */
+export const aiReadImage = (path: string) => call<ReadImageOut>('ai_read_image', { path });
 /** 首条用户消息的异步会话标题生成；失败不影响 ai_chat，标题由前端先显示本地临时标题。 */
 export const aiGenerateSessionTitle = (projectId: string, sessionId: string, firstMessage: string, expectedTitle?: string) =>
   call<void>('ai_generate_session_title', { projectId, sessionId, firstMessage, expectedTitle });
