@@ -145,7 +145,7 @@ fn writer_loop(rx: mpsc::Receiver<TraceMsg>, base: PathBuf) {
             Ok(TraceMsg::CloseSession { stem, ack }) => {
                 let suffix = format!("{stem}.jsonl");
                 writers.retain(|p, w| {
-                    let keep = !p.file_name().is_some_and(|n| n.to_string_lossy() == suffix);
+                    let keep = p.file_name().is_none_or(|n| n.to_string_lossy() != suffix);
                     if !keep {
                         let _ = w.flush();
                     }

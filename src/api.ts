@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
+  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -301,6 +301,19 @@ export const stagingDiff = (projectId: string, sessionId: string, entryId: strin
 /** 清理无变更条目：远端现状与首次快照完全一致的条目直接接受清除，有变更/检查失败的保留 */
 export const stagingClear = (projectId: string, sessionId: string) =>
   call<StagingClearOutcome>('staging_clear', { projectId, sessionId });
+/** 导出暂存备份：mode local = 快照复制到项目 .aishell/backup/（多条目打包 zip），remote =
+ *  上传回条目原远程目录，文件名均加 _bak 后缀（stamp 为前端生成的本地时间 YYYYMMDD-HHMM，
+ *  与 SFTP 快速备份同格式）；archiveName 仅多条目时需要（压缩包基础名，后缀后端追加）；
+ *  accept=true 时导出成功的条目随后接受清除。与 staging_accept 同边界：绝不加入 pi 工具 / guard。 */
+export const stagingExport = (
+  projectId: string,
+  sessionId: string,
+  entryIds: string[],
+  mode: 'local' | 'remote',
+  archiveName: string | null,
+  stamp: string,
+  accept: boolean,
+) => call<StagingExportOutcome>('staging_export', { projectId, sessionId, entryIds, mode, archiveName, stamp, accept });
 /** 暂存/清理的进度事件（staging.rs add_path 逐文件、clear_unchanged 逐条目发送；walk/stage/clear 阶段，done 结束） */
 export const onStagingProgress = (cb: (p: StagingProgress) => void): Promise<UnlistenFn> =>
   listen<StagingProgress>('staging:progress', (e) => cb(e.payload));

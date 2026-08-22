@@ -6,8 +6,8 @@
  * - `sftp:progress`（src/api.ts onSftpProgress）：sftp_upload / sftp_download 命令的传输进度。
  *   bytes = 当前文件字节进度（totalBytes > 10MB 时显示确定进度条，小文件快速传输不打扰）；
  *   files = 一个文件已完成（显示已处理文件数）；done = 命令结束（隐藏对应任务）。
- * - `staging:progress`（src/api.ts onStagingProgress）：递归暂存目录 / 清理暂存区的进度。
- *   walk = 枚举阶段（不确定条）；stage/clear = 逐文件/逐条目占比；done = 操作完成（隐藏）。
+ * - `staging:progress`（src/api.ts onStagingProgress）：递归暂存目录 / 清理暂存区 / 导出备份的进度。
+ *   walk = 枚举阶段（不确定条）；stage/clear/export = 逐文件/逐条目占比；done = 操作完成（隐藏）。
  *
  * 多任务并存（上传 + 暂存）按 key 分槽：SFTP 任务用 taskId，暂存任务用 project:session。
  * 显式控制（showProgress / hideProgress）用于暂存/清理操作开始前的占位与异常收尾；done 事件
@@ -114,9 +114,9 @@ function ensureSubscribed(): void {
       upsert(key, '正在暂存目录', null, '正在枚举目录文件…');
       return;
     }
-    const title = p.phase === 'clear' ? '正在清理暂存区' : '正在暂存目录';
+    const title = p.phase === 'clear' ? '正在清理暂存区' : p.phase === 'export' ? '正在导出备份' : '正在暂存目录';
     const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
-    const verb = p.phase === 'clear' ? '已检查' : '已暂存';
+    const verb = p.phase === 'clear' ? '已检查' : p.phase === 'export' ? '已导出' : '已暂存';
     upsert(key, title, pct, `${verb} ${p.done} / ${p.total} · ${name}`);
   });
 }
