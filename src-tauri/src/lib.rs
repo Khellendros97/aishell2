@@ -273,6 +273,7 @@ pub fn run() {
             staging::staging_restore,
             staging::staging_diff,
             staging::staging_clear,
+            staging::staging_export,
             browser::browser_ensure,
             browser::browser_set_rect,
             browser::browser_set_visible,
