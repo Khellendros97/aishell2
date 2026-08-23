@@ -631,7 +631,13 @@ const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -
 const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key -> 引用（key = `${name}:${ts}`，@browser:名称 标签）
 const pageRefs = new Map<string, BrowserPageRef>(); // 浏览器页面引用 id -> 引用（@page:页面标题 标签，@ 补全插入）
 const skillRefs = new Map<string, SkillRef>(); // 技能引用 key -> 引用（key = `${origin}:${name}`，@skill:名称 标签）
-const imageRefs = new Map<string, ImageRef>(); // 图片附件 id -> 引用（输入区 chip + 历史消息缩略图共用）
+/* 图片附件拆两个 Map：
+   - historyImageRefs  历史消息缩略图/预览查找（renderMessage 灌入，跨会话累积）；
+   - inputImageRefs    输入区待发图片（attachImages 写入、chip ✕ 删除、clearChips/挂面板清空）。
+   此前共用一个 Map：renderHistory 把历史消息 imageRefs 灌回后，发送时 imageRefs.forEach 全量
+   收集会把上一会话/历史消息的图片带进新消息（发 1 张实际带 3 张、再发变 4 张）。 */
+const historyImageRefs = new Map<string, ImageRef>(); // 历史消息图片 id -> 引用
+const inputImageRefs = new Map<string, ImageRef>(); // 输入区待发图片 id -> 引用
 /** 落盘图片回读缓存（path -> base64；null = 读取失败）。有界 FIFO，避免多图会话内存膨胀。 */
 const imageCache = new Map<string, { mime: string; data: string } | null>();
 const IMAGE_CACHE_MAX = 16;
@@ -854,6 +860,7 @@ export function mountAiPanel(container: HTMLElement): () => void {
   browserRefs.clear();
   pageRefs.clear();
   skillRefs.clear();
+  inputImageRefs.clear(); // 输入区待发图片随面板重挂清空（历史消息图片在 historyImageRefs，不受影响）
   serversCache = null;
   savedRange = null;
   autoSwitchAiWorkdir = false;
@@ -2016,7 +2023,7 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
     m.snapshots.forEach((snap) => snapshots.set(snap.id, snap));
     m.fileRefs.forEach((ref) => fileRefs.set(ref.id, ref));
     (m.browserRefs ?? []).forEach((r) => browserRefs.set(`${r.name}:${r.ts}`, r));
-    (m.imageRefs ?? []).forEach((r) => imageRefs.set(r.id, r));
+    (m.imageRefs ?? []).forEach((r) => historyImageRefs.set(r.id, r));
     /* 新版消息 content 内嵌 token：按 token 原位还原内嵌 chip（保留引用与文字的顺序）；
        旧会话 content 无 token（matched=0）→ 回退为消息上方 chip 行（历史布局） */
     const tokens = buildMessageTokens(m);
@@ -2451,7 +2458,7 @@ function onChatClick(e: MouseEvent): void {
     if (kind === 'server' || kind === 'path' || kind === 'skill' || kind === 'page') return;
     if (kind === 'file') openFileRefModal(fileRefs.get(id));
     else if (kind === 'browser') openBrowserRefModal(browserRefs.get(id));
-    else if (kind === 'image') openImageModal(imageRefs.get(id));
+    else if (kind === 'image') openImageModal(historyImageRefs.get(id) ?? inputImageRefs.get(id));
     else openSnapModal(snapshots.get(id)); // term 与旧消息无 kind 的快照 chip
   }
 }
@@ -2730,7 +2737,7 @@ const clearChips = (): void => {
   browserRefs.clear();
   pageRefs.clear();
   skillRefs.clear();
-  imageRefs.clear();
+  inputImageRefs.clear();
   savedRange = null;
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
 };
@@ -2819,11 +2826,11 @@ function onChipRowClick(e: MouseEvent): void {
   if (!chip || chip.dataset.kind !== 'image') return;
   const id = chip.dataset.id ?? '';
   if (target.closest('.ai-chip-x')) {
-    imageRefs.delete(id);
+    inputImageRefs.delete(id);
     chip.remove();
     return;
   }
-  openImageModal(imageRefs.get(id));
+  openImageModal(inputImageRefs.get(id));
 }
 
 function openSnapModal(snap: TermSnapshot | undefined): void {
@@ -2912,7 +2919,7 @@ async function attachImages(items: AttachImageItem[]): Promise<void> {
     toast('项目未加载', 'error');
     return;
   }
-  if (imageRefs.size + items.length > MAX_ATTACH_IMAGES) {
+  if (inputImageRefs.size + items.length > MAX_ATTACH_IMAGES) {
     toast(`单条消息最多附加 ${MAX_ATTACH_IMAGES} 张图片`, 'error');
     return;
   }
@@ -2946,7 +2953,7 @@ async function attachImages(items: AttachImageItem[]): Promise<void> {
       size: a.size,
       ts: Date.now(),
     };
-    imageRefs.set(ref.id, ref);
+    inputImageRefs.set(ref.id, ref);
     addImageRefChip(ref);
   });
 }
@@ -3404,7 +3411,7 @@ async function send(): Promise<void> {
       skrefs.push(r);
     }
   }
-  imageRefs.forEach((r) => imgs.push(r));
+  inputImageRefs.forEach((r) => imgs.push(r));
   const text = segmentsToText(segments).trim();
   if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && pgrefs.length === 0 && skrefs.length === 0 && imgs.length === 0) return;
 
