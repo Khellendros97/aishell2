@@ -8,10 +8,12 @@ import { explorerPanel } from './ExplorerPanel';
 import { serversPanel } from './ServersPanel';
 import { commandsPanel } from './CommandsPanel';
 import { skillsPanel } from './SkillsPanel';
+import { notesPanel } from './NotesPanel';
 
 export const PANELS: Record<PanelKey, SidebarPanelDef> = {
   explorer: explorerPanel,
   servers: serversPanel,
   commands: commandsPanel,
   skills: skillsPanel,
+  notes: notesPanel,
 };

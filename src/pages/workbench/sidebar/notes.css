@@ -1,0 +1,10 @@
+/* 笔记面板样式 —— 树行复用 explorer.css 的 .wbs-explorer-* 规则(交互习惯对齐),
+   本文件只声明笔记面板自有部分(落点高亮与根容器)。 */
+.wbs-notes-root { padding: 4px 0 8px; flex: 1 0 auto; }
+.wbs-notes-row {
+  display: flex; align-items: center; gap: 3px; height: 24px; padding-right: 6px;
+  cursor: pointer; user-select: none; border-radius: 3px;
+}
+.wbs-notes-row:hover { background: var(--bg-hover); }
+.wbs-notes-row:hover .wbs-explorer-name { color: var(--text-0); }
+.wbs-notes-drop { outline: 1px dashed var(--accent); outline-offset: -1px; background: var(--accent-dim); }

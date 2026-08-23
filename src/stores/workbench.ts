@@ -70,10 +70,10 @@ export interface AiHandle {
 
 const TYPE_ICONS: Record<string, IconName> = {
   editor: 'file', sftp: 'folderOpen', terminal: 'terminal', 'remote-staging': 'history', 'staging-diff': 'diff',
-  browser: 'globe', trace: 'history',
+  browser: 'globe', trace: 'history', note: 'note',
 };
 
-export type PanelKey = 'explorer' | 'servers' | 'commands' | 'skills';
+export type PanelKey = 'explorer' | 'servers' | 'commands' | 'skills' | 'notes';
 
 interface WorkbenchState {
   project: Project | null;
@@ -96,8 +96,9 @@ interface WorkbenchState {
 /* ---------- 事件通知(旧 bus 中非标签派生的两条事件) ----------
    'project-changed'  项目数据被某模块修改(各面板据此刷新)
    'staging-changed'  暂存区变化
+   'notes-changed'    笔记树变化(归档写笔记/面板 CRUD 后广播,笔记面板保持展开集合刷新)
    on() 返回反注册函数:组件卸载时必须调用,监听器不得只增不减 */
-type NotifyEvent = 'project-changed' | 'staging-changed';
+type NotifyEvent = 'project-changed' | 'staging-changed' | 'notes-changed';
 const notifyListeners = new Map<NotifyEvent, Set<() => void>>();
 export const wbEvents = {
   on(ev: NotifyEvent, cb: () => void): () => void {
@@ -120,7 +121,8 @@ export const wbHandles = {
 };
 
 /** 拖拽数据契约:dataTransfer 类型 'application/x-aishell',
-    JSON: { source: 'local'|'remote', path: string, name: string, isDir: boolean, serverId?: string } */
+    JSON: { source: 'local'|'remote'|'notes', path: string, name: string, isDir: boolean, serverId?: string };
+    source='notes' 仅笔记树内部拖拽(目录行 drop 只接受该 source,explorer 收到自动忽略) */
 export const DND_MIME = 'application/x-aishell';
 
 /** 终端同名自动编号:同名「30.37」开第二个 → 「30.37 #2」;编号不复用(取现有最大后缀+1) */
