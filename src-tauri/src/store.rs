@@ -665,6 +665,9 @@ pub struct ChatSession {
     /// 首条用户消息的自动标题任务是否已经尝试过；失败也不重试。
     #[serde(default)]
     pub auto_title_triggered: bool,
+    /// 会话已归档（归档后不出现在前端会话列表，数据仍保留，后续可支持取消归档）。
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// sessions: projectId -> Vec<ChatSession>
@@ -1490,7 +1493,7 @@ impl Store {
         Ok(project_dir.to_string_lossy().into_owned())
     }
 
-    fn sessions_get(&self, project_id: &str) -> Result<Vec<ChatSession>, String> {
+    pub(crate) fn sessions_get(&self, project_id: &str) -> Result<Vec<ChatSession>, String> {
         let guard = self
             .state
             .lock()
@@ -1498,7 +1501,7 @@ impl Store {
         Ok(guard.sessions.get(project_id).cloned().unwrap_or_default())
     }
 
-    fn session_upsert(&self, project_id: &str, mut session: ChatSession) -> Result<(), String> {
+    pub(crate) fn session_upsert(&self, project_id: &str, mut session: ChatSession) -> Result<(), String> {
         // 落盘前脱敏：快照/文件引用/消息正文可能含配置里读到的凭据（硬约束：密码永不进 JSON）。
         // 注意 known_secrets() 自身要锁 state，必须先于 with_state 调用（std Mutex 不可重入）。
         let known = self.known_secrets();
@@ -1513,11 +1516,14 @@ impl Store {
                     if slot.auto_title_triggered {
                         session.title = slot.title.clone();
                     }
+                    // 归档标记只由后端 set_session_archived 推进，前端残留快照不可冲掉。
+                    session.archived = slot.archived;
                     *slot = session;
                 }
                 None => {
                     // 新会话同样从未领取开始，普通前端 upsert 不可直接置位。
                     session.auto_title_triggered = false;
+                    session.archived = false;
                     list.push(session);
                 }
             }
@@ -1568,6 +1574,27 @@ impl Store {
                 return Ok(false);
             }
             session.title = title.to_string();
+            Ok(true)
+        })
+    }
+
+    /// 原子设置会话归档标记；返回是否实际变更（会话不存在视为无变更）。
+    pub(crate) fn set_session_archived(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<bool, String> {
+        self.with_state(|s| {
+            let Some(session) = s.sessions.get_mut(project_id)
+                .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
+            else {
+                return Ok(false);
+            };
+            if session.archived == archived {
+                return Ok(false);
+            }
+            session.archived = archived;
             Ok(true)
         })
     }
@@ -1658,6 +1685,18 @@ impl Store {
             .map_err(|_| "store 状态锁损坏".to_string())
             .expect("store 状态锁损坏");
         guard.settings.clone()
+    }
+
+    /// 笔记根目录:workspace 全局 `.aishell/notes`(不存在则创建);workspace 未配置报错。
+    pub fn notes_root(&self) -> Result<PathBuf, String> {
+        let ws = self
+            .settings()
+            .workspace_dir
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "请先在设置中配置工作区目录".to_string())?;
+        let root = PathBuf::from(ws).join(".aishell").join("notes");
+        fs::create_dir_all(&root).map_err(|e| format!("创建笔记目录失败: {e}"))?;
+        Ok(root)
     }
 
     /// 项目本地路径；未设置或项目不存在返回 None。
@@ -2188,6 +2227,7 @@ mod tests {
                         id: "sess-1".to_string(),
                         title: "会话一".to_string(),
                         auto_title_triggered: false,
+                    archived: false,
                         messages: vec![ChatMsg {
                             role: "user".to_string(),
                             content: "看看日志".to_string(),
@@ -3629,6 +3669,7 @@ mod tests {
                         test_chat_msg("assistant", "部署状态正常"),
                     ],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -3659,6 +3700,7 @@ mod tests {
                     title: "临时标题".to_string(),
                     messages: vec![test_chat_msg("assistant", "先有回复")],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -3679,6 +3721,7 @@ mod tests {
             title: "临时标题".to_string(),
             messages: vec![test_chat_msg("user", "请检查部署状态")],
             auto_title_triggered: false,
+            archived: false,
         };
         store.session_upsert("proj-title", first).unwrap();
         assert_eq!(
@@ -3699,6 +3742,7 @@ mod tests {
                         test_chat_msg("assistant", "已完成"),
                     ],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -3719,6 +3763,7 @@ mod tests {
                     title: "临时标题".to_string(),
                     messages: vec![test_chat_msg("user", "第一条")],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -3743,6 +3788,43 @@ mod tests {
     }
 
     #[test]
+    fn session_upsert_preserves_archived_flag_and_setter_works() {
+        let dir = temp_config_dir("session-archived");
+        let store = test_store(dir);
+        let sess = || ChatSession {
+            id: "sess-arch".to_string(),
+            title: "T".to_string(),
+            messages: vec![test_chat_msg("user", "hi")],
+            auto_title_triggered: false,
+            archived: false,
+        };
+        store.session_upsert("proj-arch", sess()).unwrap();
+        assert!(store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        // 重复设置同值返回 false（无变更）
+        assert!(!store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        // 不存在会话返回 false 而非报错
+        assert!(!store.set_session_archived("proj-arch", "sess-none", true).unwrap());
+        // 前端残留快照 upsert 不得冲掉 archived 标记
+        store.session_upsert("proj-arch", sess()).unwrap();
+        let saved = store.sessions_get("proj-arch").unwrap().pop().unwrap();
+        assert!(saved.archived, "upsert 应保留 slot 的 archived 值");
+        // 新插入会话 upsert 传入 true 也被强制回落 false
+        let mut s2 = sess();
+        s2.id = "sess-arch-2".to_string();
+        s2.archived = true;
+        store.session_upsert("proj-arch", s2).unwrap();
+        let list = store.sessions_get("proj-arch").unwrap();
+        assert!(!list.iter().find(|s| s.id == "sess-arch-2").unwrap().archived);
+    }
+
+    #[test]
+    fn old_json_without_archived_field_parses() {
+        let json = r#"{"id":"s1","title":"T","messages":[],"autoTitleTriggered":false}"#;
+        let session: ChatSession = serde_json::from_str(json).unwrap();
+        assert!(!session.archived);
+    }
+
+    #[test]
     fn sessions_upsert_and_delete_project_cleanup() {
         let dir = temp_config_dir("sessions");
         let store = test_store(dir);
@@ -3751,6 +3833,7 @@ mod tests {
             title: "T".to_string(),
             messages: vec![],
             auto_title_triggered: false,
+            archived: false,
         };
         store.session_upsert("proj-x", sess.clone()).unwrap();
         // 同 id 更新不重复插入
@@ -3807,6 +3890,7 @@ mod tests {
             id: "sess-mask".to_string(),
             title: "T".to_string(),
             auto_title_triggered: false,
+            archived: false,
             messages: vec![
                 msg(r#"db_password="hunter2""#),
                 ChatMsg {

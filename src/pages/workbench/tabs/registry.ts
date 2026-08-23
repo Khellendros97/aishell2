@@ -14,6 +14,7 @@ import { StagingTab } from './StagingTab';
 import { DiffTab } from './DiffTab';
 import BrowserTab from './BrowserTab';
 import { TraceTab } from './TraceTab';
+import { NoteTab } from './NoteTab';
 
 export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   terminal: TerminalTab,
@@ -23,4 +24,5 @@ export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   'staging-diff': DiffTab,
   browser: BrowserTab,
   trace: TraceTab,
+  note: NoteTab,
 };

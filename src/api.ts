@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -332,8 +332,27 @@ export const onStagingProgress = (cb: (p: StagingProgress) => void): Promise<Unl
 export const onSftpProgress = (cb: (p: SftpProgress) => void): Promise<UnlistenFn> =>
   listen<SftpProgress>('sftp:progress', (e) => cb(e.payload));
 
-/* ---------------- skills ---------------- */
-/** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
+/* ---------------- notes（会话归档 + 全局笔记树，Rust notes.rs） ----------------
+   笔记是 workspace 全局 <workspace>/.aishell/notes 下的 markdown 文件树；
+   面板 CRUD 复用 fs_* 命令（base 取 notesRoot 返回值）。
+   session_archive 语义：脱敏 → LLM 生成/整合笔记并落盘（mode≠only）→ 标记 archived →
+   杀会话 pi 进程；任一前置失败整体 Err，不归档不写文件。返回笔记绝对路径（only 模式为空串）。 */
+export const notesRoot = () => call<string>('notes_root_cmd');
+export const notesList = () => call<NotesListing>('notes_list_cmd');
+export const sessionArchive = (args: {
+  projectId: string;
+  sessionId: string;
+  mode: ArchiveMode;
+  /** new 模式必填（笔记标题，后端清洗非法字符） */
+  title?: string | null;
+  /** new 模式可选（目标目录相对路径，空 = 根目录） */
+  dirRel?: string | null;
+  /** update 模式必填（既有笔记相对路径） */
+  noteRel?: string | null;
+  transcript: string;
+}) => call<string>('session_archive', args);
+
+/* ---------------- skills ---------------- *//** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
 export const skillsList = (projectId: string) => call<SkillSummary[]>('skills_list', { projectId });
 /** 读取单个技能完整文档（content 为 SKILL.md 原文） */
 export const skillRead = (projectId: string, origin: SkillOrigin, name: string) =>

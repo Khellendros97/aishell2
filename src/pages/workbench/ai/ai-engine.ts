@@ -64,7 +64,7 @@ import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef,
 import { icon, type IconName } from '../../../icons';
 import {
   aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
-  sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
+  sessionArchive, sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
 } from '../../../api';
@@ -74,6 +74,8 @@ import { addQuickCommandModal } from '../tabs/useTerminal';
 import { hideProgress } from '../statusbar-progress';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { openAiDbApprovalModal, type DbRequestDetail } from './AiDbApproval';
+import { openArchiveModal } from './ArchiveModal';
+import { openNote } from '../tabs/NoteTab';
 import { DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
 
 /* ---------- 面板样式（原型 workbench-ai.js 注入的样式 + 错误气泡红边） ---------- */
@@ -1167,7 +1169,9 @@ async function loadSessions(): Promise<void> {
   const generation = ++ctx.loadGeneration;
   const promise = sessionsGet(ctx.project.id).then((list) => {
     if (ctx.loadGeneration !== generation) return;
-    for (const serverSession of list) {
+    /* 已归档会话不进列表(数据仍在 aishell.json,未来可做取消归档) */
+    const visible = list.filter((s) => s.archived !== true);
+    for (const serverSession of visible) {
       const current = ctx.sessions.get(serverSession.id);
       if (!current) {
         ctx.sessions.set(serverSession.id, serverSession);
@@ -1179,7 +1183,7 @@ async function loadSessions(): Promise<void> {
       current.autoTitleTriggered = serverSession.autoTitleTriggered === true;
     }
     /* Rust 按插入序返回（旧→新），已有前端新会话不被异步加载覆盖。 */
-    if (!ctx.activeSessionId && list.length > 0) ctx.activeSessionId = list[list.length - 1].id;
+    if (!ctx.activeSessionId && visible.length > 0) ctx.activeSessionId = visible[visible.length - 1].id;
     ctx.loaded = true;
     replayPendingSessionTitleEvents(ctx);
     for (const s of ctx.sessions.values()) void ensureSessionSubscription(ctx, s.id);
@@ -1474,8 +1478,7 @@ function finalize(sid: string): void {
   if (!s || !p || p.phase !== 'stream') {
     if (s) persistSession(s);
     return;
-  }
-  const text = p.text.trim() ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
+  }  const text = p.text.trim() ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
   s.messages.push({
     role: 'assistant',
     content: text,
@@ -1523,6 +1526,73 @@ function leaveSession(sid: string, ctx: ProjectContext | null = viewContext): vo
 function leaveAllSessions(ctx: ProjectContext | null = viewContext): void {
   if (!ctx) return;
   [...ctx.sessions.keys()].forEach((sid) => leaveSession(sid, ctx));
+}
+
+/* ---------- 会话归档(转录 → sessionArchive → 前端移除;数据仍在 aishell.json,archived 标记) ---------- */
+
+/** 转录大小上限:超长截断保留尾部(归档语义上近期内容更重要),头部标注截断标记 */
+const TRANSCRIPT_MAX_BYTES = 64 * 1024;
+
+/** 拼会话转录:标题 + [用户]/[AI] 逐条 content(不含快照/引用展开;LLM 只看对话正文) */
+function buildTranscript(session: ChatSession): string {
+  let out = `会话标题: ${session.title}\n\n`;
+  for (const m of session.messages) {
+    out += `[${m.role === 'user' ? '用户' : 'AI'}]\n${m.content}\n\n`;
+  }
+  if (out.length > TRANSCRIPT_MAX_BYTES) {
+    const tail = out.slice(out.length - TRANSCRIPT_MAX_BYTES);
+    // 截断点回退到最近的消息边界,避免从一条消息中间切开
+    const boundary = tail.indexOf('\n\n[');
+    out = `（转录过长,已截断早期内容）\n\n${boundary > 0 ? tail.slice(boundary + 2) : tail}`;
+  }
+  return out;
+}
+
+/** 归档成功后的前端收尾:移除会话 + 退订 + 活跃会话补位 + 通知笔记面板/打开笔记 */
+function afterArchived(ctx: ProjectContext, sid: string, notePath: string): void {
+  ctx.sessions.delete(sid);
+  ctx.pendingBy.delete(sid);
+  ctx.subscriptions.get(sid)?.();
+  ctx.subscriptions.delete(sid);
+  wbEvents.emit('notes-changed');
+  if (viewContext === ctx) {
+    if (ctx.activeSessionId === sid) {
+      ctx.activeSessionId = '';
+      ensureActiveSession(ctx);
+    }
+    activeSessionId = ctx.activeSessionId;
+    renderSessionBar();
+    renderHistory();
+    updateSendBtn();
+    void refreshStagingNotice();
+  }
+  if (notePath) {
+    openNote(notePath);
+    toast('已归档并生成笔记', 'success');
+  } else {
+    toast('会话已归档', 'success');
+  }
+}
+
+/** 归档入口(右键菜单「归档会话」):拼转录 → ArchiveModal → sessionArchive → 收尾 */
+function archiveSession(pid: string, sid: string): void {
+  const ctx = viewContext;
+  if (!ctx || ctx.project.id !== pid) return;
+  const session = ctx.sessions.get(sid);
+  if (!session) return;
+  openArchiveModal({
+    sessionTitle: session.title,
+    onConfirm: ({ mode, title, dirRel, noteRel }) => sessionArchive({
+      projectId: pid,
+      sessionId: sid,
+      mode,
+      title,
+      dirRel,
+      noteRel,
+      transcript: buildTranscript(session),
+    }),
+    onDone: (notePath) => afterArchived(ctx, sid, notePath),
+  });
 }
 
 function enqueueSessionSnapshot(target: ProjectContext, snapshot: ChatSession): Promise<void> {
@@ -3737,6 +3807,8 @@ function bindEvents(): void {
       traceStatus().catch(() => false),
     ])
       .then(([entries, traceOn]) => {
+        /* 归档:生成中的会话禁归档(转录不完整,且后端杀进程会打断在途回合) */
+        const archiving = isGenerating(sid);
         showContextMenu(e.clientX, e.clientY, [
           { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
           'sep',
@@ -3744,6 +3816,12 @@ function bindEvents(): void {
             ? { label: `打开文件暂存区（${entries.length}）`, iconName: 'history', action: openStaging }
             : { label: '打开文件暂存区', iconName: 'history', action: openStaging },
           ...(traceOn ? ['sep' as const, { label: '追溯', iconName: 'search' as const, action: openTrace }] : []),
+          'sep',
+          {
+            label: '归档会话', iconName: 'archive' as const,
+            disabled: archiving, disabledTip: archiving ? '会话正在生成中，请先停止或等待完成' : undefined,
+            action: () => archiveSession(pid, sid),
+          },
         ]);
       });
   });
