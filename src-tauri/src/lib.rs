@@ -4,6 +4,7 @@ pub mod ai_images;
 pub mod ai_impact;
 pub mod browser;
 pub mod mcp;
+pub mod notes;
 pub mod redact;
 pub mod session_title;
 pub mod smart_approval;
@@ -263,6 +264,9 @@ pub fn run() {
             ai::ai_respond_approval,
             ai::ai_respond_db_request,
             session_title::ai_generate_session_title,
+            notes::notes_root_cmd,
+            notes::notes_list_cmd,
+            notes::session_archive,
             trace::trace_status,
             trace::trace_set_enabled,
             trace::trace_read,

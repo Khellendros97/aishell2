@@ -290,7 +290,18 @@ export interface ChatSession {
   messages: ChatMsg[];
   /** 首条用户消息已触发自动标题；失败后也不重试，避免后续消息改写会话标题。 */
   autoTitleTriggered?: boolean;
+  /** 会话已归档（归档后不出现在前端会话列表，数据仍保留）；旧配置无此字段按未归档 */
+  archived?: boolean;
 }
+
+/** 归档对话框的目录/笔记选择器数据（notes_list 命令返回；相对路径 '/' 分隔、已排序） */
+export interface NotesListing {
+  dirs: string[];
+  notes: string[];
+}
+
+/** session_archive 归档模式：new = 新建笔记 / update = 整合进既有笔记 / only = 仅归档不生成笔记 */
+export type ArchiveMode = 'new' | 'update' | 'only';
 
 /** sessions: projectId -> ChatSession[] */
 export interface AppState {

@@ -1009,6 +1009,13 @@ impl AiManager {
         self.kill_keys(|k| k.starts_with(&prefix));
     }
 
+    /// 杀掉单个会话的 pi 进程（key = `<projectId>:<sessionId>`，ai_chat 的约定）。
+    /// 归档等场景在会话历史已安全落盘后调用；不存在该进程时为 no-op。
+    pub fn kill_session(&self, project_id: &str, session_id: &str) {
+        let key = format!("{project_id}:{session_id}");
+        self.kill_keys(|k| k == key);
+    }
+
     /// 杀掉全部子进程（应用退出时调用；Drop 也会兜底）。
     pub fn kill_all(&self) {
         self.kill_keys(|_| true);

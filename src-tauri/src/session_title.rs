@@ -45,7 +45,7 @@ pub(crate) fn clean_title(raw: &str) -> Option<String> {
 }
 
 /// 从 OpenAI 兼容响应的 message 中提取正文：兼容字符串与 content parts 数组两种形态。
-fn extract_content(message: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_content(message: &serde_json::Value) -> Option<String> {
     if let Some(s) = message["content"].as_str() {
         return Some(s.to_string());
     }
@@ -60,7 +60,7 @@ fn extract_content(message: &serde_json::Value) -> Option<String> {
 }
 
 /// 响应体诊断片段：压平空白成单行并按字素截断，避免错误页刷屏 trace。
-fn body_snippet(body: &str) -> String {
+pub(crate) fn body_snippet(body: &str) -> String {
     const MAX_GRAPHEMES: usize = 300;
     let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let snippet: String = flat.graphemes(true).take(MAX_GRAPHEMES).collect();
