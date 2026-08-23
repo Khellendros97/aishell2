@@ -55,6 +55,8 @@ pub struct LlmConfig {
     pub effort: Effort,
 }
 
+/// 云端分支：对外模型 id 保持 deepseek-v4-flash 不变（上游已切换为支持识图的模型，
+/// 见 ai.rs models_json_for 的 vision 声明），因此不引入 main 的 vision-exp 默认值迁移。
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -708,6 +710,39 @@ pub struct SkillRef {
     pub description: String,
 }
 
+/// 浏览器页面引用：UI 以 @page:页面标题 标签呈现，发送时展开页面标题与地址
+/// （页面正文由 AI 自行用 browser_read / browser_screenshot 读取）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPageRef {
+    pub url: String,
+    pub title: String,
+    pub ts: i64,
+}
+
+/// 图片附件引用：UI 以缩略图呈现，发送时随 prompt 经 pi RPC images 字段传给多模态模型。
+/// path 指向落盘副本（<project>/.aishell/ai-images/，attach 时由后端物化），
+/// aishell.json 只存路径不存 base64（该文件整体原子重写，塞图会膨胀）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRef {
+    pub id: String,
+    /// local | remote | clipboard（附件来源，仅用于展示与排查）
+    pub source: String,
+    pub name: String,
+    pub mime: String,
+    /// 落盘副本绝对路径（ai_read_image 回读用）
+    pub path: String,
+    /// 来源原始路径（local/remote 来源保留，clipboard 无）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_path: Option<String>,
+    /// remote 来源时的目标服务器；其余 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+    pub size: i64,
+    pub ts: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMsg {
@@ -726,9 +761,15 @@ pub struct ChatMsg {
     /// 内置浏览器元素引用（@browser:{#id 或标签名} 标签，发送时展开页面信息 + 元素 HTML）；旧会话无此字段时按空处理
     #[serde(default)]
     pub browser_refs: Vec<BrowserRef>,
+    /// 浏览器页面引用（@page:页面标题 标签，发送时展开页面地址与标题）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub browser_page_refs: Vec<BrowserPageRef>,
     /// 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话无此字段时按空处理
     #[serde(default)]
     pub skill_refs: Vec<SkillRef>,
+    /// 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub image_refs: Vec<ImageRef>,
     /// AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话按空。
     #[serde(default)]
     pub actions: Vec<AiActionRecord>,
@@ -744,6 +785,9 @@ pub struct ChatSession {
     /// 首条用户消息的自动标题任务是否已经尝试过；失败也不重试。
     #[serde(default)]
     pub auto_title_triggered: bool,
+    /// 会话已归档（归档后不出现在前端会话列表，数据仍保留，后续可支持取消归档）。
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// sessions: projectId -> Vec<ChatSession>
@@ -1026,6 +1070,7 @@ impl Store {
         };
         // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
         // 加载时按现行规则清洗，有变更立即原子写回。
+        // （云分支不做默认模型迁移：对外模型 id 仍是 deepseek-v4-flash，无需升级。）
         let known = store.known_secrets();
         let dirty = {
             let mut guard = store
@@ -1686,7 +1731,7 @@ impl Store {
         Ok(project_dir.to_string_lossy().into_owned())
     }
 
-    fn sessions_get(&self, project_id: &str) -> Result<Vec<ChatSession>, String> {
+    pub(crate) fn sessions_get(&self, project_id: &str) -> Result<Vec<ChatSession>, String> {
         let guard = self
             .state
             .lock()
@@ -1694,7 +1739,7 @@ impl Store {
         Ok(guard.sessions.get(project_id).cloned().unwrap_or_default())
     }
 
-    fn session_upsert(&self, project_id: &str, mut session: ChatSession) -> Result<(), String> {
+    pub(crate) fn session_upsert(&self, project_id: &str, mut session: ChatSession) -> Result<(), String> {
         // 落盘前脱敏：快照/文件引用/消息正文可能含配置里读到的凭据（硬约束：密码永不进 JSON）。
         // 注意 known_secrets() 自身要锁 state，必须先于 with_state 调用（std Mutex 不可重入）。
         let known = self.known_secrets();
@@ -1709,11 +1754,14 @@ impl Store {
                     if slot.auto_title_triggered {
                         session.title = slot.title.clone();
                     }
+                    // 归档标记只由后端 set_session_archived 推进，前端残留快照不可冲掉。
+                    session.archived = slot.archived;
                     *slot = session;
                 }
                 None => {
                     // 新会话同样从未领取开始，普通前端 upsert 不可直接置位。
                     session.auto_title_triggered = false;
+                    session.archived = false;
                     list.push(session);
                 }
             }
@@ -1764,6 +1812,27 @@ impl Store {
                 return Ok(false);
             }
             session.title = title.to_string();
+            Ok(true)
+        })
+    }
+
+    /// 原子设置会话归档标记；返回是否实际变更（会话不存在视为无变更）。
+    pub(crate) fn set_session_archived(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<bool, String> {
+        self.with_state(|s| {
+            let Some(session) = s.sessions.get_mut(project_id)
+                .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
+            else {
+                return Ok(false);
+            };
+            if session.archived == archived {
+                return Ok(false);
+            }
+            session.archived = archived;
             Ok(true)
         })
     }
@@ -1854,6 +1923,18 @@ impl Store {
             .map_err(|_| "store 状态锁损坏".to_string())
             .expect("store 状态锁损坏");
         guard.settings.clone()
+    }
+
+    /// 笔记根目录:workspace 全局 `.aishell/notes`(不存在则创建);workspace 未配置报错。
+    pub fn notes_root(&self) -> Result<PathBuf, String> {
+        let ws = self
+            .settings()
+            .workspace_dir
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "请先在设置中配置工作区目录".to_string())?;
+        let root = PathBuf::from(ws).join(".aishell").join("notes");
+        fs::create_dir_all(&root).map_err(|e| format!("创建笔记目录失败: {e}"))?;
+        Ok(root)
     }
 
     /// 项目本地路径；未设置或项目不存在返回 None。
@@ -2310,7 +2391,9 @@ mod tests {
             server_refs: vec![],
             path_refs: vec![],
             browser_refs: vec![],
+            browser_page_refs: vec![],
             skill_refs: vec![],
+            image_refs: vec![],
             actions: vec![],
             ts: 1,
         }
@@ -2383,6 +2466,7 @@ mod tests {
                         id: "sess-1".to_string(),
                         title: "会话一".to_string(),
                         auto_title_triggered: false,
+                    archived: false,
                         messages: vec![ChatMsg {
                             role: "user".to_string(),
                             content: "看看日志".to_string(),
@@ -2418,11 +2502,27 @@ mod tests {
                                 outer_html: r#"<button id="login-btn">登录</button>"#.to_string(),
                                 ts: 1_752_000_000_002,
                             }],
+                            browser_page_refs: vec![BrowserPageRef {
+                                url: "http://localhtml.localhost/C:/x/console.html".to_string(),
+                                title: "控制台".to_string(),
+                                ts: 1_752_000_000_004,
+                            }],
                             skill_refs: vec![SkillRef {
                                 name: "code-review".to_string(),
                                 origin: "project".to_string(),
                                 scope: vec!["all".to_string()],
                                 description: "代码审查".to_string(),
+                            }],
+                            image_refs: vec![ImageRef {
+                                id: "img-1".to_string(),
+                                source: "clipboard".to_string(),
+                                name: "截图.png".to_string(),
+                                mime: "image/png".to_string(),
+                                path: "D:/demo/.aishell/ai-images/1752000000000_截图.png".to_string(),
+                                origin_path: None,
+                                server_id: None,
+                                size: 4096,
+                                ts: 1_752_000_000_003,
                             }],
                             actions: vec![AiActionRecord {
                                 tool_call_id: "call-1".to_string(),
@@ -3951,6 +4051,7 @@ mod tests {
                         test_chat_msg("assistant", "部署状态正常"),
                     ],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -3981,6 +4082,7 @@ mod tests {
                     title: "临时标题".to_string(),
                     messages: vec![test_chat_msg("assistant", "先有回复")],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -4001,6 +4103,7 @@ mod tests {
             title: "临时标题".to_string(),
             messages: vec![test_chat_msg("user", "请检查部署状态")],
             auto_title_triggered: false,
+            archived: false,
         };
         store.session_upsert("proj-title", first).unwrap();
         assert_eq!(
@@ -4021,6 +4124,7 @@ mod tests {
                         test_chat_msg("assistant", "已完成"),
                     ],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -4041,6 +4145,7 @@ mod tests {
                     title: "临时标题".to_string(),
                     messages: vec![test_chat_msg("user", "第一条")],
                     auto_title_triggered: false,
+                    archived: false,
                 },
             )
             .unwrap();
@@ -4065,6 +4170,43 @@ mod tests {
     }
 
     #[test]
+    fn session_upsert_preserves_archived_flag_and_setter_works() {
+        let dir = temp_config_dir("session-archived");
+        let store = test_store(dir);
+        let sess = || ChatSession {
+            id: "sess-arch".to_string(),
+            title: "T".to_string(),
+            messages: vec![test_chat_msg("user", "hi")],
+            auto_title_triggered: false,
+            archived: false,
+        };
+        store.session_upsert("proj-arch", sess()).unwrap();
+        assert!(store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        // 重复设置同值返回 false（无变更）
+        assert!(!store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        // 不存在会话返回 false 而非报错
+        assert!(!store.set_session_archived("proj-arch", "sess-none", true).unwrap());
+        // 前端残留快照 upsert 不得冲掉 archived 标记
+        store.session_upsert("proj-arch", sess()).unwrap();
+        let saved = store.sessions_get("proj-arch").unwrap().pop().unwrap();
+        assert!(saved.archived, "upsert 应保留 slot 的 archived 值");
+        // 新插入会话 upsert 传入 true 也被强制回落 false
+        let mut s2 = sess();
+        s2.id = "sess-arch-2".to_string();
+        s2.archived = true;
+        store.session_upsert("proj-arch", s2).unwrap();
+        let list = store.sessions_get("proj-arch").unwrap();
+        assert!(!list.iter().find(|s| s.id == "sess-arch-2").unwrap().archived);
+    }
+
+    #[test]
+    fn old_json_without_archived_field_parses() {
+        let json = r#"{"id":"s1","title":"T","messages":[],"autoTitleTriggered":false}"#;
+        let session: ChatSession = serde_json::from_str(json).unwrap();
+        assert!(!session.archived);
+    }
+
+    #[test]
     fn sessions_upsert_and_delete_project_cleanup() {
         let dir = temp_config_dir("sessions");
         let store = test_store(dir);
@@ -4073,6 +4215,7 @@ mod tests {
             title: "T".to_string(),
             messages: vec![],
             auto_title_triggered: false,
+            archived: false,
         };
         store.session_upsert("proj-x", sess.clone()).unwrap();
         // 同 id 更新不重复插入
@@ -4118,7 +4261,9 @@ mod tests {
             server_refs: vec![],
             path_refs: vec![],
             browser_refs: vec![],
+            browser_page_refs: vec![],
             skill_refs: vec![],
+            image_refs: vec![],
             actions: vec![],
             ts: 1,
         };
@@ -4127,6 +4272,7 @@ mod tests {
             id: "sess-mask".to_string(),
             title: "T".to_string(),
             auto_title_triggered: false,
+            archived: false,
             messages: vec![
                 msg(r#"db_password="hunter2""#),
                 ChatMsg {
@@ -4137,7 +4283,9 @@ mod tests {
                     server_refs: vec![],
                     path_refs: vec![],
                     browser_refs: vec![],
+                    browser_page_refs: vec![],
                     skill_refs: vec![],
+                    image_refs: vec![],
                     actions: vec![AiActionRecord {
                         tool_call_id: "call-1".to_string(),
                         tool: "run_command".to_string(),
@@ -4289,6 +4437,26 @@ mod tests {
         assert!(msg.file_refs.is_empty(), "旧数据应兼容为空引用列表");
         assert!(msg.server_refs.is_empty(), "旧数据应兼容为空服务器引用列表");
         assert!(msg.path_refs.is_empty(), "旧数据应兼容为空路径引用列表");
+        assert!(msg.browser_refs.is_empty(), "旧数据应兼容为空浏览器元素引用列表");
+        assert!(msg.browser_page_refs.is_empty(), "旧数据应兼容为空浏览器页面引用列表");
+    }
+
+    #[test]
+    fn chat_msg_browser_page_refs_roundtrip_camel_case() {
+        // 新增的浏览器页面引用字段按 camelCase 往返（与前端 ChatMsg.browserPageRefs 对齐）
+        let m = ChatMsg {
+            browser_page_refs: vec![BrowserPageRef {
+                url: "http://localhtml.localhost/C:/x/console.html".to_string(),
+                title: "控制台".to_string(),
+                ts: 1_752_000_000_002,
+            }],
+            ..test_chat_msg("user", "看看 @page:控制台")
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"browserPageRefs\""), "序列化应为 camelCase: {json}");
+        let back: ChatMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.browser_page_refs.len(), 1);
+        assert_eq!(back.browser_page_refs[0].title, "控制台");
     }
 
     #[test]
@@ -5334,5 +5502,19 @@ mod tests {
         // 中文清单
         let labels = on.enabled_labels();
         assert_eq!(labels, vec!["执行命令", "数据库查询"]);
+    }
+    /// 旧会话消息无 imageRefs 字段按空解析；带 imageRefs 的消息往返不丢字段。
+    #[test]
+    fn chat_msg_image_refs_compat_roundtrip() {
+        let old = r#"{"role":"user","content":"看图","snapshots":[],"fileRefs":[],"serverRefs":[],"pathRefs":[],"browserRefs":[],"skillRefs":[],"actions":[],"ts":1}"#;
+        let msg: ChatMsg = serde_json::from_str(old).unwrap();
+        assert!(msg.image_refs.is_empty(), "旧会话无 imageRefs 应按空解析");
+
+        let with_img = r#"{"role":"user","content":"看图","snapshots":[],"fileRefs":[],"serverRefs":[],"pathRefs":[],"browserRefs":[],"skillRefs":[],"imageRefs":[{"id":"img-1","source":"remote","name":"a.png","mime":"image/png","path":"C:/x/.aishell/ai-images/1_a.png","originPath":"/srv/a.png","serverId":"srv-1","size":10,"ts":2}],"actions":[],"ts":1}"#;
+        let msg: ChatMsg = serde_json::from_str(with_img).unwrap();
+        assert_eq!(msg.image_refs.len(), 1);
+        assert_eq!(msg.image_refs[0].server_id.as_deref(), Some("srv-1"));
+        let back = serde_json::to_string(&msg).unwrap();
+        assert!(back.contains("\"imageRefs\":"), "序列化应保留 camelCase 字段名");
     }
 }

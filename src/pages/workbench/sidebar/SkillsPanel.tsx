@@ -7,12 +7,13 @@
  * skillSave 显式参数交给后端(后端只重写顶层 scope,其余字节不动),前端不解析重写 YAML。
  * 契约:skillsPanel 导出(标题 + HeadActions「Skill Hub / + 添加」)。
  * 接口点:src/api.ts skills 段(skillsList / skillRead / skillSave / skillDelete / skillSetEnabled /
- * skillPackUpload) 与 browser 段(browserEnsure / browserNavigate / browserPublishSkillhub)。
+ * skillPackUpload) 与 browser 段(browserPublishSkillhub)。
  */
 import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { Server, SkillOrigin, SkillSummary } from '../../../types';
-import { browserEnsure, browserNavigate, browserPublishSkillhub, getState, skillDelete, skillPackUpload, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
+import { browserPublishSkillhub, getState, skillDelete, skillPackUpload, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
+import { openInActivePage } from '../tabs/browser-engine';
 import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, toast } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
@@ -362,8 +363,7 @@ function SkillsPanelBody(): JSX.Element {
     const navigation = new Promise<void>((resolve, reject) => {
       useWorkbench.getState().openTab({ id: 'browser', type: 'browser', title: '浏览器' });
       void (async () => {
-        await browserEnsure();
-        await browserNavigate('https://skillhub.srun.com:6780/dashboard/publish');
+        await openInActivePage('https://skillhub.srun.com:6780/dashboard/publish');
       })().then(resolve, reject);
     });
     const packed = skillPackUpload(projectId(), d.origin, d.name);

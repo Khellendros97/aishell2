@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, Project, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -206,8 +206,16 @@ export type AiEvent =
       connection?: { serverId: string; name: string; kind: DbKind; host: string; port?: number; user?: string; database?: string } }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
-/** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发 */
-export const aiChat = (key: string, prompt: string) => call<void>('ai_chat', { key, prompt });
+/** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发。
+ *  images：随消息附带的多模态图片（mime + 不带 dataURL 前缀的 base64），经 pi RPC images 字段进入 user 消息。 */
+export const aiChat = (key: string, prompt: string, images?: Array<{ mimeType: string; data: string }>) =>
+  call<void>('ai_chat', { key, prompt, images });
+/** 图片附件物化：按来源（本地/远程/剪贴板 base64）读取、魔数嗅探后落到 <project>/.aishell/ai-images/，
+ *  返回落盘副本信息；整批任一失败报错。 */
+export const aiAttachImages = (projectId: string, items: AttachImageItem[]) =>
+  call<AttachedImage[]>('ai_attach_images', { projectId, items });
+/** 回读落盘图片为 base64（缩略图/预览用）。 */
+export const aiReadImage = (path: string) => call<ReadImageOut>('ai_read_image', { path });
 /** 首条用户消息的异步会话标题生成；失败不影响 ai_chat，标题由前端先显示本地临时标题。 */
 export const aiGenerateSessionTitle = (projectId: string, sessionId: string, firstMessage: string, expectedTitle?: string) =>
   call<void>('ai_generate_session_title', { projectId, sessionId, firstMessage, expectedTitle });
@@ -296,25 +304,28 @@ export const traceExport = (path: string, key: string) => call<number>('trace_ex
 /** 清空当前会话 trace（全部日期文件） */
 export const traceClear = (key: string) => call<void>('trace_clear', { key });
 
-/* ---------------- browser（内置浏览器子 webview，Rust browser.rs） ----------------
-   面板占位 div 经 ResizeObserver 同步位置尺寸；element 事件携带检查器选中的元素引用。 */
-/** 懒创建子 webview（全局单实例），返回 url/title/inspect 供面板恢复 */
-export const browserEnsure = () => call<BrowserState>('browser_ensure');
-export const browserSetRect = (x: number, y: number, w: number, h: number) =>
-  call<void>('browser_set_rect', { x, y, w, h });
-/** webview 显隐（面板激活 && 无全屏遮罩 的合成结果由前端计算后传入） */
-export const browserSetVisible = (visible: boolean) =>
-  call<void>('browser_set_visible', { visible });
+/* ---------------- browser（内置浏览器多页面子 webview，Rust browser.rs） ----------------
+   每个「页面」一个子 webview（viewId 由前端生成 p1/p2/…）；占位 div 经 ResizeObserver
+   同步位置尺寸（仅活跃页面）；element 事件携带检查器选中的元素引用（均带 viewId）。 */
+/** 懒创建该页面的子 webview，返回 url/title/inspect 供页面状态恢复 */
+export const browserEnsure = (viewId: string) => call<BrowserState>('browser_ensure', { viewId });
+export const browserSetRect = (viewId: string, x: number, y: number, w: number, h: number) =>
+  call<void>('browser_set_rect', { viewId, x, y, w, h });
+/** webview 显隐（活跃页面 && 标签激活 && 无全屏遮罩 的合成结果由前端计算后传入） */
+export const browserSetVisible = (viewId: string, visible: boolean) =>
+  call<void>('browser_set_visible', { viewId, visible });
 /** 地址栏导航：本地路径（盘符/UNC）→ file://，无协议补 https://；返回归一化后的 URL */
-export const browserNavigate = (input: string) =>
-  call<string>('browser_navigate', { input });
-export const browserBack = () => call<void>('browser_back');
-export const browserForward = () => call<void>('browser_forward');
-export const browserReload = () => call<void>('browser_reload');
+export const browserNavigate = (viewId: string, input: string) =>
+  call<string>('browser_navigate', { viewId, input });
+export const browserBack = (viewId: string) => call<void>('browser_back', { viewId });
+export const browserForward = (viewId: string) => call<void>('browser_forward', { viewId });
+export const browserReload = (viewId: string) => call<void>('browser_reload', { viewId });
 /** 检查元素模式开关（点击元素 → browser:event element → AI 引用 chip） */
-export const browserSetInspect = (enabled: boolean) =>
-  call<void>('browser_set_inspect', { enabled });
-export const browserOpenDevtools = () => call<void>('browser_open_devtools');
+export const browserSetInspect = (viewId: string, enabled: boolean) =>
+  call<void>('browser_set_inspect', { viewId, enabled });
+export const browserOpenDevtools = (viewId: string) => call<void>('browser_open_devtools', { viewId });
+/** 关闭页面：释放该页面的子 webview 与 Rust 侧状态 */
+export const browserCloseView = (viewId: string) => call<void>('browser_close_view', { viewId });
 /** 驱动受限本地 ZIP 走可见的 SkillHub 页面流程；只返回终态，不额外广播进度事件。 */
 export const browserPublishSkillhub = (projectId: string, origin: SkillOrigin, packagePath: string) =>
   call<SkillHubPublishOutcome>('browser_publish_skillhub', { projectId, origin, packagePath });
@@ -348,6 +359,19 @@ export const stagingDiff = (projectId: string, sessionId: string, entryId: strin
 /** 清理无变更条目：远端现状与首次快照完全一致的条目直接接受清除，有变更/检查失败的保留 */
 export const stagingClear = (projectId: string, sessionId: string) =>
   call<StagingClearOutcome>('staging_clear', { projectId, sessionId });
+/** 导出暂存备份：mode local = 快照复制到项目 .aishell/backup/（多条目打包 zip），remote =
+ *  上传回条目原远程目录，文件名均加 _bak 后缀（stamp 为前端生成的本地时间 YYYYMMDD-HHMM，
+ *  与 SFTP 快速备份同格式）；archiveName 仅多条目时需要（压缩包基础名，后缀后端追加）；
+ *  accept=true 时导出成功的条目随后接受清除。与 staging_accept 同边界：绝不加入 pi 工具 / guard。 */
+export const stagingExport = (
+  projectId: string,
+  sessionId: string,
+  entryIds: string[],
+  mode: 'local' | 'remote',
+  archiveName: string | null,
+  stamp: string,
+  accept: boolean,
+) => call<StagingExportOutcome>('staging_export', { projectId, sessionId, entryIds, mode, archiveName, stamp, accept });
 /** 暂存/清理的进度事件（staging.rs add_path 逐文件、clear_unchanged 逐条目发送；walk/stage/clear 阶段，done 结束） */
 export const onStagingProgress = (cb: (p: StagingProgress) => void): Promise<UnlistenFn> =>
   listen<StagingProgress>('staging:progress', (e) => cb(e.payload));
@@ -355,8 +379,27 @@ export const onStagingProgress = (cb: (p: StagingProgress) => void): Promise<Unl
 export const onSftpProgress = (cb: (p: SftpProgress) => void): Promise<UnlistenFn> =>
   listen<SftpProgress>('sftp:progress', (e) => cb(e.payload));
 
-/* ---------------- skills ---------------- */
-/** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
+/* ---------------- notes（会话归档 + 全局笔记树，Rust notes.rs） ----------------
+   笔记是 workspace 全局 <workspace>/.aishell/notes 下的 markdown 文件树；
+   面板 CRUD 复用 fs_* 命令（base 取 notesRoot 返回值）。
+   session_archive 语义：脱敏 → LLM 生成/整合笔记并落盘（mode≠only）→ 标记 archived →
+   杀会话 pi 进程；任一前置失败整体 Err，不归档不写文件。返回笔记绝对路径（only 模式为空串）。 */
+export const notesRoot = () => call<string>('notes_root_cmd');
+export const notesList = () => call<NotesListing>('notes_list_cmd');
+export const sessionArchive = (args: {
+  projectId: string;
+  sessionId: string;
+  mode: ArchiveMode;
+  /** new 模式必填（笔记标题，后端清洗非法字符） */
+  title?: string | null;
+  /** new 模式可选（目标目录相对路径，空 = 根目录） */
+  dirRel?: string | null;
+  /** update 模式必填（既有笔记相对路径） */
+  noteRel?: string | null;
+  transcript: string;
+}) => call<string>('session_archive', args);
+
+/* ---------------- skills ---------------- *//** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
 export const skillsList = (projectId: string) => call<SkillSummary[]>('skills_list', { projectId });
 /** 读取单个技能完整文档（content 为 SKILL.md 原文） */
 export const skillRead = (projectId: string, origin: SkillOrigin, name: string) =>

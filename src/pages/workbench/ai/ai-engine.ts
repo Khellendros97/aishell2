@@ -12,12 +12,20 @@
  * （只读展示 AI 填写的连接信息）→ 点【审批】打开审批对话框（./AiDbApproval，用户只填密码 +
  * 勾查询权限）→ 通过先 saveDbConnection 落库再 aiRespondDbRequest 回执 connectionId；
  * 关闭对话框不回执，卡片可重开。
- * 输入区 chip 五类引用：终端快照 @terminal_<id>、文件引用 @文件名_起_止、服务器/本地终端
- * 引用 @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名、
- * 浏览器元素引用 @browser:#id 或标签名（发送时展开为说明文本/元素 HTML 拼进 prompt）；
- * Settings.autoSwitchAiWorkdir 开启时输入区固定显示
- * 工作区域标签，随激活终端自动切换并作为当前目标上下文带入。
- * AI 回复中的链接：普通点击在内置浏览器标签页打开（browser_navigate + openTab('browser')），
+ * 输入区引用 tag 内嵌于输入框（contenteditable）：终端快照 @term:<id>、文件引用 @文件名_起_止、
+ * 服务器/本地终端引用 @remote:服务器名称 / @local、文件/目录路径引用 @file:文件名 / @path:目录名、
+ * 浏览器元素引用 @browser:#id 或标签名、浏览器页面引用 @page:页面标题（多页面模型）、
+ * 技能引用 @skill:名称 —— chip 可穿插在文字中，发送时按输入框内的先后顺序展开进 prompt
+ * （content 字段落盘保留 token，历史消息按 token 原位还原内嵌 chip；旧会话回退为消息上方 chip 行）；
+ * 输入 @ 唤起自动补全：浏览器页面 / 远程服务器 / 终端最后一条命令（本地文件/目录引用仍走
+ * explorer 右键与拖入入口，不进补全）；
+ * 图片附件缩略图 chip（粘贴剪贴板 / explorer/SFTP 拖入 / 右键「添加到对话」，
+ * 经 ai_attach_images 物化到 <project>/.aishell/ai-images/，发送时不进 prompt 而是随
+ * ai_chat 的 images 参数经 pi RPC images 字段传给多模态模型；单条 ≤9 张、单张 ≤10MB）；
+ * Settings.autoSwitchAiWorkdir 开启时输入框上方 chip 行首位固定显示
+ * 工作区域标签（不可移除），随激活终端自动切换并作为当前目标上下文带入。
+ * 发送无独立按钮：Enter 发送（输入盒右下角小字提示），生成中右下角切换为中断图标按钮（点击/Enter 停止）。
+ * AI 回复中的链接：普通点击在内置浏览器标签页打开（活跃页面导航 + openTab('browser')），
  * Ctrl/Shift+点击仍走系统浏览器（openUrl）。
  *
  * React 差异（语义对齐 legacy，对照 stores/workbench.ts）：
@@ -44,26 +52,30 @@
  * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_abort /
  *   ai_kill_project / ai_set_thinking / ai_respond_approval / ai_respond_db_request /
  *   ai_debug_info / set_ai_mode / get_state / save_settings / save_db_connection /
- *   ai_generate_session_title（首条消息异步标题）/ staging_list，事件 on_ai_event（ai:event:<key>）。
+ *   ai_generate_session_title（首条消息异步标题）/ staging_list /
+ *   ai_attach_images（图片附件物化）/ ai_read_image（缩略图/预览回读），事件 on_ai_event（ai:event:<key>）。
  *  AI 事件订阅按 projectId:sessionId 常驻在模块级项目上下文中：切换会话/项目只切换视图，
  *  不退订、不 abort；卸载仅回收当前面板 DOM 监听，不杀项目 pi 进程。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, BrowserRef, ChatMsg, ChatSession, FileRef, KbHit, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
-import { icon } from '../../../icons';
+import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
+import { icon, type IconName } from '../../../icons';
 import {
-  aiAbort, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiRespondApproval, aiRespondDbRequest, aiSetThinking, browserEnsure, browserNavigate, getState, kbSearch, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
-  sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
+  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, kbSearch, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
+  sessionArchive, sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
 } from '../../../api';
-import { getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
+import { DND_MIME, getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi } from '../../../stores/workbench';
+import { getBrowserPagesForMention, openInActivePage } from '../tabs/browser-engine';
 import { addQuickCommandModal } from '../tabs/useTerminal';
 import { hideProgress } from '../statusbar-progress';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { openAiDbApprovalModal, type DbRequestDetail } from './AiDbApproval';
+import { openArchiveModal } from './ArchiveModal';
+import { openNote } from '../tabs/NoteTab';
 import { DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
 
 /* ---------- 面板样式（原型 workbench-ai.js 注入的样式 + 错误气泡红边） ---------- */
@@ -261,17 +273,79 @@ const STYLE = `
   flex: none; border-top: 1px solid var(--border);
   padding: 8px; display: flex; flex-direction: column; gap: 6px;
 }
-#ai-chip-row { display: flex; flex-wrap: wrap; gap: 4px; }
-#ai-input-row { display: flex; gap: 6px; align-items: flex-end; }
-#ai-input {
-  flex: 1; resize: none; height: 34px; max-height: 120px; overflow-y: auto;
+/* 工作区域固定 chip 行(输入框上方):引用 tag 已内嵌输入框,图片附件 chip 也在本行;
+   无任何 chip 时行高塌为 0(slot 空内容),仅余 #ai-input-area 的 6px gap */
+#ai-chip-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+#ai-workarea-slot { flex: none; display: inline-flex; }
+#ai-input-row { position: relative; }
+/* 输入盒:外框承担旧 textarea 的边框/背景/滚动,内部是 contenteditable + 右下角状态区 */
+#ai-input-box {
+  position: relative;
+  display: flex; align-items: flex-start;
+  min-height: 70px; /* 初始约两行 + 底部提示预留(58px 输入区 + 上下 padding) */
+  max-height: 120px; overflow-y: auto;
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 6px;
-  color: var(--text-0); padding: 7px 10px; outline: none;
+  color: var(--text-0); padding: 6px 8px;
   font-family: var(--font-ui); font-size: 12.5px; line-height: 1.5;
 }
-#ai-input:focus { border-color: var(--accent); }
-#ai-input::placeholder { color: var(--text-2); }
-#ai-send { flex: none; height: 34px; padding: 0 14px; }
+#ai-input-box:focus-within { border-color: var(--accent); }
+#ai-input {
+  flex: 1; min-width: 0; outline: none; border: 0; background: transparent;
+  color: var(--text-0); font: inherit; white-space: pre-wrap; word-break: break-word;
+  min-height: 58px; /* 初始约两行(2×19px 行高) + 底部 20px 提示预留 */
+  padding: 0 4px 20px 0; /* 底部留白:右下角「Enter 发送」/中断按钮不压正文 */
+}
+#ai-input:empty::before {
+  content: attr(data-placeholder); color: var(--text-2); pointer-events: none;
+}
+/* 右下角状态区:空闲显示「Enter 发送」小字提示,生成中切换为中断图标按钮(带背景防文字穿透) */
+.ai-input-corner {
+  position: absolute; right: 6px; bottom: 4px;
+  display: inline-flex; align-items: center; gap: 4px;
+  padding-left: 6px; background: var(--bg-2); border-radius: 4px;
+}
+.ai-input-hint { font-size: 10.5px; color: var(--text-2); user-select: none; padding: 0 2px; }
+.ai-abort-btn {
+  width: 22px; height: 22px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border-strong); border-radius: 4px;
+  background: var(--bg-3); color: var(--red); cursor: pointer;
+}
+.ai-abort-btn:hover { border-color: var(--red); background: var(--bg-2); }
+.ai-abort-btn[hidden] { display: none; }
+/* 内嵌引用 chip:原子元素(contenteditable=false),✕ 移除 */
+.ai-inline-chip {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 0 5px; margin: 0 1px; border-radius: 4px;
+  background: var(--accent-dim); border: 1px solid var(--accent);
+  color: var(--accent-hover); font-size: 11.5px; cursor: pointer; user-select: none;
+  max-width: 220px;
+}
+.ai-inline-chip .ai-chip-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;
+}
+.ai-inline-chip .ai-chip-x { flex: none; opacity: 0.6; cursor: pointer; display: inline-flex; }
+.ai-inline-chip .ai-chip-x:hover { opacity: 1; }
+.ai-inline-chip .ai-chip-x svg { width: 11px; height: 11px; }
+/* @ 自动补全弹层:输入行上方,分组 + 项(图标 + 标签 + 右侧提示) */
+.ai-mention-pop {
+  position: absolute; left: 0; right: 0; bottom: calc(100% + 4px); z-index: 30;
+  max-height: 264px; overflow-y: auto; padding: 4px;
+  background: var(--bg-1); border: 1px solid var(--border-strong); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.28);
+}
+.ai-mention-group { font-size: 10.5px; color: var(--text-2); padding: 5px 7px 2px; }
+.ai-mention-item {
+  width: 100%; min-height: 28px; display: flex; align-items: center; gap: 6px;
+  border: 0; border-radius: 4px; padding: 4px 7px; text-align: left; cursor: pointer;
+  background: transparent; color: var(--text-0); font-size: 12px;
+}
+.ai-mention-item:hover, .ai-mention-item.active { background: var(--accent-dim); outline: none; }
+.ai-mention-item .ic { flex: none; color: var(--text-2); }
+.ai-mention-item.active .ic { color: var(--accent); }
+.ai-mention-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-mention-hint { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10.5px; color: var(--text-2); }
+.ai-msg-chip-inline { display: inline-flex; vertical-align: baseline; }
 .ai-snap-chip { cursor: pointer; user-select: none; }
 .ai-snap-chip .ai-chip-x { margin-left: 5px; opacity: 0.7; cursor: pointer; }
 .ai-snap-chip .ai-chip-x:hover { opacity: 1; }
@@ -317,6 +391,41 @@ const STYLE = `
   margin-top: 10px; font-size: 11.5px; color: var(--yellow); line-height: 1.5;
 }
 .db-approval-warn svg { flex: none; width: 12px; height: 12px; margin-top: 2px; }
+/* 图片附件：输入区 chip 缩略图（22px）与历史消息缩略图行（110px，点开大图）。
+   缩略图容器固定尺寸，加载中显示浅色占位，失败红边显示文件名。 */
+.ai-img-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px 2px 3px; }
+.ai-img-chip .ai-img-name { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-img-chip-thumb {
+  width: 22px; height: 22px; flex: none; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 4px; border: 1px solid var(--border); background: var(--bg-3);
+  font-size: 0; color: transparent;
+}
+.ai-img-chip-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ai-msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.ai-img-thumb {
+  width: 110px; height: 110px; padding: 0; overflow: hidden; cursor: zoom-in;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-3);
+  font-size: 10.5px; color: var(--text-2); text-align: center; line-height: 1.3;
+  transition: border-color 0.12s;
+}
+.ai-img-thumb:hover { border-color: var(--accent); }
+.ai-img-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ai-img-thumb.ai-img-error, .ai-img-chip-thumb.ai-img-error { border-color: var(--red); }
+/* 图片预览对话框：等比缩放居中，超大图不撑破 modal */
+.ai-img-view {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 160px; max-height: 68vh; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-1);
+  color: var(--text-2); font-size: 12px;
+}
+.ai-img-view img { max-width: 100%; max-height: 68vh; object-fit: contain; display: block; }
+/* 输入区拖拽图片高亮 */
+#ai-input-area.ai-drag-over {
+  outline: 1.5px dashed var(--accent); outline-offset: -3px;
+  border-radius: 6px; background: var(--accent-dim);
+}
 `;
 
 /* ---------- Markdown 渲染（AI 回复正文；html:false 转义原始 HTML 防 XSS，breaks 保留单换行） ---------- */
@@ -360,6 +469,19 @@ interface ActionCard {
   result?: string;
   /** 动作开始时已生成文本长度(text 内时序锚点,渲染时把卡片穿插到该位置) */
   textLen?: number;
+  /** 创建序号（同 textLen 锚点的工具行/动作卡按到达先后排序；瞬时字段，不落盘） */
+  seq?: number;
+}
+
+/** 非受控工具活动行（瞬时展示，不落盘）：textLen 为发生时已生成文本长度，渲染时按时序穿插 */
+interface ToolLine {
+  label: string;
+  /** 相邻同行折叠计数（显示为 ×N） */
+  count: number;
+  /** 发生时 p.text 长度（穿插锚点） */
+  textLen: number;
+  /** 到达序号（同锚点排序用） */
+  seq: number;
 }
 
 /** 生成中/错误气泡的瞬时状态（不进 ChatSession.messages，不落盘）；tools 为工具活动行（同上） */
@@ -367,7 +489,7 @@ interface Pending {
   phase: 'typing' | 'stream' | 'error';
   text: string;
   error?: string;
-  tools: string[];
+  tools: ToolLine[];
   /** 受控工具动作卡（本轮可观察审计，finalize 时随消息持久化） */
   actions: Map<string, ActionCard>;
 }
@@ -468,7 +590,9 @@ function cloneChatSession(s: ChatSession): ChatSession {
       serverRefs: m.serverRefs.map((ref) => ({ ...ref })),
       pathRefs: m.pathRefs.map((ref) => ({ ...ref })),
       browserRefs: m.browserRefs.map((ref) => ({ ...ref })),
+      browserPageRefs: (m.browserPageRefs ?? []).map((ref) => ({ ...ref })),
       skillRefs: m.skillRefs.map((ref) => ({ ...ref, scope: [...ref.scope] })),
+      imageRefs: (m.imageRefs ?? []).map((ref) => ({ ...ref })),
       actions: m.actions.map((action) => ({ ...action })),
       ts: m.ts,
     })),
@@ -507,7 +631,47 @@ const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编�
 const serverRefs = new Map<string, ServerRef>(); // 服务器/本地引用 key -> 引用（key = serverId ?? 'local'，@remote:名称 / @local 标签）
 const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -> 引用（@file:文件名 / @path:目录名 标签）
 const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key -> 引用（key = `${name}:${ts}`，@browser:名称 标签）
+const pageRefs = new Map<string, BrowserPageRef>(); // 浏览器页面引用 id -> 引用（@page:页面标题 标签，@ 补全插入）
 const skillRefs = new Map<string, SkillRef>(); // 技能引用 key -> 引用（key = `${origin}:${name}`，@skill:名称 标签）
+/* 图片附件拆两个 Map：
+   - historyImageRefs  历史消息缩略图/预览查找（renderMessage 灌入，跨会话累积）；
+   - inputImageRefs    输入区待发图片（attachImages 写入、chip ✕ 删除、clearChips/挂面板清空）。
+   此前共用一个 Map：renderHistory 把历史消息 imageRefs 灌回后，发送时 imageRefs.forEach 全量
+   收集会把上一会话/历史消息的图片带进新消息（发 1 张实际带 3 张、再发变 4 张）。 */
+const historyImageRefs = new Map<string, ImageRef>(); // 历史消息图片 id -> 引用
+const inputImageRefs = new Map<string, ImageRef>(); // 输入区待发图片 id -> 引用
+/** 落盘图片回读缓存（path -> base64；null = 读取失败）。有界 FIFO，避免多图会话内存膨胀。 */
+const imageCache = new Map<string, { mime: string; data: string } | null>();
+const IMAGE_CACHE_MAX = 16;
+/** 单条消息图片上限（DeepSeek 官方 600 张/请求 48MiB，产品侧收敛到 9 张；单张 10MB 由后端 attach 校验） */
+const MAX_ATTACH_IMAGES = 9;
+/** 图片扩展名粗筛（能否作为附件以粘贴/拖入与右键入口为准；实际格式由后端魔数嗅探判定） */
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)$/i;
+
+/** 回读落盘图片（带缓存）；失败缓存 null（文件被移动/删除的场景重试也无益）。 */
+async function loadImageData(path: string): Promise<{ mime: string; data: string } | null> {
+  if (imageCache.has(path)) return imageCache.get(path) ?? null;
+  let out: { mime: string; data: string } | null = null;
+  try {
+    out = await aiReadImage(path);
+  } catch {
+    out = null;
+  }
+  imageCache.set(path, out);
+  if (imageCache.size > IMAGE_CACHE_MAX) {
+    const oldest = imageCache.keys().next().value;
+    if (oldest !== undefined && oldest !== path) imageCache.delete(oldest);
+  }
+  return out;
+}
+
+/** 模型是否支持图片输入（启发式与 Rust ai.rs models_json_for 保持一致）：
+ *  模型 id 小写含 "vision"；云分支补充：托管代理的 deepseek-v4-flash 对外 id 未变、
+ *  上游已切换为多模态模型，同样视为支持图片（个人模式直连官方 API 时不算）。 */
+function supportsVisionModel(modelId: string, hosted: boolean): boolean {
+  const id = modelId.toLowerCase();
+  return id.includes('vision') || (hosted && id === 'deepseek-v4-flash');
+}
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
 /** 知识库自动注入（Settings.knowledge.autoInject）：发消息前自动把相关度最高的前 N 条命中注入用户输入；只受开关影响，不影响 kb_search 工具挂载 */
@@ -549,13 +713,22 @@ const segCache = new Map<number, { text: string; nodes: HTMLElement[] }>();
 let fixedParts: Array<{ kind: string; lang: string; body: string; nodes: HTMLElement[] }> = [];
 /** 动作卡 DOM 缓存（toolCallId -> 元素）：delta 帧渲染间卡状态不变；低频事件重建气泡时作废 */
 const cardEls = new Map<string, HTMLElement>();
+/** 工具行/动作卡创建序号：同 textLen 锚点的条目按到达先后排序（模块级单调递增即可，排序都在单个 pending 内） */
+let toolSeq = 0;
 
 let chat: HTMLElement;
 let sessionSelect: HTMLButtonElement;
 let sessionMenu: HTMLElement;
 let newSessionBtn: HTMLButtonElement;
-let input: HTMLTextAreaElement;
+/** contenteditable 输入区（引用 tag 以原子 chip 内嵌其中，可穿插文字） */
+let input: HTMLDivElement;
+/** 输入盒（边框/背景/滚动容器）：工作区域 chip 槽 + contenteditable */
+let inputBox: HTMLDivElement;
+/** 固定工作区域 chip 槽（输入盒最前，不可编辑不可移除） */
+let workareaSlot: HTMLElement;
+/** 中断按钮（生成中显示于输入盒右下角；空闲隐藏——发送走 Enter，按钮位置显示「Enter 发送」小字） */
 let sendBtn: HTMLButtonElement;
+/** 图片附件缩略图行（引用 tag 已内嵌输入框，此行只剩图片 chip） */
 let chipRow: HTMLElement;
 let effortSelect: HTMLSelectElement;
 let modeSelect: HTMLSelectElement;
@@ -563,6 +736,34 @@ let modeSelect: HTMLSelectElement;
 let effortSaving = false;
 /** AI 模式切换防抖（YOLO 确认弹窗期间防重复触发） */
 let modeSaving = false;
+
+/* ---------- @ 自动补全（输入框内输入 @ 唤起） ---------- */
+
+/** 补全候选项：apply 负责删除 @query 并插入对应 chip（本地文件/目录走文件对话框，异步） */
+interface MentionItem {
+  key: string;
+  group: string;
+  icon: IconName;
+  label: string;
+  hint?: string;
+  /** 过滤关键词（与 @ 后输入的 query 做子串匹配） */
+  keywords: string;
+  apply(): void | Promise<void>;
+}
+
+let mentionEl: HTMLElement | null = null;
+let mentionItems: MentionItem[] = [];
+let mentionIndex = 0;
+/** '@' 所在文本节点与偏移（应用时删除「@query」再插入 chip） */
+let mentionAnchor: { node: Text; at: number } | null = null;
+/** 当前补全过滤词（服务器列表异步到达后按此重渲染） */
+let mentionQuery = '';
+/** 服务器列表缓存（弹层打开时拉取一次，会话期间复用） */
+let serversCache: Server[] | null = null;
+/** 输入区最近一次光标 Range（文件对话框等异步流程失焦后恢复插入位置用） */
+let savedRange: Range | null = null;
+/** document selectionchange 监听（记录 savedRange；卸载时移除） */
+let offSelectionChange: (() => void) | null = null;
 
 /* UI 显示文案：内部枚举值不变（AiMode / LlmConfig.effort），仅展示层用中文 */
 const MODE_LABEL: Record<AiMode, string> = { suggest: '仅建议', agent: '工作', yolo: '全自动' };
@@ -666,7 +867,11 @@ export function mountAiPanel(container: HTMLElement): () => void {
   serverRefs.clear();
   pathRefs.clear();
   browserRefs.clear();
+  pageRefs.clear();
   skillRefs.clear();
+  inputImageRefs.clear(); // 输入区待发图片随面板重挂清空（历史消息图片在 historyImageRefs，不受影响）
+  serversCache = null;
+  savedRange = null;
   autoSwitchAiWorkdir = false;
   workareaRef = null;
   browserWorkarea = false;
@@ -706,10 +911,16 @@ export function mountAiPanel(container: HTMLElement): () => void {
           <option value="max">最高</option>
         </select>
       </div>
-      <div id="ai-chip-row"></div>
+      <div id="ai-chip-row"><span id="ai-workarea-slot"></span></div>
       <div id="ai-input-row">
-        <textarea id="ai-input" placeholder="向 AI 提问，Enter 发送，Shift+Enter 换行"></textarea>
-        <button id="ai-send" class="btn primary" title="发送 (Enter)">发送</button>
+        <div id="ai-input-box">
+          <div id="ai-input" contenteditable="true" role="textbox" aria-multiline="true" aria-label="AI 对话输入框"
+            data-placeholder="向 AI 提问，Shift+Enter 换行；输入 @ 引用终端/文件/服务器/浏览器；可粘贴或拖入图片"></div>
+          <span class="ai-input-corner">
+            <span class="ai-input-hint">Enter 发送</span>
+            <button class="ai-abort-btn" type="button" title="停止生成 (Enter)" hidden>${icon('square')}</button>
+          </span>
+        </div>
       </div>
     </div>`;
 
@@ -718,8 +929,10 @@ export function mountAiPanel(container: HTMLElement): () => void {
   sessionSelect = el('session-select') as HTMLButtonElement;
   sessionMenu = el('session-menu');
   newSessionBtn = el('new-session') as HTMLButtonElement;
-  input = el('input') as HTMLTextAreaElement;
-  sendBtn = el('send') as HTMLButtonElement;
+  input = el('input') as HTMLDivElement;
+  inputBox = el('input-box') as HTMLDivElement;
+  workareaSlot = el('workarea-slot');
+  sendBtn = container.querySelector<HTMLButtonElement>('.ai-abort-btn')!;
   chipRow = el('chip-row');
   effortSelect = el('effort-select') as HTMLSelectElement;
   modeSelect = el('mode-select') as HTMLSelectElement;
@@ -809,8 +1022,10 @@ function cleanup(): void {
   segCache.clear();
   fixedParts = [];
   cardEls.clear();
+  closeMention();
   saveViewContext();
   if (panelRoot) { panelRoot.removeEventListener('keydown', onPanelKeydown, true); panelRoot = null; }
+  if (offSelectionChange) { offSelectionChange(); offSelectionChange = null; }
   closeSessionMenu();
   if (offSessionOutside) { offSessionOutside(); offSessionOutside = null; }
   if (offStagingChanged) { offStagingChanged(); offStagingChanged = null; }
@@ -826,12 +1041,12 @@ const aiHandle = {
   addSnapshot(snap: TermSnapshot): void {
     if (!snap || !snap.id) return;
     snapshots.set(snap.id, snap);
-    addChip(snap);
+    insertTermChip(snap);
   },
   addFileRef(ref: FileRef): void {
     if (!ref || !ref.id) return;
     fileRefs.set(ref.id, ref);
-    addFileChip(ref);
+    insertFileChip(ref);
   },
   /** 服务器/本地终端引用（@remote:服务器名称 / @local 标签）；与固定工作区域重复时不再插入 */
   addServerRef(ref: ServerRef): void {
@@ -846,7 +1061,7 @@ const aiHandle = {
       return;
     }
     serverRefs.set(key, ref);
-    addServerRefChip(ref);
+    insertServerChip(ref);
   },
   /** 文件/目录路径引用（@file:文件名 / @path:目录名 标签，发送时只带路径不带内容；
    *   serverId 为远端 SFTP 引用，key 带服务器前缀与本地同路径引用区分）；重复添加时提示 */
@@ -858,7 +1073,7 @@ const aiHandle = {
       return;
     }
     pathRefs.set(key, ref);
-    addPathRefChip(ref, key);
+    insertPathChip(ref);
   },
   /** 浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；
    *  同名元素（如多个 button）允许重复添加——chip 各自携带完整快照数据 */
@@ -866,7 +1081,7 @@ const aiHandle = {
     if (!ref || (!ref.name && !ref.tagName)) return;
     const key = `${ref.name || ref.tagName}:${ref.ts}`;
     browserRefs.set(key, ref);
-    addBrowserRefChip(ref, key);
+    insertBrowserChip(ref, key);
   },
   /** 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述，AI 可循此读取技能文件）；重复添加时提示 */
   addSkillRef(ref: SkillRef): void {
@@ -877,7 +1092,17 @@ const aiHandle = {
       return;
     }
     skillRefs.set(key, ref);
-    addSkillRefChip(ref, key);
+    insertSkillChip(ref);
+  },
+  /** 图片附件（explorer/SFTP 右键「添加到对话」对图片文件的入口）：
+   *  物化由 attachImages 统一完成（vision 门槛 / 数量上限 / 后端嗅探都在那里） */
+  addImageRef(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void {
+    if (!ref || typeof ref.path !== 'string' || !ref.path.trim()) return;
+    void attachImages([
+      ref.source === 'remote'
+        ? { source: 'remote', serverId: ref.serverId ?? '', path: ref.path }
+        : { source: 'local', path: ref.path },
+    ]);
   },
   currentSessionId(): string | null {
     return activeSessionId || null;
@@ -951,7 +1176,9 @@ async function loadSessions(): Promise<void> {
   const generation = ++ctx.loadGeneration;
   const promise = sessionsGet(ctx.project.id).then((list) => {
     if (ctx.loadGeneration !== generation) return;
-    for (const serverSession of list) {
+    /* 已归档会话不进列表(数据仍在 aishell.json,未来可做取消归档) */
+    const visible = list.filter((s) => s.archived !== true);
+    for (const serverSession of visible) {
       const current = ctx.sessions.get(serverSession.id);
       if (!current) {
         ctx.sessions.set(serverSession.id, serverSession);
@@ -963,7 +1190,7 @@ async function loadSessions(): Promise<void> {
       current.autoTitleTriggered = serverSession.autoTitleTriggered === true;
     }
     /* Rust 按插入序返回（旧→新），已有前端新会话不被异步加载覆盖。 */
-    if (!ctx.activeSessionId && list.length > 0) ctx.activeSessionId = list[list.length - 1].id;
+    if (!ctx.activeSessionId && visible.length > 0) ctx.activeSessionId = visible[visible.length - 1].id;
     ctx.loaded = true;
     replayPendingSessionTitleEvents(ctx);
     for (const s of ctx.sessions.values()) void ensureSessionSubscription(ctx, s.id);
@@ -1081,18 +1308,16 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     p.text += ev.text;
     pendingBy.set(sid, p);
   } else if (ev.type === 'tool') {
-    /* 工具活动行：瞬时展示，不进历史；相邻重复行折叠为 ×N */
+    /* 工具活动行：瞬时展示，不进历史；锚定到发生时已生成文本位置（时序穿插），
+       相邻重复行折叠为 ×N（锚点保留首次发生位置） */
     const cur = pendingBy.get(sid) ?? null;
     const p = cur ?? emptyPending();
     const label = ev.label ? `${ev.tool} ${ev.label}` : ev.tool;
     const last = p.tools[p.tools.length - 1];
-    const m = last?.match(/^(.*) ×(\d+)$/);
-    if (last === label) {
-      p.tools[p.tools.length - 1] = `${label} ×2`;
-    } else if (m && m[1] === label) {
-      p.tools[p.tools.length - 1] = `${label} ×${Number(m[2]) + 1}`;
+    if (last && last.label === label) {
+      last.count += 1;
     } else {
-      p.tools.push(label);
+      p.tools.push({ label, count: 1, textLen: p.text.length, seq: ++toolSeq });
     }
     pendingBy.set(sid, p);
   } else if (ev.type === 'actionStart') {
@@ -1115,6 +1340,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
       impact: existing?.impact,
       status: project?.aiMode === 'agent' ? 'approving' : 'running',
       textLen: existing?.textLen ?? p.text.length,
+      seq: existing?.seq ?? ++toolSeq,
     });
     pendingBy.set(sid, p);
   } else if (ev.type === 'approval') {
@@ -1137,6 +1363,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
         requestId: ev.requestId,
         status: 'approving',
         textLen: existing?.textLen ?? p.text.length,
+        seq: existing?.seq ?? ++toolSeq,
       });
       pendingBy.set(sid, p);
     } else if (ev.smart) {
@@ -1155,6 +1382,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
         status: 'smart',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
+        seq: existing?.seq ?? ++toolSeq,
       });
       pendingBy.set(sid, p);
     } else {
@@ -1174,6 +1402,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
         status: existing?.status === 'running' ? 'running' : 'approving',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
+        seq: existing?.seq ?? ++toolSeq,
       });
       pendingBy.set(sid, p);
     }
@@ -1258,8 +1487,7 @@ function finalize(sid: string): void {
   if (!s || !p || p.phase !== 'stream') {
     if (s) persistSession(s);
     return;
-  }
-  const text = p.text.trim() ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
+  }  const text = p.text.trim() ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
   s.messages.push({
     role: 'assistant',
     content: text,
@@ -1307,6 +1535,73 @@ function leaveSession(sid: string, ctx: ProjectContext | null = viewContext): vo
 function leaveAllSessions(ctx: ProjectContext | null = viewContext): void {
   if (!ctx) return;
   [...ctx.sessions.keys()].forEach((sid) => leaveSession(sid, ctx));
+}
+
+/* ---------- 会话归档(转录 → sessionArchive → 前端移除;数据仍在 aishell.json,archived 标记) ---------- */
+
+/** 转录大小上限:超长截断保留尾部(归档语义上近期内容更重要),头部标注截断标记 */
+const TRANSCRIPT_MAX_BYTES = 64 * 1024;
+
+/** 拼会话转录:标题 + [用户]/[AI] 逐条 content(不含快照/引用展开;LLM 只看对话正文) */
+function buildTranscript(session: ChatSession): string {
+  let out = `会话标题: ${session.title}\n\n`;
+  for (const m of session.messages) {
+    out += `[${m.role === 'user' ? '用户' : 'AI'}]\n${m.content}\n\n`;
+  }
+  if (out.length > TRANSCRIPT_MAX_BYTES) {
+    const tail = out.slice(out.length - TRANSCRIPT_MAX_BYTES);
+    // 截断点回退到最近的消息边界,避免从一条消息中间切开
+    const boundary = tail.indexOf('\n\n[');
+    out = `（转录过长,已截断早期内容）\n\n${boundary > 0 ? tail.slice(boundary + 2) : tail}`;
+  }
+  return out;
+}
+
+/** 归档成功后的前端收尾:移除会话 + 退订 + 活跃会话补位 + 通知笔记面板/打开笔记 */
+function afterArchived(ctx: ProjectContext, sid: string, notePath: string): void {
+  ctx.sessions.delete(sid);
+  ctx.pendingBy.delete(sid);
+  ctx.subscriptions.get(sid)?.();
+  ctx.subscriptions.delete(sid);
+  wbEvents.emit('notes-changed');
+  if (viewContext === ctx) {
+    if (ctx.activeSessionId === sid) {
+      ctx.activeSessionId = '';
+      ensureActiveSession(ctx);
+    }
+    activeSessionId = ctx.activeSessionId;
+    renderSessionBar();
+    renderHistory();
+    updateSendBtn();
+    void refreshStagingNotice();
+  }
+  if (notePath) {
+    openNote(notePath);
+    toast('已归档并生成笔记', 'success');
+  } else {
+    toast('会话已归档', 'success');
+  }
+}
+
+/** 归档入口(右键菜单「归档会话」):拼转录 → ArchiveModal → sessionArchive → 收尾 */
+function archiveSession(pid: string, sid: string): void {
+  const ctx = viewContext;
+  if (!ctx || ctx.project.id !== pid) return;
+  const session = ctx.sessions.get(sid);
+  if (!session) return;
+  openArchiveModal({
+    sessionTitle: session.title,
+    onConfirm: ({ mode, title, dirRel, noteRel }) => sessionArchive({
+      projectId: pid,
+      sessionId: sid,
+      mode,
+      title,
+      dirRel,
+      noteRel,
+      transcript: buildTranscript(session),
+    }),
+    onDone: (notePath) => afterArchived(ctx, sid, notePath),
+  });
 }
 
 function enqueueSessionSnapshot(target: ProjectContext, snapshot: ChatSession): Promise<void> {
@@ -1487,12 +1782,6 @@ function renderPendingBubble(): void {
   wrap.className = 'ai-msg ai';
   const bubble = document.createElement('div');
   bubble.className = 'ai-bubble';
-  for (const t of p.tools) {
-    const line = document.createElement('div');
-    line.className = 'ai-tool-line';
-    line.innerHTML = `${icon('wrench')}${escapeHtml(t)}`;
-    bubble.appendChild(line);
-  }
   const textEl = document.createElement('div');
   textEl.className = 'ai-text';
   appendStreamBody(textEl, p);
@@ -1501,26 +1790,48 @@ function renderPendingBubble(): void {
   replacePending(wrap);
 }
 
-/** 流式体增量组装（语义与 interleaveActions 字符串版逐条对齐）：锚点卡按 textLen 升序
- *  穿插文本段，无锚点卡排文本末尾；全部卡无锚点时整组前置（与原 renderPending 一致）。
+/** 工具行/动作卡统一为时序条目：按 textLen 锚点穿插进文本，同锚点按到达序号排序 */
+interface StreamItem {
+  el?: HTMLElement;
+  html?: string;
+  textLen?: number;
+  seq?: number;
+}
+
+/** 流式体增量组装（语义与 interleaveActions 字符串版逐条对齐）：锚点条目（动作卡 +
+ *  工具行）按 textLen 升序、同锚点按 seq 穿插文本段，无锚点条目排文本末尾；全部条目
+ *  无锚点时整组前置（与原 renderPending 一致，typing 相位尚无文本时即此形态）。
  *  文本段经 appendSegNodes 复用缓存节点，卡片经 reuseCard 复用 DOM（append 移动）。 */
 function appendStreamBody(container: HTMLElement, p: Pending): void {
-  const cards = [...p.actions.values()];
-  const anchored = cards.some((c) => c.textLen != null);
+  const items: StreamItem[] = [
+    ...p.tools.map((t) => ({ el: toolLineEl(t), textLen: t.textLen, seq: t.seq })),
+    ...[...p.actions.values()].map((c) => ({ el: reuseCard(c), textLen: c.textLen, seq: c.seq })),
+  ];
+  const anchored = items.some((i) => i.textLen != null);
   if (!anchored) {
-    cards.forEach((c) => container.appendChild(reuseCard(c)));
+    items.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    items.forEach((i) => container.appendChild(i.el!));
     if (p.text) appendSegNodes(container, p.text, 0);
     return;
   }
-  const sorted = cards.slice().sort((a, b) => (a.textLen ?? Infinity) - (b.textLen ?? Infinity));
+  const sorted = items.slice().sort((a, b) =>
+    (a.textLen ?? Infinity) - (b.textLen ?? Infinity) || (a.seq ?? 0) - (b.seq ?? 0));
   let last = 0;
-  for (const c of sorted) {
-    const at = Math.min(c.textLen ?? p.text.length, p.text.length);
+  for (const i of sorted) {
+    const at = Math.min(i.textLen ?? p.text.length, p.text.length);
     if (at > last) appendSegNodes(container, p.text.slice(last, at), last);
-    container.appendChild(reuseCard(c));
+    container.appendChild(i.el!);
     last = at;
   }
   if (last < p.text.length) appendSegNodes(container, p.text.slice(last), last);
+}
+
+/** 工具行元素（每帧重建：数量少、无内部状态；相邻重复折叠为 ×N 后缀） */
+function toolLineEl(t: ToolLine): HTMLElement {
+  const line = document.createElement('div');
+  line.className = 'ai-tool-line';
+  line.innerHTML = `${icon('wrench')}${escapeHtml(t.label)}${t.count > 1 ? ` ×${t.count}` : ''}`;
+  return line;
 }
 
 /** 动作卡 DOM 复用：delta 帧渲染间卡状态不变，直接移动已有节点（低频事件重建
@@ -1705,6 +2016,84 @@ function renderActionGroup(actions: AiActionRecord[], groupKey: string): string 
   </div>`;
 }
 
+/* ---------- 历史消息内嵌 token 还原（content 中 chip 文本形态 → 原位 chip） ---------- */
+
+/** 历史消息引用的 chip 描述：token = 文本形态（与 chipToken 同规则），html = 展示 chip */
+interface MessageToken {
+  token: string;
+  html: string;
+}
+
+/** 由消息的各引用数组构建 token 清单（顺序 = 各数组顺序；点击委托与输入区 chip 同一套 data 属性） */
+function buildMessageTokens(m: ChatMsg): MessageToken[] {
+  const out: MessageToken[] = [];
+  const push = (token: string, id: string, kind: string, title: string): void => {
+    out.push({
+      token,
+      html: `<span class="tag blue ai-msg-chip ai-msg-chip-inline" data-snap-id="${escapeHtml(id)}" data-kind="${kind}" title="${escapeHtml(title)}">${escapeHtml(token)}</span>`,
+    });
+  };
+  m.snapshots.forEach((snap) => push(`@term:${snap.id}`, snap.id, 'term', '点击查看快照全文'));
+  m.fileRefs.forEach((ref) => {
+    const n = ref.path.split(/[\\/]/).pop() || ref.path;
+    push(`@${n}_${ref.startLine}_${ref.endLine}`, ref.id, 'file', `点击查看文件引用 · ${ref.path} 第${ref.startLine}-${ref.endLine}行`);
+  });
+  (m.serverRefs ?? []).forEach((r) => {
+    const label = r.serverId ? `@remote:${r.name}` : '@local';
+    push(label, serverRefKey(r), 'server', r.serverId ? `引用服务器「${r.name}」` : '引用本地终端');
+  });
+  (m.pathRefs ?? []).forEach((r) => {
+    const name = r.path.split('/').filter(Boolean).pop() || r.path;
+    push(r.isDir ? `@path:${name}` : `@file:${name}`, pathRefKey(r), 'path', `引用路径${r.serverId ? `（服务器 ${r.serverId}）` : ''} ${r.path}`);
+  });
+  (m.browserRefs ?? []).forEach((r) =>
+    push(`@browser:${r.name}`, `${r.name}:${r.ts}`, 'browser', `点击查看元素引用（${r.url}）`));
+  (m.browserPageRefs ?? []).forEach((r) =>
+    push(`@page:${pageRefLabel(r)}`, '', 'page', `浏览器页面引用 ${pageRefLabel(r)}（${r.url}）`));
+  (m.skillRefs ?? []).forEach((r) =>
+    push(`@skill:${r.name}`, skillRefKey(r), 'skill', `技能引用「${r.name}」（${r.origin === 'global' ? '全局' : '项目'}）`));
+  return out;
+}
+
+/** content 内嵌 token 原位还原为 chip：同名 token 按出现顺序消费第 i 个引用；
+ *  返回 HTML 与命中数（0 = 旧会话 content 无 token，回退消息上方 chip 行布局） */
+function renderContentWithTokens(content: string, tokens: MessageToken[]): { html: string; matched: number } {
+  if (!tokens.length || !content) return { html: '', matched: 0 };
+  const byToken = new Map<string, MessageToken[]>();
+  for (const t of tokens) {
+    const arr = byToken.get(t.token) ?? [];
+    arr.push(t);
+    byToken.set(t.token, arr);
+  }
+  const cursor = new Map<string, number>();
+  let html = '';
+  let i = 0;
+  let matched = 0;
+  while (i < content.length) {
+    let best: { token: string; at: number } | null = null;
+    for (const token of byToken.keys()) {
+      const at = content.indexOf(token, i);
+      if (at < 0) continue;
+      // 同位置优先更长的 token（如 @term:x1 是 @term:x12 的前缀）
+      if (!best || at < best.at || (at === best.at && token.length > best.token.length)) best = { token, at };
+    }
+    if (!best) break;
+    if (best.at > i) html += escapeHtml(content.slice(i, best.at));
+    const idx = cursor.get(best.token) ?? 0;
+    const list = byToken.get(best.token) ?? [];
+    if (idx < list.length) {
+      html += list[idx].html;
+      cursor.set(best.token, idx + 1);
+      matched += 1;
+    } else {
+      html += escapeHtml(best.token); // 引用数据缺失（理论上不会）：按原文展示
+    }
+    i = best.at + best.token.length;
+  }
+  if (i < content.length) html += escapeHtml(content.slice(i));
+  return { html, matched };
+}
+
 function renderMessage(m: ChatMsg, sid: string): HTMLElement {
   const wrap = document.createElement('div');
   if (m.role === 'user') {
@@ -1713,34 +2102,22 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
     m.snapshots.forEach((snap) => snapshots.set(snap.id, snap));
     m.fileRefs.forEach((ref) => fileRefs.set(ref.id, ref));
     (m.browserRefs ?? []).forEach((r) => browserRefs.set(`${r.name}:${r.ts}`, r));
-    const chips = [
-      ...m.snapshots.map((snap) =>
-        `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(snap.id)}" title="点击查看快照全文">@terminal_${escapeHtml(snap.id)}</span>`,
-      ),
-      ...m.fileRefs.map((ref) => {
-        const n = ref.path.split(/[\\/]/).pop() || ref.path;
-        return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(ref.id)}" data-kind="file" title="点击查看文件引用">@${escapeHtml(n)}_${ref.startLine}_${ref.endLine}</span>`;
-      }),
-      ...(m.serverRefs ?? []).map((r) => {
-        const key = serverRefKey(r);
-        const label = r.serverId ? `@remote:${r.name}` : '@local';
-        return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(key)}" data-kind="server" title="${r.serverId ? `引用服务器「${r.name}」` : '引用本地终端'}">${escapeHtml(label)}</span>`;
-      }),
-      ...(m.pathRefs ?? []).map((r) => {
-        const name = r.path.split('/').filter(Boolean).pop() || r.path;
-        const label = r.isDir ? `@path:${name}` : `@file:${name}`;
-        return `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(pathRefKey(r))}" data-kind="path" title="引用路径${r.serverId ? `（服务器 ${escapeHtml(r.serverId)}）` : ''}">${escapeHtml(label)}</span>`;
-      }),
-      ...(m.browserRefs ?? []).map((r) =>
-        `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(`${r.name}:${r.ts}`)}" data-kind="browser" title="点击查看元素引用（${escapeHtml(r.url)}）">@browser:${escapeHtml(r.name)}</span>`,
-      ),
-      ...(m.skillRefs ?? []).map((r) =>
-        `<span class="tag blue ai-msg-chip" data-snap-id="${escapeHtml(skillRefKey(r))}" data-kind="skill" title="技能引用「${escapeHtml(r.name)}」（${r.origin === 'global' ? '全局' : '项目'}）">@skill:${escapeHtml(r.name)}</span>`,
-      ),
-    ].join('');
+    (m.imageRefs ?? []).forEach((r) => historyImageRefs.set(r.id, r));
+    /* 新版消息 content 内嵌 token：按 token 原位还原内嵌 chip（保留引用与文字的顺序）；
+       旧会话 content 无 token（matched=0）→ 回退为消息上方 chip 行（历史布局） */
+    const tokens = buildMessageTokens(m);
+    const { html, matched } = renderContentWithTokens(m.content, tokens);
+    const legacyChips = matched > 0 ? '' : tokens.map((t) => t.html).join('');
+    /* 图片附件：文字下方缩略图行（点击弹大图；加载失败红边显示文件名） */
+    const imgsHtml = (m.imageRefs ?? [])
+      .map((r) =>
+        `<button type="button" class="ai-img-thumb" data-snap-id="${escapeHtml(r.id)}" data-kind="image" data-img-path="${escapeHtml(r.path)}" data-img-name="${escapeHtml(r.name)}" title="${escapeHtml(r.name)} · 点击查看大图">${escapeHtml(r.name)}</button>`,
+      )
+      .join('');
     wrap.innerHTML =
-      `<div class="ai-bubble">${chips ? `<div class="ai-msg-chips">${chips}</div>` : ''}` +
-      `<div class="ai-text">${escapeHtml(m.content)}</div></div>`;
+      `<div class="ai-bubble">${legacyChips ? `<div class="ai-msg-chips">${legacyChips}</div>` : ''}` +
+      `<div class="ai-text">${matched > 0 ? html : escapeHtml(m.content)}</div>${imgsHtml ? `<div class="ai-msg-images">${imgsHtml}</div>` : ''}</div>`;
+    wrap.querySelectorAll('.ai-img-thumb').forEach((el) => hydrateImageThumb(el as HTMLElement));
   } else {
     wrap.className = 'ai-msg ai';
     /* 时序排版:有 textLen 锚点的动作卡穿插进 content 对应位置(文本段→卡→文本段);
@@ -1770,36 +2147,46 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
 function renderPending(p: Pending): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'ai-msg ai';
-  const toolLines = p.tools.map((t) => `<div class="ai-tool-line">${icon('wrench')}${escapeHtml(t)}</div>`).join('');
-  const actionCards = [...p.actions.values()].map((a) => renderActionCard(a)).join('');
+  const toolLineHtml = (t: ToolLine): string =>
+    `<div class="ai-tool-line">${icon('wrench')}${escapeHtml(t.label)}${t.count > 1 ? ` ×${t.count}` : ''}</div>`;
+  /* 工具行与动作卡合并为时序条目（同锚点/无文本时按到达序号排序） */
+  const items: StreamItem[] = [
+    ...p.tools.map((t) => ({ html: toolLineHtml(t), textLen: t.textLen, seq: t.seq })),
+    ...[...p.actions.values()].map((a) => ({ html: renderActionCard(a), textLen: a.textLen, seq: a.seq })),
+  ];
   if (p.phase === 'typing' || (p.phase === 'stream' && !p.text)) {
+    const headItems = items.slice().sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+      .map((i) => i.html).join('');
     wrap.innerHTML =
-      `<div class="ai-bubble">${toolLines}${actionCards}` +
+      `<div class="ai-bubble">${headItems}` +
       '<span class="ai-typing"><span class="ai-typing-label">正在输入</span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span></span></div>';
   } else if (p.phase === 'error') {
     wrap.innerHTML = `<div class="ai-bubble error"><div class="ai-text">${escapeHtml(p.error ?? '')}</div></div>`;
   } else {
-    /* 流式:动作卡按 textLen 锚点穿插进已生成文本(与历史时序排版同规则) */
-    const cards = [...p.actions.values()].map((a) => ({ html: renderActionCard(a), textLen: a.textLen }));
-    const body = cards.some((c) => c.textLen != null)
-      ? interleaveActions(p.text, cards)
-      : `${actionCards}${renderAI(p.text)}`;
-    wrap.innerHTML = `<div class="ai-bubble">${toolLines}<div class="ai-text">${body}</div></div>`;
+    /* 流式:工具行/动作卡按 textLen 锚点穿插进已生成文本(与历史时序排版同规则);
+       全部无锚点时整组前置(尚无文本即发生工具调用的形态) */
+    const anchored = items.some((i) => i.textLen != null);
+    const body = anchored
+      ? interleaveActions(p.text, items)
+      : `${items.map((i) => i.html).join('')}${renderAI(p.text)}`;
+    wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${body}</div></div>`;
   }
   return wrap;
 }
 
-/** 把动作卡按 textLen 锚点穿插进文本:时间顺序排版(文本段 → 动作卡 → 文本段);
- *  无锚点的卡按序排在文本末尾(兼容旧记录)。锚点是 content 的字符偏移,
- *  text 只增不减故偏移稳定;锚点恰好落在 ``` 围栏中间的概率极低(工具边界即文本分段点)。 */
-function interleaveActions(text: string, cards: Array<{ html: string; textLen?: number }>): string {
-  const sorted = [...cards].sort((a, b) => (a.textLen ?? Infinity) - (b.textLen ?? Infinity));
+/** 把工具行/动作卡按 textLen 锚点穿插进文本:时间顺序排版(文本段 → 条目 → 文本段),
+ *  同锚点条目按 seq(到达序号)排序;无锚点的条目按序排在文本末尾(兼容旧记录)。锚点是
+ *  content 的字符偏移,text 只增不减故偏移稳定;锚点恰好落在 ``` 围栏中间的概率极低
+ *  (工具边界即文本分段点)。 */
+function interleaveActions(text: string, cards: StreamItem[]): string {
+  const sorted = [...cards].sort((a, b) =>
+    (a.textLen ?? Infinity) - (b.textLen ?? Infinity) || (a.seq ?? 0) - (b.seq ?? 0));
   let out = '';
   let last = 0;
   for (const c of sorted) {
     const at = Math.min(c.textLen ?? text.length, text.length);
     if (at > last) out += renderAI(text.slice(last, at));
-    out += c.html;
+    out += c.html ?? '';
     last = at;
   }
   if (last < text.length) out += renderAI(text.slice(last));
@@ -1844,11 +2231,10 @@ function isSingleUrl(s: string): boolean {
   return /^(https?|file):\/\//i.test(t);
 }
 
-/** 在内置浏览器标签页打开地址（共享单实例:固定 id 去重激活） */
+/** 在内置浏览器标签页打开地址（浏览器引擎活跃页面导航；标签页固定 id 去重激活） */
 async function openUrlInBrowser(url: string): Promise<void> {
   try {
-    await browserEnsure();
-    await browserNavigate(url);
+    await openInActivePage(url);
     useWorkbench.getState().openTab({ id: 'browser', type: 'browser', title: '浏览器' });
   } catch (err) {
     toast(`无法打开链接: ${String(err)}`, 'error');
@@ -2146,50 +2532,21 @@ function onChatClick(e: MouseEvent): void {
   const chip = target.closest('[data-snap-id]') as HTMLElement | null;
   if (chip) {
     const id = chip.dataset.snapId ?? '';
-    if (chip.dataset.kind === 'server' || chip.dataset.kind === 'path') return; // 服务器/路径引用无详情弹窗
-    if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(id));
-    else if (chip.dataset.kind === 'browser') openBrowserRefModal(browserRefs.get(id));
-    else openSnapModal(snapshots.get(id));
+    const kind = chip.dataset.kind ?? '';
+    // 服务器/路径/技能/页面引用无详情弹窗（title 已带说明）
+    if (kind === 'server' || kind === 'path' || kind === 'skill' || kind === 'page') return;
+    if (kind === 'file') openFileRefModal(fileRefs.get(id));
+    else if (kind === 'browser') openBrowserRefModal(browserRefs.get(id));
+    else if (kind === 'image') openImageModal(historyImageRefs.get(id) ?? inputImageRefs.get(id));
+    else openSnapModal(snapshots.get(id)); // term 与旧消息无 kind 的快照 chip
   }
 }
 
-/* ---------- 输入区 chip（终端快照 / 文件引用 / 服务器引用 / 固定工作区域） ---------- */
-function addChip(snap: TermSnapshot): void {
-  const c = document.createElement('span');
-  c.className = 'tag blue ai-snap-chip';
-  c.dataset.id = snap.id;
-  c.dataset.kind = 'term';
-  c.title = '点击查看快照全文，✕ 移除';
-  c.innerHTML = `@terminal_${escapeHtml(snap.id)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
-  chipRow.appendChild(c);
-}
-
-function addFileChip(ref: FileRef): void {
-  const name = ref.path.split(/[\\/]/).pop() || ref.path;
-  const c = document.createElement('span');
-  c.className = 'tag blue ai-snap-chip';
-  c.dataset.id = ref.id;
-  c.dataset.kind = 'file';
-  c.title = `点击查看文件引用，✕ 移除 · ${ref.path} 第${ref.startLine}-${ref.endLine}行`;
-  c.innerHTML = `@${escapeHtml(name)}_${ref.startLine}_${ref.endLine}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
-  chipRow.appendChild(c);
-}
+/* ---------- 输入区内嵌引用 chip（contenteditable 原子元素，可穿插在文字中） ---------- */
 
 /** 服务器/本地引用 key：serverId 为空 = 本地终端 */
 function serverRefKey(r: ServerRef): string {
   return r.serverId ?? 'local';
-}
-
-function addServerRefChip(ref: ServerRef): void {
-  const key = serverRefKey(ref);
-  const label = ref.serverId ? `@remote:${ref.name}` : '@local';
-  const c = document.createElement('span');
-  c.className = 'tag blue ai-snap-chip';
-  c.dataset.id = key;
-  c.dataset.kind = 'server';
-  c.title = ref.serverId ? `引用服务器「${ref.name}」，✕ 移除` : '引用本地终端，✕ 移除';
-  c.innerHTML = `${escapeHtml(label)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
-  chipRow.appendChild(c);
 }
 
 /** 文件/目录路径引用 key：远端引用带服务器前缀，本地引用仅路径（与本地 explorer 旧数据一致） */
@@ -2197,48 +2554,259 @@ function pathRefKey(r: PathRef): string {
   return r.serverId ? `${r.serverId}:${r.path}` : r.path;
 }
 
-/** 文件/目录路径引用 chip：标签只用路径最后一段（@file:文件名 / @path:目录名），title 带完整路径与服务器 */
-function addPathRefChip(ref: PathRef, key: string): void {
-  const name = ref.path.split('/').filter(Boolean).pop() || ref.path;
-  const label = ref.isDir ? `@path:${name}` : `@file:${name}`;
-  const c = document.createElement('span');
-  c.className = 'tag blue ai-snap-chip';
-  c.dataset.id = key;
-  c.dataset.kind = 'path';
-  c.title = `${ref.serverId ? `[服务器 ${ref.serverId}] ` : ''}${ref.path}，✕ 移除`;
-  c.innerHTML = `${escapeHtml(label)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
-  chipRow.appendChild(c);
-}
-
-/** 浏览器元素引用 chip：@browser:#id 或标签名，title 带页面地址，点击查看元素详情 */
-function addBrowserRefChip(ref: BrowserRef, key: string): void {
-  const c = document.createElement('span');
-  c.className = 'tag blue ai-snap-chip';
-  c.dataset.id = key;
-  c.dataset.kind = 'browser';
-  c.title = `页面元素引用 ${ref.name}（${ref.url}），点击查看元素 HTML，✕ 移除`;
-  c.innerHTML = `@browser:${escapeHtml(ref.name || ref.tagName)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
-  chipRow.appendChild(c);
-}
-
 /** 技能引用 key：来源 + 名称（全局/项目同名技能并存） */
 function skillRefKey(r: SkillRef): string {
   return `${r.origin}:${r.name}`;
 }
 
-/** 技能引用 chip：@skill:名称，title 带来源与 scope，点击查看详情 */
-function addSkillRefChip(ref: SkillRef, key: string): void {
+/** 浏览器页面引用显示标签：页面标题 → URL host */
+function pageRefLabel(r: BrowserPageRef): string {
+  if (r.title) return r.title;
+  try {
+    return new URL(r.url).hostname || r.url;
+  } catch {
+    return r.url;
+  }
+}
+
+/** chip 的文本形态（= 落盘 content 中的内嵌 token；历史渲染按 token 原位还原 chip） */
+function chipToken(kind: string, id: string): string {
+  switch (kind) {
+    case 'term': {
+      const sn = snapshots.get(id);
+      return sn ? `@term:${sn.id}` : '';
+    }
+    case 'file': {
+      const r = fileRefs.get(id);
+      if (!r) return '';
+      const n = r.path.split(/[\\/]/).pop() || r.path;
+      return `@${n}_${r.startLine}_${r.endLine}`;
+    }
+    case 'server': {
+      const r = serverRefs.get(id);
+      return r ? (r.serverId ? `@remote:${r.name}` : '@local') : '';
+    }
+    case 'path': {
+      const r = pathRefs.get(id);
+      if (!r) return '';
+      const n = r.path.split('/').filter(Boolean).pop() || r.path;
+      return r.isDir ? `@path:${n}` : `@file:${n}`;
+    }
+    case 'browser': {
+      const r = browserRefs.get(id);
+      return r ? `@browser:${r.name || r.tagName}` : '';
+    }
+    case 'skill': {
+      const r = skillRefs.get(id);
+      return r ? `@skill:${r.name}` : '';
+    }
+    case 'page': {
+      const r = pageRefs.get(id);
+      return r ? `@page:${pageRefLabel(r)}` : '';
+    }
+    default:
+      return '';
+  }
+}
+
+/** 内嵌 chip 元素：原子元素（contenteditable=false），✕ 移除，点击主体查看详情 */
+function makeInlineChip(kind: string, id: string, label: string, title: string): HTMLElement {
   const c = document.createElement('span');
-  c.className = 'tag blue ai-snap-chip';
-  c.dataset.id = key;
-  c.dataset.kind = 'skill';
-  c.title = `技能引用「${ref.name}」（${ref.origin === 'global' ? '全局' : '项目'}），✕ 移除`;
-  c.innerHTML = `@skill:${escapeHtml(ref.name)}<span class="ai-chip-x" title="移除">${icon('x')}</span>`;
+  c.className = 'ai-inline-chip';
+  c.contentEditable = 'false';
+  c.dataset.kind = kind;
+  c.dataset.id = id;
+  c.title = title;
+  c.innerHTML = `<span class="ai-chip-label">${escapeHtml(label)}</span><span class="ai-chip-x" title="移除">${icon('x')}</span>`;
+  return c;
+}
+
+/** 在光标处插入 chip（无可用光标时追加末尾）；chip 后补空格并把光标移到空格后 */
+function insertChipEl(chip: HTMLElement): void {
+  input.focus();
+  const sel = window.getSelection();
+  let range: Range | null = null;
+  if (sel && sel.rangeCount && input.contains(sel.anchorNode)) {
+    range = sel.getRangeAt(0);
+  } else if (savedRange && input.contains(savedRange.commonAncestorContainer)) {
+    range = savedRange.cloneRange();
+  }
+  if (range) {
+    if (sel) {
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+    range.deleteContents();
+    range.insertNode(chip);
+  } else {
+    input.appendChild(chip);
+  }
+  const space = document.createTextNode(' ');
+  chip.after(space);
+  const caret = document.createRange();
+  caret.setStart(space, 1);
+  caret.collapse(true);
+  if (sel) {
+    sel.removeAllRanges();
+    sel.addRange(caret);
+  }
+  savedRange = caret.cloneRange();
+}
+
+/** 终端快照 chip：@term:<id>（与其他 @kind:名称 形态标签命名对齐） */
+function insertTermChip(snap: TermSnapshot): void {
+  insertChipEl(makeInlineChip('term', snap.id, `@term:${snap.id}`, '终端命令快照，点击查看全文，✕ 移除'));
+}
+
+/** 文件引用 chip：@文件名_起始行_结束行号 */
+function insertFileChip(ref: FileRef): void {
+  const name = ref.path.split(/[\\/]/).pop() || ref.path;
+  insertChipEl(makeInlineChip('file', ref.id, `@${name}_${ref.startLine}_${ref.endLine}`,
+    `点击查看文件引用，✕ 移除 · ${ref.path} 第${ref.startLine}-${ref.endLine}行`));
+}
+
+/** 服务器/本地终端引用 chip：@remote:服务器名称 / @local */
+function insertServerChip(ref: ServerRef): void {
+  const key = serverRefKey(ref);
+  const label = ref.serverId ? `@remote:${ref.name}` : '@local';
+  insertChipEl(makeInlineChip('server', key, label,
+    ref.serverId ? `引用服务器「${ref.name}」，✕ 移除` : '引用本地终端，✕ 移除'));
+}
+
+/** 文件/目录路径引用 chip：标签只用路径最后一段（@file:文件名 / @path:目录名），title 带完整路径与服务器 */
+function insertPathChip(ref: PathRef): void {
+  const key = pathRefKey(ref);
+  const name = ref.path.split('/').filter(Boolean).pop() || ref.path;
+  const label = ref.isDir ? `@path:${name}` : `@file:${name}`;
+  insertChipEl(makeInlineChip('path', key, label,
+    `${ref.serverId ? `[服务器 ${ref.serverId}] ` : ''}${ref.path}，✕ 移除`));
+}
+
+/** 浏览器元素引用 chip：@browser:#id 或标签名，title 带页面地址，点击查看元素详情 */
+function insertBrowserChip(ref: BrowserRef, key: string): void {
+  insertChipEl(makeInlineChip('browser', key, `@browser:${ref.name || ref.tagName}`,
+    `页面元素引用 ${ref.name}（${ref.url}），点击查看元素 HTML，✕ 移除`));
+}
+
+/** 技能引用 chip：@skill:名称，title 带来源 */
+function insertSkillChip(ref: SkillRef): void {
+  insertChipEl(makeInlineChip('skill', skillRefKey(ref), `@skill:${ref.name}`,
+    `技能引用「${ref.name}」（${ref.origin === 'global' ? '全局' : '项目'}），✕ 移除`));
+}
+
+/** 浏览器页面引用 chip：@page:页面标题（@ 补全插入；发送时展开页面地址与标题） */
+function insertPageChip(ref: BrowserPageRef): void {
+  const id = uid('page');
+  pageRefs.set(id, ref);
+  insertChipEl(makeInlineChip('page', id, `@page:${pageRefLabel(ref)}`,
+    `浏览器页面引用 ${pageRefLabel(ref)}（${ref.url}），✕ 移除`));
+}
+
+/** 输入区 chip 点击（委托）：✕ 移除；主体打开详情弹窗（与历史 chip 同一套） */
+function onInlineChipClick(e: MouseEvent): void {
+  const target = e.target as HTMLElement;
+  const chip = target.closest('.ai-inline-chip') as HTMLElement | null;
+  if (!chip) return;
+  const id = chip.dataset.id ?? '';
+  if (target.closest('.ai-chip-x')) {
+    /* 状态 Map 必须与 chip DOM 同步删除:残留会导致再次添加同一引用被误判
+       「该引用已在输入框中」(与旧版 chip-row ✕ 路径同语义) */
+    const kind = chip.dataset.kind ?? '';
+    if (kind === 'term') snapshots.delete(id);
+    else if (kind === 'file') fileRefs.delete(id);
+    else if (kind === 'server') serverRefs.delete(id);
+    else if (kind === 'path') pathRefs.delete(id);
+    else if (kind === 'browser') browserRefs.delete(id);
+    else if (kind === 'page') pageRefs.delete(id);
+    else if (kind === 'skill') skillRefs.delete(id);
+    chip.remove();
+    input.focus();
+    return;
+  }
+  const kind = chip.dataset.kind ?? '';
+  if (kind === 'file') openFileRefModal(fileRefs.get(id));
+  else if (kind === 'browser') openBrowserRefModal(browserRefs.get(id));
+  else if (kind === 'term') openSnapModal(snapshots.get(id));
+}
+
+/** 缩略图容器填充：加载中占位（固定尺寸），成功替换为 <img>，失败红边显示文件名 */
+function hydrateImageThumb(el: HTMLElement): void {
+  const path = el.dataset.imgPath ?? '';
+  const name = el.dataset.imgName ?? '图片';
+  void loadImageData(path).then((out) => {
+    if (!el.isConnected) return;
+    if (!out) {
+      el.classList.add('ai-img-error');
+      el.textContent = name;
+      return;
+    }
+    const img = document.createElement('img');
+    img.src = `data:${out.mime};base64,${out.data}`;
+    img.alt = name;
+    el.replaceChildren(img);
+  });
+}
+
+/** 图片附件 chip：缩略图 + 名称，点击预览大图，✕ 移除 */
+function addImageRefChip(ref: ImageRef): void {
+  const c = document.createElement('span');
+  c.className = 'tag blue ai-snap-chip ai-img-chip';
+  c.dataset.id = ref.id;
+  c.dataset.kind = 'image';
+  c.title = `图片附件「${ref.name}」，点击预览，✕ 移除`;
+  c.innerHTML =
+    `<span class="ai-img-chip-thumb" data-img-path="${escapeHtml(ref.path)}" data-img-name="${escapeHtml(ref.name)}"></span>` +
+    `<span class="ai-img-name">${escapeHtml(ref.name)}</span><span class="ai-chip-x" title="移除">${icon('x')}</span>`;
   chipRow.appendChild(c);
+  hydrateImageThumb(c.querySelector('.ai-img-chip-thumb') as HTMLElement);
+}
+
+/** 图片附件详情：来源/大小说明 + 大图（等比缩放，超大图不撑破 modal） */
+function openImageModal(ref: ImageRef | undefined): void {
+  if (!ref) return;
+  const originText =
+    ref.source === 'remote'
+      ? `远程 · ${ref.originPath ?? ''}`
+      : ref.source === 'local'
+        ? `本地 · ${ref.originPath ?? ''}`
+        : '剪贴板粘贴';
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = `
+    <div class="modal" style="width:720px">
+      <div class="modal-head"><h3>图片 · ${escapeHtml(ref.name)}</h3><button class="icon-btn ai-modal-x" title="关闭">${icon('x')}</button></div>
+      <div class="modal-body">
+        <div class="ai-snap-command mono">${escapeHtml(originText)} · ${(ref.size / 1024).toFixed(0)} KB · ${escapeHtml(ref.mime)}</div>
+        <div class="ai-img-view">加载中…</div>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  requestAnimationFrame(() => mask.classList.add('open'));
+  const close = (): void => {
+    mask.classList.remove('open');
+    setTimeout(() => mask.remove(), 160);
+  };
+  (mask.querySelector('.ai-modal-x') as HTMLButtonElement).onclick = close;
+  mask.addEventListener('mousedown', (e) => {
+    if (e.target === mask) close();
+  });
+  const box = mask.querySelector('.ai-img-view') as HTMLElement;
+  void loadImageData(ref.path).then((out) => {
+    if (!box.isConnected) return;
+    if (!out) {
+      box.textContent = '图片加载失败（文件可能已被移动或删除）';
+      return;
+    }
+    const img = document.createElement('img');
+    img.src = `data:${out.mime};base64,${out.data}`;
+    img.alt = ref.name;
+    box.replaceChildren(img);
+  });
 }
 
 const clearChips = (): void => {
   chipRow.innerHTML = '';
+  input.innerHTML = '';
   /* 状态 Map 必须与 chip DOM 同步清空:此前只清 DOM,serverRefs 等残留导致
      发送后重新添加同一引用被误判「该引用已在输入框中」(与 chip ✕ 移除路径同语义) */
   snapshots.clear();
@@ -2246,14 +2814,19 @@ const clearChips = (): void => {
   serverRefs.clear();
   pathRefs.clear();
   browserRefs.clear();
+  pageRefs.clear();
   skillRefs.clear();
+  inputImageRefs.clear();
+  savedRange = null;
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
 };
 
-/** 固定工作区域标签（不可移除）：显示 @local / @remote:服务器名称，随激活终端自动切换 */
+/** 固定工作区域标签（不可移除）：输入框上方 chip 行首位（#ai-workarea-slot），
+ *  显示 @local / @remote:服务器名称 / @browser，随激活终端自动切换；独立槽位保证始终在行首 */
 function renderWorkareaChip(): void {
   if (!autoSwitchAiWorkdir) {
-    if (workareaChipEl) { workareaChipEl.remove(); workareaChipEl = null; }
+    workareaChipEl = null;
+    workareaSlot.replaceChildren();
     return;
   }
   if (browserWorkarea) {
@@ -2269,7 +2842,7 @@ function renderWorkareaChip(): void {
     c.dataset.kind = 'workarea';
     c.title = title;
     c.innerHTML = `${icon('globe')} ${label}`;
-    chipRow.prepend(c);
+    workareaSlot.replaceChildren(c);
     workareaChipEl = c;
     return;
   }
@@ -2288,7 +2861,7 @@ function renderWorkareaChip(): void {
   c.dataset.kind = 'workarea';
   c.title = title;
   c.innerHTML = `${icon('globe')} ${escapeHtml(label)}`;
-  chipRow.prepend(c);
+  workareaSlot.replaceChildren(c);
   workareaChipEl = c;
 }
 
@@ -2305,9 +2878,7 @@ function setWorkarea(ref: ServerRef): void {
   workareaRef = ref;
   if (serverRefs.has(key)) {
     serverRefs.delete(key);
-    chipRow.querySelectorAll('.ai-snap-chip[data-kind="server"]').forEach((el) => {
-      if ((el as HTMLElement).dataset.id === key) el.remove();
-    });
+    input.querySelectorAll(`.ai-inline-chip[data-kind="server"][data-id="${CSS.escape(key)}"]`).forEach((el) => el.remove());
   }
   renderWorkareaChip();
 }
@@ -2327,23 +2898,18 @@ function updateWorkareaFromTab(t: Tab | null): void {
   });
 }
 
+/** 图片附件行点击（引用 tag 已内嵌输入框，此行只剩图片 chip）：✕ 移除 / 点击预览 */
 function onChipRowClick(e: MouseEvent): void {
   const target = e.target as HTMLElement;
   const chip = target.closest('.ai-snap-chip') as HTMLElement | null;
-  if (!chip) return;
-  if (chip.dataset.kind === 'workarea') return; // 固定工作区域标签不可移除
+  if (!chip || chip.dataset.kind !== 'image') return;
+  const id = chip.dataset.id ?? '';
   if (target.closest('.ai-chip-x')) {
-    if (chip.dataset.kind === 'server') serverRefs.delete(chip.dataset.id ?? '');
-    else if (chip.dataset.kind === 'path') pathRefs.delete(chip.dataset.id ?? '');
-    else if (chip.dataset.kind === 'browser') browserRefs.delete(chip.dataset.id ?? '');
-    else if (chip.dataset.kind === 'skill') skillRefs.delete(chip.dataset.id ?? '');
+    inputImageRefs.delete(id);
     chip.remove();
     return;
   }
-  if (chip.dataset.kind === 'server' || chip.dataset.kind === 'path') return; // 服务器/路径引用无详情弹窗
-  if (chip.dataset.kind === 'file') openFileRefModal(fileRefs.get(chip.dataset.id ?? ''));
-  else if (chip.dataset.kind === 'browser') openBrowserRefModal(browserRefs.get(chip.dataset.id ?? ''));
-  else openSnapModal(snapshots.get(chip.dataset.id ?? ''));
+  openImageModal(inputImageRefs.get(id));
 }
 
 function openSnapModal(snap: TermSnapshot | undefined): void {
@@ -2352,7 +2918,7 @@ function openSnapModal(snap: TermSnapshot | undefined): void {
   mask.className = 'modal-mask';
   mask.innerHTML = `
     <div class="modal" style="width:560px">
-      <div class="modal-head"><h3>终端快照 · @terminal_${escapeHtml(snap.id)}</h3><button class="icon-btn ai-modal-x" title="关闭">${icon('x')}</button></div>
+      <div class="modal-head"><h3>终端快照 · @term:${escapeHtml(snap.id)}</h3><button class="icon-btn ai-modal-x" title="关闭">${icon('x')}</button></div>
       <div class="modal-body">
         <div class="ai-snap-command mono">$ ${escapeHtml(snap.command)}</div>
         <pre class="ai-snap-pre">${escapeHtml(snap.content || '')}</pre>
@@ -2421,20 +2987,426 @@ function openBrowserRefModal(ref: BrowserRef | undefined): void {
 }
 
 /* ---------- 输入区 ---------- */
-function autoGrow(): void {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-  input.style.overflowY = input.scrollHeight > 120 ? 'auto' : 'hidden';
+
+/** 图片附件统一入口：数量上限 → vision 模型门槛 → 后端物化（嗅探+落盘）→ 输入区出 chip。
+ *  粘贴剪贴板 / explorer、SFTP 拖拽与右键添加共用；失败整批 toast（后端任一项失败即报错）。 */
+async function attachImages(items: AttachImageItem[]): Promise<void> {
+  if (!items.length) return;
+  const ctx = viewContext;
+  const proj = project;
+  if (!ctx || !proj) {
+    toast('项目未加载', 'error');
+    return;
+  }
+  if (inputImageRefs.size + items.length > MAX_ATTACH_IMAGES) {
+    toast(`单条消息最多附加 ${MAX_ATTACH_IMAGES} 张图片`, 'error');
+    return;
+  }
+  try {
+    const st = await getState();
+    if (!supportsVisionModel(st.settings.llm.modelId, st.settings.cloud?.mode === 'hosted')) {
+      toast('当前模型不支持图片，请先在设置中切换为 vision 模型', 'error');
+      return;
+    }
+  } catch {
+    /* 后端未就绪时放行，由 ai_attach_images / 发送侧兜底报错 */
+  }
+  let attached;
+  try {
+    attached = await aiAttachImages(proj.id, items);
+  } catch (err) {
+    toast(String(err), 'error');
+    return;
+  }
+  items.forEach((item, i) => {
+    const a = attached[i];
+    if (!a) return;
+    const ref: ImageRef = {
+      id: uid('img'),
+      source: item.source,
+      name: a.name,
+      mime: a.mime,
+      path: a.path,
+      originPath: item.source === 'clipboard' ? undefined : item.path,
+      serverId: item.source === 'remote' ? item.serverId : null,
+      size: a.size,
+      ts: Date.now(),
+    };
+    inputImageRefs.set(ref.id, ref);
+    addImageRefChip(ref);
+  });
 }
 
+/** File -> 不带 dataURL 前缀的 base64（FileReader，与 explorer OS 导入同模式） */
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const s = String(reader.result ?? '');
+      resolve(s.slice(s.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(new Error(`读取 ${file.name} 失败`));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** 从剪贴板/拖拽 DataTransfer 提取图片文件（粘贴多张与资源管理器多选复制都走这里；按名称去重） */
+function extractImageFiles(dt: DataTransfer | null): File[] {
+  if (!dt) return [];
+  const seen = new Set<string>();
+  const out: File[] = [];
+  const push = (f: File | null): void => {
+    if (!f) return;
+    const isImage = f.type.startsWith('image/') || IMAGE_EXT_RE.test(f.name);
+    if (!isImage || seen.has(f.name + f.size)) return;
+    seen.add(f.name + f.size);
+    out.push(f);
+  };
+  if (dt.items) {
+    for (const item of Array.from(dt.items)) {
+      if (item.kind === 'file') push(item.getAsFile());
+    }
+  } else {
+    Array.from(dt.files).forEach(push);
+  }
+  return out;
+}
+
+/** 输入框粘贴：含图片文件时拦截默认行为并转为附件（一次可多张）；
+ *  文本粘贴统一以纯文本插入（contenteditable 默认会带富文本格式） */
+function onInputPaste(e: ClipboardEvent): void {
+  const files = extractImageFiles(e.clipboardData);
+  if (files.length) {
+    e.preventDefault();
+    void Promise.all(files.map(async (f) => ({ source: 'clipboard' as const, name: f.name, data: await readFileAsBase64(f) })))
+      .then(attachImages)
+      .catch((err) => toast(String(err), 'error'));
+    return;
+  }
+  const text = e.clipboardData?.getData('text/plain');
+  if (typeof text === 'string' && text) {
+    e.preventDefault();
+    document.execCommand('insertText', false, text);
+  }
+}
+
+/** 输入区拖放：①应用内 explorer/SFTP 拖拽载荷（DND_MIME，图片扩展名）②OS 文件拖入。
+ *  两者都不是时不拦截（保留文本拖放等默认行为）。 */
+function onInputAreaDrop(e: DragEvent): void {
+  const area = e.currentTarget as HTMLElement;
+  area.classList.remove('ai-drag-over');
+  const dt = e.dataTransfer;
+  if (!dt) return;
+  const raw = dt.getData(DND_MIME);
+  if (raw) {
+    try {
+      const p = JSON.parse(raw) as { source: 'local' | 'remote'; path: string; name: string; isDir: boolean; serverId?: string };
+      e.preventDefault();
+      if (p.isDir) {
+        toast('目录不能作为图片附件');
+        return;
+      }
+      if (!IMAGE_EXT_RE.test(p.name)) {
+        toast('仅支持 PNG / JPEG / GIF / WebP 图片');
+        return;
+      }
+      void attachImages([
+        p.source === 'remote'
+          ? { source: 'remote', serverId: p.serverId ?? '', path: p.path }
+          : { source: 'local', path: p.path },
+      ]);
+      return;
+    } catch {
+      /* 载荷损坏按 OS 文件分支处理 */
+    }
+  }
+  const files = extractImageFiles(dt);
+  if (!files.length) return;
+  e.preventDefault();
+  void Promise.all(files.map(async (f) => ({ source: 'clipboard' as const, name: f.name, data: await readFileAsBase64(f) })))
+    .then(attachImages)
+    .catch((err) => toast(String(err), 'error'));
+}
+
+/* ---------- @ 自动补全（输入框内输入 @ 唤起；Enter/Tab 选中，Esc 关闭） ---------- */
+
+function isMentionOpen(): boolean {
+  return !!mentionEl && mentionEl.isConnected;
+}
+
+/** 弹层挂 #ai-input-row（position:relative），覆盖在输入行上方 */
+function ensureMentionEl(): void {
+  if (mentionEl && mentionEl.isConnected) return;
+  const el = document.createElement('div');
+  el.className = 'ai-mention-pop';
+  el.style.display = 'none';
+  el.addEventListener('mousedown', (e) => e.preventDefault()); // 不抢输入焦点
+  el.addEventListener('click', (e) => {
+    const item = (e.target as HTMLElement).closest<HTMLElement>('[data-mention-key]');
+    if (!item) return;
+    const idx = mentionItems.findIndex((it) => it.key === item.dataset.mentionKey);
+    if (idx >= 0) {
+      mentionIndex = idx;
+      void applyMentionActive();
+    }
+  });
+  inputBox.parentElement?.appendChild(el);
+  mentionEl = el;
+}
+
+/** 组装补全候选：浏览器页面 / 远程服务器 / 本地文件 / 本地目录 / 终端最后一条命令 */
+function buildMentionItems(): MentionItem[] {
+  const items: MentionItem[] = [];
+  getBrowserPagesForMention().forEach((p) => {
+    items.push({
+      key: `page-${p.id}`,
+      group: '浏览器页面',
+      icon: 'globe',
+      label: `@page:${p.title}`,
+      hint: p.url,
+      keywords: `page 浏览器 browser ${p.title} ${p.url}`,
+      apply: () => insertPageChip({ url: p.url, title: p.title, ts: Date.now() }),
+    });
+  });
+  (serversCache ?? []).forEach((sv) => {
+    items.push({
+      key: `server-${sv.id}`,
+      group: '远程服务器',
+      icon: 'monitor',
+      label: `@remote:${sv.name}`,
+      hint: `${sv.username}@${sv.host}:${sv.port}`,
+      keywords: `remote server 服务器 ${sv.name} ${sv.host}`,
+      apply: () => {
+        const ref: ServerRef = { serverId: sv.id, name: sv.name };
+        const key = serverRefKey(ref);
+        if (autoSwitchAiWorkdir && workareaRef && serverRefKey(workareaRef) === key) {
+          toast('该终端已是当前 AI 工作区域，无需重复添加');
+          return;
+        }
+        if (serverRefs.has(key)) {
+          toast('该引用已在输入框中');
+          return;
+        }
+        serverRefs.set(key, ref);
+        insertServerChip(ref);
+      },
+    });
+  });
+  const termApi = getActiveTerminalApi();
+  if (termApi) {
+    items.push({
+      key: 'term-last',
+      group: '终端',
+      icon: 'terminal',
+      label: '终端最后一条命令（输出快照）',
+      hint: '@term:',
+      keywords: 'term terminal 终端 命令 快照 snapshot',
+      apply: () => {
+        const snap = termApi.takeSnapshot();
+        if (!snap.command && !snap.content) {
+          toast('终端还没有可引用的命令输出');
+          return;
+        }
+        snapshots.set(snap.id, snap);
+        insertTermChip(snap);
+      },
+    });
+  }
+  return items;
+}
+
+/** 输入事件驱动：光标前文本以「@query」结尾（@ 前是起点或非单词字符，避免邮箱中段误触发）时打开弹层 */
+function updateMention(): void {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !sel.isCollapsed || !input.contains(sel.anchorNode)) {
+    closeMention();
+    return;
+  }
+  const range = sel.getRangeAt(0);
+  if (range.startContainer.nodeType !== Node.TEXT_NODE) {
+    closeMention();
+    return;
+  }
+  const node = range.startContainer as Text;
+  const before = (node.nodeValue ?? '').slice(0, range.startOffset);
+  const m = /(?:^|[^\w@])@([^\s@]*)$/.exec(before);
+  if (!m) {
+    closeMention();
+    return;
+  }
+  const query = m[1];
+  const at = before.length - query.length - 1; // '@' 在文本节点中的偏移
+  ensureMentionEl();
+  mentionAnchor = { node, at };
+  mentionIndex = 0;
+  if (!serversCache) {
+    void getState().then((st) => {
+      serversCache = st.servers;
+      if (isMentionOpen()) renderMention(mentionQuery);
+    }).catch(() => { /* 拉取失败仅缺服务器分组 */ });
+  }
+  renderMention(query);
+}
+
+function renderMention(query: string): void {
+  mentionQuery = query;
+  if (!mentionEl) return;
+  const q = query.toLowerCase();
+  const items = buildMentionItems()
+    .filter((it) => !q || it.keywords.toLowerCase().includes(q) || it.label.toLowerCase().includes(q));
+  mentionItems = items;
+  if (!items.length) {
+    closeMention();
+    return;
+  }
+  if (mentionIndex >= items.length) mentionIndex = 0;
+  const seenGroups: string[] = [];
+  let html = '';
+  items.forEach((it, i) => {
+    if (!seenGroups.includes(it.group)) {
+      seenGroups.push(it.group);
+      html += `<div class="ai-mention-group">${escapeHtml(it.group)}</div>`;
+    }
+    html += `<button type="button" class="ai-mention-item${i === mentionIndex ? ' active' : ''}" data-mention-key="${escapeHtml(it.key)}">${icon(it.icon)}<span class="ai-mention-label">${escapeHtml(it.label)}</span>${it.hint ? `<span class="ai-mention-hint">${escapeHtml(it.hint)}</span>` : ''}</button>`;
+  });
+  mentionEl.innerHTML = html;
+  mentionEl.style.display = 'block';
+  mentionEl.querySelector('.ai-mention-item.active')?.scrollIntoView({ block: 'nearest' });
+}
+
+function moveMention(delta: number): void {
+  if (!mentionItems.length) return;
+  mentionIndex = (mentionIndex + delta + mentionItems.length) % mentionItems.length;
+  const rows = mentionEl?.querySelectorAll<HTMLElement>('.ai-mention-item') ?? [];
+  rows.forEach((el) => el.classList.remove('active'));
+  const active = rows[mentionIndex];
+  active?.classList.add('active');
+  active?.scrollIntoView({ block: 'nearest' });
+}
+
+/** 应用当前选中项：删除「@query」文本 → 执行 apply（插入 chip / 打开文件对话框） */
+async function applyMentionActive(): Promise<void> {
+  const item = mentionItems[mentionIndex];
+  const anchor = mentionAnchor;
+  closeMention();
+  if (!item) return;
+  if (!anchor || !anchor.node.isConnected || !input.contains(anchor.node)) {
+    await item.apply();
+    return;
+  }
+  const sel = window.getSelection();
+  const end = sel && sel.anchorNode === anchor.node ? sel.anchorOffset : anchor.node.nodeValue?.length ?? 0;
+  const range = document.createRange();
+  range.setStart(anchor.node, Math.min(anchor.at, end));
+  range.setEnd(anchor.node, Math.max(Math.min(anchor.at, end), end));
+  if (sel) {
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  range.deleteContents();
+  savedRange = range.cloneRange();
+  await item.apply();
+}
+
+function closeMention(): void {
+  mentionAnchor = null;
+  mentionItems = [];
+  mentionIndex = 0;
+  mentionQuery = '';
+  if (mentionEl) {
+    mentionEl.remove();
+    mentionEl = null;
+  }
+}
+
+/** 生成状态切换：右下角「Enter 发送」小字 ↔ 中断图标按钮（点击/Enter 停止生成） */
 function updateSendBtn(): void {
-  sendBtn.textContent = isGenerating(activeSessionId) ? '停止' : '发送';
+  const generating = isGenerating(activeSessionId);
+  sendBtn.hidden = !generating;
+  const hint = sendBtn.parentElement?.querySelector<HTMLElement>('.ai-input-hint');
+  if (hint) hint.style.display = generating ? 'none' : '';
 }
 
 /** 是否正在生成（错误气泡不算生成中，允许继续发新消息） */
 function isGenerating(sid: string): boolean {
   const p = pendingBy.get(sid) ?? null;
   return !!p && p.phase !== 'error';
+}
+
+/* ---------- 输入区内容读取（contenteditable → 有序段） ---------- */
+
+/** 输入区内容段：文本段与内嵌 chip 段（顺序即输入框视觉顺序；发送展开与落盘都按此顺序） */
+type InputSegment = { kind: 'text'; text: string } | { kind: 'chip'; chipKind: string; id: string };
+
+/** chip 引用数据（发送时捕获的快照；buildPrompt 展开用，不依赖输入区全局 Map） */
+type ChipDatum =
+  | { kind: 'term'; snap: TermSnapshot }
+  | { kind: 'file'; ref: FileRef }
+  | { kind: 'server'; ref: ServerRef }
+  | { kind: 'path'; ref: PathRef }
+  | { kind: 'browser'; ref: BrowserRef }
+  | { kind: 'page'; ref: BrowserPageRef }
+  | { kind: 'skill'; ref: SkillRef };
+
+function readInputSegments(): InputSegment[] {
+  const segs: InputSegment[] = [];
+  const pushText = (t: string): void => {
+    if (!t) return;
+    const last = segs[segs.length - 1];
+    if (last && last.kind === 'text') last.text += t;
+    else segs.push({ kind: 'text', text: t });
+  };
+  const walkInline = (node: Node): void => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      pushText(node.nodeValue ?? '');
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node as HTMLElement;
+    if (el.classList.contains('ai-inline-chip')) {
+      segs.push({ kind: 'chip', chipKind: el.dataset.kind ?? '', id: el.dataset.id ?? '' });
+      return;
+    }
+    if (el.tagName === 'BR') {
+      pushText('\n');
+      return;
+    }
+    if (el.tagName === 'DIV' || el.tagName === 'P') {
+      // 嵌套块级（粘贴残留）：按行处理，行前补换行
+      if (segs.length > 0) pushText('\n');
+      el.childNodes.forEach(walkInline);
+      return;
+    }
+    el.childNodes.forEach(walkInline);
+  };
+  input.childNodes.forEach((node, i) => {
+    const isLast = i === input.childNodes.length - 1;
+    if (node.nodeType === Node.ELEMENT_NODE
+      && ((node as HTMLElement).tagName === 'DIV' || (node as HTMLElement).tagName === 'P')) {
+      if (segs.length > 0) pushText('\n');
+      node.childNodes.forEach(walkInline);
+      if (!isLast) pushText('\n');
+    } else {
+      walkInline(node);
+    }
+  });
+  return segs;
+}
+
+/** 输入区纯文本形态（chip → token）——落盘 content（历史按 token 原位还原 chip） */
+function segmentsToText(segments: InputSegment[]): string {
+  let out = '';
+  for (const seg of segments) {
+    if (seg.kind === 'text') out += seg.text;
+    else out += chipToken(seg.chipKind, seg.id);
+  }
+  return out;
+}
+
+/** 输入区是否为空（无文本且无内嵌 chip；图片附件不算——与旧 textarea 空判语义一致） */
+function isInputEmpty(): boolean {
+  if (input.querySelector('.ai-inline-chip')) return false;
+  return !input.textContent?.trim();
 }
 
 /* ---------- 发送与流式接收 ---------- */
@@ -2458,54 +3430,89 @@ async function send(): Promise<void> {
     updateSendBtn();
     return;
   }
-  const text = input.value.trim();
+  closeMention(); // 发送按钮路径可能带着打开的 @ 补全弹层
+  // 读取输入区：文本段与内嵌 chip 按输入框内顺序；content 落盘保留 token（历史按 token 还原位置）
+  const segments = readInputSegments();
+  const seenIds = new Set<string>();
+  /** chip 引用数据快照（clearChips 会清空全局 Map，prompt 展开用这份捕获） */
+  const chipData = new Map<string, ChipDatum>();
   const snaps: TermSnapshot[] = [];
   const refs: FileRef[] = [];
   const srefs: ServerRef[] = [];
   const prefs: PathRef[] = [];
   const brefs: BrowserRef[] = [];
+  const pgrefs: BrowserPageRef[] = [];
   const skrefs: SkillRef[] = [];
-  // 固定工作区域引用最先（开启自动切换时）；浏览器工作区不携带上一终端引用
-  if (autoSwitchAiWorkdir && !browserWorkarea && workareaRef) srefs.push(workareaRef);
-  chipRow.querySelectorAll('.ai-snap-chip').forEach((c) => {
-    const el = c as HTMLElement;
-    const id = el.dataset.id ?? '';
-    const kind = el.dataset.kind ?? '';
-    if (kind === 'file') {
-      const r = fileRefs.get(id);
-      if (r) refs.push(r);
-    } else if (kind === 'term') {
-      const sn = snapshots.get(id);
-      if (sn) snaps.push(sn);
-    } else if (kind === 'server') {
-      const r = serverRefs.get(id);
-      if (r) srefs.push(r);
-    } else if (kind === 'path') {
-      const p = pathRefs.get(id);
-      if (p) prefs.push(p);
-    } else if (kind === 'browser') {
-      const b = browserRefs.get(id);
-      if (b) brefs.push(b);
-    } else if (kind === 'skill') {
-      const r = skillRefs.get(id);
-      if (r) skrefs.push(r);
+  const imgs: ImageRef[] = [];
+  for (const seg of segments) {
+    if (seg.kind !== 'chip' || seenIds.has(seg.id)) continue;
+    if (seg.chipKind === 'file') {
+      const r = fileRefs.get(seg.id);
+      if (!r) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'file', ref: r });
+      refs.push(r);
+    } else if (seg.chipKind === 'term') {
+      const sn = snapshots.get(seg.id);
+      if (!sn) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'term', snap: sn });
+      snaps.push(sn);
+    } else if (seg.chipKind === 'server') {
+      const r = serverRefs.get(seg.id);
+      if (!r) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'server', ref: r });
+      srefs.push(r);
+    } else if (seg.chipKind === 'path') {
+      const p = pathRefs.get(seg.id);
+      if (!p) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'path', ref: p });
+      prefs.push(p);
+    } else if (seg.chipKind === 'browser') {
+      const b = browserRefs.get(seg.id);
+      if (!b) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'browser', ref: b });
+      brefs.push(b);
+    } else if (seg.chipKind === 'page') {
+      const p = pageRefs.get(seg.id);
+      if (!p) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'page', ref: p });
+      pgrefs.push(p);
+    } else if (seg.chipKind === 'skill') {
+      const r = skillRefs.get(seg.id);
+      if (!r) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'skill', ref: r });
+      skrefs.push(r);
     }
-  });
-  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && skrefs.length === 0) return;
+  }
+  inputImageRefs.forEach((r) => imgs.push(r));
+  const text = segmentsToText(segments).trim();
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && pgrefs.length === 0 && skrefs.length === 0 && imgs.length === 0) return;
 
   // 只有新会话的第一条用户消息触发一次标题任务；后续消息永不自动改名。
   const shouldGenerateTitle = s.messages.length === 0 && !s.autoTitleTriggered;
   if (shouldGenerateTitle) {
     s.title = temporarySessionTitle(
       text,
-      brefs.length ? '页面元素引用' : skrefs.length ? '技能引用' : srefs.length || prefs.length ? '引用' : '文件引用',
+      !text && imgs.length
+        ? '图片消息'
+        : brefs.length || pgrefs.length
+          ? '页面元素引用'
+          : skrefs.length
+            ? '技能引用'
+            : srefs.length || prefs.length
+              ? '引用'
+              : '文件引用',
     );
   }
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, skillRefs: skrefs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, imageRefs: imgs, actions: [], ts: Date.now() });
   if (shouldGenerateTitle) s.autoTitleTriggered = true;
-  input.value = '';
-  autoGrow();
   clearChips();
   pendingBy.set(sid, emptyPending());
   renderSessionBar();
@@ -2532,9 +3539,21 @@ async function send(): Promise<void> {
     void persistSession(s, ctx);
   }
 
-  // 提交给 ai_chat 的 prompt = 用户文本 + 快照/文件引用全文 + 服务器/路径/技能引用说明（UI 气泡只显示 chip）
-  const prompt = await buildPrompt(text, snaps, refs, srefs, prefs, brefs, skrefs);
-  aiChat(`${pid}:${sid}`, prompt).catch((err: unknown) => {
+  // 提交给 ai_chat 的 prompt = 工作区域上下文 + 输入区各段按序展开（文本原样、chip 展开为引用说明）
+  const prompt = await buildPrompt(segments, imgs, chipData);
+  // 图片本体不进 prompt：经 ai_chat 的 images 参数走 pi RPC images 字段（多模态 user 消息）。
+  // 回读失败的图片跳过并提示（落盘副本被移动/删除的极端场景），不阻塞整条消息。
+  const loaded = await Promise.all(
+    imgs.map(async (r) => {
+      const out = await loadImageData(r.path);
+      return out ? { mimeType: out.mime, data: out.data } : null;
+    }),
+  );
+  const images = loaded.filter((x): x is { mimeType: string; data: string } => x !== null);
+  if (images.length < imgs.length) {
+    toast(`${imgs.length - images.length} 张图片读取失败，已跳过`, 'error');
+  }
+  aiChat(`${pid}:${sid}`, prompt, images.length ? images : undefined).catch((err: unknown) => {
     // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
     console.error('[AI] ai_chat 失败:', err);
     ctx.pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
@@ -2547,13 +3566,16 @@ async function send(): Promise<void> {
 }
 
 /**
- * 组装发给 pi 的 prompt：用户文本 + 快照/文件引用全文 + 服务器/路径/浏览器元素/技能引用说明。
- * 固定工作区域（开启自动切换时 srefs[0]）作为「当前工作区域」上下文说明，
+ * 组装发给 pi 的 prompt：固定工作区域上下文最先（与输入框工作区域标签始终最前一致），
+ * 之后按输入框内的视觉顺序逐段展开——文本段原样、chip 段展开为引用说明（快照/文件引用全文、
+ * 服务器/路径/浏览器元素与页面/技能引用说明），保留用户书写的引用与文字的相对顺序。
  * 远程引用附 user@host:port 便于 AI 选择命令目标（后端 run_command 的 target 由 AI 工具参数决定）；
  * 路径引用只带完整路径不带文件内容；浏览器元素引用展开为页面信息 + 元素完整 HTML；
- * 技能引用展开为名称/来源/scope/描述（AI 可循技能目录读取 SKILL.md 后按技能工作）。
+ * 浏览器页面引用展开为页面标题与地址（正文由 AI 自行用 browser_read 读取）；
+ * 技能引用展开为名称/来源/scope/描述（AI 可循技能目录读取 SKILL.md 后按技能工作）；
+ * 图片附件只附一行文件名清单（图片本体经 ai_chat 的 images 参数传给多模态模型，不进 prompt）。
  */
-async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[], srefs: ServerRef[], prefs: PathRef[], brefs: BrowserRef[], skrefs: SkillRef[]): Promise<string> {
+async function buildPrompt(segments: InputSegment[], imgs: ImageRef[], chipData: Map<string, ChipDatum>): Promise<string> {
   let servers: Server[] = [];
   /* 自动注入只在托管模式且平台启用了 knowledge 能力时执行（后端命令在个人模式会报错，静默降级） */
   let kbKnown = false;
@@ -2571,47 +3593,62 @@ async function buildPrompt(text: string, snaps: TermSnapshot[], refs: FileRef[],
     if (!sv) return `[引用服务器: ${r.name}]`;
     return `[引用服务器: ${sv.name} (${sv.username}@${sv.host}:${sv.port})]`;
   };
+  /** 引用段展开（各分类展开文本与历史版本一致，只是位置改为跟随输入框内顺序） */
+  const expand = (d: ChipDatum): string => {
+    switch (d.kind) {
+      case 'term':
+        return `\n\n[终端快照 命令: ${d.snap.command}]\n${d.snap.content.slice(0, 4000)}`;
+      case 'file':
+        return `\n\n[文件引用 ${d.ref.path} 第${d.ref.startLine}-${d.ref.endLine}行]\n${d.ref.content.slice(0, 4000)}`;
+      case 'server':
+        return d.ref.serverId === null ? '\n\n[引用: 本地终端]' : `\n\n${remoteText(d.ref)}`;
+      case 'path': {
+        const r = d.ref;
+        if (!r.serverId) return `\n\n[${r.isDir ? '目录路径' : '文件路径'}: ${r.path}]`;
+        const sv = servers.find((s) => s.id === r.serverId);
+        const where = sv ? `${sv.name} (${sv.username}@${sv.host}:${sv.port})` : r.serverId;
+        return `\n\n[${r.isDir ? '远程目录路径' : '远程文件路径'}（服务器 ${where}）: ${r.path}]`;
+      }
+      case 'browser':
+        return `\n\n[浏览器元素引用 @browser:${d.ref.name}]\n页面: ${d.ref.title || '（无标题）'} (${d.ref.url})\n元素 HTML:\n${d.ref.outerHTML.slice(0, 8000)}`;
+      case 'page':
+        return `\n\n[浏览器页面引用 @page:${pageRefLabel(d.ref)}]\n页面: ${d.ref.title || '（无标题）'} (${d.ref.url})\n可用 browser_read / browser_screenshot 读取该页面内容`;
+      case 'skill':
+        return `\n\n[技能引用 @skill:${d.ref.name}]\n名称: ${d.ref.name}（${d.ref.origin === 'global' ? '全局' : '项目'}）\nscope: ${d.ref.scope.join(', ') || '-'}\n描述: ${d.ref.description}`;
+    }
+  };
   const parts: string[] = [];
   if (autoSwitchAiWorkdir && browserWorkarea) {
-    parts.push('[当前工作区域: 浏览器]');
-  } else if (autoSwitchAiWorkdir && workareaRef && srefs[0] === workareaRef) {
-    // 固定工作区域：作为当前目标上下文说明
+    parts.push('[当前工作区域: 浏览器]\n');
+  } else if (autoSwitchAiWorkdir && workareaRef) {
+    // 固定工作区域：作为当前目标上下文说明（输入框最前标签）
     const wr: ServerRef = workareaRef; // 具名 const：IIFE 闭包内保持收窄
     parts.push(
-      wr.serverId === null
+      (wr.serverId === null
         ? '[当前工作区域: 本地]'
         : (() => {
             const sv = servers.find((s) => s.id === wr.serverId);
             return sv
               ? `[当前工作区域: 服务器 ${sv.name} (${sv.username}@${sv.host}:${sv.port})]`
               : `[当前工作区域: ${wr.name}]`;
-          })(),
+          })()) + '\n',
     );
   }
-  for (const r of srefs) {
-    if (r === workareaRef) continue; // 工作区域已作为上下文说明，避免重复
-    parts.push(r.serverId === null ? '[引用: 本地终端]' : remoteText(r));
+  for (const seg of segments) {
+    if (seg.kind === 'text') parts.push(seg.text);
+    else {
+      const d = chipData.get(seg.id);
+      if (d) parts.push(expand(d));
+    }
   }
-  const refText = parts.map((p) => `\n\n${p}`).join('');
-  const base = text
-    + snaps.map((sn) => `\n\n[终端快照 命令: ${sn.command}]\n${sn.content.slice(0, 4000)}`).join('')
-    + refs.map((r) => `\n\n[文件引用 ${r.path} 第${r.startLine}-${r.endLine}行]\n${r.content.slice(0, 4000)}`).join('')
-    + prefs.map((r) => {
-      if (!r.serverId) return `\n\n[${r.isDir ? '目录路径' : '文件路径'}: ${r.path}]`;
-      const sv = servers.find((s) => s.id === r.serverId);
-      const where = sv ? `${sv.name} (${sv.username}@${sv.host}:${sv.port})` : r.serverId;
-      return `\n\n[${r.isDir ? '远程目录路径' : '远程文件路径'}（服务器 ${where}）: ${r.path}]`;
-    }).join('')
-    + brefs.map((r) =>
-      `\n\n[浏览器元素引用 @browser:${r.name}]\n页面: ${r.title || '（无标题）'} (${r.url})\n元素 HTML:\n${r.outerHTML.slice(0, 8000)}`).join('')
-    + skrefs.map((r) =>
-      `\n\n[技能引用 @skill:${r.name}]\n名称: ${r.name}（${r.origin === 'global' ? '全局' : '项目'}）\nscope: ${r.scope.join(', ') || '-'}\n描述: ${r.description}`).join('')
-    + refText;
+  if (imgs.length) parts.push(`\n\n[已附加 ${imgs.length} 张图片: ${imgs.map((r) => r.name).join(', ')}]`);
+  const base = parts.join('').trim();
   // 知识库自动注入：开启且用户输入了文本时，用用户原文检索并把相关度最高的前 N 条命中前置到 prompt；
   // 检索失败（未登录/知识库不可用/网络）静默降级，不阻断对话
-  if (kbAutoInject && kbKnown && text.trim()) {
+  const userText = segments.filter((s) => s.kind === 'text').map((s) => s.text).join(' ').trim();
+  if (kbAutoInject && kbKnown && userText) {
     try {
-      const hits = await kbSearch(text.trim(), kbInjectCount);
+      const hits = await kbSearch(userText, kbInjectCount);
       if (hits.length) return `${buildKbBlock(hits)}\n\n${base}`;
     } catch {
       /* 自动注入失败静默降级 */
@@ -2636,7 +3673,7 @@ function buildKbBlock(hits: KbHit[]): string {
 /** AI 面板 Ctrl+C 策略（capture 阶段）：
  *  1) 输入框有选区 → 不拦截，交给浏览器默认复制；
  *  2) 消息区有选中文本 → 显式复制；
- *  3) 输入框为空且当前标签为终端 → 转发 ^C 给终端。 */
+ *  3) 输入框为空（无文本且无内嵌 chip）且当前标签为终端 → 转发 ^C 给终端。 */
 function onPanelKeydown(e: KeyboardEvent): void {
   if (e.key !== 'c' && e.key !== 'C') return;
   if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
@@ -2653,9 +3690,9 @@ function onPanelKeydown(e: KeyboardEvent): void {
     return;
   }
   // 输入框有选区 → 不拦截,交给浏览器默认复制
-  if (input.selectionStart !== input.selectionEnd) return;
+  if (sel && !sel.isCollapsed && input.contains(sel.anchorNode)) return;
   // 输入框为空且当前标签为终端 → 转发 ^C 给终端(旧 Tab.api 字段 → tabApis 注册表)
-  if (input.value === '') {
+  if (isInputEmpty()) {
     const active = getActiveTab(useWorkbench.getState());
     if (active && active.type === 'terminal') {
       const api = tabApis.get(active.id) as TerminalApi | undefined;
@@ -2678,6 +3715,55 @@ function onSessionDocumentKeydown(e: KeyboardEvent): void {
   if (e.key === 'Escape' && sessionMenuOpen) {
     closeSessionMenu();
     sessionSelect.focus();
+  }
+}
+
+/** 输入事件：空内容归位（清掉残留 <br>，placeholder 依赖 :empty）+ @ 补全探测 */
+function onInputInput(): void {
+  if (!input.textContent && !input.querySelector('.ai-inline-chip') && input.childNodes.length > 0) {
+    const sel = window.getSelection();
+    const inside = !!sel && input.contains(sel.anchorNode);
+    input.innerHTML = '';
+    if (inside && sel) {
+      const r = document.createRange();
+      r.setStart(input, 0);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+  }
+  updateMention();
+}
+
+/** 输入框按键：补全弹层导航（↑↓/Enter/Tab/Esc）优先；Enter 发送、Shift+Enter 换行 */
+function onInputKeydown(e: KeyboardEvent): void {
+  if (e.isComposing) return; // IME 组合中的按键不触发发送/补全
+  if (isMentionOpen()) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveMention(e.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      void applyMentionActive();
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeMention();
+      return;
+    }
+  }
+  if (e.key === 'Enter') {
+    if (e.shiftKey) {
+      // Shift+Enter 换行：显式插入 <br>（发送提取时按换行还原）
+      e.preventDefault();
+      document.execCommand('insertLineBreak');
+    } else {
+      e.preventDefault();
+      void send();
+    }
   }
 }
 
@@ -2759,6 +3845,8 @@ function bindEvents(): void {
       traceStatus().catch(() => false),
     ])
       .then(([entries, traceOn]) => {
+        /* 归档:生成中的会话禁归档(转录不完整,且后端杀进程会打断在途回合) */
+        const archiving = isGenerating(sid);
         showContextMenu(e.clientX, e.clientY, [
           { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
           'sep',
@@ -2766,18 +3854,52 @@ function bindEvents(): void {
             ? { label: `打开文件暂存区（${entries.length}）`, iconName: 'history', action: openStaging }
             : { label: '打开文件暂存区', iconName: 'history', action: openStaging },
           ...(traceOn ? ['sep' as const, { label: '追溯', iconName: 'search' as const, action: openTrace }] : []),
+          'sep',
+          {
+            label: '归档会话', iconName: 'archive' as const,
+            disabled: archiving, disabledTip: archiving ? '会话正在生成中，请先停止或等待完成' : undefined,
+            action: () => archiveSession(pid, sid),
+          },
         ]);
       });
   });
   stagingNotice.addEventListener('click', openCurrentStaging);
   chipRow.addEventListener('click', onChipRowClick);
-  input.addEventListener('input', autoGrow);
-  input.addEventListener('keydown', (e: KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+  /* 内嵌引用 chip：✕ 移除 / 点击主体查看详情 */
+  input.addEventListener('click', onInlineChipClick);
+  /* 输入：空内容归位（placeholder 依赖 :empty）+ @ 补全探测 */
+  input.addEventListener('input', onInputInput);
+  /* 失焦关闭 @ 补全弹层（弹层自身 mousedown 已 preventDefault，不会触发） */
+  input.addEventListener('blur', closeMention);
+  /* 粘贴：图片文件转附件（一次可多张）；文本以纯文本插入 */
+  input.addEventListener('paste', onInputPaste);
+  /* 拖入图片：应用内 explorer/SFTP 拖拽载荷 + OS 文件（dragDropEnabled:false 下 HTML5 DnD 可用）。
+     dragover 必须 preventDefault 才能接收 drop；dragleave 在离开整个输入区时才撤高亮（越过子元素会连发） */
+  const inputArea = input.closest<HTMLElement>('#ai-input-area');
+  if (inputArea) {
+    inputArea.addEventListener('dragover', (e) => {
       e.preventDefault();
-      send();
+      inputArea.classList.add('ai-drag-over');
+    });
+    inputArea.addEventListener('dragleave', (e) => {
+      if (!e.relatedTarget || !inputArea.contains(e.relatedTarget as Node)) {
+        inputArea.classList.remove('ai-drag-over');
+      }
+    });
+    inputArea.addEventListener('drop', onInputAreaDrop);
+  }
+  input.addEventListener('keydown', onInputKeydown);
+  /* 记录输入区最近光标（补全选中/文件对话框失焦后恢复插入位置用） */
+  const onSelChange = (): void => {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount && input.contains(sel.anchorNode)) {
+      savedRange = sel.getRangeAt(0).cloneRange();
     }
-  });
+  };
+  document.addEventListener('selectionchange', onSelChange);
+  offSelectionChange = (): void => {
+    document.removeEventListener('selectionchange', onSelChange);
+  };
   sendBtn.onclick = send;
   effortSelect.onchange = () => {
     void switchEffort(effortSelect.value as LlmConfig['effort']);

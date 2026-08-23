@@ -1,9 +1,11 @@
 pub mod ai;
 pub mod ai_actions;
+pub mod ai_images;
 pub mod ai_impact;
 pub mod browser;
 pub mod cloud;
 pub mod fsops;
+pub mod notes;
 pub mod session_title;
 #[cfg(windows)]
 pub mod gitinstall;
@@ -121,8 +123,8 @@ pub fn run() {
                 s
             };
             let cloud_mgr = Arc::new(cloud::CloudManager::default());
-            // 内置浏览器（主窗口内嵌子 webview，懒创建）：先注入 AppHandle（事件发射/建视图用），
-            // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一实例（共享单实例语义）
+            // 内置浏览器（主窗口内嵌多子 webview，按页面懒创建）：先注入 AppHandle（事件发射/建视图用），
+            // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一管理器（多页面共享）
             browser::set_app(app.handle().clone());
             let browser = Arc::new(browser::BrowserManager::new());
             let ai = Arc::new(ai::AiManager::new(
@@ -289,6 +291,8 @@ pub fn run() {
             ai::ai_debug_info,
             ai::ai_kill_project,
             ai::ai_set_thinking,
+            ai_images::ai_attach_images,
+            ai_images::ai_read_image,
             ai::set_ai_mode,
             ai::ai_respond_approval,
             cloud::cloud_begin_login,
@@ -307,6 +311,9 @@ pub fn run() {
             cloud::kb_search,
             ai::ai_respond_db_request,
             session_title::ai_generate_session_title,
+            notes::notes_root_cmd,
+            notes::notes_list_cmd,
+            notes::session_archive,
             trace::trace_status,
             trace::trace_set_enabled,
             trace::trace_read,
@@ -320,6 +327,7 @@ pub fn run() {
             staging::staging_restore,
             staging::staging_diff,
             staging::staging_clear,
+            staging::staging_export,
             browser::browser_ensure,
             browser::browser_set_rect,
             browser::browser_set_visible,
@@ -329,6 +337,7 @@ pub fn run() {
             browser::browser_reload,
             browser::browser_set_inspect,
             browser::browser_open_devtools,
+            browser::browser_close_view,
             browser::browser_publish_skillhub,
             update::update_status,
             update::update_check,

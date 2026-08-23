@@ -4,8 +4,11 @@
  * - 会话级远程文件暂存的可视化(自动备份):AI 会话第一次修改远程文件前自动保存原始快照,
  *   接受 = 确认本次修改并清除暂存条目(不改远程内容);还原 = 恢复首次修改前内容;
  *   清理 = 远端现状与首次快照一致的条目一次性接受清除(有变更的保留,后端 staging_clear);
- * - 数据源 staging_list / staging_accept / staging_restore(接口点见 src/api.ts staging 段);
- *   服务器名从 getState().servers 查(找不到回退 id);
+ *   导出 = 把首次快照落为备份文件(无 .proto 对照,新功能):本地 = 项目 .aishell/backup/,
+ *   远程 = 条目原远程目录,文件名加 _bakYYYYMMDD-HHMM 后缀(与 SFTP 快速备份同规则,
+ *   重名自动 (n));多条目打包 zip(压缩包名用户指定,时间后缀自动追加);可选同时接受变更;
+ * - 数据源 staging_list / staging_accept / staging_restore / staging_export(接口点见
+ *   src/api.ts staging 段);服务器名从 getState().servers 查(找不到回退 id);
  * - keep-alive:组件常驻挂载,active 仅切显隐(由外壳 .tab-pane.active 承担,本组件不消费);
  *   数据订阅(initial 刷新 + wbEvents 'staging-changed')在挂载时建立、卸载时经
  *   useEffect return 清理;接受/还原成功后 wbEvents.emit('staging-changed')(已打开的
@@ -17,7 +20,7 @@
  * '../../../stores/workbench'(registry.ts 接线,不得变更)。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getState, stagingAccept, stagingClear, stagingList, stagingRestore } from '../../../api';
+import { getState, stagingAccept, stagingClear, stagingExport, stagingList, stagingRestore } from '../../../api';
 import type { StagedFile } from '../../../types';
 import { confirmDialog, toast } from '../../../ui';
 import { useWorkbench, wbEvents, type TabProps } from '../../../stores/workbench';
@@ -41,6 +44,13 @@ function fmtSize(size: number | null): string {
 
 const STATE_LABEL: Record<string, string> = { existing: '存在', absent: '不存在' };
 
+/** 备份时间后缀：本地时间 YYYYMMDD-HHMM（与 SftpTab 快速备份同格式，后端追加到导出文件名）。 */
+function backupStamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
 export function StagingTab({ tab, active }: TabProps): JSX.Element {
   const data = tab.data as { projectId: string; sessionId: string };
   const [servers, setServers] = useState<Array<{ id: string; name: string }>>([]);
@@ -49,6 +59,12 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkRunning, setBulkRunning] = useState(false);
+  /* 导出备份对话框：exportSel 非 null 时显示；entries 为前置过滤后可导出的条目 */
+  const [exportSel, setExportSel] = useState<{ entries: StagedFile[]; skipped: number } | null>(null);
+  const [exportMode, setExportMode] = useState<'local' | 'remote'>('local');
+  const [exportAccept, setExportAccept] = useState(false);
+  const [exportName, setExportName] = useState('暂存备份');
+  const [exportErr, setExportErr] = useState('');
   /** 刷新防重入(legacy loading 标志) */
   const loadingRef = useRef(false);
   /** 刷新序号:只接受最新一次结果(修复并发刷新乱序) */
@@ -257,6 +273,58 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
     });
   }
 
+  /** 打开导出对话框：新建文件(首次快照前不存在)无备份可导出，前置过滤并在对话框中提示跳过数。 */
+  function openExport(list: StagedFile[]): void {
+    const entries = list.filter((e) => e.originalState === 'existing' && e.blobRef);
+    if (!entries.length) {
+      toast('所选条目均为新建文件（首次快照前不存在），无备份可导出', 'info');
+      return;
+    }
+    setExportMode('local');
+    setExportAccept(false);
+    setExportName('暂存备份');
+    setExportErr('');
+    setExportSel({ entries, skipped: list.length - entries.length });
+  }
+
+  /** 执行导出（对话框「导出」按钮）：多条目打包 zip（名称后端追加 _bak 时间后缀），
+   *  可选同时接受变更（导出成功的条目随后清除）。 */
+  async function doExport(): Promise<void> {
+    if (!exportSel || bulkRunning) return;
+    const batch = exportSel.entries.length > 1;
+    const name = exportName.trim();
+    if (batch) {
+      if (!name) { setExportErr('名称不能为空'); return; }
+      if (/[\\/:*?"<>|]/.test(name)) { setExportErr('名称不能包含 \\ / : * ? " < > | 字符'); return; }
+    }
+    setBulkRunning(true);
+    // 远程上传可能较慢：底边栏显示进度（纯事件驱动——后端逐条发 staging:progress、done 自动收起；finally 兜底）
+    const progKey = `staging:${data.projectId}:${data.sessionId}`;
+    try {
+      const out = await stagingExport(
+        data.projectId,
+        data.sessionId,
+        exportSel.entries.map((e) => e.entryId),
+        exportMode,
+        batch ? name : null,
+        backupStamp(),
+        exportAccept,
+      );
+      const target = out.targets.length ? `已导出到：${out.targets.join('；')}` : '';
+      if (out.errors.length) toast(`已导出 ${out.exported} 项，${out.errors.length} 项失败。${target}`, 'error');
+      else toast(`已导出 ${out.exported} 项备份。${target}`, 'success');
+      setExportSel(null);
+      setSelected(new Set());
+      wbEvents.emit('staging-changed');
+      void refresh();
+    } catch (err) {
+      toast(String(err), 'error');
+    } finally {
+      setBulkRunning(false);
+      hideProgress(progKey);
+    }
+  }
+
   /* ---------- 渲染 ---------- */
   const count = entries?.length ?? 0;
   const selCount = selected.size;
@@ -282,6 +350,11 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
         <button className="btn small primary" disabled={selCount === 0 || bulkRunning} onClick={() => void doBulkAccept()}>批量接受</button>
         <button className="btn small" disabled={selCount === 0 || bulkRunning} onClick={() => void doBulkRestore()}>
           <Icon name="restore" /> 批量还原
+        </button>
+        <button className="btn small" disabled={selCount === 0 || bulkRunning}
+          title="把选中条目的首次快照导出为备份（本地 .aishell/backup/ 或原远程目录，多条目打包 zip）"
+          onClick={() => openExport((entries ?? []).filter((e) => selected.has(e.entryId)))}>
+          <Icon name="download" /> 批量导出
         </button>
       </div>
       <div className="staging-body">
@@ -347,6 +420,11 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
                         onClick={() => void doAccept(entry)}>接受</button>
                       <button className="btn small" title="把远程文件还原到首次修改前的内容"
                         onClick={() => confirmRestore(entry)}>还原</button>
+                      <button className="btn small"
+                        title="把首次快照导出为备份文件（本地 .aishell/backup/ 或原远程目录，加 _bak 时间后缀）"
+                        onClick={() => openExport([entry])}>
+                        <Icon name="download" /> 导出
+                      </button>
                     </td>
                   </tr>
                 );
@@ -355,6 +433,62 @@ export function StagingTab({ tab, active }: TabProps): JSX.Element {
           </table>
         )}
       </div>
+
+      {/* 导出备份对话框（modal-mask/modal 结构复用 design.css，内容区样式见 staging.css） */}
+      {exportSel && (
+        <div className="modal-mask open"
+          onMouseDown={(e) => { if (e.target === e.currentTarget) setExportSel(null); }}>
+          <div className="modal" style={{ width: 470 }}>
+            <div className="modal-head"><h3>导出暂存备份</h3></div>
+            <div className="modal-body">
+              <div className="staging-export-label">
+                将 <b>{exportSel.entries.length}</b> 个条目的首次快照导出为备份文件
+                {exportSel.skipped > 0 && <span className="staging-export-skipped">（已跳过 {exportSel.skipped} 个新建文件，无可导出备份）</span>}
+              </div>
+              <label className="staging-export-opt">
+                <input type="radio" name="staging-export-mode" checked={exportMode === 'local'}
+                  onChange={() => setExportMode('local')} />
+                <span>
+                  <span className="staging-export-opt-title">导出备份到本地</span>
+                  <span className="staging-export-opt-desc">复制到项目目录 .aishell/backup/，文件名自动加 _bakYYYYMMDD-HHMM 后缀</span>
+                </span>
+              </label>
+              <label className="staging-export-opt">
+                <input type="radio" name="staging-export-mode" checked={exportMode === 'remote'}
+                  onChange={() => setExportMode('remote')} />
+                <span>
+                  <span className="staging-export-opt-title">导出备份到远程</span>
+                  <span className="staging-export-opt-desc">上传回文件原所在的远程服务器目录，同样加 _bak 时间后缀</span>
+                </span>
+              </label>
+              {exportSel.entries.length > 1 && (
+                <div className="staging-export-name">
+                  <div className="prompt-label">压缩包名称（多条目打包导出，自动追加 _bakYYYYMMDD-HHMM 后缀）</div>
+                  <input className="input prompt-input" type="text" style={{ width: '100%' }} spellCheck={false}
+                    value={exportName} placeholder="例如 暂存备份"
+                    onChange={(e) => { setExportName(e.currentTarget.value); setExportErr(''); }}
+                    onKeyDown={(e) => {
+                      e.stopPropagation();
+                      if (e.key === 'Enter') void doExport();
+                    }} />
+                  <div className="prompt-error">{exportErr}</div>
+                </div>
+              )}
+              <label className="staging-export-accept">
+                <input type="checkbox" checked={exportAccept}
+                  onChange={(e) => setExportAccept(e.currentTarget.checked)} />
+                同时接受变更（导出完成后清除已导出的暂存条目，不改远程文件）
+              </label>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" disabled={bulkRunning} onClick={() => setExportSel(null)}>取消</button>
+              <button className="btn primary" disabled={bulkRunning} onClick={() => void doExport()}>
+                <Icon name="download" /> 导出
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

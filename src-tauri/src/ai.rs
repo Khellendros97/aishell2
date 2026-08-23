@@ -93,7 +93,7 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
 - request_db_connection：当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时，调用该工具申请添加连接。把已知的连接信息填进参数（serverId 取自 list_servers；名称、类型、主机、端口、用户名、默认库），主机相对该服务器（数据库在服务器本机填 127.0.0.1）；申请理由（reason）用一句中文说明用途。用户会在审批对话框里补密码并勾选查询权限，批准后工具结果会直接返回 connectionId，用它继续 db_query；被拒绝时不要反复重试，向用户说明需要哪些信息或请其在「服务器设置-数据库连接」中手动配置。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
-- 远程文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff、按用户要求把远程文件还原到首次修改前的内容。**应用更新补丁前应先用 staging_add 主动暂存目标文件/目录**（目录递归暂存全部文件，作为可还原的备份）。staging_clear 只清理「远端现状与首次快照完全一致」的条目（备份已冗余）；仍有变更的条目自动保留。**不能接受（清除）仍有变更的暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
+- 远程文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff（仅返回 unified diff 差异块及每块前后 3 行上下文）、按用户要求把远程文件还原到首次修改前的内容。**应用更新补丁前应先用 staging_add 主动暂存目标文件/目录**（目录递归暂存全部文件，作为可还原的备份）。staging_clear 只清理「远端现状与首次快照完全一致」的条目（备份已冗余）；仍有变更的条目自动保留。**不能接受（清除）仍有变更的暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
 - 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
 凭据纪律（硬性，优先级高于任务效率）：
@@ -361,6 +361,55 @@ fn hosted_llm_base(server_url: &str) -> String {
     format!("{}/api/proxy/llm/v1", server_url.trim_end_matches('/'))
 }
 
+/// 构造 pi 的 models.json 内容（providers.deepseek + 单模型）。
+/// reasoning：v4 系列与 reasoner 支持思考档位，deepseek-chat 等旧模型不支持（pi 会强制 thinking off）。
+/// input：vision 模型声明图片输入能力（pi 默认 input=["text"]，不声明时 RPC images 会被拒）；
+/// 启发式与前端 ai-engine.ts supportsVision 保持一致（模型 id 小写含 "vision"；
+/// 云分支补充：托管代理的 deepseek-v4-flash 上游已切换为多模态模型、对外 id 未变，同样视为支持图片）。
+/// hosted_base：托管模式传云服务器地址（Some），baseUrl/apiKey/compat 走公司代理；
+/// 个人模式传 None，维持本地 baseUrl + $DEEPSEEK_API_KEY。
+fn models_json_for(cfg: &crate::store::LlmConfig, hosted_base: Option<&str>) -> serde_json::Value {
+    let model_id = &cfg.model_id;
+    let id_lower = model_id.to_lowercase();
+    let reasoning = id_lower.contains("reasoner") || id_lower.contains("v4");
+    let hosted = hosted_base.is_some();
+    let input_images = id_lower.contains("vision") || (hosted && id_lower == "deepseek-v4-flash");
+    let mut model = json!({
+        "id": model_id,
+        "name": model_id,
+        "reasoning": reasoning,
+        "contextWindow": 64000,
+    });
+    if input_images {
+        model["input"] = json!(["text", "image"]);
+    }
+    let (base_url, api_key_env) = match hosted_base {
+        Some(server) => (hosted_llm_base(server), "$AISHELL_CLOUD_TOKEN"),
+        None => (
+            cfg.base_url.trim_end_matches('/').to_string(),
+            "$DEEPSEEK_API_KEY",
+        ),
+    };
+    json!({
+        "providers": {
+            "deepseek": {
+                "baseUrl": base_url,
+                "api": "openai-completions",
+                "apiKey": api_key_env,
+                // 托管模式：云平台服务端不接受 developer role（实测 400 unknown variant），
+                // pi docs models.md：compat.supportsDeveloperRole=false → 系统提示走 system role；
+                // 个人模式保持默认（DeepSeek 官方支持 developer）
+                "compat": if hosted {
+                    json!({"supportsDeveloperRole": false})
+                } else {
+                    json!({})
+                },
+                "models": [model],
+            }
+        }
+    })
+}
+
 impl AiManager {
     // 两侧分支（云会话 / 内置浏览器）各加一个参数后共 8 个；与 ai_actions::run_command 同惯例
     #[allow(clippy::too_many_arguments)]
@@ -419,13 +468,6 @@ impl AiManager {
 
     /// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
     fn write_models_json(&self) -> Result<(), String> {
-        let cfg = self.store.llm_config();
-        let model_id = &cfg.model_id;
-        // v4 系列与 reasoner 支持思考档位；deepseek-chat 等旧模型不支持（pi 会强制 thinking off）
-        let reasoning = {
-            let id = model_id.to_lowercase();
-            id.contains("reasoner") || id.contains("v4")
-        };
         // 托管模式（CR-3.1）：provider 指向公司服务器代理端点，apiKey 用 $AISHELL_CLOUD_TOKEN
         // （spawn 时注入当前 access_token）；个人模式维持现状（本地 baseUrl + $DEEPSEEK_API_KEY）。
         // 已知限制：开放 API 文档 §2.1/§6.6 建议 LLM 请求体顶层携带 sessionId/projectName 以便
@@ -433,40 +475,15 @@ impl AiManager {
         // （仅 baseUrl/apiKey/headers，session-affinity 走请求头与 prompt_cache_key，非 body 顶层）。
         // memoryScope 服务端可推断，客户端不传。待云服务端新增「对话历史」专用接口后另行对接
         // （届时由 ai.rs 按 key 的 sessionId 维度上报，见服务端变更）。
-        let hosted = self.store.cloud_mode() == CloudMode::Hosted;
-        let (base_url, api_key_env) = if hosted {
-            let server = crate::cloud::server_url()
-                .ok_or_else(|| "当前构建未配置云服务，无法使用托管模式".to_string())?;
-            (hosted_llm_base(&server), "$AISHELL_CLOUD_TOKEN")
-        } else {
-            (
-                cfg.base_url.trim_end_matches('/').to_string(),
-                "$DEEPSEEK_API_KEY",
+        let hosted_base = if self.store.cloud_mode() == CloudMode::Hosted {
+            Some(
+                crate::cloud::server_url()
+                    .ok_or_else(|| "当前构建未配置云服务，无法使用托管模式".to_string())?,
             )
+        } else {
+            None
         };
-        let models = json!({
-            "providers": {
-                "deepseek": {
-                    "baseUrl": base_url,
-                    "api": "openai-completions",
-                    "apiKey": api_key_env,
-                    // 托管模式：云平台服务端不接受 developer role（实测 400 unknown variant），
-                    // pi docs models.md：compat.supportsDeveloperRole=false → 系统提示走 system role；
-                    // 个人模式保持默认（DeepSeek 官方支持 developer）
-                    "compat": if hosted {
-                        json!({"supportsDeveloperRole": false})
-                    } else {
-                        json!({})
-                    },
-                    "models": [{
-                        "id": model_id,
-                        "name": model_id,
-                        "reasoning": reasoning,
-                        "contextWindow": 64000,
-                    }],
-                }
-            }
-        });
+        let models = models_json_for(&self.store.llm_config(), hosted_base.as_deref());
         std::fs::create_dir_all(&self.agent_dir)
             .map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
         let text = serde_json::to_string_pretty(&models).map_err(|e| e.to_string())?;
@@ -1176,6 +1193,13 @@ impl AiManager {
     pub fn kill_project(&self, project_id: &str) {
         let prefix = format!("{project_id}:");
         self.kill_keys(|k| k.starts_with(&prefix));
+    }
+
+    /// 杀掉单个会话的 pi 进程（key = `<projectId>:<sessionId>`，ai_chat 的约定）。
+    /// 归档等场景在会话历史已安全落盘后调用；不存在该进程时为 no-op。
+    pub fn kill_session(&self, project_id: &str, session_id: &str) {
+        let key = format!("{project_id}:{session_id}");
+        self.kill_keys(|k| k == key);
     }
 
     /// 杀掉全部子进程（应用退出时调用；Drop 也会兜底）。
@@ -2213,7 +2237,17 @@ fn report_sediment(
     }
 }
 
+/// 随 prompt 一起发给 pi 的图片（pi RPC images 字段，pi 侧转 OpenAI image_url 块）。
+/// data 为不带 dataURL 前缀的 base64；mime 仅接受 image/png|jpeg|gif|webp（attach 时已嗅探）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptImage {
+    pub mime_type: String,
+    pub data: String,
+}
+
 /// 发送一条 prompt：进程不存在则先 spawn；上一轮未完成（busy）先取消审批并写 abort 再发。
+/// images：随消息附带的多模态图片（可选），经 pi RPC images 字段进入 user 消息。
 #[tauri::command]
 pub async fn ai_chat(
     mgr: State<'_, Arc<AiManager>>,
@@ -2221,6 +2255,7 @@ pub async fn ai_chat(
     app: AppHandle,
     key: String,
     prompt: String,
+    images: Option<Vec<PromptImage>>,
 ) -> Result<(), String> {
     let project_id = key
         .split_once(':')
@@ -2307,20 +2342,36 @@ pub async fn ai_chat(
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
         aborted_prev = true;
     }
-    // trace：用户输入（脱敏后最终 prompt，含前端 buildPrompt 展开的引用注入全文）
+    // pi RPC ImageContent：{"type":"image","data":"<base64>","mimeType":"..."}。
+    // 前端已按 attach 时的嗅探结果传 mime，这里不再重复校验内容。
+    let images_json: Vec<serde_json::Value> = images
+        .unwrap_or_default()
+        .into_iter()
+        .map(|img| json!({"type": "image", "data": img.data, "mimeType": img.mime_type}))
+        .collect();
+    // trace：用户输入（脱敏后最终 prompt，含前端 buildPrompt 展开的引用注入全文）；
+    // 图片只记 mime 与字节数，不落 base64（体积大且无排查价值）
     crate::trace::log(&key, "user_input", json!({
         "prompt": prompt.as_str(),
         "redacted": redacted,
         "abortedPrev": aborted_prev,
+        "images": images_json.iter().map(|img| json!({
+            "mimeType": img["mimeType"],
+            "bytes": img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0),
+        })).collect::<Vec<_>>(),
     }));
     // 用 JSON 序列化生成，勿手拼。刚 abort 过时带 streamingBehavior=followUp：
     // abort 清理流式状态可能未即时生效，agent 仍在流式期间时裸发 prompt 会被 RPC
-    // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同
-    let payload = if aborted_prev {
+    // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同。
+    // images 为空时不带该字段（与旧 payload 逐字节一致，便于对照 trace）。
+    let mut payload = if aborted_prev {
         json!({"type": "prompt", "message": prompt, "streamingBehavior": "followUp"})
     } else {
         json!({"type": "prompt", "message": prompt})
     };
+    if !images_json.is_empty() {
+        payload["images"] = json!(images_json);
+    }
     let mut buf = serde_json::to_vec(&payload)
         .map_err(|e| e.to_string())?;
     buf.push(b'\n');
@@ -2987,5 +3038,66 @@ mod tests {
         let key2 = "proj-1";
         let s2 = key2.split_once(':').map(|(_, s)| s).unwrap_or("default");
         assert_eq!(s2, "default");
+    }
+
+    /// models.json：vision 模型声明 input=["text","image"]，非 vision 模型不带该字段；
+    /// apiKey 永远是 $DEEPSEEK_API_KEY 占位（真实密钥只经环境变量进 pi）。
+    #[test]
+    fn models_json_declares_image_input_for_vision_models() {
+        let vision = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-v4-flash-vision-exp".to_string(),
+                base_url: "https://api.deepseek.com/v1/".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            None,
+        );
+        let model = &vision["providers"]["deepseek"]["models"][0];
+        assert_eq!(model["input"], json!(["text", "image"]), "vision 模型应声明图片输入");
+        assert_eq!(model["id"], "deepseek-v4-flash-vision-exp");
+        assert_eq!(vision["providers"]["deepseek"]["baseUrl"], "https://api.deepseek.com/v1", "尾部斜杠应去除");
+        assert_eq!(vision["providers"]["deepseek"]["apiKey"], "$DEEPSEEK_API_KEY");
+
+        let text_only = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-chat".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            None,
+        );
+        let model = &text_only["providers"]["deepseek"]["models"][0];
+        assert!(model.get("input").is_none(), "非 vision 模型不应带 input 字段");
+        assert_eq!(model["reasoning"], false, "deepseek-chat 不支持思考档位");
+        assert_eq!(vision["providers"]["deepseek"]["models"][0]["reasoning"], true, "v4 系列支持思考档位");
+
+        // 云分支：托管代理的 deepseek-v4-flash（对外 id 未变，上游已支持识图）应声明图片输入；
+        // 同名模型在个人模式直连官方 API 时仍视为纯文本。
+        let hosted = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-v4-flash".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            Some("https://cloud.example.com/"),
+        );
+        let model = &hosted["providers"]["deepseek"]["models"][0];
+        assert_eq!(model["input"], json!(["text", "image"]), "托管默认模型应声明图片输入");
+        assert_eq!(hosted["providers"]["deepseek"]["baseUrl"], "https://cloud.example.com/api/proxy/llm/v1");
+        assert_eq!(hosted["providers"]["deepseek"]["apiKey"], "$AISHELL_CLOUD_TOKEN");
+        assert_eq!(hosted["providers"]["deepseek"]["compat"]["supportsDeveloperRole"], false);
+
+        let personal = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-v4-flash".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            None,
+        );
+        assert!(
+            personal["providers"]["deepseek"]["models"][0].get("input").is_none(),
+            "个人模式 deepseek-v4-flash（官方上游）不应声明图片输入"
+        );
     }
 }

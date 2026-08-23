@@ -519,7 +519,8 @@ async fn exists_remote(sftp: &SftpSession, dir: &str, name: &str) -> Result<bool
 }
 
 /// 远端重名改名：`name (1).ext`；无扩展名（如目录）为 `name (1)`。
-async fn unique_remote_name(sftp: &SftpSession, dir: &str, name: &str) -> Result<String, String> {
+/// pub(crate)：staging.rs 导出备份的远端目标命名复用同一规则。
+pub(crate) async fn unique_remote_name(sftp: &SftpSession, dir: &str, name: &str) -> Result<String, String> {
     if !exists_remote(sftp, dir, name).await? {
         return Ok(name.to_string());
     }
@@ -534,7 +535,8 @@ async fn unique_remote_name(sftp: &SftpSession, dir: &str, name: &str) -> Result
 }
 
 /// 拆出「最后一个点之前」与「最后一个点及扩展名」；无扩展名时 (name, "")。
-fn split_ext(name: &str) -> (&str, &str) {
+/// pub(crate)：staging.rs 本地导出目标重名探测复用同一拆分规则。
+pub(crate) fn split_ext(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
         _ => (name, ""),

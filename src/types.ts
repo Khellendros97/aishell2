@@ -359,9 +359,56 @@ export interface SkillRef {
   description: string;
 }
 
-/** browser:event 事件 payload（Rust browser.rs 发射） */
+/** 浏览器页面引用：UI 以 @page:页面标题 标签呈现，发送时展开页面标题与地址
+ *  （页面正文由 AI 自行用 browser_read / browser_screenshot 读取） */
+export interface BrowserPageRef {
+  url: string;
+  title: string;
+  ts: number;
+}
+
+/** 图片附件：UI 以缩略图呈现，发送时经 ai_chat 的 images 参数（pi RPC images 字段）传给多模态模型 */
+export interface ImageRef {
+  id: string;
+  /** local | remote | clipboard（附件来源） */
+  source: 'local' | 'remote' | 'clipboard';
+  name: string;
+  mime: string;
+  /** 后端物化副本绝对路径（ai_read_image 回读用，永不指向原图） */
+  path: string;
+  /** 来源原始路径（local/remote 附件保留，clipboard 无） */
+  originPath?: string;
+  /** remote 来源时的目标服务器 ID */
+  serverId?: string | null;
+  size: number;
+  ts: number;
+}
+
+/** ai_attach_images 单项入参：source 标记来源（与 Rust AttachImageIn 的 serde tag 对齐） */
+export type AttachImageItem =
+  | { source: 'local'; path: string }
+  | { source: 'remote'; serverId: string; path: string }
+  | { source: 'clipboard'; name: string; data: string };
+
+/** ai_attach_images 返回：落盘副本信息（前端补 id/source 等组成 ImageRef） */
+export interface AttachedImage {
+  name: string;
+  mime: string;
+  path: string;
+  size: number;
+}
+
+/** ai_read_image 返回：data 为不带 dataURL 前缀的 base64 */
+export interface ReadImageOut {
+  mime: string;
+  data: string;
+}
+
+/** browser:event 事件 payload（Rust browser.rs 发射）；viewId 标记来源页面（多页面模型） */
 export interface BrowserEvent {
   kind: 'url' | 'title' | 'element' | 'ai-navigate';
+  /** 来源页面 id（Rust 侧 viewId） */
+  viewId?: string;
   url?: string;
   title?: string;
   /** kind=element 时的元素引用字段（与 BrowserRef 对齐） */
@@ -390,8 +437,12 @@ export interface ChatMsg {
   pathRefs: PathRef[];
   /** 内置浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；旧会话为空 */
   browserRefs: BrowserRef[];
+  /** 浏览器页面引用（@page:页面标题 标签，发送时展开页面地址与标题）；旧会话为空 */
+  browserPageRefs?: BrowserPageRef[];
   /** 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话为空 */
   skillRefs: SkillRef[];
+  /** 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话为空 */
+  imageRefs?: ImageRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
   actions: AiActionRecord[];
   ts: number;
@@ -403,7 +454,18 @@ export interface ChatSession {
   messages: ChatMsg[];
   /** 首条用户消息已触发自动标题；失败后也不重试，避免后续消息改写会话标题。 */
   autoTitleTriggered?: boolean;
+  /** 会话已归档（归档后不出现在前端会话列表，数据仍保留）；旧配置无此字段按未归档 */
+  archived?: boolean;
 }
+
+/** 归档对话框的目录/笔记选择器数据（notes_list 命令返回；相对路径 '/' 分隔、已排序） */
+export interface NotesListing {
+  dirs: string[];
+  notes: string[];
+}
+
+/** session_archive 归档模式：new = 新建笔记 / update = 整合进既有笔记 / only = 仅归档不生成笔记 */
+export type ArchiveMode = 'new' | 'update' | 'only';
 
 /** sessions: projectId -> ChatSession[] */
 export interface AppState {
@@ -688,12 +750,24 @@ export interface StagingClearOutcome {
   errors: string[];
 }
 
-/** 递归暂存目录 / 清理的进度（staging:progress 事件；与 staging.rs StagingProgress serde camelCase 对齐） */
+/** staging_export 结果 —— 与 staging.rs StagingExportOutcome serde camelCase 对齐 */
+export interface StagingExportOutcome {
+  /** 成功导出的条目数 */
+  exported: number;
+  /** 导出后已接受清除的条目数（accept=true 时） */
+  accepted: number;
+  /** 失败说明（对应条目保留在暂存区） */
+  errors: string[];
+  /** 导出目标（本地绝对路径或远端路径；远程批量按服务器分组可能多个） */
+  targets: string[];
+}
+
+/** 递归暂存目录 / 清理 / 导出的进度（staging:progress 事件；与 staging.rs StagingProgress serde camelCase 对齐） */
 export interface StagingProgress {
   projectId: string;
   sessionId: string;
-  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目；done = 操作完成（隐藏进度） */
-  phase: 'walk' | 'stage' | 'clear' | 'done';
+  /** walk = 枚举目录文件；stage = 逐个暂存文件；clear = 逐条检查暂存条目；export = 逐条导出备份；done = 操作完成（隐藏进度） */
+  phase: 'walk' | 'stage' | 'clear' | 'export' | 'done';
   done: number;
   total: number;
   currentPath: string;

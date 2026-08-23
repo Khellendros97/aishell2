@@ -55,18 +55,16 @@ tauri-plugin-dialog = "2.7.2"
 base64 = "0.22"
 # 智能审批：直连 LLM API 判定操作是否危险（不走 pi）
 reqwest = { version = "0.12", features = ["json"] }
-# SkillHub 下载包安装：只启用标准 deflate，避免引入不必要的压缩格式依赖
-zip = { version = "2", default-features = false, features = ["deflate"] }
 # 输出脱敏与凭据提取前置规则（redact / smart_approval）
 regex = "1"
-parking_lot = "0.12"
 # 云服务 OAuth2 授权 state（CSRF 防注入）用密码学随机
 getrandom = "0.3"
 # 会话标题按 Unicode 字素截断，避免中文/emoji 被截断成半个字符
 unicode-segmentation = "1"
-# 远程文件暂存 blob 内容寻址（staging.rs）
+# 远程文件暂存 blob 内容寻址与大文件行级 diff（staging.rs）
 sha2 = "0.10"
 hex = "0.4"
+similar = "2.7"
 # Skill 系统 frontmatter 解析（serde_yaml 已归档，采用维护中的 serde_yaml_ng）
 serde_yaml_ng = "0.9.36"
 # MCP 服务端（Streamable HTTP，仅绑定 127.0.0.1）：hyper 1 已在依赖树（reqwest 带入），
@@ -74,6 +72,8 @@ serde_yaml_ng = "0.9.36"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 http-body-util = "0.1"
+# SkillHub 下载包安装与暂存区导出备份：只启用标准 deflate，避免引入不必要的压缩格式依赖
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # WebView2 设置（禁用浏览器快捷键，避免劫持终端 Ctrl+Shift+C/V）；版本与 wry 对齐
 [target.'cfg(windows)'.dependencies]

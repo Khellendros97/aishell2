@@ -1246,13 +1246,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "staging_diff",
-		label: "查看暂存 diff",
-		description:
-			"查看某条暂存条目「首次快照 vs 当前内容」的差异（entryId 来自 staging_list）。文本文件返回行级 diff（上=快照，下=当前）；二进制或超大文件返回 hash/size/mtime 元数据。",
-		promptSnippet: "查看某个暂存条目的 diff",
-		promptGuidelines: [
-			"diff 内容已由系统脱敏；还原前建议先 diff 确认影响，并向用户说明差异。",
-		],
+			label: "查看暂存 diff",
+			description:
+				"查看某条暂存条目「首次快照 vs 当前内容」的差异（entryId 来自 staging_list）。文本文件仅返回 unified diff 差异块，每块保留前后 3 行上下文；二进制或超大文件返回 hash/size/mtime 元数据。",
+			promptSnippet: "查看某个暂存条目的 diff",
+			promptGuidelines: [
+				"diff 内容已由系统脱敏且仅包含差异块；还原前建议先 diff 确认影响，并向用户说明差异。",
+			],
 		parameters: Type.Object({
 			entryId: Type.String({ description: "暂存条目 ID（staging_list 返回的 entryId）" }),
 		}),
