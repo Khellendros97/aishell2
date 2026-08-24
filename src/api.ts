@@ -358,6 +358,18 @@ export const sessionArchive = (args: {
   noteRel?: string | null;
   transcript: string;
 }) => call<string>('session_archive', args);
+/** 仅生成笔记（不归档、不杀会话进程）：与 session_archive 共用生成/落盘逻辑，仅支持 new/update 模式。
+ *  返回笔记绝对路径；失败整体 Err，不写文件。 */
+export const sessionNote = (args: {
+  mode: Exclude<ArchiveMode, 'only'>;
+  /** new 模式必填（笔记标题，后端清洗非法字符） */
+  title?: string | null;
+  /** new 模式可选（目标目录相对路径，空 = 根目录） */
+  dirRel?: string | null;
+  /** update 模式必填（既有笔记相对路径） */
+  noteRel?: string | null;
+  transcript: string;
+}) => call<string>('session_note', args);
 
 /* ---------------- skills ---------------- *//** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
 export const skillsList = (projectId: string) => call<SkillSummary[]>('skills_list', { projectId });

@@ -264,6 +264,49 @@ where
     Ok(note)
 }
 
+/// 生成并落盘笔记(归档 new/update 与「生成笔记」命令共用):脱敏 → LLM 生成/整合 → 原子写。
+/// 返回笔记绝对路径;任一失败整体 Err,不写文件。
+async fn write_note(
+    store: &Store,
+    mode: &str,
+    title: Option<&str>,
+    dir_rel: Option<&str>,
+    note_rel: Option<&str>,
+    transcript: &str,
+) -> Result<String, String> {
+    // 脱敏:前端内存里的消息可能含用户键入的凭据,同 ai_chat 的处理。
+    let (transcript, _) = crate::redact::redact_secrets(transcript, &store.known_secrets());
+    let root = store.notes_root()?;
+    let (target, existing) = if mode == "new" {
+        let title = sanitize_title(title.unwrap_or(""))?;
+        let dir = match dir_rel.map(str::trim) {
+            Some(d) if !d.is_empty() => resolve_in_root(&root, d, false)?,
+            _ => root.clone(),
+        };
+        fs::create_dir_all(&dir).map_err(|e| format!("创建笔记目录失败: {e}"))?;
+        let target = dir.join(format!("{title}.md"));
+        if target.exists() {
+            return Err(format!("笔记已存在: {}", target.display()));
+        }
+        (target, None)
+    } else {
+        let rel = note_rel
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "请选择要更新的笔记".to_string())?;
+        let target = resolve_in_root(&root, rel, true)?;
+        if target.extension().is_none_or(|ext| ext != "md") {
+            return Err("只能更新 .md 笔记".to_string());
+        }
+        let existing = fs::read_to_string(&target).map_err(|e| format!("读取笔记失败: {e}"))?;
+        (target, Some(existing))
+    };
+    // LLM 失败则整体 Err:不写文件。
+    let note = generate_note(store, mode == "update", existing.as_deref(), &transcript).await?;
+    write_atomic(&target, &note)?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
 /// 归档会话:脱敏 → (可选)LLM 生成/整合笔记并落盘 → 标记 archived → 杀 pi 进程。
 /// 任一前置失败整体 Err:不归档、不写文件。返回笔记绝对路径(仅归档模式为空串)。
 #[tauri::command]
@@ -282,47 +325,48 @@ pub async fn session_archive(
     if !matches!(mode.as_str(), "new" | "update" | "only") {
         return Err(format!("未知归档模式: {mode}"));
     }
-    // 脱敏:前端内存里的消息可能含用户键入的凭据,同 ai_chat 的处理。
-    let (transcript, _) = crate::redact::redact_secrets(&transcript, &store.known_secrets());
-
-    let mut note_path = String::new();
-    if mode != "only" {
-        let root = store.notes_root()?;
-        let (target, existing) = if mode == "new" {
-            let title = sanitize_title(title.as_deref().unwrap_or(""))?;
-            let dir = match dir_rel.as_deref().map(str::trim) {
-                Some(d) if !d.is_empty() => resolve_in_root(&root, d, false)?,
-                _ => root.clone(),
-            };
-            fs::create_dir_all(&dir).map_err(|e| format!("创建笔记目录失败: {e}"))?;
-            let target = dir.join(format!("{title}.md"));
-            if target.exists() {
-                return Err(format!("笔记已存在: {}", target.display()));
-            }
-            (target, None)
-        } else {
-            let rel = note_rel
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "请选择要更新的笔记".to_string())?;
-            let target = resolve_in_root(&root, rel, true)?;
-            if target.extension().is_none_or(|ext| ext != "md") {
-                return Err("只能更新 .md 笔记".to_string());
-            }
-            let existing = fs::read_to_string(&target).map_err(|e| format!("读取笔记失败: {e}"))?;
-            (target, Some(existing))
-        };
-        // LLM 失败则整体 Err:不归档、不写文件。
-        let note = generate_note(&store, mode == "update", existing.as_deref(), &transcript).await?;
-        write_atomic(&target, &note)?;
-        note_path = target.to_string_lossy().into_owned();
-    }
+    let note_path = if mode != "only" {
+        write_note(
+            &store,
+            &mode,
+            title.as_deref(),
+            dir_rel.as_deref(),
+            note_rel.as_deref(),
+            &transcript,
+        )
+        .await?
+    } else {
+        String::new()
+    };
 
     // 笔记写成功后才标记归档,再杀会话 pi 进程(killed 标记 + 取消审批在 kill_keys 内)。
     store.set_session_archived(&project_id, &session_id, true)?;
     mgr.kill_session(&project_id, &session_id);
     Ok(note_path)
+}
+
+/// 生成笔记:与归档共用生成/落盘逻辑,但不标记归档、不杀进程,会话保持活跃。
+#[tauri::command]
+pub async fn session_note(
+    store: State<'_, Arc<Store>>,
+    mode: String,
+    title: Option<String>,
+    dir_rel: Option<String>,
+    note_rel: Option<String>,
+    transcript: String,
+) -> Result<String, String> {
+    if !matches!(mode.as_str(), "new" | "update") {
+        return Err(format!("生成笔记不支持模式: {mode}"));
+    }
+    write_note(
+        &store,
+        &mode,
+        title.as_deref(),
+        dir_rel.as_deref(),
+        note_rel.as_deref(),
+        &transcript,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------- tests
