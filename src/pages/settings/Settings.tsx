@@ -438,7 +438,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                     id="f-model-id"
                     className="select"
                     value={fields.modelId}
-                    onChange={(e) => setFields((f) => ({ ...f, modelId: e.currentTarget.value }))}
+                    onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
                   >
                     {cloudModels.map((m) => <option key={m} value={m}>{m}</option>)}
                   </select>
@@ -448,7 +448,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                     className="input"
                     placeholder="deepseek-v4-flash"
                     value={fields.modelId}
-                    onInput={(e) => setFields((f) => ({ ...f, modelId: e.currentTarget.value }))}
+                    onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
                   />
                 )}
               </div>
@@ -461,7 +461,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                       className="input mono"
                       placeholder="https://api.deepseek.com/v1"
                       value={fields.baseUrl}
-                      onInput={(e) => setFields((f) => ({ ...f, baseUrl: e.currentTarget.value }))}
+                      onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, baseUrl: v })); }}
                     />
                   </div>
                   <div className="field" id="llm-key-field">
@@ -473,7 +473,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                         type={apiKeyVisible ? 'text' : 'password'}
                         placeholder="已保存则不显示，留空表示不修改"
                         value={fields.apiKey}
-                        onInput={(e) => setFields((f) => ({ ...f, apiKey: e.currentTarget.value }))}
+                        onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, apiKey: v })); }}
                       />
                       <button
                         id="btn-toggle-key"
@@ -513,7 +513,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   type="checkbox"
                   checked={fields.searchEnabled}
                   disabled={hosted}
-                  onChange={(e) => setFields((f) => ({ ...f, searchEnabled: e.currentTarget.checked }))}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, searchEnabled: checked })); }}
                 />
                 <div className="hint">启用后 AI 助手可通过 Brave Search 获取最新信息（问时效性问题时自动使用）</div>
               </div>
@@ -529,7 +529,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                       type={braveKeyVisible ? 'text' : 'password'}
                       placeholder="已保存则不显示，留空表示不修改"
                       value={fields.braveKey}
-                      onInput={(e) => setFields((f) => ({ ...f, braveKey: e.currentTarget.value }))}
+                      onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, braveKey: v })); }}
                     />
                     <button
                       id="btn-toggle-brave"
