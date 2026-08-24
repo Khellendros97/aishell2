@@ -30,6 +30,10 @@ dist-ssr
 src-tauri/resources/pi/
 # Git 安装程序（scripts/fetch-git.sh 拉取，首启静默安装用）
 src-tauri/resources/git/
+# Python 安装程序（scripts/fetch-python.mjs 拉取，首启静默安装用）
+src-tauri/resources/python/
+# Python SDK 包的解释器缓存（冒烟测试产生，不入库）
+__pycache__/
 src-tauri/target
 tmp/
 # 本地云配置文件（含 client_secret，绝不入库；debug 构建读 dev.env，release 构建读 release.env）

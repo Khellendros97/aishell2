@@ -858,10 +858,19 @@ pub struct Store {
 
 const STATE_FILE: &str = "aishell.json";
 
+/// 内置技能播种代际：skills.rs 新增内置技能时 +1。记录值为 `<ws>#gen<N>`；
+/// 老记录是裸 `<ws>`（gen1，仅 skill-management 时代），不匹配新一代标记 →
+/// 老工作区会补种一次（seed_one_builtin_skill 文件级幂等，已有技能文件不覆盖）。
+const SEED_GENERATION: u32 = 2;
+
+/// 播种记录标记（`<ws>#gen<N>`）， seeded_skill_workspaces 按此精确匹配去重。
+fn seed_marker(ws: &str) -> String {
+    format!("{ws}#gen{SEED_GENERATION}")
+}
+
 /// 规范化 workspace 路径用于播种记录去重：目录存在时 canonicalize，否则原样（写入前会创建）。
 /// Windows canonicalize 的 `\\?\` verbatim 前缀统一剥掉，避免落盘记录形态不一致。
-fn normalize_ws(ws: &str) -> String {
-    let p = PathBuf::from(ws.trim());
+fn normalize_ws(ws: &str) -> String {    let p = PathBuf::from(ws.trim());
     let p = std::fs::canonicalize(&p).unwrap_or(p);
     #[cfg(windows)]
     let p = {
@@ -1036,9 +1045,10 @@ impl Store {
                 .filter(|w| !w.trim().is_empty())
             {
                 let ws = normalize_ws(ws);
-                if !s.seeded_skill_workspaces.contains(&ws) {
+                let marker = seed_marker(&ws);
+                if !s.seeded_skill_workspaces.contains(&marker) {
                     crate::skills::seed_builtin_skill_files(&ws)?;
-                    s.seeded_skill_workspaces.push(ws);
+                    s.seeded_skill_workspaces.push(marker);
                 }
             }
             s.settings = settings.clone();
@@ -1046,23 +1056,24 @@ impl Store {
         })
     }
 
-    /// 内置技能播种：workspace 非空且未记录时创建 `<workspace>/.aishell/skills/skill-management/SKILL.md`；
+    /// 内置技能播种：workspace 非空且未记录时创建 `<workspace>/.aishell/skills/<name>/SKILL.md`；
     /// 目标已存在则保留用户文件不覆盖；只有文件已存在或成功创建后才记录 workspace 并原子落盘。
     fn seed_builtin_skill(&self, workspace: &str) -> Result<(), String> {
         let ws = normalize_ws(workspace);
         if ws.is_empty() {
             return Ok(());
         }
+        let marker = seed_marker(&ws);
         {
             let guard = self.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
-            if guard.seeded_skill_workspaces.contains(&ws) {
+            if guard.seeded_skill_workspaces.contains(&marker) {
                 return Ok(());
             }
         }
         crate::skills::seed_builtin_skill_files(&ws)?;
         self.with_state(|s| {
-            if !s.seeded_skill_workspaces.contains(&ws) {
-                s.seeded_skill_workspaces.push(ws);
+            if !s.seeded_skill_workspaces.contains(&marker) {
+                s.seeded_skill_workspaces.push(marker);
             }
             Ok(())
         })
@@ -1471,7 +1482,8 @@ impl Store {
 
     /// path 为 Some → 在该目录下创建 .aishell/；为 None → 用 <workspace_dir>/<name> 并创建（含 .aishell/）。
     /// 目录已存在不报错。返回最终项目路径。
-    fn ensure_project_dirs(&self, path: Option<&str>, name: &str) -> Result<String, String> {
+    /// pub(crate)：ai_actions 的 SDK 导入项目（路径留空时默认 workspace 下创建）复用。
+    pub(crate) fn ensure_project_dirs(&self, path: Option<&str>, name: &str) -> Result<String, String> {
         let project_dir = match path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
             _ => {
@@ -1713,6 +1725,16 @@ impl Store {
     pub fn project(&self, project_id: &str) -> Option<Project> {
         let guard = self.state.lock().ok()?;
         guard.projects.iter().find(|p| p.id == project_id).cloned()
+    }
+
+    /// 全部服务器配置（clone 返回；不含密码——密码在 keyring）。SDK 导入去重等用。
+    pub fn servers_all(&self) -> Vec<Server> {
+        self.state.lock().map(|g| g.servers.clone()).unwrap_or_default()
+    }
+
+    /// 全部项目（clone 返回）。SDK 导入按名称去重等用。
+    pub fn projects_all(&self) -> Vec<Project> {
+        self.state.lock().map(|g| g.projects.clone()).unwrap_or_default()
     }
 
     /// 项目 AI 模式；项目不存在返回 None。
@@ -2324,8 +2346,9 @@ mod tests {
                 );
                 m
             },
-            // 与 settings.workspace_dir 一致：reload 时视为已播种（不创建 D:\AIShellWorkspace，不破坏往返相等）
-            seeded_skill_workspaces: vec!["D:\\AIShellWorkspace".to_string()],
+            // 与 settings.workspace_dir 一致：reload 时视为已播种（不创建 D:\AIShellWorkspace，不破坏往返相等）。
+            // 记录值必须带当前播种代际标记（裸 workspace 是 gen1 旧记录，会触发补种写盘）
+            seeded_skill_workspaces: vec![seed_marker("D:\\AIShellWorkspace")],
             trace_enabled: false,
         }
     }
@@ -4501,22 +4524,51 @@ mod tests {
             .unwrap();
         let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
         assert!(file.is_file(), "首次保存未播种内置技能");
+        let py_file = ws.join(".aishell").join("skills").join("python-script").join("SKILL.md");
+        assert!(py_file.is_file(), "首次保存未播种 python-script 内置技能");
         let content = fs::read_to_string(&file).unwrap();
         // 内容含两个目录、目录结构、scope/enabled 语义
         assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {content}");
         assert!(content.contains("<name>/SKILL.md"), "缺少目录结构: {content}");
         assert!(content.contains("## scope 语义"), "缺少 scope 语义: {content}");
         assert!(content.contains("enabled") && content.contains("scope"), "缺少字段 schema");
-        // 播种记录已落盘（记录的是 normalize_ws 规范化路径：canonicalize + 剥 verbatim 前缀）
+        // 播种记录已落盘（记录的是 normalize_ws 规范化路径 + 播种代际标记）
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
         let expected_ws = normalize_ws(&ws.to_string_lossy());
         assert_eq!(
             state.seeded_skill_workspaces,
-            vec![expected_ws],
+            vec![seed_marker(&expected_ws)],
             "播种记录不符: {:?}",
             state.seeded_skill_workspaces
         );
+    }
+
+    /// gen1 旧记录（裸 workspace，仅 skill-management 时代）：加载时按当前代际补种——
+    /// python-script 落盘、skill-management 文件级幂等不覆盖；旧记录保留并追加新代际标记。
+    #[test]
+    fn legacy_bare_seed_record_triggers_reseed() {
+        let dir = temp_config_dir("seed-gen1");
+        let ws = temp_config_dir("seed-gen1-ws");
+        let legacy = normalize_ws(&ws.to_string_lossy());
+        let state = AppState {
+            settings: Settings {
+                workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            seeded_skill_workspaces: vec![legacy.clone()],
+            ..Default::default()
+        };
+        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        let store = test_store(dir);
+        assert!(
+            ws.join(".aishell").join("skills").join("python-script").join("SKILL.md").is_file(),
+            "旧工作区未补种 python-script"
+        );
+        let records = store.state.lock().unwrap().seeded_skill_workspaces.clone();
+        assert_eq!(records.len(), 2, "旧记录保留 + 追加新代际标记: {records:?}");
+        assert!(records.contains(&legacy), "旧记录被改写: {records:?}");
+        assert!(records.contains(&seed_marker(&legacy)), "缺新代际标记: {records:?}");
     }
 
     /// 目标已存在不覆盖；用户删除后同 workspace 重启/再次保存不复活。

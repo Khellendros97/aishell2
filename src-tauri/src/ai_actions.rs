@@ -19,16 +19,19 @@ use std::time::Duration;
 use regex::Regex;
 use russh_sftp::client::SftpSession;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::ai_impact::{analyze_remote_command, Effect, ImpactPlan};
+use crate::skills::SkillOrigin;
 use crate::ssh::SshManager;
 use crate::staging::{DiffLine, RemoteStaging, StagedState};
-use crate::store::{DbKind, Store};
+use crate::store::{AuthType, DbKind, Project, QuickCommand, Server, Store};
 
 const DEFAULT_RUN_COMMAND_TIMEOUT_SECS: u64 = 10;
 const MAX_RUN_COMMAND_TIMEOUT_SECS: u64 = 3600;
+/// py 工具默认超时（脚本通常比单条命令久，默认宽于 run_command）。
+const DEFAULT_PY_TIMEOUT_SECS: u64 = 60;
 /// 流式拷贝缓冲（与 sftp.rs / staging.rs 一致）。
 const COPY_BUF: usize = 64 * 1024;
 /// 返回给模型的文本上限（与 ai.rs MAX_RESULT_CHARS 一致）。
@@ -773,6 +776,584 @@ impl AiActions {
         Ok(format!("已删除远程文件：{resolved}（服务器 {server_id}）"))
     }
 
+    // ---------------------------------------------------------------- py 工具（本机执行 Python 脚本）
+
+    /// py 工具执行体：本机运行 Python 脚本（code 内联脚本 / path 项目内 .py 文件，二选一）。
+    /// sdk_env 由调用方（ai.rs 动作桥）在起好 PySdkBridge 后注入（AISHELL_SDK_URL/TOKEN）；
+    /// PYTHONPATH 注入内置 SDK 包目录（pysdk::pysdk_dir），脚本里 `import aishell` 即用。
+    pub async fn run_py(
+        &self,
+        project_id: &str,
+        code: Option<String>,
+        path: Option<String>,
+        args: Vec<String>,
+        timeout_seconds: Option<u64>,
+        sdk_env: Vec<(String, String)>,
+    ) -> Result<CommandResult, String> {
+        let root = self.project_root(project_id)?;
+        let python = crate::pythoninstall::find_python().ok_or_else(|| {
+            "未检测到 Python3：请重启 AIShell 触发自动安装引导，或手动安装 Python3（https://www.python.org/downloads/）；已安装也可设置环境变量 AISHELL_PYTHON 指向 python.exe".to_string()
+        })?;
+        let seconds = timeout_seconds.unwrap_or(DEFAULT_PY_TIMEOUT_SECS);
+        if !(1..=MAX_RUN_COMMAND_TIMEOUT_SECS).contains(&seconds) {
+            return Err(format!(
+                "timeoutSeconds 必须在 1–{MAX_RUN_COMMAND_TIMEOUT_SECS} 秒之间"
+            ));
+        }
+        let timeout = Duration::from_secs(seconds);
+        // 脚本来源：code 落临时文件（避免命令行转义/编码问题），path 限项目根内已存在文件
+        let mut tmp_script: Option<PathBuf> = None;
+        let script = match (code, path) {
+            (Some(c), None) => {
+                if c.trim().is_empty() {
+                    return Err("code 不能为空".to_string());
+                }
+                let p = std::env::temp_dir().join(format!(
+                    "aishell-py-{}-{}.py",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                std::fs::write(&p, c).map_err(|e| format!("写入临时脚本失败：{e}"))?;
+                tmp_script = Some(p.clone());
+                p
+            }
+            (None, Some(p)) => {
+                let resolved = self.resolve_inside(&root, Path::new(&p))?;
+                if !resolved.is_file() {
+                    return Err(format!("脚本文件不存在：{}", resolved.display()));
+                }
+                resolved
+            }
+            _ => return Err("code 与 path 必须二选一（恰传其一）".to_string()),
+        };
+        let mut cmd = tokio::process::Command::new(&python);
+        cmd.arg(&script)
+            .args(&args)
+            .current_dir(&root)
+            .kill_on_drop(true)
+            // 强制 UTF-8 模式：Windows 默认 GBK 会让 print 中文/读 UTF-8 文件乱码
+            .env("PYTHONUTF8", "1");
+        if let Some(dir) = crate::pysdk::pysdk_dir() {
+            cmd.env("PYTHONPATH", &dir);
+        }
+        for (k, v) in sdk_env {
+            cmd.env(k, v);
+        }
+        // Windows 下隐藏 Python 的临时控制台窗口（tokio Command 自带 creation_flags）
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        // kill_on_drop：timeout 丢弃 output future 时终止子进程，避免后台残留（同 run_local）
+        let out = tokio::time::timeout(timeout, cmd.output()).await;
+        if let Some(p) = &tmp_script {
+            let _ = std::fs::remove_file(p);
+        }
+        let out = out
+            .map_err(|_| format!("脚本执行超时（{} 秒），已终止 Python 进程", timeout.as_secs()))?
+            .map_err(|e| format!("启动 Python 失败：{e}（解释器：{}）", python.display()))?;
+        Ok(CommandResult {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            exit_code: out.status.code(),
+            timed_out: false,
+        })
+    }
+
+    // ---------------------------------------------------------------- py SDK 桥方法（pysdk.rs 一次性通道的 dispatcher 调用）
+
+    /// SDK 通道的服务器清单（结构化 JSON）：项目绑定的服务器 + 锁定状态。
+    /// 与 list_servers 文本版同事实源；凭据永不出 keyring，这里只暴露连接元数据。
+    pub fn sdk_list_servers(&self, project_id: &str) -> Result<serde_json::Value, String> {
+        let project = self
+            .store
+            .project(project_id)
+            .ok_or_else(|| format!("项目不存在：{project_id}"))?;
+        let mut out = Vec::new();
+        for sid in &project.server_ids {
+            if let Some(sv) = self.store.server(sid) {
+                out.push(json!({
+                    "id": sv.id,
+                    "name": sv.name,
+                    "host": sv.host,
+                    "port": sv.port,
+                    "username": sv.username,
+                    "locked": sv.locked,
+                }));
+            }
+        }
+        Ok(serde_json::Value::Array(out))
+    }
+
+    /// SDK 通道的数据库连接清单（仅启用中；凭据不返回）。
+    pub fn sdk_db_connections(&self, server_id: &str) -> Result<serde_json::Value, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let conns = self.store.db_connections(server_id);
+        let out: Vec<serde_json::Value> = conns
+            .iter()
+            .filter(|c| c.enabled)
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "kind": c.kind.as_str(),
+                    "host": c.host,
+                    "port": c.port,
+                    "user": c.user,
+                    "database": c.database,
+                    "allowedCommands": c.effective_commands(),
+                })
+            })
+            .collect();
+        Ok(serde_json::Value::Array(out))
+    }
+
+    /// SDK 通道的远程命令执行：AI 锁 + 超时校验后直接 exec。
+    /// 脚本级审批已覆盖整体执行，脚本内单项命令不再逐次审批；输出脱敏
+    /// （脚本可 print 进 py 工具结果，与 run_command 输出同标准）。
+    pub async fn sdk_exec(
+        &self,
+        server_id: &str,
+        command: &str,
+        timeout_seconds: Option<u64>,
+    ) -> Result<CommandResult, String> {
+        self.ensure_ai_allowed(server_id)?;
+        if command.trim().is_empty() {
+            return Err("命令不能为空".to_string());
+        }
+        let timeout = command_timeout(timeout_seconds)?;
+        let r = self.ssh.exec_with_timeout(server_id, command, timeout).await?;
+        Ok(self.redact_result(r))
+    }
+
+    /// SDK 通道的数据库查询：复用 db_query 全链路（AI 锁 + 白名单裁决 + 凭据代管），输出脱敏。
+    pub async fn sdk_db_query(
+        &self,
+        server_id: &str,
+        connection_id: &str,
+        command: &str,
+    ) -> Result<CommandResult, String> {
+        let r = self
+            .db_query(
+                server_id.to_string(),
+                connection_id.to_string(),
+                command.to_string(),
+            )
+            .await?;
+        Ok(self.redact_result(r))
+    }
+
+    /// 远端重命名/移动（SDK 通道）：目标已存在报错；自动备份开启时先快照源路径。
+    pub async fn remote_rename(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        server_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<String, String> {
+        self.ensure_ai_allowed(server_id)?;
+        let from_r = self.resolve_remote_path(server_id, from).await?;
+        let to_r = self.resolve_remote_path(server_id, to).await?;
+        let sftp = self
+            .ssh
+            .open_sftp(server_id)
+            .await
+            .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
+        let auto_backup = self.staging.auto_backup_enabled();
+        if auto_backup {
+            self.staging
+                .ensure_snapshot(project_id, session_id, server_id, &from_r)
+                .await?;
+        }
+        crate::sftp::rename_one(&sftp, &from_r, &to_r).await?;
+        if auto_backup {
+            let _ = self
+                .staging
+                .refresh_current(project_id, session_id, server_id, &from_r)
+                .await;
+            let _ = self
+                .staging
+                .refresh_current(project_id, session_id, server_id, &to_r)
+                .await;
+        }
+        Ok(format!("已重命名：{from_r} → {to_r}（服务器 {server_id}）"))
+    }
+
+    /// 命令结果脱敏（SDK 通道输出共用）：配置里的密码不进脚本可 print 的文本。
+    fn redact_result(&self, mut r: CommandResult) -> CommandResult {
+        let (masked, _) = crate::redact::redact_secrets(&r.stdout, &self.store.known_secrets());
+        r.stdout = masked;
+        let (masked, _) = crate::redact::redact_secrets(&r.stderr, &self.store.known_secrets());
+        r.stderr = masked;
+        r
+    }
+
+    // ---------------------------------------------------------------- py SDK 配置导入（import_project / import_commands / import_skill / import_note）
+
+    /// SDK 导入项目（含服务器列表）：
+    /// - 服务器按 host+port+username 去重——命中已有条目则复用其 id（仅传了 password 时更新
+    ///   keyring，不改动已有配置；堡垒机绑定只对新建条目生效）；
+    /// - bastion 字段按服务器名称引用（本批或已有），第一遍全部落库后再绑定（upsert_server
+    ///   要求堡垒机已存在且开启堡垒机功能）；
+    /// - 项目按名称去重：已存在则并入服务器列表、保留原路径；不存在则创建——path 留空时
+    ///   在 workspace 下建 <workspace>/<name>（含 .aishell/），显式 path 也会补建目录。
+    ///
+    /// 密码只进 keyring（account server:<id>），不落 aishell.json。
+    pub fn sdk_import_project(&self, params: &Value) -> Result<Value, String> {
+        let get = |k: &str| {
+            params
+                .get(k)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let name = get("name");
+        if name.is_empty() {
+            return Err("导入项目：name 不能为空".to_string());
+        }
+        let items = params
+            .get("servers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        struct Pending {
+            server: Server,
+            bastion_name: Option<String>,
+            created: bool,
+        }
+        let mut pendings: Vec<Pending> = Vec::new();
+        for (i, item) in items.iter().enumerate() {
+            let sget = |k: &str| {
+                item.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let sname = sget("name");
+            let host = sget("host");
+            let username = sget("username");
+            if sname.is_empty() || host.is_empty() || username.is_empty() {
+                return Err(format!(
+                    "导入项目：servers 第 {} 项 name/host/username 不能为空",
+                    i + 1
+                ));
+            }
+            let port = match item.get("port") {
+                None => 22u16,
+                Some(v) => match v.as_u64() {
+                    Some(p) if (1..=65535).contains(&p) => p as u16,
+                    _ => {
+                        return Err(format!(
+                            "导入项目：servers 第 {} 项 port 必须是 1–65535 之间的整数",
+                            i + 1
+                        ))
+                    }
+                },
+            };
+            let auth_type = match sget("authType").as_str() {
+                "" | "password" => AuthType::Password,
+                "key" => AuthType::Key,
+                other => {
+                    return Err(format!(
+                        "导入项目：servers 第 {} 项 authType 只支持 password/key（收到 {other}）",
+                        i + 1
+                    ))
+                }
+            };
+            if auth_type == AuthType::Key && sget("keyPath").is_empty() {
+                return Err(format!(
+                    "导入项目：servers 第 {} 项 key 认证必须提供 keyPath",
+                    i + 1
+                ));
+            }
+            let password = match sget("password") {
+                p if p.is_empty() => None,
+                p => Some(p),
+            };
+            let bastion_name = match sget("bastion") {
+                b if b.is_empty() => None,
+                b => Some(b),
+            };
+            let is_bastion = item
+                .get("isBastion")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let locked = item
+                .get("locked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // 去重：host+port+username 相同视为同一台
+            let existing = self
+                .store
+                .servers_all()
+                .into_iter()
+                .find(|sv| sv.host == host && sv.port == port && sv.username == username);
+            match existing {
+                Some(sv) => {
+                    // 复用已有配置；仅显式传了 password 时更新 keyring 凭据
+                    if password.is_some() {
+                        self.store.upsert_server(sv.clone(), password.as_deref())?;
+                    }
+                    pendings.push(Pending {
+                        server: sv,
+                        bastion_name,
+                        created: false,
+                    });
+                }
+                None => {
+                    let sv = Server {
+                        id: new_id("srv"),
+                        name: sname,
+                        host,
+                        port,
+                        auth_type,
+                        username,
+                        key_path: sget("keyPath"),
+                        locked,
+                        is_bastion,
+                        bastion_id: None,
+                    };
+                    self.store.upsert_server(sv.clone(), password.as_deref())?;
+                    pendings.push(Pending {
+                        server: sv,
+                        bastion_name,
+                        created: true,
+                    });
+                }
+            }
+        }
+        // 第二遍：新建条目的堡垒机绑定（按名称解析，含本批新建与已有服务器）
+        for p in &mut pendings {
+            let Some(bname) = &p.bastion_name else {
+                continue;
+            };
+            if !p.created {
+                continue; // 已有服务器的堡垒机绑定不改动（避免覆盖用户既有配置）
+            }
+            let bastion = self
+                .store
+                .servers_all()
+                .into_iter()
+                .find(|sv| sv.name == *bname)
+                .ok_or_else(|| {
+                    format!(
+                        "导入项目：服务器「{}」引用的堡垒机「{bname}」不存在（bastion 按服务器名称引用）",
+                        p.server.name
+                    )
+                })?;
+            p.server.bastion_id = Some(bastion.id);
+            self.store.upsert_server(p.server.clone(), None)?;
+        }
+
+        let server_ids: Vec<String> = pendings.iter().map(|p| p.server.id.clone()).collect();
+        let server_report: Vec<Value> = pendings
+            .iter()
+            .map(|p| {
+                json!({"id": p.server.id, "name": p.server.name, "host": p.server.host, "created": p.created})
+            })
+            .collect();
+
+        // 项目按名称去重：已存在则并入服务器、保留原路径
+        let existing = self
+            .store
+            .projects_all()
+            .into_iter()
+            .find(|p| p.name == name);
+        match existing {
+            Some(mut p) => {
+                for sid in &server_ids {
+                    if !p.server_ids.contains(sid) {
+                        p.server_ids.push(sid.clone());
+                    }
+                }
+                let pid = p.id.clone();
+                self.store.upsert_project(p)?;
+                Ok(json!({
+                    "projectId": pid,
+                    "name": name,
+                    "existed": true,
+                    "servers": server_report,
+                }))
+            }
+            None => {
+                let path = get("path");
+                let final_path = self.store.ensure_project_dirs(
+                    if path.is_empty() { None } else { Some(path.as_str()) },
+                    &name,
+                )?;
+                let p = Project {
+                    id: new_id("proj"),
+                    name: name.clone(),
+                    path: Some(final_path.clone()),
+                    server_ids,
+                    quick_commands: Vec::new(),
+                    folder: get("folder"),
+                    ai_mode: Default::default(),
+                };
+                let pid = p.id.clone();
+                self.store.upsert_project(p)?;
+                Ok(json!({
+                    "projectId": pid,
+                    "name": name,
+                    "path": final_path,
+                    "existed": false,
+                    "servers": server_report,
+                }))
+            }
+        }
+    }
+
+    /// SDK 导入命令收藏：挂到 projectId / projectName 指定的项目（global=true 的命令
+    /// 在所有项目可见，但仍归属该项目）；title+command 完全相同的已有条目跳过。
+    pub fn sdk_import_commands(&self, params: &Value) -> Result<Value, String> {
+        let get = |k: &str| {
+            params
+                .get(k)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let mut project = if !get("projectId").is_empty() {
+            self.store
+                .project(&get("projectId"))
+                .ok_or_else(|| format!("导入命令收藏：项目不存在（{}）", get("projectId")))?
+        } else if !get("projectName").is_empty() {
+            self.store
+                .projects_all()
+                .into_iter()
+                .find(|p| p.name == get("projectName"))
+                .ok_or_else(|| format!("导入命令收藏：项目不存在（{}）", get("projectName")))?
+        } else {
+            return Err("导入命令收藏：必须提供 projectId 或 projectName".to_string());
+        };
+        let commands = params
+            .get("commands")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "导入命令收藏：commands 必须是数组".to_string())?;
+        if commands.is_empty() {
+            return Err("导入命令收藏：commands 不能为空".to_string());
+        }
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for (i, item) in commands.iter().enumerate() {
+            let cget = |k: &str| {
+                item.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let title = cget("title");
+            let command = cget("command");
+            if title.is_empty() || command.is_empty() {
+                return Err(format!(
+                    "导入命令收藏：commands 第 {} 项 title/command 不能为空",
+                    i + 1
+                ));
+            }
+            if project
+                .quick_commands
+                .iter()
+                .any(|qc| qc.title == title && qc.command == command)
+            {
+                skipped += 1;
+                continue;
+            }
+            project.quick_commands.push(QuickCommand {
+                id: new_id("qc"),
+                title,
+                command,
+                folder: cget("folder"),
+                global: item
+                    .get("global")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+            added += 1;
+        }
+        let pid = project.id.clone();
+        let pname = project.name.clone();
+        self.store.upsert_project(project)?;
+        Ok(json!({"projectId": pid, "projectName": pname, "added": added, "skipped": skipped}))
+    }
+
+    /// SDK 导入技能：content 为完整 SKILL.md（含 frontmatter）；同名已存在则整体覆盖
+    /// （保留附属资源目录）。origin 缺省 global（workspace 全局技能根），project = 当前项目。
+    /// scope 参数缺省时保留 content frontmatter 里声明的 scope。
+    pub fn sdk_import_skill(&self, project_id: &str, params: &Value) -> Result<Value, String> {
+        let content = params
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if content.trim().is_empty() {
+            return Err("导入技能：content（完整 SKILL.md 文本）不能为空".to_string());
+        }
+        let origin = match params
+            .get("origin")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+        {
+            "" | "global" => SkillOrigin::Global,
+            "project" => SkillOrigin::Project,
+            other => {
+                return Err(format!(
+                    "导入技能：origin 只支持 global/project（收到 {other}）"
+                ))
+            }
+        };
+        // scope 显式参数优先；缺省保留 content frontmatter 中的声明
+        let scope: Vec<String> = match params.get("scope").and_then(Value::as_array) {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            None => crate::skills::skill_scope_of(&content)?,
+        };
+        let name = crate::skills::skill_name_of(&content)?;
+        let exists = crate::skills::skill_exists(&self.store, project_id, origin, &name);
+        let summary = crate::skills::save_skill(
+            &self.store,
+            project_id,
+            origin,
+            if exists { Some(name.as_str()) } else { None },
+            &content,
+            &scope,
+        )?;
+        Ok(json!({
+            "name": summary.name,
+            "origin": summary.origin.as_str(),
+            "path": summary.path,
+            "overwritten": exists,
+        }))
+    }
+
+    /// SDK 导入笔记：写入 workspace 全局 .aishell/notes 下的 markdown（rel 相对路径，
+    /// 缺 .md 后缀自动补；同名覆盖）。执行体在 notes.rs（边界校验 + 原子写）。
+    pub fn sdk_import_note(&self, params: &Value) -> Result<Value, String> {
+        let rel = params
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let content = params
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let path = crate::notes::import_note(&self.store, &rel, &content)?;
+        Ok(json!({"path": path}))
+    }
+
     /// 覆盖上传的影响计划（审批阶段计算，供合并/展示/执行确认）。
     pub async fn upload_impact(
         &self,
@@ -1187,7 +1768,8 @@ impl AiActions {
     }
 
     /// 远程动作前的锁检查（只放本模块入口）。
-    fn ensure_ai_allowed(&self, server_id: &str) -> Result<(), String> {
+    /// pub(crate)：pysdk.rs 的 SDK 桥 dispatcher 复用同一锁语义。
+    pub(crate) fn ensure_ai_allowed(&self, server_id: &str) -> Result<(), String> {
         let server = self
             .store
             .server(server_id)
@@ -1221,6 +1803,18 @@ pub(crate) fn normalize_path(p: &Path) -> PathBuf {
 /// 单引号 shell 引用（`'` → `'\''`）：远程 cwd 含空格/特殊字符时安全包装 exec 命令。
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 导入实体的 id 生成：`{prefix}-<纳秒hex><计数hex>`（形态贴近前端的 prefix-随机串；
+/// 进程内计数器防同纳秒碰撞）。
+fn new_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{:x}{:x}", nanos, CTR.fetch_add(1, Ordering::Relaxed))
 }
 
 const STAGING_DIFF_CONTEXT: usize = 3;
@@ -2143,5 +2737,285 @@ mod tests {
         let err4 = rt.block_on(actions.resolve_remote_path("srv-a", "  "));
         assert!(err4.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------- SDK 配置导入
+
+    /// 造独立 store（内存密钥，绝不碰真实 keyring）+ 已配置 workspace 的 AiActions。
+    /// 返回 (actions, store, config_dir, workspace)，测试末尾负责清理后两个目录。
+    fn sdk_fixture(tag: &str) -> (AiActions, Arc<Store>, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-sdk-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(crate::store::test_store(dir.clone()));
+        let ws = std::env::temp_dir().join(format!(
+            "aishell-sdk-ws-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        store
+            .save_settings(
+                crate::store::Settings {
+                    workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let actions = test_actions(Arc::clone(&store));
+        (actions, store, dir, ws)
+    }
+
+    #[test]
+    fn sdk_import_project_creates_default_workspace_path_and_binds_bastion() {
+        let (actions, store, dir, ws) = sdk_fixture("import-proj");
+        let r = actions
+            .sdk_import_project(&json!({
+                "name": "电商生产",
+                "servers": [
+                    {"name": "web-1", "host": "10.0.0.1", "username": "deploy", "isBastion": true},
+                    {"name": "db-1", "host": "10.0.0.2", "username": "root", "port": 2222, "bastion": "web-1"}
+                ]
+            }))
+            .unwrap();
+        assert_eq!(r["existed"], false);
+        // path 留空 → <workspace>/<name>，含 .aishell/
+        let path = r["path"].as_str().unwrap();
+        assert_eq!(PathBuf::from(path), ws.join("电商生产"));
+        assert!(ws.join("电商生产").join(".aishell").is_dir());
+        let servers = r["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(servers.iter().all(|s| s["created"] == true));
+        // 第二遍堡垒机绑定：db-1 按名称解析到本批新建的 web-1
+        let web_id = servers[0]["id"].as_str().unwrap();
+        let db = store
+            .servers_all()
+            .into_iter()
+            .find(|s| s.name == "db-1")
+            .unwrap();
+        assert_eq!(db.bastion_id.as_deref(), Some(web_id));
+        assert_eq!(db.port, 2222);
+        let proj = store.project(r["projectId"].as_str().unwrap()).unwrap();
+        assert_eq!(proj.server_ids.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sdk_import_project_dedupes_server_by_endpoint_and_project_by_name() {
+        let (actions, store, dir, ws) = sdk_fixture("import-dedupe");
+        // 预置一台同 host+port+username 的服务器
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-pre".into(),
+                    name: "既有".into(),
+                    host: "10.0.0.1".into(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "deploy".into(),
+                    key_path: String::new(),
+                    locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
+                },
+                None,
+            )
+            .unwrap();
+        let r1 = actions
+            .sdk_import_project(&json!({
+                "name": "项目A",
+                "servers": [{"name": "别名", "host": "10.0.0.1", "username": "deploy"}]
+            }))
+            .unwrap();
+        assert_eq!(r1["existed"], false);
+        // host+port+username 命中 → 复用已有 id，不新建
+        assert_eq!(r1["servers"][0]["created"], false);
+        assert_eq!(r1["servers"][0]["id"], "srv-pre");
+        assert_eq!(store.servers_all().len(), 1);
+
+        // 同名项目再导入：existed=true、并入服务器、保留原路径（不返回 path）
+        let r2 = actions
+            .sdk_import_project(&json!({
+                "name": "项目A",
+                "servers": [
+                    {"name": "再引用", "host": "10.0.0.1", "username": "deploy"},
+                    {"name": "新增", "host": "10.0.0.9", "username": "root"}
+                ]
+            }))
+            .unwrap();
+        assert_eq!(r2["existed"], true);
+        assert_eq!(r2["projectId"], r1["projectId"]);
+        assert!(r2.get("path").is_none());
+        let proj = store.project(r1["projectId"].as_str().unwrap()).unwrap();
+        assert_eq!(proj.server_ids.len(), 2); // srv-pre + 新增（重复引用不重复并入）
+        assert_eq!(store.servers_all().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sdk_import_project_validates_fields() {
+        let (actions, _store, dir, ws) = sdk_fixture("import-invalid");
+        let err = actions.sdk_import_project(&json!({"name": "  "})).unwrap_err();
+        assert!(err.contains("name 不能为空"), "{err}");
+        let err = actions
+            .sdk_import_project(&json!({"name": "x", "servers": [{"name": "s", "host": "", "username": "u"}]}))
+            .unwrap_err();
+        assert!(err.contains("不能为空"), "{err}");
+        let err = actions
+            .sdk_import_project(&json!({"name": "x", "servers": [{"name": "s", "host": "h", "username": "u", "port": 0}]}))
+            .unwrap_err();
+        assert!(err.contains("port"), "{err}");
+        let err = actions
+            .sdk_import_project(&json!({"name": "x", "servers": [{"name": "s", "host": "h", "username": "u", "authType": "token"}]}))
+            .unwrap_err();
+        assert!(err.contains("authType"), "{err}");
+        let err = actions
+            .sdk_import_project(&json!({"name": "x", "servers": [{"name": "s", "host": "h", "username": "u", "authType": "key"}]}))
+            .unwrap_err();
+        assert!(err.contains("keyPath"), "{err}");
+        let err = actions
+            .sdk_import_project(&json!({"name": "x", "servers": [{"name": "s", "host": "h", "username": "u", "bastion": "不存在"}]}))
+            .unwrap_err();
+        assert!(err.contains("堡垒机"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sdk_import_commands_adds_and_skips_duplicates() {
+        let (actions, store, dir, ws) = sdk_fixture("import-cmds");
+        let r = actions.sdk_import_project(&json!({"name": "命令项目"})).unwrap();
+        let pid = r["projectId"].as_str().unwrap().to_string();
+
+        let c1 = actions
+            .sdk_import_commands(&json!({
+                "projectId": pid,
+                "commands": [
+                    {"title": "日志", "command": "tail -f /var/log/app.log"},
+                    {"title": "日志", "command": "tail -f /var/log/app.log"},
+                    {"title": "磁盘", "command": "df -h", "global": true}
+                ]
+            }))
+            .unwrap();
+        assert_eq!(c1["added"], 2);
+        assert_eq!(c1["skipped"], 1); // 同批内 title+command 重复也跳过
+
+        // 再次导入（按 projectName 解析）：已有条目全部跳过
+        let c2 = actions
+            .sdk_import_commands(&json!({
+                "projectName": "命令项目",
+                "commands": [{"title": "日志", "command": "tail -f /var/log/app.log"}]
+            }))
+            .unwrap();
+        assert_eq!(c2["added"], 0);
+        assert_eq!(c2["skipped"], 1);
+        let proj = store.project(&pid).unwrap();
+        assert_eq!(proj.quick_commands.len(), 2);
+        assert!(proj.quick_commands.iter().any(|q| q.global && q.title == "磁盘"));
+
+        let err = actions
+            .sdk_import_commands(&json!({"commands": [{"title": "t", "command": "c"}]}))
+            .unwrap_err();
+        assert!(err.contains("projectId 或 projectName"), "{err}");
+        let err = actions
+            .sdk_import_commands(&json!({"projectId": pid, "commands": []}))
+            .unwrap_err();
+        assert!(err.contains("不能为空"), "{err}");
+        let err = actions
+            .sdk_import_commands(&json!({"projectName": "不存在", "commands": [{"title": "t", "command": "c"}]}))
+            .unwrap_err();
+        assert!(err.contains("项目不存在"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sdk_import_skill_creates_then_overwrites_and_supports_project_origin() {
+        let (actions, _store, dir, ws) = sdk_fixture("import-skill");
+        let content = "---\nname: sdk-test-skill\ndescription: 导入测试\n---\n\n正文 v1\n";
+        let r1 = actions
+            .sdk_import_skill("proj-none", &json!({"content": content}))
+            .unwrap();
+        assert_eq!(r1["name"], "sdk-test-skill");
+        assert_eq!(r1["origin"], "global");
+        assert_eq!(r1["overwritten"], false);
+        let file = ws
+            .join(".aishell")
+            .join("skills")
+            .join("sdk-test-skill")
+            .join("SKILL.md");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("正文 v1"));
+
+        // 同名再导入 → 覆盖
+        let r2 = actions
+            .sdk_import_skill("proj-none", &json!({"content": content.replace("v1", "v2")}))
+            .unwrap();
+        assert_eq!(r2["overwritten"], true);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("正文 v2"));
+
+        // 项目级技能：落在项目目录的 .aishell/skills 下
+        let rp = actions.sdk_import_project(&json!({"name": "技能项目"})).unwrap();
+        let pid = rp["projectId"].as_str().unwrap();
+        let r3 = actions
+            .sdk_import_skill(pid, &json!({"content": content, "origin": "project"}))
+            .unwrap();
+        assert_eq!(r3["origin"], "project");
+        // summary.path 来自 canonicalize 后的受信根（Windows 短路径已展开、去 \\?\ 前缀），
+        // 比较前对期望侧做同样的归一
+        let proj_root = std::fs::canonicalize(ws.join("技能项目")).unwrap();
+        let proj_root = PathBuf::from(proj_root.to_string_lossy().trim_start_matches(r"\\?\"));
+        assert!(
+            PathBuf::from(r3["path"].as_str().unwrap()).starts_with(&proj_root),
+            "项目技能路径应在项目目录内: {}",
+            r3["path"]
+        );
+
+        let err = actions.sdk_import_skill("p", &json!({"content": "  "})).unwrap_err();
+        assert!(err.contains("content"), "{err}");
+        assert!(actions
+            .sdk_import_skill("p", &json!({"content": "没有 frontmatter"}))
+            .is_err());
+        let err = actions
+            .sdk_import_skill("p", &json!({"content": content, "origin": "bad"}))
+            .unwrap_err();
+        assert!(err.contains("origin"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sdk_import_note_appends_md_extension_and_overwrites() {
+        let (actions, _store, dir, ws) = sdk_fixture("import-note");
+        let r = actions
+            .sdk_import_note(&json!({"path": "电商/概览", "content": "# 标题\n"}))
+            .unwrap();
+        assert_eq!(r["path"], "电商/概览.md");
+        let file = ws
+            .join(".aishell")
+            .join("notes")
+            .join("电商")
+            .join("概览.md");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "# 标题\n");
+
+        // 同名（显式带 .md）覆盖
+        actions
+            .sdk_import_note(&json!({"path": "电商/概览.md", "content": "v2"}))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
+
+        assert!(actions
+            .sdk_import_note(&json!({"path": "a", "content": "  "}))
+            .is_err());
+        assert!(actions
+            .sdk_import_note(&json!({"path": "../escape", "content": "x"}))
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

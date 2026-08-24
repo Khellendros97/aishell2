@@ -82,6 +82,9 @@ jobs:
       # 与 macOS 同一脚本：win32-x64 走 pi-windows-x64.zip + PowerShell 解压
       - run: npm run fetch-pi
 
+      # 显式拉取 Python 安装器（beforeBuildCommand 会再跑一次，幂等跳过；独立成步便于失败定位）
+      - run: npm run fetch-python
+
       - run: npm run tauri -- build
 
       - uses: actions/upload-artifact@v4

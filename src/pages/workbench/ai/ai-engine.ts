@@ -507,6 +507,7 @@ const ACTION_NAMES: Record<string, string> = {
   staging_add: '主动暂存文件',
   staging_clear: '清理无变更暂存',
   request_db_connection: '申请数据库连接',
+  py: '执行 Python 脚本',
 };
 
 const ACTION_STATUS: Record<ActionCard['status'], string> = {
@@ -560,6 +561,13 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `主动暂存 ${String(args.remotePath ?? '')}（服务器 ${String(args.serverId ?? '')}）`;
     case 'staging_clear':
       return '清理暂存区无变更条目';
+    case 'py': {
+      const p = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
+      if (p) return `执行 Python 脚本 ${p}`;
+      const code = typeof args.code === 'string' ? args.code.trim() : '';
+      const lines = code ? code.split('\n').length : 0;
+      return `执行内联 Python 脚本（${lines} 行）`;
+    }
     default:
       return '';
   }

@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "fetch-pi": "node scripts/fetch-pi.mjs",
     "fetch-git": "node scripts/fetch-git.mjs",
+    "fetch-python": "node scripts/fetch-python.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
