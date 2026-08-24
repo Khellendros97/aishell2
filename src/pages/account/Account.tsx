@@ -1,6 +1,6 @@
 /**
  * 账号页（#/account）—— React 版，对照旧实现 src/pages/account.ts 逐条移植。
- * 云服务三页导航：账号信息（ProfileView）/ 用量报表（UsageView）/ 记忆宫殿（MemoriesView）；
+ * 云服务四页导航：账号信息（ProfileView）/ 用量报表（UsageView）/ 记忆宫殿（MemoriesView）/ 用户反馈（FeedbackView）；
  * 顶栏由 App.tsx 提供，本组件不渲染 Topbar，根节点类名与旧版一致（settings-page account-page）。
  * 数据源：cloud_status（Rust 端单一事实源，token 永不返回前端，本页无任何 token 展示）；
  * 用量与记忆数据经 Rust 端代理命令（cloud_usage / memories_*）获取，token 全程留在后端。
@@ -26,12 +26,13 @@ import { Icon } from '../../shared/Icon';
 import { ProfileView } from './ProfileView';
 import { UsageView } from './UsageView';
 import { MemoriesView } from './MemoriesView';
+import { FeedbackView } from './FeedbackView';
 import '../account.css';
 
 /** 登录等待超时（与后端 LOGIN_TIMEOUT 120s 一致）：超时自动恢复按钮 */
 const LOGIN_WAIT_MS = 120_000;
 
-type ViewName = 'profile' | 'usage' | 'memories';
+type ViewName = 'profile' | 'usage' | 'memories' | 'feedback';
 
 export function Account(_props: { params: URLSearchParams }): JSX.Element {
   /** 云状态（cloud_status 初始拉取 + cloud:changed 驱动刷新；token 不在其中） */
@@ -127,7 +128,7 @@ export function Account(_props: { params: URLSearchParams }): JSX.Element {
     // eslint 语义同旧版一次性订阅：clearWait/setStatus/setView 均稳定
   }, []);
 
-  const navItem = (name: ViewName, icon: 'user' | 'chart' | 'database', title: string, label: string): JSX.Element => (
+  const navItem = (name: ViewName, icon: 'user' | 'chart' | 'database' | 'message', title: string, label: string): JSX.Element => (
     <div className={`account-nav-item${view === name ? ' active' : ''}`} data-tab={name} title={title}
          onClick={() => setView(name)}>
       <Icon name={icon} /><span>{label}</span>
@@ -141,6 +142,7 @@ export function Account(_props: { params: URLSearchParams }): JSX.Element {
           {navItem('profile', 'user', '账号信息', '账号信息')}
           {navItem('usage', 'chart', '用量报表', '用量报表')}
           {navItem('memories', 'database', '记忆宫殿', '记忆宫殿')}
+          {navItem('feedback', 'message', '用户反馈', '用户反馈')}
         </aside>
         <main className="account-content">
           <section className={`account-view${view === 'profile' ? ' active' : ''}`} data-view="profile">
@@ -170,6 +172,14 @@ export function Account(_props: { params: URLSearchParams }): JSX.Element {
               {view === 'memories' ? (
                 <MemoriesView status={status} scope={memScope} onScopeChange={setMemScope}
                               onGoLogin={() => setView('profile')} />
+              ) : null}
+            </div>
+          </section>
+          <section className={`account-view${view === 'feedback' ? ' active' : ''}`} data-view="feedback">
+            <div className="account-view-head"><Icon name="message" /> 用户反馈</div>
+            <div id="feedback-body" className="account-body">
+              {view === 'feedback' ? (
+                <FeedbackView status={status} onGoLogin={() => setView('profile')} />
               ) : null}
             </div>
           </section>

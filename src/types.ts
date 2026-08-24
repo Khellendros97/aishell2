@@ -193,6 +193,48 @@ export interface MemoryHit {
   score: number;
 }
 
+/* ---------- 用户反馈（用户反馈 API 文档 §1.2/§3.2，与 cloud.rs serde camelCase 对齐） ---------- */
+
+/** 反馈分类（创建必填白名单） */
+export type FeedbackCategory = 'bug' | 'suggestion' | 'question' | 'other';
+/** 反馈状态（用户只读，由管理员后台流转） */
+export type FeedbackStatus = 'pending' | 'processing' | 'resolved' | 'closed';
+
+/** 反馈附件元数据（§1.3）；downloadURL 为需鉴权的相对下载地址 */
+export interface FeedbackAttachment {
+  id: number;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  sha256: string;
+  createdAt: string;
+  downloadURL: string;
+}
+
+/** 反馈对象：创建响应 / 详情 / 列表条目同构 */
+export interface Feedback {
+  id: number;
+  reporterId: number | null;
+  reporterName: string | null;
+  reporterDept: string | null;
+  category: FeedbackCategory;
+  title: string;
+  content: string;
+  status: FeedbackStatus;
+  attachments: FeedbackAttachment[];
+  attachmentCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 分页响应（§3.2）：total 为过滤条件下本人反馈总数 */
+export interface FeedbackPage {
+  items: Feedback[];
+  page: number;
+  pageSize: number;
+  total: number;
+}
+
 /** MCP 服务全局配置（AppState 顶层字段）—— 与 store.rs McpServiceConfig serde camelCase 对齐。
  *  port 为回环监听端口（仅 127.0.0.1，不做局域网暴露）；旧配置无此字段按默认 8945。 */
 export interface McpServiceConfig {

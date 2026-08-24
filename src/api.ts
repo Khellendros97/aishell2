@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -289,6 +289,30 @@ export const memoryPromote = (id: string) => call<string>('memory_promote', { id
  *  供前端「自动注入」客户端检索用；AI 工具侧的 kb_search 走 pi 扩展。 */
 export const kbSearch = (query: string, limit?: number, workspaceId?: number | null) =>
   call<KbHit[]>('kb_search', { query, limit: limit ?? null, workspaceId: workspaceId ?? null });
+
+/* ---------------- 用户反馈（用户反馈 API 文档；token 全程留在 Rust 端） ----------------
+   提交为 multipart/form-data（附件传本地文件绝对路径，由后端读取上传）；
+   列表/详情只返回本人反馈，状态由管理员后台流转（用户只读）。 */
+/** 提交反馈（POST /api/feedback）；attachmentPaths 为本地文件绝对路径（最多 10 个，单个 ≤20MB） */
+export const feedbackSubmit = (
+  category: FeedbackCategory,
+  title: string,
+  content: string,
+  attachmentPaths?: string[],
+) => call<Feedback>('feedback_submit', { category, title, content, attachmentPaths: attachmentPaths ?? null });
+/** 分页查询本人反馈（GET /api/feedback）；status/category 传 '' 或 undefined = 不过滤 */
+export const feedbackList = (page?: number, pageSize?: number, status?: FeedbackStatus | '', category?: FeedbackCategory | '') =>
+  call<FeedbackPage>('feedback_list', {
+    page: page ?? null,
+    pageSize: pageSize ?? null,
+    status: status ?? '',
+    category: category ?? '',
+  });
+/** 反馈详情（GET /api/feedback/:id） */
+export const feedbackDetail = (id: number) => call<Feedback>('feedback_detail', { id });
+/** 下载本人反馈附件到指定本地路径（savePath 由保存对话框取得） */
+export const feedbackDownloadAttachment = (id: number, attachmentId: number, savePath: string) =>
+  call<void>('feedback_download_attachment', { id, attachmentId, savePath });
 
 /* ---------------- AI 会话 trace（Rust trace.rs） ----------------
    开关持久化在 AppState.traceEnabled（命令面板 `trace on/off`）；日志按会话分文件落盘

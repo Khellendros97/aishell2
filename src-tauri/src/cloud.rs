@@ -648,12 +648,15 @@ async fn cloud_api_request(
     serde_json::from_str(t).map_err(|e| format!("解析云平台响应失败: {e}"))
 }
 
-/// 带 Bearer 的二进制下载请求，供 SkillHub ZIP 使用，响应体不经过 JSON 解析。
+/// 带 Bearer 的二进制下载请求，响应体不经过 JSON 解析。
+/// `max_bytes` / `label`：超限与读流错误文案中的资源名（SkillHub ZIP 50 MiB / 反馈附件 20 MiB）。
 async fn cloud_api_download(
     cloud: &Arc<CloudManager>,
     store: &Arc<Store>,
     path: &str,
     query: &[(&str, String)],
+    max_bytes: u64,
+    label: &str,
 ) -> Result<Vec<u8>, String> {
     let (server, ..) = credentials()?;
     let token = cloud.valid_access_token(store).await?;
@@ -675,22 +678,18 @@ async fn cloud_api_download(
             .map_err(|e| format!("读取云平台错误响应失败：{e}"))?;
         return Err(api_error_text(status.as_u16(), &text));
     }
-    const MAX_SKILLHUB_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
-    if resp
-        .content_length()
-        .is_some_and(|length| length > MAX_SKILLHUB_DOWNLOAD_BYTES as u64)
-    {
-        return Err("SkillHub 下载包过大（上限 50 MiB）".to_string());
+    if resp.content_length().is_some_and(|length| length > max_bytes) {
+        return Err(format!("{label}过大（上限 {} MiB）", max_bytes / 1024 / 1024));
     }
     let mut resp = resp;
     let mut bytes = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| format!("读取 SkillHub 下载包失败：{e}"))?
+        .map_err(|e| format!("读取{label}失败：{e}"))?
     {
-        if bytes.len().saturating_add(chunk.len()) > MAX_SKILLHUB_DOWNLOAD_BYTES {
-            return Err("SkillHub 下载包过大（上限 50 MiB）".to_string());
+        if bytes.len().saturating_add(chunk.len()) as u64 > max_bytes {
+            return Err(format!("{label}过大（上限 {} MiB）", max_bytes / 1024 / 1024));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -1085,7 +1084,15 @@ pub async fn skillhub_download(
         skillhub_segment(&slug)
     );
     let query = vec![("version", version)];
-    let bytes = cloud_api_download(&cloud, &store, &path, &query).await?;
+    let bytes = cloud_api_download(
+        &cloud,
+        &store,
+        &path,
+        &query,
+        50 * 1024 * 1024,
+        "SkillHub 下载包",
+    )
+    .await?;
     crate::skills::install_skillhub_zip(store.inner().as_ref(), &project_id, origin, &slug, &bytes)
 }
 
@@ -1421,6 +1428,322 @@ fn sediment_body(
     body
 }
 
+// ---------------------------------------------------------------- 用户反馈（文档：AIShell云服务-用户反馈API文档.md）
+
+/// 反馈分类白名单（§1.4）：创建必填，筛选参数同样校验。
+const FEEDBACK_CATEGORIES: [&str; 4] = ["bug", "suggestion", "question", "other"];
+/// 反馈状态白名单（§3.1 筛选参数）。
+const FEEDBACK_STATUSES: [&str; 4] = ["pending", "processing", "resolved", "closed"];
+const FEEDBACK_TITLE_MAX_CHARS: usize = 120;
+const FEEDBACK_CONTENT_MAX_CHARS: usize = 10000;
+const FEEDBACK_MAX_ATTACHMENTS: usize = 10;
+const FEEDBACK_MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const FEEDBACK_MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+
+/// 服务端安全扩展名白名单（§1.4）：客户端预检拦截明显不合规文件，服务端校验为最终准入
+/// （脚本/可执行文件/SVG/HTML 不在白名单；结构化格式服务端另查文件签名）。
+const FEEDBACK_ALLOWED_EXTS: [&str; 37] = [
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif", "heic", // 图片
+    "pdf", // 文档
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", // Office/ODF
+    "txt", "log", "md", "markdown", "csv", "tsv", "json", "xml", "yaml", "yml", // 文本/日志
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", // 压缩包（tar.gz 单独判定）
+];
+
+/// 反馈附件元数据（§1.3）；文档字段为 camelCase，仅 downloadURL 需显式重命名。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FeedbackAttachment {
+    pub id: i64,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub created_at: String,
+    #[serde(rename = "downloadURL")]
+    pub download_url: String,
+}
+
+/// 反馈对象（§1.2）：创建响应 / 详情 / 列表条目同构。status 用户只读，客户端不得提交。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Feedback {
+    pub id: i64,
+    pub reporter_id: Option<i64>,
+    pub reporter_name: Option<String>,
+    pub reporter_dept: Option<String>,
+    pub category: String,
+    pub title: String,
+    pub content: String,
+    pub status: String,
+    pub attachments: Vec<FeedbackAttachment>,
+    pub attachment_count: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 分页响应（§3.2）：total 为过滤条件下本人反馈总数。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FeedbackPage {
+    pub items: Vec<Feedback>,
+    pub page: u32,
+    pub page_size: u32,
+    pub total: u64,
+}
+
+/// 分类中文标签（AI 工具结果文案与前端展示共用映射口径）。
+pub fn feedback_category_label(category: &str) -> &'static str {
+    match category {
+        "bug" => "缺陷",
+        "suggestion" => "建议",
+        "question" => "问题",
+        _ => "其他",
+    }
+}
+
+/// 状态中文标签。
+pub fn feedback_status_label(status: &str) -> &'static str {
+    match status {
+        "pending" => "待处理",
+        "processing" => "处理中",
+        "resolved" => "已解决",
+        "closed" => "已关闭",
+        _ => "未知",
+    }
+}
+
+/// 创建字段预检（§2.1）：分类白名单；标题/正文去首尾空白后非空且限长。返回修剪后的三元组。
+fn validate_feedback_fields(
+    category: &str,
+    title: &str,
+    content: &str,
+) -> Result<(String, String, String), String> {
+    let category = category.trim();
+    if !FEEDBACK_CATEGORIES.contains(&category) {
+        return Err("反馈分类无效（只能是 bug / suggestion / question / other）".to_string());
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("反馈标题不能为空".to_string());
+    }
+    if title.chars().count() > FEEDBACK_TITLE_MAX_CHARS {
+        return Err(format!("反馈标题不能超过 {FEEDBACK_TITLE_MAX_CHARS} 字"));
+    }
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("反馈正文不能为空".to_string());
+    }
+    if content.chars().count() > FEEDBACK_CONTENT_MAX_CHARS {
+        return Err(format!("反馈正文不能超过 {FEEDBACK_CONTENT_MAX_CHARS} 字"));
+    }
+    Ok((
+        category.to_string(),
+        title.to_string(),
+        content.to_string(),
+    ))
+}
+
+/// 附件文件名扩展名预检（§1.4 白名单；tar.gz 双后缀单独判定）。
+fn feedback_check_attachment_name(name: &str) -> Result<(), String> {
+    let lower = name.to_lowercase();
+    if lower.ends_with(".tar.gz") {
+        return Ok(());
+    }
+    let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    if !FEEDBACK_ALLOWED_EXTS.contains(&ext) {
+        return Err(format!(
+            "附件类型不允许：{name}（支持图片/PDF/Office/文本日志/压缩包，不支持脚本与可执行文件）"
+        ));
+    }
+    Ok(())
+}
+
+/// 提交反馈（POST /api/feedback，multipart/form-data；§2）。
+/// 客户端预检数量/大小/类型，服务端校验为最终准入；multipart 边界由 reqwest 自动生成，
+/// 不得手工设置 Content-Type。供 feedback_submit 命令与 AI 反馈工具（附件恒空）共用。
+pub async fn feedback_submit_inner(
+    cloud: &Arc<CloudManager>,
+    store: &Arc<Store>,
+    category: &str,
+    title: &str,
+    content: &str,
+    attachment_paths: &[String],
+) -> Result<Feedback, String> {
+    let (category, title, content) = validate_feedback_fields(category, title, content)?;
+    if attachment_paths.len() > FEEDBACK_MAX_ATTACHMENTS {
+        return Err(format!("附件最多 {FEEDBACK_MAX_ATTACHMENTS} 个"));
+    }
+    let (server, ..) = credentials()?;
+    let token = cloud.valid_access_token(store).await?;
+    let mut form = reqwest::multipart::Form::new()
+        .text("category", category)
+        .text("title", title)
+        .text("content", content);
+    let mut total: u64 = 0;
+    for p in attachment_paths {
+        let path = std::path::Path::new(p);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| format!("附件路径无效：{p}"))?;
+        feedback_check_attachment_name(&name)?;
+        let meta = std::fs::metadata(path).map_err(|e| format!("读取附件失败：{name}（{e}）"))?;
+        if !meta.is_file() {
+            return Err(format!("附件不是文件：{name}"));
+        }
+        let size = meta.len();
+        if size == 0 {
+            return Err(format!("附件是空文件：{name}"));
+        }
+        if size > FEEDBACK_MAX_FILE_BYTES {
+            return Err(format!("附件超过 20 MB 上限：{name}"));
+        }
+        total += size;
+        if total > FEEDBACK_MAX_TOTAL_BYTES {
+            return Err("附件总大小超过 100 MB 上限".to_string());
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("读取附件失败：{name}（{e}）"))?;
+        // 同名 attachments 字段重复追加，服务端按上传顺序接收（§2.1）；
+        // MIME 由服务端按扩展名识别，不采信客户端声明，这里不设置
+        form = form.part(
+            "attachments",
+            reqwest::multipart::Part::bytes(bytes).file_name(name),
+        );
+    }
+    let url = format!("{server}/api/feedback");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("连接云平台失败: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取云平台响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(api_error_text(status.as_u16(), &text));
+    }
+    serde_json::from_str(text.trim()).map_err(|e| format!("解析反馈响应失败: {e}"))
+}
+
+/// AI 助手 feedback_submit 工具的动作桥入口（ai.rs run_internal_action 调用）：
+/// 仅文本反馈（附件由用户在账号页补充提交），返回给模型的结果文本。
+pub async fn feedback_submit_for_ai(
+    cloud: &Arc<CloudManager>,
+    store: &Arc<Store>,
+    category: &str,
+    title: &str,
+    content: &str,
+) -> Result<String, String> {
+    let fb = feedback_submit_inner(cloud, store, category, title, content, &[]).await?;
+    Ok(format!(
+        "反馈已提交：编号 #{}（分类：{}，状态：{}）。可在「账号 → 用户反馈」页查看处理进度。",
+        fb.id,
+        feedback_category_label(&fb.category),
+        feedback_status_label(&fb.status),
+    ))
+}
+
+/// 提交反馈（前端命令）：附件为本地文件绝对路径列表（前端文件对话框给出），后端读取上传。
+#[tauri::command]
+pub async fn feedback_submit(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    category: String,
+    title: String,
+    content: String,
+    attachment_paths: Option<Vec<String>>,
+) -> Result<Feedback, String> {
+    feedback_submit_inner(
+        &cloud,
+        &store,
+        &category,
+        &title,
+        &content,
+        &attachment_paths.unwrap_or_default(),
+    )
+    .await
+}
+
+/// 分页查询本人反馈（GET /api/feedback，§3）：按创建时间倒序；status/category 可组合过滤。
+#[tauri::command]
+pub async fn feedback_list(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    status: Option<String>,
+    category: Option<String>,
+) -> Result<FeedbackPage, String> {
+    let mut q: Vec<(&str, String)> = vec![
+        ("page", page.unwrap_or(1).max(1).to_string()),
+        ("pageSize", page_size.unwrap_or(20).clamp(1, 100).to_string()),
+    ];
+    if let Some(s) = status.filter(|s| !s.trim().is_empty()) {
+        let s = s.trim().to_string();
+        if !FEEDBACK_STATUSES.contains(&s.as_str()) {
+            return Err("反馈状态筛选无效".to_string());
+        }
+        q.push(("status", s));
+    }
+    if let Some(c) = category.filter(|c| !c.trim().is_empty()) {
+        let c = c.trim().to_string();
+        if !FEEDBACK_CATEGORIES.contains(&c.as_str()) {
+            return Err("反馈分类筛选无效".to_string());
+        }
+        q.push(("category", c));
+    }
+    let v = cloud_api_request(&cloud, &store, reqwest::Method::GET, "/api/feedback", &q, None).await?;
+    serde_json::from_value(v).map_err(|e| format!("解析反馈列表失败: {e}"))
+}
+
+/// 反馈详情（GET /api/feedback/:id，§4）：不存在或不属于本人统一 404（由服务端透传错误）。
+#[tauri::command]
+pub async fn feedback_detail(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    id: i64,
+) -> Result<Feedback, String> {
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::GET,
+        &format!("/api/feedback/{id}"),
+        &[],
+        None,
+    )
+    .await?;
+    serde_json::from_value(v).map_err(|e| format!("解析反馈详情失败: {e}"))
+}
+
+/// 下载本人反馈附件（GET /api/feedback/:id/attachments/:attachmentId，§5）到指定本地路径；
+/// 前端先用保存对话框取得目标路径。下载地址需鉴权，不经过前端。
+#[tauri::command]
+pub async fn feedback_download_attachment(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    id: i64,
+    attachment_id: i64,
+    save_path: String,
+) -> Result<(), String> {
+    let bytes = cloud_api_download(
+        &cloud,
+        &store,
+        &format!("/api/feedback/{id}/attachments/{attachment_id}"),
+        &[],
+        FEEDBACK_MAX_FILE_BYTES,
+        "反馈附件",
+    )
+    .await?;
+    std::fs::write(&save_path, &bytes).map_err(|e| format!("保存附件失败：{e}"))
+}
+
 /// 极简 URL 编码（授权 URL 参数；redirect_uri 只含 `:/-_` 无需全量编码，保守处理特殊字符）。
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1716,9 +2039,108 @@ mod tests {
         let res = rt.block_on(sediment_dialogue(&cloud, &store, vec![], None, None));
         assert!(res.is_ok(), "空消息应无操作成功返回");
     }
+    // ---------------------------------------------------------------- 用户反馈
+
     #[test]
-    fn skillhub_models_parse_and_escape_path_segments() {
-        let list: SkillHubList = serde_json::from_value(json!({
+    fn feedback_parses_document_sample() {
+        // 用户反馈 API 文档 §1.2 完整示例（含附件对象 §1.3）
+        let json = r#"{
+          "id": 42, "reporterId": 7, "reporterName": "张三", "reporterDept": "研发部",
+          "category": "bug", "title": "切换工作区后终端无法连接",
+          "content": "切换到第二个工作区后，新开的终端一直显示连接中。",
+          "status": "pending",
+          "attachments": [{
+            "id": 9, "filename": "terminal.log", "contentType": "text/plain",
+            "sizeBytes": 18432,
+            "sha256": "3a7bd3e2360a3d29eea436fcfb7e44c7f6ad5a0e8f2d6c1b4a5e9d3f7c8b2a1e",
+            "createdAt": "2026-08-21T10:30:12+08:00",
+            "downloadURL": "/api/feedback/42/attachments/9"
+          }],
+          "attachmentCount": 1,
+          "createdAt": "2026-08-21T10:30:12+08:00",
+          "updatedAt": "2026-08-21T10:30:12+08:00"
+        }"#;
+        let f: Feedback = serde_json::from_str(json).unwrap();
+        assert_eq!(f.id, 42);
+        assert_eq!(f.reporter_id, Some(7));
+        assert_eq!(f.reporter_name.as_deref(), Some("张三"));
+        assert_eq!(f.category, "bug");
+        assert_eq!(f.status, "pending");
+        assert_eq!(f.attachment_count, 1);
+        assert_eq!(f.attachments.len(), 1);
+        assert_eq!(f.attachments[0].filename, "terminal.log");
+        assert_eq!(f.attachments[0].size_bytes, 18432);
+        assert_eq!(f.attachments[0].download_url, "/api/feedback/42/attachments/9");
+    }
+
+    #[test]
+    fn feedback_page_parses_and_tolerates_missing_fields() {
+        let json = r#"{
+          "items": [{ "id": 42, "category": "bug", "title": "t", "content": "c",
+                      "status": "processing", "attachments": [], "attachmentCount": 0,
+                      "createdAt": "2026-08-21T10:30:12+08:00", "updatedAt": "2026-08-21T11:05:44+08:00" }],
+          "page": 2, "pageSize": 10, "total": 21
+        }"#;
+        let p: FeedbackPage = serde_json::from_str(json).unwrap();
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.page, 2);
+        assert_eq!(p.page_size, 10);
+        assert_eq!(p.total, 21);
+        assert_eq!(p.items[0].status, "processing");
+        assert_eq!(p.items[0].reporter_id, None, "列表条目 reporter 缺失应兜底");
+        // 空结果页
+        let empty: FeedbackPage = serde_json::from_str(r#"{"items":[],"page":1,"pageSize":20,"total":0}"#).unwrap();
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.total, 0);
+    }
+
+    #[test]
+    fn validate_feedback_fields_enforces_document_limits() {
+        // 合法输入：去首尾空白后返回
+        let (c, t, b) = validate_feedback_fields("bug", "  标题  ", "  正文  ").unwrap();
+        assert_eq!((c.as_str(), t.as_str(), b.as_str()), ("bug", "标题", "正文"));
+        // 分类白名单
+        assert!(validate_feedback_fields("其他", "t", "c").is_err());
+        assert!(validate_feedback_fields("", "t", "c").is_err());
+        // 标题/正文空白拒绝
+        assert!(validate_feedback_fields("bug", "   ", "c").is_err());
+        assert!(validate_feedback_fields("bug", "t", "  ").is_err());
+        // 长度上限（按字符数，中文按 1 字）
+        let long_title = "标".repeat(FEEDBACK_TITLE_MAX_CHARS + 1);
+        assert!(validate_feedback_fields("bug", &long_title, "c").is_err());
+        let ok_title = "标".repeat(FEEDBACK_TITLE_MAX_CHARS);
+        assert!(validate_feedback_fields("bug", &ok_title, "c").is_ok());
+        let long_content = "正".repeat(FEEDBACK_CONTENT_MAX_CHARS + 1);
+        assert!(validate_feedback_fields("bug", "t", &long_content).is_err());
+    }
+
+    #[test]
+    fn feedback_attachment_name_whitelist() {
+        // 白名单内（含双后缀 tar.gz、大小写不敏感）
+        for name in ["a.png", "b.PDF", "c.log", "d.tar.gz", "e.zip", "f.md"] {
+            assert!(feedback_check_attachment_name(name).is_ok(), "{name} 应放行");
+        }
+        // 拒绝：脚本/可执行/SVG/HTML/无扩展名
+        for name in ["a.exe", "b.sh", "c.svg", "d.html", "e.htm", "f", "g.py"] {
+            assert!(feedback_check_attachment_name(name).is_err(), "{name} 应拒绝");
+        }
+    }
+
+    #[test]
+    fn feedback_labels_cover_document_values() {
+        assert_eq!(feedback_category_label("bug"), "缺陷");
+        assert_eq!(feedback_category_label("suggestion"), "建议");
+        assert_eq!(feedback_category_label("question"), "问题");
+        assert_eq!(feedback_category_label("other"), "其他");
+        assert_eq!(feedback_status_label("pending"), "待处理");
+        assert_eq!(feedback_status_label("processing"), "处理中");
+        assert_eq!(feedback_status_label("resolved"), "已解决");
+        assert_eq!(feedback_status_label("closed"), "已关闭");
+        assert_eq!(feedback_status_label("???"), "未知");
+    }
+
+    #[test]
+    fn skillhub_models_parse_and_escape_path_segments() {        let list: SkillHubList = serde_json::from_value(json!({
             "items": [{
                 "namespace": "global",
                 "slug": "skillhub-hello",

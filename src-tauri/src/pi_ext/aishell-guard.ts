@@ -40,6 +40,9 @@
  * 内置浏览器四件套（browser_open/browser_read/browser_console/browser_screenshot）：只读、
  * 免审批，三档模式都可用（不进 AI_ONLY_TOOLS）；经 AISHELL_ACTION 桥交给 Rust browser.rs 的
  * 共享单实例 webview（后台打开不切面板不抢焦点；截图存 <workspace>/.aishell/tmp/screenshot）。
+ * 用户反馈（feedback_submit）：对外提交到云平台（仅托管模式由 ai.rs 挂进 --tools），三档模式
+ * 可用但 agent 模式逐调用审批（在 CONTROLLED_TOOLS）；仅文本，经 AISHELL_ACTION 桥交给
+ * Rust cloud.rs（令牌从 keyring 取，不经扩展环境变量）。
  * 路径处理：path.resolve 归一（相对路径、`..`、绝对路径）后统一小写做前缀比较
  * （Windows 大小写不敏感）；8.3 短文件名等无法归一的形式会因前缀失配被拒（安全方向）。
  */
@@ -69,8 +72,9 @@ type AiMode = (typeof VALID_MODES)[number];
 const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "staging_add", "staging_clear", "request_db_connection"];
 /** agent 模式逐调用审批的受控工具：staging_restore 为远程写操作需审批；
  *  staging_list / staging_diff 只读、staging_add 主动备份（只读远端）/ staging_clear 只清
- *  无变更条目，均不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
-const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore"];
+ *  无变更条目，均不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。
+ *  feedback_submit 是对外提交动作（内容发到云平台），agent 模式需人工确认。 */
+const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore", "feedback_submit"];
 /** 单次 AI SFTP 动作最多传输的根项数；目录内部递归仍由后端统一处理。 */
 const MAX_SFTP_BATCH_ITEMS = 32;
 
@@ -341,6 +345,14 @@ export default function (pi: ExtensionAPI) {
 				};
 			case "staging_clear":
 				return { action: "staging_clear", intent: "清理暂存区无变更条目", summary: "staging_clear：接受并清除远端现状与首次快照一致的条目" };
+			case "feedback_submit": {
+				const fbTitle = typeof input.title === "string" ? input.title : "";
+				return {
+					action: "feedback_submit",
+					intent: `提交用户反馈：${fbTitle}`,
+					summary: `feedback_submit：向云平台提交反馈「${fbTitle}」，提交后由管理员在后台处理（内容将发送到公司服务器）`,
+				};
+			}
 			default:
 				return { action: tool, intent: "执行操作", summary: "" };
 		}
@@ -568,6 +580,22 @@ export default function (pi: ExtensionAPI) {
 				return undefined;
 			}
 			case "browser_screenshot": {
+				return undefined;
+			}
+			case "feedback_submit": {
+				// 用户反馈（对外提交到云平台；三档模式可用，agent 模式逐调用审批，不进 AI_ONLY_TOOLS）
+				const fbCategory = typeof input.category === "string" ? input.category : "";
+				if (!["bug", "suggestion", "question", "other"].includes(fbCategory)) {
+					return { block: true, reason: "feedback_submit: category 必须是 bug / suggestion / question / other。" };
+				}
+				const fbTitle = typeof input.title === "string" ? input.title.trim() : "";
+				if (!fbTitle || fbTitle.length > 120) {
+					return { block: true, reason: "feedback_submit: title 必填且不能超过 120 字。" };
+				}
+				const fbContent = typeof input.content === "string" ? input.content.trim() : "";
+				if (!fbContent || fbContent.length > 10000) {
+					return { block: true, reason: "feedback_submit: content 必填且不能超过 10000 字。" };
+				}
 				return undefined;
 			}
 			case "request_agent_mode":
@@ -1213,6 +1241,35 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
 			return await rustAction(ctx, toolCallId, { action: "browser_screenshot" });
+		},
+	});
+
+	/* ---------- 用户反馈（提交到云平台；三档模式可用，agent 模式逐调用审批——对外提交动作） ----------
+	   仅托管模式由 ai.rs 挂进 --tools；凭据不进扩展环境变量，由 Rust 动作桥从 keyring 取令牌。
+	   工具仅文本反馈（附件由用户在「账号 → 用户反馈」页补充），服务端约束见用户反馈 API 文档。 */
+	pi.registerTool({
+		name: "feedback_submit",
+		label: "提交用户反馈",
+		description:
+			"向 AIShell 云平台提交一条用户反馈（缺陷 bug / 建议 suggestion / 问题 question / 其他 other），仅文本内容。提交成功返回反馈编号，管理员在后台处理，用户可在「账号 → 用户反馈」页查看进度。",
+		promptSnippet: "向开发团队提交用户反馈",
+		promptGuidelines: [
+			"仅当用户明确想反馈 AIShell 本身的问题或建议（而非当前项目的技术问题）时使用本工具；先把拟提交的标题与正文给用户确认后再调用。",
+			"正文写清现象、期望行为、复现步骤与关键环境信息；不得在反馈中包含密码、密钥、Token 等敏感信息。",
+			"附件（截图/日志）本工具不能提交，告知用户可在「账号 → 用户反馈」页找到该条反馈并补充附件。",
+		],
+		parameters: Type.Object({
+			category: StringEnum(["bug", "suggestion", "question", "other"] as const),
+			title: Type.String({ description: "反馈标题（必填，不超过 120 字）" }),
+			content: Type.String({ description: "反馈正文（必填，不超过 10000 字）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, {
+				action: "feedback_submit",
+				category: params.category,
+				title: params.title,
+				content: params.content,
+			});
 		},
 	});
 

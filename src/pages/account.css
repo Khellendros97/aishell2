@@ -408,3 +408,97 @@
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ---------- 用户反馈 ---------- */
+/* 工具行内嵌状态 tabs：去掉列表场景的下边距/底边框 */
+.account-page .fb-status-tabs { margin-bottom: 0; border-bottom: none; }
+.account-page .fb-toolbar-gap { flex: 1; }
+
+/* 状态徽标（只读；颜色区分流转阶段） */
+.account-page .fb-status {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+.account-page .fb-status-pending { background: var(--bg-3); color: var(--warn); }
+.account-page .fb-status-processing { background: var(--accent-dim); color: var(--accent); }
+.account-page .fb-status-resolved { background: var(--accent-dim); color: var(--accent); }
+.account-page .fb-status-closed { background: var(--bg-3); color: var(--text-3); }
+
+/* 列表卡片（复用 mem-card 骨架，整卡可点进详情） */
+.account-page .fb-card { cursor: pointer; }
+.account-page .fb-card:hover { border-color: var(--border-strong); }
+.account-page .fb-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  word-break: break-word;
+}
+.account-page .fb-card-attach {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.account-page .fb-card-attach .ic { width: 12px; height: 12px; }
+
+/* 附件列表（提交弹窗已选文件 / 详情弹窗附件行共用） */
+.account-page .fb-attach-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.account-page .fb-attach-row .hint { margin-top: 0; }
+.account-page .fb-attach-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.account-page .fb-attach-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-1);
+  font-size: 12px;
+  color: var(--text-1);
+}
+.account-page .fb-attach-item .ic { flex: none; width: 13px; height: 13px; color: var(--text-3); }
+.account-page .fb-attach-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-page .fb-attach-size { flex: none; color: var(--text-3); font-size: 11px; }
+
+/* 详情弹窗 */
+.account-page .fb-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.account-page .fb-detail-time { font-size: 11px; color: var(--text-3); }
+.account-page .fb-detail-content { margin-bottom: 12px; }
+.account-page .fb-detail-sub {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.account-page .fb-detail-attachments { display: flex; flex-direction: column; gap: 4px; }
+.account-page .fb-detail-hint { margin-top: 12px; }
+
+/* 分页条 */
+.account-page .fb-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+.account-page .fb-pager-info { font-size: 12px; color: var(--text-2); }

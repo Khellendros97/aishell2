@@ -53,8 +53,9 @@ async-trait = "0.1.91"
 futures = "0.3.33"
 tauri-plugin-dialog = "2.7.2"
 base64 = "0.22"
-# 智能审批：直连 LLM API 判定操作是否危险（不走 pi）
-reqwest = { version = "0.12", features = ["json"] }
+# 智能审批：直连 LLM API 判定操作是否危险（不走 pi）；
+# multipart：用户反馈附件上传（POST /api/feedback，multipart/form-data）
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 # 输出脱敏与凭据提取前置规则（redact / smart_approval）
 regex = "1"
 # 云服务 OAuth2 授权 state（CSRF 防注入）用密码学随机

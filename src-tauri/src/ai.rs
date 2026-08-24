@@ -138,7 +138,8 @@ const BASE_TOOLS: &str =
 /// staging_list / staging_diff 只读不入审批（guard 侧不在 CONTROLLED_TOOLS），但执行时
 /// 仍经动作桥并在 ai.rs 侧渲染小字活动行；staging_restore 两侧都要（审批 + 卡片）。
 /// staging_add（主动备份，只读远端）/ staging_clear（只清无变更条目）同样不入审批。
-const CONTROLLED_TOOLS: [&str; 7] = [
+/// feedback_submit（用户反馈，对外提交到云平台）两侧都要：agent 模式人工确认后发送。
+const CONTROLLED_TOOLS: [&str; 8] = [
     "write",
     "edit",
     "delete_path",
@@ -146,6 +147,7 @@ const CONTROLLED_TOOLS: [&str; 7] = [
     "sftp_upload",
     "sftp_download",
     "staging_restore",
+    "feedback_submit",
 ];
 
 /// 影响计划跟踪条目（tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费）。
@@ -591,6 +593,11 @@ impl AiManager {
         }
         if kb_enabled {
             tools.push_str(",kb_search");
+        }
+        // 用户反馈工具：仅托管模式（令牌在 keyring，由动作桥取用；个人模式无云账号不挂载）。
+        // 工具注册在 guard 扩展（常驻加载），这里只控制模型可见性。
+        if hosted {
+            tools.push_str(",feedback_submit");
         }
 
         // 会话持久化（每 key 固定路径）：pi 自动把对话条目落盘到此 jsonl；
@@ -1131,6 +1138,7 @@ impl AiManager {
                             &approvals2,
                             &actions,
                             &store2,
+                            &cloud2,
                             &project_id2,
                             &session_id2,
                             &mut impact_tracker,
@@ -1266,6 +1274,7 @@ fn handle_extension_ui_request(
     approvals2: &Arc<Mutex<HashMap<String, String>>>,
     actions: &Arc<AiActions>,
     store2: &Arc<Store>,
+    cloud2: &Option<Arc<crate::cloud::CloudManager>>,
     project_id: &str,
     session_id: &str,
     impact_tracker: &mut HashMap<String, ImpactEntry>,
@@ -1306,6 +1315,7 @@ fn handle_extension_ui_request(
         let result = runtime.block_on(run_internal_action(
             actions,
             store2,
+            cloud2,
             project_id,
             session_id,
             &tool_call_id,
@@ -1721,6 +1731,7 @@ fn compute_approval_impact(
 async fn run_internal_action(
     actions: &Arc<AiActions>,
     store: &Arc<Store>,
+    cloud: &Option<Arc<crate::cloud::CloudManager>>,
     project_id: &str,
     session_id: &str,
     tool_call_id: &str,
@@ -2056,6 +2067,19 @@ async fn run_internal_action(
                 .screenshot(std::path::Path::new(&dir))
                 .await
                 .map(|text| json!({"ok": true, "text": text}))
+        }
+        // 用户反馈（对外提交到云平台；仅文本，附件由用户在账号页补充）：
+        // 令牌由 cloud.rs 从 keyring 取并续期，不经 pi 环境变量
+        "feedback_submit" => {
+            let category = str_field("category");
+            let title = str_field("title");
+            let content = str_field("content");
+            match cloud {
+                Some(c) => crate::cloud::feedback_submit_for_ai(c, store, &category, &title, &content)
+                    .await
+                    .map(|text| json!({"ok": true, "text": text})),
+                None => Err("云服务不可用，无法提交反馈".to_string()),
+            }
         }
         other => Err(format!("未知动作：{other}")),
     };
