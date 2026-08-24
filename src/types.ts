@@ -242,7 +242,7 @@ export interface ReadImageOut {
 
 /** browser:event 事件 payload（Rust browser.rs 发射）；viewId 标记来源页面（多页面模型） */
 export interface BrowserEvent {
-  kind: 'url' | 'title' | 'element' | 'ai-navigate';
+  kind: 'url' | 'title' | 'element' | 'ai-navigate' | 'new-window';
   /** 来源页面 id（Rust 侧 viewId） */
   viewId?: string;
   url?: string;
