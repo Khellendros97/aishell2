@@ -64,7 +64,7 @@ import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef,
 import { icon, type IconName } from '../../../icons';
 import {
   aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, kbSearch, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
-  sessionArchive, sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
+  sessionArchive, sessionNote, sessionUpsert, sessionsGet, setAiMode, stagingAccept, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
 } from '../../../api';
@@ -1557,8 +1557,22 @@ function buildTranscript(session: ChatSession): string {
   return out;
 }
 
+/** 归档后自动接受暂存区剩余变更(归档入口已向用户警告);失败不阻塞收尾,条目保留由用户处理 */
+async function acceptStagingOnArchive(pid: string, sid: string): Promise<void> {
+  try {
+    const entries = await stagingList(pid, sid);
+    for (const e of entries) {
+      await stagingAccept(pid, sid, e.entryId);
+    }
+    if (entries.length > 0) wbEvents.emit('staging-changed');
+  } catch (err) {
+    toast(`暂存区变更自动接受失败：${String(err)}`, 'error');
+  }
+}
+
 /** 归档成功后的前端收尾:移除会话 + 退订 + 活跃会话补位 + 通知笔记面板/打开笔记 */
 function afterArchived(ctx: ProjectContext, sid: string, notePath: string): void {
+  void acceptStagingOnArchive(ctx.project.id, sid);
   ctx.sessions.delete(sid);
   ctx.pendingBy.delete(sid);
   ctx.subscriptions.get(sid)?.();
@@ -1583,13 +1597,13 @@ function afterArchived(ctx: ProjectContext, sid: string, notePath: string): void
   }
 }
 
-/** 归档入口(右键菜单「归档会话」):拼转录 → ArchiveModal → sessionArchive → 收尾 */
+/** 归档入口(右键菜单「归档会话」):暂存区未审查变更警告 → 拼转录 → ArchiveModal → sessionArchive → 收尾 */
 function archiveSession(pid: string, sid: string): void {
   const ctx = viewContext;
   if (!ctx || ctx.project.id !== pid) return;
   const session = ctx.sessions.get(sid);
   if (!session) return;
-  openArchiveModal({
+  const openModal = (): void => openArchiveModal({
     sessionTitle: session.title,
     onConfirm: ({ mode, title, dirRel, noteRel }) => sessionArchive({
       projectId: pid,
@@ -1601,6 +1615,42 @@ function archiveSession(pid: string, sid: string): void {
       transcript: buildTranscript(session),
     }),
     onDone: (notePath) => afterArchived(ctx, sid, notePath),
+  });
+  /* 暂存区还有未接受变更时先警告:归档后这些变更将被自动接受(查询失败不阻塞归档) */
+  void stagingList(pid, sid).then(async (entries) => {
+    if (entries.length > 0) {
+      const ok = await confirmDialog({
+        title: '归档会话',
+        message: `当前会话暂存区还有 ${entries.length} 个变更未审查，归档后自动接受所有变更。`,
+        okText: '继续归档',
+      });
+      if (!ok) return;
+    }
+    openModal();
+  }).catch(() => openModal());
+}
+
+/** 生成笔记入口(右键菜单「生成笔记」):与归档共用对话框/LLM 整理,但不归档、不动暂存区,会话保持活跃 */
+function generateSessionNote(pid: string, sid: string): void {
+  const ctx = viewContext;
+  if (!ctx || ctx.project.id !== pid) return;
+  const session = ctx.sessions.get(sid);
+  if (!session) return;
+  openArchiveModal({
+    variant: 'note',
+    sessionTitle: session.title,
+    onConfirm: ({ mode, title, dirRel, noteRel }) => sessionNote({
+      mode: mode === 'update' ? 'update' : 'new', // note 变体无仅归档模式,防御性收敛
+      title,
+      dirRel,
+      noteRel,
+      transcript: buildTranscript(session),
+    }),
+    onDone: (notePath) => {
+      wbEvents.emit('notes-changed');
+      openNote(notePath);
+      toast('已生成笔记', 'success');
+    },
   });
 }
 
@@ -3845,8 +3895,9 @@ function bindEvents(): void {
       traceStatus().catch(() => false),
     ])
       .then(([entries, traceOn]) => {
-        /* 归档:生成中的会话禁归档(转录不完整,且后端杀进程会打断在途回合) */
-        const archiving = isGenerating(sid);
+        /* 生成中的会话禁生成笔记/归档(转录不完整;归档后端还会杀进程打断在途回合) */
+        const generating = isGenerating(sid);
+        const busyTip = generating ? '会话正在生成中，请先停止或等待完成' : undefined;
         showContextMenu(e.clientX, e.clientY, [
           { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
           'sep',
@@ -3856,8 +3907,13 @@ function bindEvents(): void {
           ...(traceOn ? ['sep' as const, { label: '追溯', iconName: 'search' as const, action: openTrace }] : []),
           'sep',
           {
+            label: '生成笔记', iconName: 'note' as const,
+            disabled: generating, disabledTip: busyTip,
+            action: () => generateSessionNote(pid, sid),
+          },
+          {
             label: '归档会话', iconName: 'archive' as const,
-            disabled: archiving, disabledTip: archiving ? '会话正在生成中，请先停止或等待完成' : undefined,
+            disabled: generating, disabledTip: busyTip,
             action: () => archiveSession(pid, sid),
           },
         ]);

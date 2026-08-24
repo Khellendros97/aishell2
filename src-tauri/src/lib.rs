@@ -318,6 +318,7 @@ pub fn run() {
             notes::notes_root_cmd,
             notes::notes_list_cmd,
             notes::session_archive,
+            notes::session_note,
             trace::trace_status,
             trace::trace_set_enabled,
             trace::trace_read,
