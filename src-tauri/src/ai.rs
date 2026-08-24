@@ -90,6 +90,7 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - 远程文件读写：read/grep/find/ls/write/edit/delete_path 都支持可选 serverId 参数（先用 list_servers 确认 serverId；不传则操作本地项目目录）。远程文件的内容查看/修改**优先用这些工具**，不要用 run_command 的 cat/sed/echo/tee 等命令读写远程文件内容——基础工具的远程写入/删除会自动进入会话暂存（自动备份原始快照，可 diff/还原）；run_command 用于服务管理、进程、包管理等非文件内容操作。远程路径可用绝对路径（/ 开头）或相对服务器登录目录的相对路径；不支持盘符形态。
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
 - request_db_connection：当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时，调用该工具申请添加连接。把已知的连接信息填进参数（serverId 取自 list_servers；名称、类型、主机、端口、用户名、默认库），主机相对该服务器（数据库在服务器本机填 127.0.0.1）；申请理由（reason）用一句中文说明用途。用户会在审批对话框里补密码并勾选查询权限，批准后工具结果会直接返回 connectionId，用它继续 db_query；被拒绝时不要反复重试，向用户说明需要哪些信息或请其在「服务器设置-数据库连接」中手动配置。
+- py：在本机执行 Python 脚本（code 内联脚本 / path 项目内 .py 文件，二选一；args 传命令行参数；默认 60 秒超时，可用 timeoutSeconds 覆盖）。脚本内可 `import aishell` 使用内置 SDK 调用服务器能力——servers.list() 服务器清单、ssh.exec() 远程命令、sftp.* 远程文件操作、db.connections()/db.query() 数据库管道；用法详见 python-script 技能（用 read 读取该技能的 SKILL.md）。适合批量/程序化操作（遍历多台服务器执行同一命令、批量传输、结果加工）；单次简单操作仍优先用对应的专用工具。SDK 调用受同样的服务器锁与数据库白名单约束，凭据由系统代管、脚本拿不到密码。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
 - 远程文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff（仅返回 unified diff 差异块及每块前后 3 行上下文）、按用户要求把远程文件还原到首次修改前的内容。**应用更新补丁前应先用 staging_add 主动暂存目标文件/目录**（目录递归暂存全部文件，作为可还原的备份）。staging_clear 只清理「远端现状与首次快照完全一致」的条目（备份已冗余）；仍有变更的条目自动保留。**不能接受（清除）仍有变更的暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
@@ -131,7 +132,7 @@ const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read
 /// staging_list / staging_diff 只读不入审批（guard 侧不在 CONTROLLED_TOOLS），但执行时
 /// 仍经动作桥并在 ai.rs 侧渲染小字活动行；staging_restore 两侧都要（审批 + 卡片）。
 /// staging_add（主动备份，只读远端）/ staging_clear（只清无变更条目）同样不入审批。
-const CONTROLLED_TOOLS: [&str; 7] = [
+const CONTROLLED_TOOLS: [&str; 8] = [
     "write",
     "edit",
     "delete_path",
@@ -139,6 +140,7 @@ const CONTROLLED_TOOLS: [&str; 7] = [
     "sftp_upload",
     "sftp_download",
     "staging_restore",
+    "py",
 ];
 
 /// 影响计划跟踪条目（tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费）。
@@ -479,7 +481,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -1592,6 +1594,51 @@ async fn run_internal_action(
                 .await
                 .map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
         }
+        // py 工具：本机执行 Python 脚本。执行前起一次性 SDK 桥（127.0.0.1 ephemeral 端口 +
+        // 仅内存的随机 token），经环境变量注入 Python 进程；进程结束后销毁（成败都停），
+        // token 随之失效。脚本内 `import aishell` 即经此桥调用 ssh/sftp/数据库能力。
+        "run_py" => {
+            let code = payload
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let path = payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let args: Vec<String> = payload
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let timeout_seconds = match payload.get("timeoutSeconds") {
+                None => None,
+                Some(v) => match v.as_u64() {
+                    Some(seconds) => Some(seconds),
+                    None => {
+                        return json!({
+                            "ok": false,
+                            "error": "timeoutSeconds 必须是 1–3600 之间的整数秒"
+                        });
+                    }
+                },
+            };
+            let bridge = match crate::pysdk::PySdkBridge::start(actions.clone(), project_id, session_id).await {
+                Ok(b) => b,
+                Err(e) => return json!({"ok": false, "error": format!("SDK 通道启动失败：{e}")}),
+            };
+            let result = actions
+                .run_py(project_id, code, path, args, timeout_seconds, bridge.env_pairs())
+                .await;
+            bridge.stop().await;
+            result.map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
+        }
         "sftp_upload" => {
             let server_id = str_field("serverId");
             let items: Vec<SftpUploadItem> = if let Some(raw_items) = payload.get("items").and_then(serde_json::Value::as_array) {
@@ -2434,7 +2481,7 @@ mod tests {
         // suggest 模式不提供受控远程工具（工具集变量中无 staging_*）
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
         assert!(!tools_suggest.contains("staging_"), "suggest 工具集不应含暂存工具");
-        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear");
+        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,py");
         assert!(tools_agent.contains("staging_list"));
         assert!(tools_agent.contains("staging_restore"));
         assert!(tools_agent.contains("staging_add"));
@@ -2442,6 +2489,29 @@ mod tests {
         // ai.rs 侧动作卡列表：staging_restore 有卡片，但接受类动作绝不入列
         assert!(CONTROLLED_TOOLS.contains(&"staging_restore"));
         assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("staging_accept")));
+    }
+
+    #[test]
+    fn guard_extension_registers_py_tool() {
+        // py 工具探针：guard 注册 + 动作桥 run_py + 受控审批 + 仅 agent/yolo；
+        // ai.rs 侧工具白名单（agent/yolo）含 py、suggest 不含，受控列表含 py
+        assert!(GUARD_EXT.contains("name: \"py\""), "guard 应注册 py 工具");
+        assert!(GUARD_EXT.contains("\"run_py\""), "py 应走 run_py 动作桥");
+        let controlled_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const CONTROLLED_TOOLS"))
+            .unwrap_or_default();
+        assert!(controlled_line.contains("\"py\""), "py 应受控审批");
+        let ai_only_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const AI_ONLY_TOOLS"))
+            .unwrap_or_default();
+        assert!(ai_only_line.contains("\"py\""), "py 应仅 agent/yolo 可用");
+        assert!(CONTROLLED_TOOLS.contains(&"py"));
+        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py");
+        assert!(tools_agent.contains(",py"), "agent/yolo 工具集应含 py");
+        let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
+        assert!(!tools_suggest.contains(",py"), "suggest 工具集不应含 py");
     }
 
     #[test]

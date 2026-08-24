@@ -44,6 +44,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 - **AI 输出协议**:pi 的系统提示词约定 ```command 围栏 = 可粘贴终端的命令卡、```text 围栏 = 可插入输入框的文本卡;改提示词或渲染器要两边(ai.rs / ai/ai-engine.ts)同步。
 - **AI 输入区引用 tag**:contenteditable 内嵌原子 chip,content 落盘保留 token(`@term:<id>`、`@file:名` 等);新增引用类型要同步 `chipToken`(发送侧 token 生成)与 `buildMessageTokens`(历史侧 token 还原),两处不一致历史消息会回退纯文本。
 - **内置浏览器多页面**:browser.rs 按 viewId 持有多个子 webview(标签栏每页一个,右侧页面栏默认折叠),browser_* 命令/事件全带 viewId;AI 四件套目标视图 = 可视页面 → 最近浏览页面 → 专用 "ai" 页面(`ai_target`)。
+- **内置技能播种**:skills.rs `seed_builtin_skill_files` 带 `.builtin-sha256` 侧车——磁盘文件与侧车一致(用户没改过)时推送内置内容更新,用户改过则保留;新增内置技能还要 bump store.rs `SEED_GENERATION`(否则老工作区不补种新技能)。
 
 ## 代码风格
 

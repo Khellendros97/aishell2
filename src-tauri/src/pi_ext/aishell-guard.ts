@@ -40,6 +40,10 @@
  * 内置浏览器四件套（browser_open/browser_read/browser_console/browser_screenshot）：只读、
  * 免审批，三档模式都可用（不进 AI_ONLY_TOOLS）；经 AISHELL_ACTION 桥交给 Rust browser.rs 的
  * 共享单实例 webview（后台打开不切面板不抢焦点；截图存 <workspace>/.aishell/tmp/screenshot）。
+ * py（本机执行 Python 脚本）：仅 agent/yolo，逐调用审批（受控）；code 内联脚本 / path 项目内
+ * .py 文件二选一，经 AISHELL_ACTION 桥（run_py）交 Rust 执行——执行前 Rust 起一次性 SDK 桥
+ * （127.0.0.1 ephemeral 端口 + 内存 token，进程结束销毁），脚本内 import aishell 即经此桥
+ * 调用 ssh/sftp/数据库能力（用法见内置技能 python-script）。
  * 路径处理：path.resolve 归一（相对路径、`..`、绝对路径）后统一小写做前缀比较
  * （Windows 大小写不敏感）；8.3 短文件名等无法归一的形式会因前缀失配被拒（安全方向）。
  */
@@ -66,11 +70,11 @@ const VALID_MODES = ["suggest", "agent", "yolo"] as const;
 type AiMode = (typeof VALID_MODES)[number];
 
 /** 仅 agent/yolo 提供的变更工具（suggest 一律拒绝） */
-const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "staging_add", "staging_clear", "request_db_connection"];
+const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "staging_add", "staging_clear", "request_db_connection", "py"];
 /** agent 模式逐调用审批的受控工具：staging_restore 为远程写操作需审批；
  *  staging_list / staging_diff 只读、staging_add 主动备份（只读远端）/ staging_clear 只清
  *  无变更条目，均不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
-const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore"];
+const CONTROLLED_TOOLS = ["write", "edit", "delete_path", "run_command", "sftp_upload", "sftp_download", "staging_restore", "py"];
 /** 单次 AI SFTP 动作最多传输的根项数；目录内部递归仍由后端统一处理。 */
 const MAX_SFTP_BATCH_ITEMS = 32;
 
@@ -278,6 +282,24 @@ export default function (pi: ExtensionAPI) {
 				const target = input.target === "remote" ? `远程(${String(input.serverId || "")})` : "本地";
 				const timeout = typeof input.timeoutSeconds === "number" ? input.timeoutSeconds : 10;
 				return { action: "run_command", intent, summary: `执行命令（${target}，超时 ${timeout} 秒）：${command}` };
+			}
+			case "py": {
+				const p = typeof input.path === "string" ? input.path.trim() : "";
+				if (p) {
+					return {
+						action: "py",
+						intent: `执行 Python 脚本 ${p}`,
+						summary: `py：在本机运行项目内脚本文件 ${p}（脚本可经内置 SDK 调用服务器 SSH/SFTP/数据库能力，SDK 单项调用不再逐次审批）`,
+					};
+				}
+				const code = typeof input.code === "string" ? input.code.trim() : "";
+				const lines = code ? code.split("\n") : [];
+				const preview = lines.slice(0, 5).join("\n");
+				return {
+					action: "py",
+					intent: `执行内联 Python 脚本（${lines.length} 行）`,
+					summary: `py：在本机执行内联 Python 脚本（脚本可经内置 SDK 调用服务器 SSH/SFTP/数据库能力，SDK 单项调用不再逐次审批）：\n${preview}${lines.length > 5 ? "\n…" : ""}`,
+				};
 			}
 				case "sftp_upload": {
 					const items = Array.isArray(input.items) ? input.items : [];
@@ -498,6 +520,27 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (!(typeof input.command === "string" && input.command.trim())) {
 					return { block: true, reason: "db_query: command 不能为空。" };
+				}
+				return undefined;
+			}
+			case "py": {
+				// 本机执行 Python 脚本（可经 SDK 触达远程）：仅 agent/yolo；code/path 恰传其一
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不能执行 Python 脚本，请调用 request_agent_mode 申请切换到工作模式。" };
+				}
+				const code = typeof input.code === "string" && input.code.trim() ? input.code : "";
+				const p = typeof input.path === "string" && input.path.trim() ? input.path : "";
+				if (!code && !p) return { block: true, reason: "py: code 与 path 必须传其一。" };
+				if (code && p) return { block: true, reason: "py: code 与 path 只能二选一，不能同时传。" };
+				if (p) {
+					const resolved = path.resolve(cwd, p).toLowerCase();
+					if (!inside(root, resolved)) {
+						return { block: true, reason: `AIShell 权限边界:脚本文件必须在项目目录内(拒绝:${p})。` };
+					}
+				}
+				if (input.timeoutSeconds !== undefined
+					&& !(Number.isInteger(input.timeoutSeconds) && Number(input.timeoutSeconds) >= 1 && Number(input.timeoutSeconds) <= 3600)) {
+					return { block: true, reason: "py: timeoutSeconds 必须是 1–3600 之间的整数秒。" };
 				}
 				return undefined;
 			}
@@ -956,6 +999,37 @@ export default function (pi: ExtensionAPI) {
 				sessionId: process.env.AISHELL_SESSION_ID || "",
 			};
 			if (params.serverId) payload.serverId = params.serverId;
+			if (params.timeoutSeconds !== undefined) payload.timeoutSeconds = params.timeoutSeconds;
+			return await rustAction(ctx, toolCallId, payload);
+		},
+	});
+
+	pi.registerTool({
+		name: "py",
+		label: "Python 脚本",
+		description:
+			"在本机执行 Python 脚本：code 内联脚本或 path 项目内 .py 文件（二选一），args 传命令行参数；默认 60 秒超时，可用 timeoutSeconds（1–3600 秒）覆盖。脚本内可 import aishell 使用内置 SDK：servers.list() 服务器清单、ssh.exec() 远程命令、sftp.* 远程文件操作、db.connections()/db.query() 数据库管道（API 用法见 python-script 技能）。适合批量/程序化操作（遍历多台服务器执行同一命令、批量传输、结果加工）；单次简单操作优先用对应专用工具。",
+		promptSnippet: "执行 Python 脚本（可经内置 SDK 调用服务器能力）",
+		promptGuidelines: [
+			"py 工具适合批量/程序化场景（遍历多台服务器、批量传输、结果加工汇总）；单次简单操作仍优先用 run_command/sftp_upload/db_query 等专用工具。",
+			"脚本内 import aishell 使用 SDK 前，先 read 读取 python-script 技能的 SKILL.md 获取 API 用法与示例；SDK 调用受服务器锁与数据库白名单约束，凭据由系统代管、脚本拿不到密码。",
+			"脚本默认 60 秒超时；预计更久时主动设置 timeoutSeconds（1–3600）。脚本的 print 输出即工具结果，保持简洁（大输出会被截断）。",
+		],
+		parameters: Type.Object({
+			code: Type.Optional(Type.String({ description: "内联 Python 脚本源码；与 path 二选一（恰传其一）" })),
+			path: Type.Optional(Type.String({ description: "项目目录内的 .py 文件路径（相对项目根或绝对路径）；与 code 二选一" })),
+			args: Type.Optional(Type.Array(Type.String(), { description: "传给脚本的命令行参数（sys.argv[1:]）" })),
+			timeoutSeconds: Type.Optional(Type.Integer({
+				minimum: 1,
+				maximum: 3600,
+				description: "脚本整体超时秒数；不传默认 60 秒",
+			})),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			const payload: Record<string, unknown> = { action: "run_py" };
+			if (params.code) payload.code = params.code;
+			if (params.path) payload.path = params.path;
+			if (params.args) payload.args = params.args;
 			if (params.timeoutSeconds !== undefined) payload.timeoutSeconds = params.timeoutSeconds;
 			return await rustAction(ctx, toolCallId, payload);
 		},
