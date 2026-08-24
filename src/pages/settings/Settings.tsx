@@ -65,6 +65,11 @@ const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'about', label: '关于与更新', icon: 'info' },
 ];
 
+function pageFromParams(params: URLSearchParams): SettingsPage {
+  const requested = params.get('page');
+  return SETTINGS_NAV.some((item) => item.id === requested) ? (requested as SettingsPage) : 'features';
+}
+
 export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   /* 后端状态快照（get_state / aishell:data-changed 刷新）；表单字段独立于它：
      刷新只更新快照不覆盖用户正在编辑的输入（同旧版 onDataChanged 语义） */
@@ -73,7 +78,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const mcpPortRef = useRef<HTMLInputElement>(null);
 
   const [fields, setFields] = useState<SysFields>(EMPTY_FIELDS);
-  const [page, setPage] = useState<SettingsPage>('features');
+  const requestedPage = pageFromParams(params);
+  const [page, setPage] = useState<SettingsPage>(requestedPage);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [braveKeyVisible, setBraveKeyVisible] = useState(false);
   const [mcpStatus, setMcpStatus] = useState<McpStatusLine>({ text: '加载中…', cls: 'mcp-status-line' });
@@ -86,6 +92,17 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
 
   /* reason=missing-config：顶部黄色提示条（同 .proto/settings.js） */
   const warnShown = params.get('reason') === 'missing-config';
+
+  useEffect(() => setPage(requestedPage), [requestedPage]);
+
+  const selectPage = (next: SettingsPage): void => {
+    setPage(next);
+    const nextParams = new URLSearchParams(params);
+    if (next === 'features') nextParams.delete('page');
+    else nextParams.set('page', next);
+    const query = nextParams.toString();
+    navigate(`#/settings${query ? `?${query}` : ''}`);
+  };
 
   /** MCP 服务状态行：运行中/未运行/端口占用原因（与服务器 MCP 弹窗同源） */
   const refreshMcpStatus = async (): Promise<void> => {
@@ -195,7 +212,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     const workspaceDir = fields.workspace.trim();
     if (!workspaceDir) {
       toast('请填写 Workspace 目录', 'error');
-      setPage('features');
+      selectPage('features');
       workspaceRef.current?.focus();
       return;
     }
@@ -204,7 +221,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     const mcpPort = Number(fields.mcpPort);
     if (!Number.isInteger(mcpPort) || mcpPort < 1024 || mcpPort > 65535) {
       toast('MCP 端口必须在 1024–65535 之间', 'error');
-      setPage('features');
+      selectPage('features');
       mcpPortRef.current?.focus();
       return;
     }
@@ -312,7 +329,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
             <button
               key={item.id}
               className={`settings-nav-item${page === item.id ? ' active' : ''}`}
-              onClick={() => setPage(item.id)}
+              onClick={() => selectPage(item.id)}
             >
               <Icon name={item.icon} /> {item.label}
             </button>

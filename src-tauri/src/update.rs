@@ -574,13 +574,8 @@ impl UpdateManager {
 
     /// 下载并验签更新（tauri-plugin-updater）。成功后进入 ready 并持久化待安装版本。
     pub async fn run_download(&self) -> Result<UpdateStatus, String> {
-        {
+        let state = {
             let g = self.inner.lock().expect("更新状态锁损坏");
-            match g.state {
-                UpdateState::Ready => return Ok(self.status()), // 幂等：已就绪
-                UpdateState::Downloading => return Ok(self.status()),
-                _ => {}
-            }
             if g.available_version.is_none() {
                 return Err("当前没有可下载的更新，请先检查更新".to_string());
             }
@@ -588,9 +583,29 @@ impl UpdateManager {
                 return Err("该版本未提供更新签名，无法自动更新；请使用「打开下载页」手动下载安装"
                     .to_string());
             }
+            g.state
+        };
+        if matches!(state, UpdateState::Ready | UpdateState::Downloading) {
+            return Ok(self.status());
         }
+
         let server = self.validate_server()?;
         let _guard = self.op.lock().await;
+        let state = {
+            let g = self.inner.lock().expect("更新状态锁损坏");
+            if g.available_version.is_none() {
+                return Err("当前没有可下载的更新，请先检查更新".to_string());
+            }
+            if g.signature_missing {
+                return Err("该版本未提供更新签名，无法自动更新；请使用「打开下载页」手动下载安装"
+                    .to_string());
+            }
+            g.state
+        };
+        if matches!(state, UpdateState::Ready | UpdateState::Downloading) {
+            return Ok(self.status());
+        }
+
         {
             let mut g = self.inner.lock().expect("更新状态锁损坏");
             g.state = UpdateState::Downloading;

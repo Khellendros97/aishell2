@@ -363,6 +363,10 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 .toast.success { border-color: var(--green); }
 .toast.error { border-color: var(--red); }
 .toast.info { border-color: var(--accent); }
+.toast.clickable { cursor: pointer; user-select: none; }
+.toast.clickable:hover { background: var(--bg-hover); border-color: var(--accent); }
+.toast.clickable:active { transform: translateY(1px); }
+.toast.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
 /* ---------- 工具方法（JS 依赖这些类名） ---------- */

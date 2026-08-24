@@ -9,18 +9,40 @@ import {
   onUpdateDownloadProgress,
   onUpdateReady,
   onUpdateStatusChanged,
+  updateDownload,
   updateStatus,
 } from './api';
 import type { UpdateStatus } from './types';
 import { dbg } from './debug';
+import { navigate, parseHash } from './router';
 import { toast } from './ui';
 
 let current: UpdateStatus | null = null;
 const listeners = new Set<(s: UpdateStatus) => void>();
 let started = false;
+let autoDownloadInFlight = false;
+let autoDownloadedVersion: string | null = null;
 
-function onSettingsPage(): boolean {
-  return location.hash.startsWith('#/settings');
+function onAboutUpdatePage(): boolean {
+  const route = parseHash();
+  return route.name === '/settings' && route.params.get('page') === 'about';
+}
+
+function openAboutUpdate(): void {
+  navigate('#/settings?page=about');
+}
+
+function startAutoDownload(s: UpdateStatus): void {
+  const version = s.availableVersion;
+  if (!version || s.signatureMissing || autoDownloadInFlight || autoDownloadedVersion === version) return;
+  autoDownloadInFlight = true;
+  autoDownloadedVersion = version;
+  void updateDownload()
+    .catch((err) => {
+      dbg(`update: 自动下载 v${version} 失败 (${String(err)})`);
+      toast('更新下载失败，点击重试', 'error', 8000, { onClick: openAboutUpdate });
+    })
+    .finally(() => { autoDownloadInFlight = false; });
 }
 
 function apply(s: UpdateStatus): void {
@@ -28,13 +50,21 @@ function apply(s: UpdateStatus): void {
   current = s;
   dbg(`update: 状态 ${s.state}${s.availableVersion ? ` v${s.availableVersion}` : ''}${s.error ? ` (${s.error})` : ''}`);
   for (const fn of listeners) fn(s);
-  // 非阻塞通知（§6.4）：后台发现新版本 / 下载完成。设置页内已直接展示，不重复弹。
-  if (prev !== 'available' && prev !== 'ready' && !onSettingsPage()) {
-    if (s.state === 'available' && s.availableVersion) {
-      toast(`发现新版本 v${s.availableVersion}，可到「设置 → 关于与更新」查看`, 'info', 4000);
-    } else if (s.state === 'ready' && s.availableVersion) {
-      toast(`新版本 v${s.availableVersion} 已就绪，重启后生效（设置 → 关于与更新）`, 'info', 4000);
+
+  if (s.state === 'available' && s.availableVersion) {
+    if (s.signatureMissing) {
+      if (prev !== 'available' && !onAboutUpdatePage()) {
+        toast(`发现新版本 v${s.availableVersion}，点击手动下载`, 'info', 8000, { onClick: openAboutUpdate });
+      }
+    } else {
+      startAutoDownload(s);
     }
+    return;
+  }
+
+  // 下载验签完成后再通知用户；设置页其他分类仍提示，仅当前更新页内不重复弹。
+  if (s.state === 'ready' && prev !== 'ready' && !onAboutUpdatePage()) {
+    toast('新版本已准备好，点击安装', 'info', 8000, { onClick: openAboutUpdate });
   }
 }
 
