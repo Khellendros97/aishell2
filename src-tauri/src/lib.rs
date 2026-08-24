@@ -47,7 +47,13 @@ async fn delete_project_with_ai(
 
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+        // 内置浏览器自行接管 target=_blank / window.open；全局注入会让远程子 webview
+        // 误调 opener IPC 并被 ACL 拒绝。显式 openUrl 命令仍由插件提供。
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         // 内置浏览器本地 HTML 协议（browser.rs serve_local_html）：
         // 本地文件统一走 localhtml://，规避 file:// 空 host 触发的 wry ipc 处理器崩溃

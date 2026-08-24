@@ -9,15 +9,17 @@
  *   - 脏标记 ● + 800ms 防抖自动保存 + Ctrl+S + 关闭时静默落盘;
  *   - onFsChanged 模块级订阅:同路径无脏改动重载,有脏改动 toast 提示(照 EditorTab.tsx:882)。
  * keep-alive 契约:effect 依赖 [tab.id](硬约束 9:tab 对象引用会被 setTabTitle 换,不可作依赖)。
- * 接口点:fs_read / fs_write / fs:changed;外部入口 openNote(tab id = note:<path> 去重激活)。
+ * 接口点:fs_read / fs_write / fs:changed;预览外链显式调用 opener openUrl;
+ * 外部入口 openNote(tab id = note:<path> 去重激活)。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type MouseEvent } from 'react';
 import { EditorState, Prec, StateEffect, type Extension } from '@codemirror/state';
 import { EditorView, highlightActiveLine, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { LanguageDescription, indentUnit } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import MarkdownIt from 'markdown-it';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { fsRead, fsWrite, onFsChanged } from '../../../api';
 import { toast } from '../../../ui';
 import { useWorkbench, tabApis, type Tab, type TabProps } from '../../../stores/workbench';
@@ -219,6 +221,16 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
     ? md.render(entryRef.current?.view.state.doc.toString() ?? '')
     : '';
 
+  const onPreviewClick = (e: MouseEvent<HTMLDivElement>): void => {
+    const target = e.target;
+    const link = target instanceof Element ? target.closest('a[href]') : null;
+    if (!(link instanceof HTMLAnchorElement)) return;
+    const url = new URL(link.href);
+    if (!['http:', 'https:', 'mailto:', 'tel:'].includes(url.protocol)) return;
+    e.preventDefault();
+    void openUrl(url.href).catch((err) => toast(`无法打开链接: ${String(err)}`, 'error'));
+  };
+
   return (
     <div className="note-root">
       <div className="note-toolbar">
@@ -238,7 +250,7 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
       </div>
       <div className={`note-editor${mode === 'edit' ? '' : ' hidden'}`} ref={rootRef} />
       {mode === 'preview' && (
-        <div className="note-md" dangerouslySetInnerHTML={{ __html: previewHtml }} />
+        <div className="note-md" onClick={onPreviewClick} dangerouslySetInnerHTML={{ __html: previewHtml }} />
       )}
     </div>
   );

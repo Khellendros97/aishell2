@@ -3,7 +3,7 @@
  * 与后端的接口点:
  * - 命令:browser_ensure / set_rect / set_visible / navigate / back / forward / reload /
  *   set_inspect / open_devtools / close_view(全部带 viewId,src/api.ts 封装,Rust browser.rs);
- * - 事件:browser:event(url / title / element / ai-navigate,均带 viewId)。
+ * - 事件:browser:event(url / title / element / ai-navigate / new-window,均带 viewId)。
  * 多页面模型:工作台浏览器标签页(固定 id 'browser' 单实例)内部维护多个「页面」,
  * 每页对应 Rust 侧一个子 webview(label = browser-<viewId>),首次导航才懒创建,
  * 关闭页面经 close_view 释放;页面状态(地址/标题/检查模式)Rust 侧持有,前端模块级
@@ -159,20 +159,26 @@ function setInspectState(on: boolean, silent = false): void {
 
 /* ---------- 导航 ---------- */
 
+async function navigatePage(p: PageState, input: string): Promise<string> {
+  const value = input.trim();
+  if (!value) throw new Error('地址不能为空');
+  await browserEnsure(p.id);
+  const normalized = await browserNavigate(p.id, value);
+  p.url = normalized;
+  p.hasNavigated = true;
+  updateHint();
+  applyVisibility();
+  syncRect();
+  updateAddress();
+  renderPagesBar();
+  return normalized;
+}
+
 async function navigate(input: string): Promise<void> {
   const p = activePage();
-  const value = input.trim();
-  if (!p || !value) return;
+  if (!p || !input.trim()) return;
   try {
-    await browserEnsure(p.id);
-    const normalized = await browserNavigate(p.id, value);
-    p.url = normalized;
-    p.hasNavigated = true;
-    updateHint();
-    applyVisibility();
-    syncRect();
-    updateAddress();
-    renderPagesBar();
+    await navigatePage(p, input);
   } catch (err) {
     toast(`无法打开: ${String(err)}`, 'error');
   }
@@ -192,16 +198,7 @@ export async function openInActivePage(input: string): Promise<string> {
   if (!value) throw new Error('地址不能为空');
   let p = activePage();
   if (!p) p = newPage();
-  await browserEnsure(p.id);
-  const normalized = await browserNavigate(p.id, value);
-  p.url = normalized;
-  p.hasNavigated = true;
-  updateHint();
-  applyVisibility();
-  syncRect();
-  updateAddress();
-  renderPagesBar();
-  return normalized;
+  return navigatePage(p, value);
 }
 
 /* ---------- 页面增删切换 ---------- */
@@ -451,6 +448,11 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
       renderPagesBar();
     } else if (ev.kind === 'ai-navigate' && ev.url) {
       toast(`AI 正在打开: ${ev.url}`);
+    } else if (ev.kind === 'new-window' && ev.url) {
+      const target = newPage();
+      void navigatePage(target, ev.url).catch((err) => {
+        toast(`无法在新页面打开: ${String(err)}`, 'error');
+      });
     } else if (ev.kind === 'element') {
       handleElementSelected(ev);
     }
