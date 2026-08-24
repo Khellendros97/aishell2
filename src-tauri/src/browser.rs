@@ -4,7 +4,7 @@
 //! - 命令 `browser_ensure` / `browser_set_rect` / `browser_set_visible` / `browser_navigate` /
 //!   `browser_back` / `browser_forward` / `browser_reload` / `browser_set_inspect` /
 //!   `browser_open_devtools` / `browser_close_view`（除 close_view 外均带 viewId 参数）；
-//! - 事件 `browser:event` payload `{ kind: 'url'|'title'|'element'|'ai-navigate', viewId, ... }`；
+//! - 事件 `browser:event` payload `{ kind: 'url'|'title'|'element'|'ai-navigate'|'new-window', viewId, ... }`；
 //! - AI 动作桥（ai.rs run_internal_action）：browser_open / browser_read / browser_console / browser_screenshot，
 //!   目标视图 = 当前用户可视页面 → 用户最近浏览过的页面 → 专用 "ai" 页面（延续旧单实例的共享语义）。
 //!
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
-use tauri::webview::PageLoadEvent;
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State, Url, Webview, WebviewBuilder,
     WebviewUrl, Wry,
@@ -171,6 +171,7 @@ impl BrowserManager {
         let view_id_nav = view_id.to_string();
         let view_id_load = view_id.to_string();
         let view_id_title = view_id.to_string();
+        let view_id_new_window = view_id.to_string();
         let builder = WebviewBuilder::new(
             label,
             WebviewUrl::External(Url::parse("about:blank").map_err(|e| format!("初始地址非法: {e}"))?),
@@ -197,6 +198,17 @@ impl BrowserManager {
                 return false;
             }
             true
+        })
+        .on_new_window(move |url, _features| {
+            if let Some(url) = new_window_url(&url) {
+                if let Some(a) = app_handle() {
+                    let _ = a.emit(
+                        "browser:event",
+                        json!({ "kind": "new-window", "viewId": view_id_new_window, "url": url }),
+                    );
+                }
+            }
+            NewWindowResponse::Deny
         })
         .on_page_load(move |_wv, payload| {
             let url = payload.url().to_string();
@@ -608,6 +620,15 @@ fn display_url(url: &str) -> String {
         }
     }
     url.to_string()
+}
+
+/// 新窗口请求只接纳可作为内置页面导航的网页地址。其他 scheme 保持拒绝，
+/// 避免远程页面借新窗口请求触发系统协议或执行脚本。
+fn new_window_url(url: &Url) -> Option<String> {
+    match url.scheme() {
+        "http" | "https" | LOCAL_HTML_SCHEME => Some(display_url(url.as_str())),
+        _ => None,
+    }
 }
 
 /// localhtml 协议响应（lib.rs 注册）：还原后的 URI 形如 `localhtml://localhost/C:/x/page.html`，
@@ -1146,6 +1167,37 @@ mod tests {
         );
         assert_eq!(display_url("https://example.com/a"), "https://example.com/a");
         assert_eq!(display_url("file://server/share/x.html"), "file://server/share/x.html");
+    }
+
+    #[test]
+    fn new_window_accepts_web_pages_only() {
+        assert_eq!(
+            new_window_url(&Url::parse("https://example.com/path").unwrap()).as_deref(),
+            Some("https://example.com/path")
+        );
+        assert_eq!(
+            new_window_url(&Url::parse("http://example.com/").unwrap()).as_deref(),
+            Some("http://example.com/")
+        );
+        assert_eq!(
+            new_window_url(&Url::parse("http://localhtml.localhost/C:/x/page.html").unwrap()).as_deref(),
+            Some("file:///C:/x/page.html")
+        );
+        assert_eq!(
+            new_window_url(&Url::parse("localhtml://localhost/C:/x/page.html").unwrap()).as_deref(),
+            Some("file:///C:/x/page.html")
+        );
+        for denied in [
+            "about:blank",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "file:///C:/x/page.html",
+            "mailto:test@example.com",
+            "tel:+123456",
+        ] {
+            let url = Url::parse(denied).unwrap();
+            assert!(new_window_url(&url).is_none(), "应拒绝新窗口地址: {denied}");
+        }
     }
 
     #[test]
