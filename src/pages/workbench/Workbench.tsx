@@ -270,7 +270,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
             <div className={`activity-icon${panel === 'servers' ? ' active' : ''}`} data-panel="servers" title="服务器列表"><Icon name="monitor" /></div>
             <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
             <div className={`activity-icon${panel === 'skills' ? ' active' : ''}`} data-panel="skills" title="Skill"><Icon name="sparkles" /></div>
-            <div className={`activity-icon${panel === 'notes' ? ' active' : ''}`} data-panel="notes" title="笔记"><Icon name="note" /></div>
+            <div className={`activity-icon${panel === 'notes' ? ' active' : ''}`} data-panel="notes" title="笔记"><Icon name="pencil" /></div>
             <div className="activity-icon" data-panel="browser" title="浏览器(在标签页中打开)"><Icon name="globe" /></div>
           </div>
         <div id="sidebar" ref={sidebarRef}>
