@@ -962,6 +962,19 @@ mod tests {
     }
 
     #[test]
+    fn task_project_skills_root_uses_synthetic_store_project() {
+        let (store, ws) = store_with_workspace("task-root");
+        let root = project_skills_root(&store, crate::store::TASK_PROJECT_ID).unwrap();
+        assert_eq!(
+            root,
+            ws.join(".aishell")
+                .join("tasks")
+                .join(".aishell")
+                .join("skills")
+        );
+    }
+
+    #[test]
     fn roots_derive_from_workspace_and_project() {
         let (store, ws) = store_with_workspace("roots");
         assert_eq!(

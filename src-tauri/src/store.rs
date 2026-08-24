@@ -857,6 +857,27 @@ pub struct Store {
 }
 
 const STATE_FILE: &str = "aishell.json";
+/// 系统任务项目的保留 ID。该值参与 `<projectId>:<sessionId>` 会话 key，不能含冒号。
+pub const TASK_PROJECT_ID: &str = "system-tasks";
+const TASK_PROJECT_NAME: &str = "系统任务";
+
+fn is_task_project_id(project_id: &str) -> bool {
+    project_id == TASK_PROJECT_ID
+}
+
+/// 系统任务项目的固定目录：`<workspace>/.aishell/tasks`。
+fn task_project_for_workspace(workspace: &str) -> Project {
+    let path = PathBuf::from(workspace).join(".aishell").join("tasks");
+    Project {
+        id: TASK_PROJECT_ID.to_string(),
+        name: TASK_PROJECT_NAME.to_string(),
+        path: Some(path.to_string_lossy().into_owned()),
+        server_ids: Vec::new(),
+        quick_commands: Vec::new(),
+        folder: String::new(),
+        ai_mode: AiMode::Agent,
+    }
+}
 
 /// 内置技能播种代际：skills.rs 新增内置技能时 +1。记录值为 `<ws>#gen<N>`；
 /// 老记录是裸 `<ws>`（gen1，仅 skill-management 时代），不匹配新一代标记 →
@@ -1445,6 +1466,9 @@ impl Store {
     }
 
     pub fn upsert_project(&self, project: Project) -> Result<(), String> {
+        if is_task_project_id(&project.id) {
+            return Err("系统任务项目不可修改".to_string());
+        }
         // 命令收藏非空 folder 自动注册进 command_folders、项目自身非空 folder 自动注册进
         // project_folders（前端手输新目录保存时无需先建目录）
         let folders: Vec<String> = project
@@ -1473,6 +1497,9 @@ impl Store {
 
     /// 删除项目并顺带清理该项目的 sessions。
     fn delete_project(&self, id: &str) -> Result<(), String> {
+        if is_task_project_id(id) {
+            return Err("系统任务项目不可删除".to_string());
+        }
         self.with_state(|s| {
             s.projects.retain(|p| p.id != id);
             s.sessions.remove(id);
@@ -1711,8 +1738,27 @@ impl Store {
         Ok(root)
     }
 
-    /// 项目本地路径；未设置或项目不存在返回 None。
+    /// 系统任务项目：不落入 AppState.projects，按当前 workspace 合成并确保目录存在。
+    /// 任务项目固定使用 `<workspace>/.aishell/tasks`，没有 workspace 时返回可执行的中文错误。
+    pub fn task_project(&self) -> Result<Project, String> {
+        let workspace = self
+            .settings()
+            .workspace_dir
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "请先在设置中配置工作区目录".to_string())?;
+        let project = task_project_for_workspace(workspace.trim());
+        fs::create_dir_all(
+            PathBuf::from(project.path.as_deref().unwrap_or_default()).join(".aishell"),
+        )
+        .map_err(|e| format!("创建系统任务目录失败: {e}"))?;
+        Ok(project)
+    }
+
+    /// 项目本地路径；任务项目按 workspace 合成，普通项目未设置或不存在返回 None。
     pub fn project_path(&self, project_id: &str) -> Option<String> {
+        if is_task_project_id(project_id) {
+            return self.task_project().ok().and_then(|p| p.path);
+        }
         let guard = self.state.lock().ok()?;
         guard
             .projects
@@ -1721,8 +1767,11 @@ impl Store {
             .and_then(|p| p.path.clone())
     }
 
-    /// 项目配置（clone 返回）；不存在返回 None。
+    /// 项目配置（clone 返回）；系统任务项目按 workspace 合成，不写入 projects。
     pub fn project(&self, project_id: &str) -> Option<Project> {
+        if is_task_project_id(project_id) {
+            return self.task_project().ok();
+        }
         let guard = self.state.lock().ok()?;
         guard.projects.iter().find(|p| p.id == project_id).cloned()
     }
@@ -1732,13 +1781,25 @@ impl Store {
         self.state.lock().map(|g| g.servers.clone()).unwrap_or_default()
     }
 
-    /// 全部项目（clone 返回）。SDK 导入按名称去重等用。
+    /// 全部普通项目（clone 返回）。系统任务合成项目永不暴露给项目列表或 SDK 导入。
     pub fn projects_all(&self) -> Vec<Project> {
-        self.state.lock().map(|g| g.projects.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| {
+                g.projects
+                    .iter()
+                    .filter(|p| !is_task_project_id(&p.id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// 项目 AI 模式；项目不存在返回 None。
+    /// 项目 AI 模式；系统任务上下文固定为 Agent，普通项目不存在返回 None。
     pub fn ai_mode(&self, project_id: &str) -> Option<AiMode> {
+        if is_task_project_id(project_id) {
+            return Some(AiMode::Agent);
+        }
         let guard = self.state.lock().ok()?;
         guard
             .projects
@@ -1748,7 +1809,15 @@ impl Store {
     }
 
     /// 原子更新单个项目的 ai_mode（只改目标字段，不回传整个 Project）。
+    /// 系统任务上下文固定 Agent，拒绝任何试图打开 yolo 的调用。
     pub fn set_ai_mode(&self, project_id: &str, mode: AiMode) -> Result<(), String> {
+        if is_task_project_id(project_id) {
+            return if mode == AiMode::Agent {
+                Ok(())
+            } else {
+                Err("系统任务上下文固定为工作模式".to_string())
+            };
+        }
         self.with_state(|s| {
             let p = s
                 .projects
@@ -1964,6 +2033,12 @@ pub async fn get_state(store: State<'_, Arc<Store>>) -> Result<AppState, String>
         .lock()
         .map_err(|_| "store 状态锁损坏".to_string())?;
     Ok(guard.clone())
+}
+
+/// 返回欢迎页系统任务上下文；该合成项目不写入 AppState.projects。
+#[tauri::command]
+pub async fn get_task_project(store: State<'_, Arc<Store>>) -> Result<Project, String> {
+    store.task_project()
 }
 
 #[tauri::command]
@@ -4355,6 +4430,102 @@ mod tests {
         // 非法字面量拒绝（fail-closed）
         assert!(serde_json::from_str::<AiMode>("\"yolo2\"").is_err());
         assert!(serde_json::from_str::<AiMode>("\"YOLO\"").is_err());
+    }
+
+    #[test]
+    fn task_project_is_synthetic_fixed_path_and_agent_only() {
+        let dir = temp_config_dir("task-project");
+        let workspace = std::env::temp_dir().join(format!(
+            "aishell-store-task-ws-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        let store = test_store(dir.clone());
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(workspace.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store.task_project().unwrap();
+        assert_eq!(task.id, TASK_PROJECT_ID);
+        assert!(!TASK_PROJECT_ID.contains(':'), "任务项目 ID 不能含冒号");
+        assert_eq!(task.name, "系统任务");
+        assert_eq!(
+            task.path.as_deref(),
+            Some(workspace.join(".aishell").join("tasks").to_str().unwrap())
+        );
+        assert!(workspace.join(".aishell").join("tasks").join(".aishell").is_dir());
+        assert_eq!(store.project(TASK_PROJECT_ID), Some(task.clone()));
+        assert_eq!(store.project_path(TASK_PROJECT_ID), task.path);
+        assert_eq!(store.ai_mode(TASK_PROJECT_ID), Some(AiMode::Agent));
+        assert!(store.projects_all().iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store.set_ai_mode(TASK_PROJECT_ID, AiMode::Agent).is_ok());
+        assert_eq!(
+            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Yolo).unwrap_err(),
+            "系统任务上下文固定为工作模式"
+        );
+        assert_eq!(
+            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Suggest).unwrap_err(),
+            "系统任务上下文固定为工作模式"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn task_project_requires_workspace_and_reserved_id_rejected() {
+        let dir = temp_config_dir("task-project-reject");
+        let store = test_store(dir);
+        assert_eq!(store.task_project().unwrap_err(), "请先在设置中配置工作区目录");
+        let task = Project {
+            id: TASK_PROJECT_ID.to_string(),
+            name: "伪造任务项目".to_string(),
+            path: None,
+            server_ids: Vec::new(),
+            quick_commands: Vec::new(),
+            folder: String::new(),
+            ai_mode: AiMode::Yolo,
+        };
+        assert_eq!(store.upsert_project(task), Err("系统任务项目不可修改".to_string()));
+        assert_eq!(store.delete_project(TASK_PROJECT_ID), Err("系统任务项目不可删除".to_string()));
+        store
+            .with_state(|s| {
+                s.projects.push(Project {
+                    id: TASK_PROJECT_ID.to_string(),
+                    name: "历史任务项目".to_string(),
+                    path: None,
+                    server_ids: Vec::new(),
+                    quick_commands: Vec::new(),
+                    folder: String::new(),
+                    ai_mode: AiMode::Agent,
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.projects_all().iter().all(|p| p.id != TASK_PROJECT_ID));
+    }
+
+    #[test]
+    fn task_project_sessions_are_stored_without_project_record() {
+        let dir = temp_config_dir("task-sessions");
+        let store = test_store(dir.clone());
+        let session = ChatSession {
+            id: "task-session".to_string(),
+            title: "迁移探查".to_string(),
+            messages: vec![test_chat_msg("user", "只读探查")],
+            auto_title_triggered: false,
+            archived: false,
+        };
+        store.session_upsert(TASK_PROJECT_ID, session.clone()).unwrap();
+        assert_eq!(store.sessions_get(TASK_PROJECT_ID).unwrap(), vec![session]);
+        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        let reloaded = test_store(dir);
+        assert_eq!(reloaded.sessions_get(TASK_PROJECT_ID).unwrap().len(), 1);
     }
 
     #[test]
