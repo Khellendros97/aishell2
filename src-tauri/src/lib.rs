@@ -199,6 +199,7 @@ pub fn run() {
             open_devtools,
             store::is_config_complete,
             store::get_state,
+            store::get_task_project,
             store::save_settings,
             store::set_theme,
             store::upsert_server,

@@ -1291,8 +1291,9 @@ fn handle_extension_ui_request(
             }
         }
 
-        // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）
-        if store2.approval_mode() == ApprovalMode::Smart {
+        // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）。
+        // 系统任务上下文是受控迁移任务，必须逐调用人工确认，不能被全局 smart 自动放行。
+        if should_use_smart_approval(project_id, store2.approval_mode()) {
             let runtime = rt.get_or_insert_with(|| {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1413,6 +1414,11 @@ fn handle_extension_ui_request(
         let _ = app2.emit(event, ev_json);
     }
     // 其余 UI 请求（notify/setStatus 等）不转发也不响应（fire-and-forget）
+}
+
+/// 任务上下文必须人工审批；普通项目才允许按全局设置进入智能审批。
+fn should_use_smart_approval(project_id: &str, mode: ApprovalMode) -> bool {
+    project_id != crate::store::TASK_PROJECT_ID && mode == ApprovalMode::Smart
 }
 
 /// 审批上下文：run_command 取命令/目标/服务器/工作目录（LLM 判定输入）；其余动作空串。
@@ -2355,6 +2361,14 @@ mod tests {
         // 同 list 序稳定（skill_fingerprint 固定字段顺序，不依赖 hash 随机性）
         let fp_repeated = skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]);
         assert_eq!(fp_repeated, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
+    }
+
+    #[test]
+    fn task_project_never_uses_smart_approval() {
+        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::Smart));
+        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::All));
+        assert!(should_use_smart_approval("proj-1", ApprovalMode::Smart));
+        assert!(!should_use_smart_approval("proj-1", ApprovalMode::All));
     }
 
     #[test]
