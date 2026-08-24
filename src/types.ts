@@ -509,6 +509,40 @@ export interface NotesListing {
 /** session_archive 归档模式：new = 新建笔记 / update = 整合进既有笔记 / only = 仅归档不生成笔记 */
 export type ArchiveMode = 'new' | 'update' | 'only';
 
+/** dws 认证状态（dws_auth_status 返回；installed=false 表示本机未安装 dws CLI） */
+export interface DwsAuthStatus {
+  installed: boolean;
+  authenticated: boolean;
+  userName: string;
+  corpName: string;
+}
+
+/** 钉钉日志模版（dws_report_templates 返回） */
+export interface DwsTemplate {
+  id: string;
+  name: string;
+}
+
+/** 日志内容项（与 dws report entry submit --contents 数组元素对齐；发布预览可编辑 content） */
+export interface DwsReportContent {
+  key: string;
+  sort: string;
+  content: string;
+  contentType: string;
+  type: string;
+}
+
+/** dws_report_generate 返回：解析出的模版 id + LLM 整理的 contents JSON 字符串（pretty） */
+export interface DwsReportDraft {
+  templateId: string;
+  contents: string;
+}
+
+/** dws_report_submit 返回：openUrl = 钉钉日志跳转链接（dws 缺失时为 null） */
+export interface DwsSubmitResult {
+  openUrl?: string | null;
+}
+
 /** sessions: projectId -> ChatSession[] */
 export interface AppState {
   settings: Settings;

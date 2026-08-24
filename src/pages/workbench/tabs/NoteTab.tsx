@@ -8,6 +8,7 @@
  *     (配置抄 ai-engine.ts:429);切到预览前先把未保存内容落盘;
  *   - 脏标记 ● + 800ms 防抖自动保存 + Ctrl+S + 关闭时静默落盘;
  *   - onFsChanged 模块级订阅:同路径无脏改动重载,有脏改动 toast 提示(照 EditorTab.tsx:882)。
+ *   - 工具栏「发布日志」:落盘后开 PublishReportModal(发布钉钉日志,见 ../notes/PublishReportModal.tsx)。
  * keep-alive 契约:effect 依赖 [tab.id](硬约束 9:tab 对象引用会被 setTabTitle 换,不可作依赖)。
  * 接口点:fs_read / fs_write / fs:changed;外部入口 openNote(tab id = note:<path> 去重激活)。
  */
@@ -24,6 +25,7 @@ import { useWorkbench, tabApis, type Tab, type TabProps } from '../../../stores/
 import { onThemeChange } from '../../../theme';
 import { Icon } from '../../../shared/Icon';
 import { reconfigureTheme, editorCmThemeExt } from './EditorTab';
+import { openPublishReportModal } from '../notes/PublishReportModal';
 import './note.css';
 
 /* Markdown 预览渲染器:配置抄 ai-engine.ts(html:false 转义原始 HTML 防 XSS,
@@ -215,6 +217,15 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
     setMode(next);
   };
 
+  /* 发布钉钉日志:先落盘(后端 generate 按路径读文件),再开发布模态框 */
+  const publishReport = (): void => {
+    const entry = entryRef.current;
+    if (!entry) return;
+    const open = (): void => openPublishReportModal({ notePath: entry.path, noteName: entry.baseTitle });
+    if (entry.dirty) void queueSave(entry, true).then(open);
+    else open();
+  };
+
   const previewHtml = mode === 'preview'
     ? md.render(entryRef.current?.view.state.doc.toString() ?? '')
     : '';
@@ -232,6 +243,9 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
             onClick={() => switchMode('preview')}
           ><Icon name="eye" /> 预览</button>
         </div>
+        <button className="btn small" title="将笔记整理后发布为钉钉日志" onClick={publishReport}>
+          <Icon name="upload" /> 发布日志
+        </button>
         <span className="note-path ellipsis" title={String(tab.data.path ?? '')}>
           {String(tab.data.path ?? '')}
         </span>

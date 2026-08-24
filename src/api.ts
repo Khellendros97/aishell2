@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -434,6 +434,21 @@ export const sessionNote = (args: {
   noteRel?: string | null;
   transcript: string;
 }) => call<string>('session_note', args);
+
+/* ---------------- 钉钉日志发布（Rust dws.rs，经本机 dws CLI） ----------------
+   流程：dwsAuthStatus 检测认证 → dwsReportTemplates 列模版 → dwsReportGenerate
+   （后端读笔记 + 查模版字段 + LLM 整理为 contents JSON，前端预览可编辑）→
+   dwsReportSubmit（后端写临时 report.json 调 dws 提交，无论成败即删临时文件）。 */
+/** 检测 dws 认证状态；installed=false 表示未安装 dws CLI，由前端展示引导 */
+export const dwsAuthStatus = () => call<DwsAuthStatus>('dws_auth_status');
+/** 列出当前用户可用的日志模版 */
+export const dwsReportTemplates = () => call<DwsTemplate[]>('dws_report_templates');
+/** LLM 整理笔记为日志 contents JSON；返回模版 id + contents 字符串（pretty，供预览编辑） */
+export const dwsReportGenerate = (templateName: string, notePath: string) =>
+  call<DwsReportDraft>('dws_report_generate', { templateName, notePath });
+/** 按模版提交日志；contentsJson 须为 DwsReportContent 数组的 JSON 串 */
+export const dwsReportSubmit = (templateId: string, contentsJson: string) =>
+  call<DwsSubmitResult>('dws_report_submit', { templateId, contentsJson });
 
 /* ---------------- skills ---------------- *//** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
 export const skillsList = (projectId: string) => call<SkillSummary[]>('skills_list', { projectId });

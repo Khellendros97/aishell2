@@ -1,0 +1,97 @@
+/* 发布钉钉日志模态框(PublishReportModal.tsx)局部样式;基础骨架复用 design.css 的 .modal*/.field/.input */
+
+.publish-report-modal {
+  width: 560px;
+}
+
+.publish-report-modal .modal-body {
+  max-height: 60vh;
+}
+
+.pr-note {
+  margin-bottom: 10px;
+}
+
+.pr-templates {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.pr-template {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.pr-template:hover {
+  background: var(--bg-2);
+}
+
+.pr-template input {
+  margin: 0;
+}
+
+.pr-content {
+  width: 100%;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+.pr-tip {
+  margin-bottom: 10px;
+}
+
+.pr-guide {
+  line-height: 1.7;
+  padding: 8px 0;
+}
+
+.pr-guide code {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12px;
+  user-select: all;
+}
+
+.pr-success {
+  color: var(--green, #3fb950);
+}
+
+.pr-busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-1);
+}
+
+.pr-busy svg {
+  animation: pr-spin 1s linear infinite;
+}
+
+@keyframes pr-spin {
+  to { transform: rotate(360deg); }
+}
+
+.pr-error {
+  margin-top: 10px;
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.pr-link {
+  margin-top: 8px;
+  word-break: break-all;
+  font-size: 12px;
+}

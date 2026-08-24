@@ -4,6 +4,7 @@ pub mod ai_images;
 pub mod ai_impact;
 pub mod browser;
 pub mod cloud;
+pub mod dws;
 pub mod fsops;
 pub mod notes;
 pub mod session_title;
@@ -319,6 +320,10 @@ pub fn run() {
             notes::notes_list_cmd,
             notes::session_archive,
             notes::session_note,
+            dws::dws_auth_status,
+            dws::dws_report_templates,
+            dws::dws_report_generate,
+            dws::dws_report_submit,
             trace::trace_status,
             trace::trace_set_enabled,
             trace::trace_read,
