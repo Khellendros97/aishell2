@@ -20,6 +20,8 @@ export const openDevtools = () => call<void>('open_devtools');
    apiKey / braveKey / password 传 null 表示「不修改已保存的密钥」。 */
 export const isConfigComplete = () => call<boolean>('is_config_complete');
 export const getState = () => call<AppState>('get_state');
+/** 欢迎页 AI 的系统任务上下文；不进入普通项目列表。 */
+export const getTaskProject = () => call<Project>('get_task_project');
 export const saveSettings = (settings: Settings, apiKey: string | null, braveKey: string | null) =>
   call<void>('save_settings', { settings, apiKey, braveKey });
 /** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */

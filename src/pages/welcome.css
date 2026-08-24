@@ -3,7 +3,27 @@
    分组标题样式沿用设置页 server-group 的风格但改名 .proj-group-*，避免与历史样式混淆。 */
 .page-root { display: flex; flex-direction: column; height: 100vh; }
 
-.welcome-page main { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 32px; }
+.welcome-page .welcome-content { flex: 1; min-height: 0; display: flex; }
+.welcome-page main { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 20px 24px 32px; }
+.welcome-page .welcome-ai {
+  width: clamp(360px, 34vw, 520px); flex: none; min-height: 0;
+  display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--bg-1);
+}
+.welcome-page .welcome-ai-head {
+  height: 42px; flex: none; display: flex; align-items: center; gap: 7px;
+  padding: 0 12px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600;
+}
+.welcome-page .welcome-ai-head .tag { margin-left: auto; font-weight: 400; }
+.welcome-page .welcome-ai-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.welcome-page .welcome-ai-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 28px; text-align: center; color: var(--text-2); font-size: 12px;
+}
+.welcome-page .welcome-ai-empty strong { color: var(--text-0); font-size: 14px; }
+@media (max-width: 980px) {
+  .welcome-page .welcome-ai { width: 360px; }
+  .welcome-page .welcome-toolbar #proj-search { max-width: none; width: 100%; }
+}
 .welcome-page .welcome-logo-watermark {
   position: fixed; z-index: 0; pointer-events: none; opacity: 0.08;
   left: 50vw; top: calc(var(--topbar-h) + (100vh - var(--topbar-h)) / 2);
@@ -16,7 +36,7 @@
 .welcome-page .page-head h2 { font-size: 16px; font-weight: 600; }
 .welcome-page .page-head .spacer { flex: 1; }
 
-/* ---------- 工具行：搜索 / 全部展开折叠 / 视图切换 / Xshell 导入 / 分类目录 / 新建项目 ---------- */
+/* ---------- 工具行：搜索 / 全部展开折叠 / 视图切换 / SSH 配置迁移 / 分类目录 / 新建项目 ---------- */
 .welcome-page .welcome-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
 .welcome-page .welcome-toolbar #proj-search { flex: 1; min-width: 200px; max-width: 340px; }
 .welcome-page .view-switch {
@@ -25,13 +45,6 @@
 }
 .welcome-page .view-switch .icon-btn { width: 26px; height: 24px; font-size: 13px; border-radius: 4px; }
 .welcome-page .view-switch .icon-btn.active { background: var(--bg-3); color: var(--accent); }
-
-/* ---------- Xshell 导入提示条（needsAttention>0 时展示） ---------- */
-.welcome-page .import-note {
-  display: flex; align-items: center; gap: 8px;
-  margin: 0 0 14px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
-  background: var(--yellow-dim); color: var(--yellow); border-radius: var(--radius-s);
-}
 
 /* ---------- 项目分类目录分组 ---------- */
 .welcome-page .proj-group { margin-bottom: 10px; }

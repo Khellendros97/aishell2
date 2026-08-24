@@ -121,6 +121,28 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| format!("保存笔记失败: {e}"))
 }
 
+/// SDK 导入笔记（py 工具 aishell.config.import_note 的执行体）：rel 为笔记根内相对路径
+/// （缺 .md 后缀自动补上），父目录自动创建；已存在同名笔记整体覆盖（原子写）。
+/// 返回规范化后的相对路径（'/' 分隔）。
+pub(crate) fn import_note(store: &Store, rel: &str, content: &str) -> Result<String, String> {
+    if content.trim().is_empty() {
+        return Err("笔记内容不能为空".to_string());
+    }
+    let root = store.notes_root()?;
+    let rel = rel.trim().trim_matches(['/', '\\']);
+    let rel = if rel.to_ascii_lowercase().ends_with(".md") {
+        rel.to_string()
+    } else {
+        format!("{rel}.md")
+    };
+    let target = resolve_in_root(&root, &rel, false)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建笔记目录失败: {e}"))?;
+    }
+    write_atomic(&target, content)?;
+    Ok(rel.replace('\\', "/"))
+}
+
 const NOTE_TIMEOUT: Duration = Duration::from_secs(180);
 const NOTE_MAX_TOKENS: u32 = 8192;
 
