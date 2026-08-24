@@ -11,6 +11,8 @@ pub mod smart_approval;
 pub mod staging;
 #[cfg(windows)]
 pub mod gitinstall;
+pub mod pythoninstall;
+pub mod pysdk;
 pub mod fsops;
 pub mod sftp;
 pub mod skills;
@@ -153,10 +155,18 @@ pub fn run() {
             // （dialog 插件内部 run_on_main_thread 依赖主循环在运行）。
             #[cfg(windows)]
             {
-                let app = app.handle().clone();
+                let app_git = app.handle().clone();
+                let app_py = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(1500));
-                    gitinstall::ensure_on_startup(&app);
+                    gitinstall::ensure_on_startup(&app_git);
+                });
+                // Python3 首启引导（py 工具运行时依赖）：与 Git 同一套「检测 → 同意 → 静默装」
+                // 流程。错开 3 秒：两者都缺失时避免两个确认框同时弹出（dialog 会排队，但
+                // 间隔出让 Git 的弹框先展示更符合依赖直觉）。
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(4500));
+                    pythoninstall::ensure_on_startup(&app_py);
                 });
             }
             if let Some(win) = app.get_webview_window("main") {
@@ -189,6 +199,7 @@ pub fn run() {
             open_devtools,
             store::is_config_complete,
             store::get_state,
+            store::get_task_project,
             store::save_settings,
             store::set_theme,
             store::upsert_server,

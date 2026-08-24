@@ -72,10 +72,15 @@ pub struct SkillDocument {
 
 const SKILL_FILE: &str = "SKILL.md";
 pub const SKILL_MANAGEMENT_NAME: &str = "skill-management";
+pub const SKILL_PYTHON_SCRIPT_NAME: &str = "python-script";
 
 /// 内置 skill-management 模板（include_str! 嵌入，不修改 Tauri bundle resources）。
 pub const BUILTIN_SKILL_MANAGEMENT: &str =
     include_str!("builtin_skills/skill-management/SKILL.md");
+
+/// 内置 python-script 模板（py 工具 + aishell SDK 用法指导）。
+pub const BUILTIN_SKILL_PYTHON_SCRIPT: &str =
+    include_str!("builtin_skills/python-script/SKILL.md");
 
 // ---------------------------------------------------------------- 根目录推导
 
@@ -714,6 +719,29 @@ pub fn save_skill(
     }
 }
 
+/// 解析 SKILL.md 内容 frontmatter 的 name（SDK 导入判断新增/覆盖用）。
+pub(crate) fn skill_name_of(content: &str) -> Result<String, String> {
+    let split = split_frontmatter(content)?;
+    let v = parse_fm_value(split.fm)?;
+    Ok(validate_fm_common(&v)?.name)
+}
+
+/// 解析 SKILL.md 内容 frontmatter 的 scope（缺失/空已规范化为 ["all"]）；
+/// SDK 导入未显式传 scope 参数时以此保留内容里的声明。
+pub(crate) fn skill_scope_of(content: &str) -> Result<Vec<String>, String> {
+    let split = split_frontmatter(content)?;
+    let v = parse_fm_value(split.fm)?;
+    Ok(validate_fm(&v)?.1)
+}
+
+/// 指定技能是否已存在于对应根（SDK 导入判断覆盖语义用）。
+pub(crate) fn skill_exists(store: &Store, project_id: &str, origin: SkillOrigin, name: &str) -> bool {
+    let Ok(root) = skills_root(store, project_id, origin) else {
+        return false;
+    };
+    validated_skill_dir(&root, origin, project_id, name).is_ok()
+}
+
 /// 删除技能：不存在报错；递归删除前重复做根内校验。
 pub fn delete_skill(
     store: &Store,
@@ -751,24 +779,76 @@ pub fn set_skill_enabled(
 
 // ---------------------------------------------------------------- 内置播种
 
-/// 内置 skill-management 一次性播种：`<workspace>/.aishell/skills/skill-management/SKILL.md`。
-/// 目标已存在则保留用户文件不覆盖；返回 Ok 表示文件已就绪（已存在或成功创建）。
+/// 内置技能一次性播种：`<workspace>/.aishell/skills/<name>/SKILL.md` 逐个播种。
+/// 目标已存在则保留用户文件不覆盖；内置内容更新会推送给未被用户改过的播种副本
+/// （按 .builtin-sha256 侧车判定，见 seed_one_builtin_skill）。返回 Ok 表示全部就绪。
 pub fn seed_builtin_skill_files(workspace: &str) -> Result<(), String> {
-    let file = PathBuf::from(workspace)
-        .join(".aishell")
-        .join("skills")
-        .join(SKILL_MANAGEMENT_NAME)
-        .join(SKILL_FILE);
-    if file.is_file() {
-        return Ok(());
+    for (name, content) in [
+        (SKILL_MANAGEMENT_NAME, BUILTIN_SKILL_MANAGEMENT),
+        (SKILL_PYTHON_SCRIPT_NAME, BUILTIN_SKILL_PYTHON_SCRIPT),
+    ] {
+        seed_one_builtin_skill(workspace, name, content)?;
     }
-    let dir = file
-        .parent()
-        .ok_or_else(|| "内置技能路径非法".to_string())?;
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("创建内置技能目录失败（{}）: {e}", dir.display()))?;
-    std::fs::write(&file, BUILTIN_SKILL_MANAGEMENT)
-        .map_err(|e| format!("写入内置技能失败（{}）: {e}", file.display()))
+    Ok(())
+}
+
+/// 内置技能内容哈希侧车文件名（与 SKILL.md 同目录），用于区分「上次播种的原样文件」
+/// 与「用户改过的文件」——只有前者才允许推送内置内容更新。
+const BUILTIN_HASH_FILE: &str = ".builtin-sha256";
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// 播种单个内置技能：
+/// - SKILL.md 不存在 → 写入并记录内容哈希侧车；
+/// - 侧车哈希 == 当前内置内容哈希 → 已是最新，不动（用户改没改都不动）；
+/// - 侧车哈希落后，但磁盘文件仍与侧车一致（用户没改过）→ 覆盖为新内容并更新侧车；
+/// - 磁盘文件与侧车不一致（用户改过）→ 保留用户文件；
+/// - 无侧车（旧版本播种的）→ 仅当文件与当前内置内容一致时补记侧车，否则保守不动。
+fn seed_one_builtin_skill(workspace: &str, name: &str, content: &str) -> Result<(), String> {
+    let dir = PathBuf::from(workspace).join(".aishell").join("skills").join(name);
+    let file = dir.join(SKILL_FILE);
+    let sidecar = dir.join(BUILTIN_HASH_FILE);
+    let new_hash = sha256_hex(content.as_bytes());
+    // 先写 SKILL.md 再写侧车：若中途失败，下次运行时磁盘文件与侧车不一致，
+    // 按「用户改过」保守保留，不会把旧文件误标为已更新
+    let write_all = |dir: &Path, file: &Path, sidecar: &Path| -> Result<(), String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("创建内置技能目录失败（{}）: {e}", dir.display()))?;
+        std::fs::write(file, content)
+            .map_err(|e| format!("写入内置技能失败（{}）: {e}", file.display()))?;
+        std::fs::write(sidecar, &new_hash)
+            .map_err(|e| format!("写入内置技能哈希失败（{}）: {e}", sidecar.display()))
+    };
+    if !file.is_file() {
+        return write_all(&dir, &file, &sidecar);
+    }
+    match std::fs::read_to_string(&sidecar) {
+        Ok(recorded) => {
+            let recorded = recorded.trim();
+            if recorded == new_hash {
+                return Ok(());
+            }
+            let current = std::fs::read(&file)
+                .map_err(|e| format!("读取内置技能失败（{}）: {e}", file.display()))?;
+            if sha256_hex(&current) == recorded {
+                write_all(&dir, &file, &sidecar)?;
+            }
+            Ok(())
+        }
+        Err(_) => {
+            if let Ok(current) = std::fs::read(&file) {
+                if sha256_hex(&current) == new_hash {
+                    let _ = std::fs::write(&sidecar, &new_hash);
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------- Tauri commands
@@ -882,6 +962,19 @@ mod tests {
     }
 
     #[test]
+    fn task_project_skills_root_uses_synthetic_store_project() {
+        let (store, ws) = store_with_workspace("task-root");
+        let root = project_skills_root(&store, crate::store::TASK_PROJECT_ID).unwrap();
+        assert_eq!(
+            root,
+            ws.join(".aishell")
+                .join("tasks")
+                .join(".aishell")
+                .join("skills")
+        );
+    }
+
+    #[test]
     fn roots_derive_from_workspace_and_project() {
         let (store, ws) = store_with_workspace("roots");
         assert_eq!(
@@ -916,15 +1009,16 @@ mod tests {
     #[test]
     fn missing_root_returns_empty_without_creating() {
         let (store, _ws) = store_with_workspace("missing-root");
-        // 全局根已被播种（存在 skill-management）：改用项目根验证「根不存在 → 空且不创建」
+        // 全局根已被播种（存在内置技能）：改用项目根验证「根不存在 → 空且不创建」
         project(&store, "p1", "my-proj", None);
         let root = project_skills_root(&store, "p1").unwrap();
         let list = list_skills(&store, "p1").unwrap();
         assert!(!root.exists(), "列表不应创建根");
-        // 只有全局 skill-management
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "skill-management");
-        assert_eq!(list[0].origin, SkillOrigin::Global);
+        // 只有两个全局内置技能（skill-management + python-script）
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|s| s.origin == SkillOrigin::Global));
+        assert!(list.iter().any(|s| s.name == "skill-management"));
+        assert!(list.iter().any(|s| s.name == "python-script"));
         // 无 workspace 时全局根报错
         let store_no_ws = test_store(tmp_base("missing-root-nows"));
         let err = global_skills_root(&store_no_ws).unwrap_err();
@@ -1213,15 +1307,58 @@ mod tests {
         let ws = tmp_base("seed");
         std::fs::create_dir_all(&ws).unwrap();
         let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
+        let py_file = ws.join(".aishell").join("skills").join("python-script").join("SKILL.md");
         seed_builtin_skill_files(ws.to_str().unwrap()).unwrap();
         assert!(file.is_file(), "内置技能未播种");
+        assert!(py_file.is_file(), "python-script 内置技能未播种");
         let first = std::fs::read_to_string(&file).unwrap();
         assert!(first.contains("## 两个技能根目录"), "内置文档缺少目录结构说明");
         assert!(first.contains("## scope 语义"), "内置文档缺少 scope 语义");
+        let py_first = std::fs::read_to_string(&py_file).unwrap();
+        assert!(py_first.contains("aishell SDK"), "python-script 缺少 SDK 说明");
+        assert!(py_first.contains("name: python-script"), "python-script frontmatter 名称不符");
         // 已存在不覆盖
         std::fs::write(&file, "用户改写的文件").unwrap();
         seed_builtin_skill_files(ws.to_str().unwrap()).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "用户改写的文件", "已存在文件被覆盖");
+        assert_eq!(std::fs::read_to_string(&py_file).unwrap(), py_first, "python-script 被重复播种改写");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn seed_builtin_skill_pushes_update_only_when_unmodified() {
+        let ws = tmp_base("seed-update");
+        std::fs::create_dir_all(&ws).unwrap();
+        let dir = ws.join(".aishell").join("skills").join("demo");
+        let file = dir.join("SKILL.md");
+        // 首次播种 v1：写文件 + 哈希侧车
+        seed_one_builtin_skill(ws.to_str().unwrap(), "demo", "v1 内容").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1 内容");
+        assert!(dir.join(BUILTIN_HASH_FILE).is_file(), "缺少哈希侧车");
+        // 内置内容更新：文件未被用户改动（与侧车一致）→ 推送更新
+        seed_one_builtin_skill(ws.to_str().unwrap(), "demo", "v2 内容").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2 内容", "未改动的播种副本应收到更新");
+        // 用户改写后：再更新不覆盖
+        std::fs::write(&file, "用户定制").unwrap();
+        seed_one_builtin_skill(ws.to_str().unwrap(), "demo", "v3 内容").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "用户定制", "用户改过的文件被覆盖");
+
+        // 无侧车的旧播种文件：内容与当前内置一致 → 补记侧车
+        let dir2 = ws.join(".aishell").join("skills").join("demo2");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("SKILL.md"), "legacy 相同").unwrap();
+        seed_one_builtin_skill(ws.to_str().unwrap(), "demo2", "legacy 相同").unwrap();
+        assert!(dir2.join(BUILTIN_HASH_FILE).is_file(), "一致文件未补记侧车");
+        // 无侧车且内容与当前内置不一致（旧版/用户文件无法区分）→ 保守不动
+        let dir3 = ws.join(".aishell").join("skills").join("demo3");
+        std::fs::create_dir_all(&dir3).unwrap();
+        std::fs::write(dir3.join("SKILL.md"), "legacy 旧版内容").unwrap();
+        seed_one_builtin_skill(ws.to_str().unwrap(), "demo3", "全新内容").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir3.join("SKILL.md")).unwrap(),
+            "legacy 旧版内容",
+            "无侧车的异内容文件不应被覆盖"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

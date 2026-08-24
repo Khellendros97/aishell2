@@ -37,7 +37,7 @@
  * - 旧 Tab.api 字段（openTab 返回的渲染器句柄）→ tabApis 注册表（tabApis.get(tab.id)）；
  * - MutationObserver 容器移除守卫删除：React keep-alive 常驻挂载，卸载由 useEffect cleanup
  *   调 mountAiPanel 返回的清理函数完成；
- * - mountAiPanel(container) 返回清理函数（原为 void，靠 observer 触发 cleanup）。
+ * - mountAiPanel(container, options) 返回面板控制器（cleanup + 程序化新会话发送）。
  * 瞬时错误自动重试：pi 默认对限流/过载瞬时错误自动重试，失败尝试的错误气泡会被重试
  * 恢复的流式内容取代（delta 分支复活错误 pending）；重试以「自动重试」瞬时工具行提示，
  * 回合结束仍会收到 done（ai.rs 在 delta 恢复时重置终态抑制）。停止键不等后端事件，
@@ -507,6 +507,7 @@ const ACTION_NAMES: Record<string, string> = {
   staging_add: '主动暂存文件',
   staging_clear: '清理无变更暂存',
   request_db_connection: '申请数据库连接',
+  py: '执行 Python 脚本',
 };
 
 const ACTION_STATUS: Record<ActionCard['status'], string> = {
@@ -560,6 +561,13 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `主动暂存 ${String(args.remotePath ?? '')}（服务器 ${String(args.serverId ?? '')}）`;
     case 'staging_clear':
       return '清理暂存区无变更条目';
+    case 'py': {
+      const p = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
+      if (p) return `执行 Python 脚本 ${p}`;
+      const code = typeof args.code === 'string' ? args.code.trim() : '';
+      const lines = code ? code.split('\n').length : 0;
+      return `执行内联 Python 脚本（${lines} 行）`;
+    }
     default:
       return '';
   }
@@ -599,6 +607,23 @@ function cloneChatSession(s: ChatSession): ChatSession {
   };
 }
 
+export interface AiPanelOptions {
+  /** 显式 AI 上下文；工作台不传时沿用 zustand 当前项目。 */
+  project?: Project;
+  /** 是否接入工作台标签、暂存区和 wbHandles；欢迎页任务上下文关闭。 */
+  workbenchIntegration?: boolean;
+  /** 固定本地工作区域说明；设置后不跟随工作台标签切换。 */
+  fixedWorkareaPath?: string;
+  /** 锁定模式选择；系统任务上下文固定为工作模式。 */
+  lockedMode?: AiMode;
+}
+
+export interface AiPanelController {
+  cleanup(): void;
+  /** 新建独立会话并发送首条纯文本消息。 */
+  startConversation(prompt: string): Promise<void>;
+}
+
 interface ProjectContext {
   project: Project;
   sessions: Map<string, ChatSession>;
@@ -622,6 +647,9 @@ const projectContexts = new Map<string, ProjectContext>();
 let viewContext: ProjectContext | null = null;
 let eventContext: ProjectContext | null = null;
 let project: Project | null = null;
+let panelOptions: Required<Pick<AiPanelOptions, 'workbenchIntegration'>> & Omit<AiPanelOptions, 'workbenchIntegration' | 'project'> = {
+  workbenchIntegration: true,
+};
 /** 以下是当前视图上下文的别名，保留命令式引擎原有函数结构。 */
 let sessions = new Map<string, ChatSession>();
 let pendingBy = new Map<string, Pending | null>();
@@ -843,14 +871,22 @@ function saveViewContext(): void {
   if (viewContext) viewContext.activeSessionId = activeSessionId;
 }
 
-export function mountAiPanel(container: HTMLElement): () => void {
-  const nextProject = useWorkbench.getState().project;
+export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {}): AiPanelController {
+  const nextProject = options.project ?? useWorkbench.getState().project;
   if (!nextProject) {
     toast('项目未加载', 'error');
-    return () => { /* 项目尚未加载，不创建引擎状态 */ };
+    return {
+      cleanup: () => { /* 项目尚未加载，不创建引擎状态 */ },
+      startConversation: async () => { throw new Error('项目未加载'); },
+    };
   }
   const ctx = getProjectContext(nextProject);
   bindViewContext(ctx);
+  panelOptions = {
+    workbenchIntegration: options.workbenchIntegration !== false,
+    fixedWorkareaPath: options.fixedWorkareaPath,
+    lockedMode: options.lockedMode,
+  };
   unmounted = false;
 
   /* 输入引用属于当前面板，跨项目不串入下一个输入框；会话/流式状态属于项目上下文，
@@ -871,9 +907,12 @@ export function mountAiPanel(container: HTMLElement): () => void {
   workareaChipEl = null;
   activeSessionId = ctx.activeSessionId;
 
-  const style = document.createElement('style');
-  style.textContent = STYLE;
-  document.head.appendChild(style);
+  if (!document.getElementById('aishell-ai-panel-style')) {
+    const style = document.createElement('style');
+    style.id = 'aishell-ai-panel-style';
+    style.textContent = STYLE;
+    document.head.appendChild(style);
+  }
 
   container.innerHTML = `
     <div id="ai-session-bar">
@@ -930,23 +969,30 @@ export function mountAiPanel(container: HTMLElement): () => void {
   effortSelect = el('effort-select') as HTMLSelectElement;
   modeSelect = el('mode-select') as HTMLSelectElement;
   stagingNotice = el('staging-notice') as HTMLButtonElement;
-  modeSelect.value = project?.aiMode ?? 'suggest';
+  modeSelect.value = panelOptions.lockedMode ?? project?.aiMode ?? 'suggest';
+  if (panelOptions.lockedMode) {
+    modeSelect.disabled = true;
+    modeSelect.title = '系统任务上下文固定为工作模式';
+  }
 
-  wbHandles.ai = aiHandle;
+  const mountedHandle = createAiHandle();
+  if (panelOptions.workbenchIntegration) wbHandles.ai = mountedHandle;
 
   /* 自动切换 AI 工作区域：激活终端标签（含新开终端）时跟随切换。
      legacy 由 bus 'tab-activated' 广播（activeId 变化时发激活 Tab），
      这里订阅 store 状态按 activeId 变化推导，语义一致；AI 面板页级常驻（每页只挂一次），
      unmounted 守卫 + container.isConnected 守卫兜底 */
-  offTabActivated = useWorkbench.subscribe((s, prev) => {
-    if (s.activeId === prev.activeId) return;
-    if (unmounted || !container.isConnected) return;
-    if (autoSwitchAiWorkdir) updateWorkareaFromTab(getActiveTab(s));
-  });
+  if (panelOptions.workbenchIntegration) {
+    offTabActivated = useWorkbench.subscribe((s, prev) => {
+      if (s.activeId === prev.activeId) return;
+      if (unmounted || !container.isConnected) return;
+      if (autoSwitchAiWorkdir) updateWorkareaFromTab(getActiveTab(s));
+    });
 
-  offStagingChanged = wbEvents.on('staging-changed', () => {
-    if (!unmounted && container.isConnected) void refreshStagingNotice();
-  });
+    offStagingChanged = wbEvents.on('staging-changed', () => {
+      if (!unmounted && container.isConnected) void refreshStagingNotice();
+    });
+  }
   /* 标题事件是全局单例订阅；先启动注册，send 首条消息时再 await 同一个 Promise。 */
   void ensureSessionTitleListener().catch(() => { /* 发送流程仍可继续，标题命令失败不阻塞 ai_chat */ });
 
@@ -958,8 +1004,12 @@ export function mountAiPanel(container: HTMLElement): () => void {
   container.addEventListener('keydown', onPanelKeydown, true);
   void loadSessions();
   void loadEffort();
-  void refreshStagingNotice();
-  return cleanup;
+  if (panelOptions.workbenchIntegration) void refreshStagingNotice();
+  else stagingNotice.hidden = true;
+  return {
+    cleanup: () => cleanup(mountedHandle),
+    startConversation: (prompt: string) => startConversation(ctx, prompt),
+  };
 }
 
 function ensureSessionTitleListener(): Promise<void> {
@@ -1006,7 +1056,7 @@ function replayPendingSessionTitleEvents(ctx: ProjectContext): void {
   }
 }
 
-function cleanup(): void {
+function cleanup(handle: ReturnType<typeof createAiHandle>): void {
   if (unmounted) return;
   unmounted = true;
   cancelPendingRender();
@@ -1023,14 +1073,15 @@ function cleanup(): void {
   if (offSessionOutside) { offSessionOutside(); offSessionOutside = null; }
   if (offStagingChanged) { offStagingChanged(); offStagingChanged = null; }
   if (offTabActivated) { offTabActivated(); offTabActivated = null; }
-  if (wbHandles.ai === aiHandle) wbHandles.ai = null;
+  if (wbHandles.ai === handle) wbHandles.ai = null;
   /* 不退订项目/会话事件，也不 aiAbort/aiKillProject；上下文继续接收并保存后台流。 */
   viewContext = null;
   project = null;
 }
 
 /* ---------- wbHandles.ai 句柄（终端模块添加快照 / 服务器引用 / 路径引用） ---------- */
-const aiHandle = {
+function createAiHandle() {
+  return {
   addSnapshot(snap: TermSnapshot): void {
     if (!snap || !snap.id) return;
     snapshots.set(snap.id, snap);
@@ -1100,7 +1151,8 @@ const aiHandle = {
   currentSessionId(): string | null {
     return activeSessionId || null;
   },
-};
+  };
+}
 
 /* ---------- 会话管理 ---------- */
 function newSession(): ChatSession {
@@ -1108,6 +1160,22 @@ function newSession(): ChatSession {
   sessions.set(s.id, s);
   if (viewContext) void ensureSessionSubscription(viewContext, s.id);
   return s;
+}
+
+async function startConversation(ctx: ProjectContext, prompt: string): Promise<void> {
+  const text = prompt.trim();
+  if (!text) throw new Error('对话内容不能为空');
+  if (viewContext !== ctx || unmounted) throw new Error('AI 面板尚未就绪');
+  await loadSessions();
+  if (viewContext !== ctx || unmounted) throw new Error('AI 面板已离开当前页面');
+  const created = newSession();
+  ctx.activeSessionId = created.id;
+  activeSessionId = created.id;
+  await ensureSessionSubscription(ctx, created.id);
+  renderSessionBar();
+  renderHistory();
+  updateSendBtn();
+  await send(text);
 }
 
 function openCurrentStaging(): void {
@@ -1123,6 +1191,10 @@ function openCurrentStaging(): void {
 }
 
 async function refreshStagingNotice(): Promise<void> {
+  if (!panelOptions.workbenchIntegration) {
+    stagingNotice.classList.remove('visible');
+    return;
+  }
   const pid = project?.id;
   const sid = activeSessionId;
   const version = ++stagingRefreshVersion;
@@ -1235,12 +1307,17 @@ async function loadEffort(): Promise<void> {
   try {
     const st = await getState();
     effortSelect.value = st.settings.llm.effort || 'low';
-    autoSwitchAiWorkdir = !!st.settings.autoSwitchAiWorkdir;
+    autoSwitchAiWorkdir = panelOptions.fixedWorkareaPath
+      ? true
+      : panelOptions.workbenchIntegration && !!st.settings.autoSwitchAiWorkdir;
   } catch {
     /* 读取失败保持默认 low / 开启（与 Settings 默认一致） */
   }
-  // 开启自动切换时：初始工作区域默认本地；已有激活标签则跟随终端或浏览器
-  if (autoSwitchAiWorkdir) {
+  if (panelOptions.fixedWorkareaPath) {
+    workareaRef = { serverId: null, name: panelOptions.fixedWorkareaPath };
+    renderWorkareaChip();
+  } else if (autoSwitchAiWorkdir) {
+    // 开启自动切换时：初始工作区域默认本地；已有激活标签则跟随终端或浏览器
     const active = getActiveTab(useWorkbench.getState());
     if (active) updateWorkareaFromTab(active);
     renderWorkareaChip();
@@ -1411,6 +1488,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
        本地 write/edit 不改远程文件，不触发（后端对远程 write/edit 不发 fs:changed，
        本地文件刷新走 fs:changed 事件，见 editor.ts）。 */
     const isRemoteFileOp = ['write', 'edit', 'delete_path'].includes(ev.tool) && !!existing?.serverId;
+    if (ev.tool === 'py' && !ev.isError) window.dispatchEvent(new CustomEvent('aishell:data-changed'));
     if (ev.tool === 'run_command' || ev.tool === 'sftp_upload'
       || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff'
       || ev.tool === 'staging_add' || ev.tool === 'staging_clear'
@@ -2838,10 +2916,13 @@ function renderWorkareaChip(): void {
     return;
   }
   if (!workareaRef) workareaRef = { serverId: null, name: '本地终端' };
-  const label = workareaRef.serverId ? `@remote:${workareaRef.name}` : '@local';
-  const title = workareaRef.serverId
-    ? `当前 AI 工作区域：服务器「${workareaRef.name}」（随激活终端自动切换）`
-    : '当前 AI 工作区域：本地（随激活终端自动切换）';
+  const fixedPath = panelOptions.fixedWorkareaPath;
+  const label = fixedPath ? '@tasks' : workareaRef.serverId ? `@remote:${workareaRef.name}` : '@local';
+  const title = fixedPath
+    ? `当前 AI 工作区域：${fixedPath}`
+    : workareaRef.serverId
+      ? `当前 AI 工作区域：服务器「${workareaRef.name}」（随激活终端自动切换）`
+      : '当前 AI 工作区域：本地（随激活终端自动切换）';
   if (workareaChipEl && workareaChipEl.isConnected) {
     workareaChipEl.innerHTML = `${icon('globe')} ${escapeHtml(label)}`;
     workareaChipEl.title = title;
@@ -3148,7 +3229,7 @@ function ensureMentionEl(): void {
 /** 组装补全候选：浏览器页面 / 远程服务器 / 本地文件 / 本地目录 / 终端最后一条命令 */
 function buildMentionItems(): MentionItem[] {
   const items: MentionItem[] = [];
-  getBrowserPagesForMention().forEach((p) => {
+  if (panelOptions.workbenchIntegration) getBrowserPagesForMention().forEach((p) => {
     items.push({
       key: `page-${p.id}`,
       group: '浏览器页面',
@@ -3159,7 +3240,7 @@ function buildMentionItems(): MentionItem[] {
       apply: () => insertPageChip({ url: p.url, title: p.title, ts: Date.now() }),
     });
   });
-  (serversCache ?? []).forEach((sv) => {
+  if (panelOptions.workbenchIntegration) (serversCache ?? []).forEach((sv) => {
     items.push({
       key: `server-${sv.id}`,
       group: '远程服务器',
@@ -3183,7 +3264,7 @@ function buildMentionItems(): MentionItem[] {
       },
     });
   });
-  const termApi = getActiveTerminalApi();
+  const termApi = panelOptions.workbenchIntegration ? getActiveTerminalApi() : null;
   if (termApi) {
     items.push({
       key: 'term-last',
@@ -3230,7 +3311,7 @@ function updateMention(): void {
   ensureMentionEl();
   mentionAnchor = { node, at };
   mentionIndex = 0;
-  if (!serversCache) {
+  if (panelOptions.workbenchIntegration && !serversCache) {
     void getState().then((st) => {
       serversCache = st.servers;
       if (isMentionOpen()) renderMention(mentionQuery);
@@ -3401,7 +3482,7 @@ function isInputEmpty(): boolean {
 }
 
 /* ---------- 发送与流式接收 ---------- */
-async function send(): Promise<void> {
+async function send(textOverride?: string): Promise<void> {
   const ctx = viewContext;
   const targetProject = project;
   if (!ctx || !targetProject) {
@@ -3422,8 +3503,10 @@ async function send(): Promise<void> {
     return;
   }
   closeMention(); // 发送按钮路径可能带着打开的 @ 补全弹层
-  // 读取输入区：文本段与内嵌 chip 按输入框内顺序；content 落盘保留 token（历史按 token 还原位置）
-  const segments = readInputSegments();
+  // 读取输入区：文本段与内嵌 chip 按输入框内顺序；程序化首条消息直接使用纯文本段。
+  const segments: InputSegment[] = textOverride === undefined
+    ? readInputSegments()
+    : [{ kind: 'text', text: textOverride }];
   const seenIds = new Set<string>();
   /** chip 引用数据快照（clearChips 会清空全局 Map，prompt 展开用这份捕获） */
   const chipData = new Map<string, ChipDatum>();
@@ -3604,7 +3687,9 @@ async function buildPrompt(segments: InputSegment[], imgs: ImageRef[], chipData:
     }
   };
   const parts: string[] = [];
-  if (autoSwitchAiWorkdir && browserWorkarea) {
+  if (panelOptions.fixedWorkareaPath) {
+    parts.push(`[当前工作区域: 本地系统任务目录 ${panelOptions.fixedWorkareaPath}；未绑定任何远程服务器]\n`);
+  } else if (autoSwitchAiWorkdir && browserWorkarea) {
     parts.push('[当前工作区域: 浏览器]\n');
   } else if (autoSwitchAiWorkdir && workareaRef) {
     // 固定工作区域：作为当前目标上下文说明（输入框最前标签）
@@ -3862,7 +3947,7 @@ function bindEvents(): void {
   offSelectionChange = (): void => {
     document.removeEventListener('selectionchange', onSelChange);
   };
-  sendBtn.onclick = send;
+  sendBtn.onclick = () => { void send(); };
   effortSelect.onchange = () => {
     void switchEffort(effortSelect.value as LlmConfig['effort']);
   };

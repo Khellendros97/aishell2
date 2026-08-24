@@ -6,8 +6,8 @@
  * 后端接口点（均见 src/api.ts）：get_state / upsert_project / delete_project / upsert_server /
  * delete_server / create_project_folder / rename_project_folder / delete_project_folder /
  * set_ui_expanded（welcome:projectGroups 分组展开状态）/ save_settings（projectView 视图持久化）/
- * ensure_project_dirs（新建项目先拿最终路径再落盘）/ import_xshell_sessions / import_xshell_from_dir；
- * 浏览按钮走 @tauri-apps/plugin-dialog 的 openDialog。
+ * ensure_project_dirs（新建项目先拿最终路径再落盘）/ get_task_project（欢迎页 AI 系统任务上下文）；
+ * 浏览按钮走 @tauri-apps/plugin-dialog 的 openDialog，通用 SSH 配置迁移走 AI + python-script skill。
  *
  * 服务器表单（mini 快捷新建 + 弹层完整模式）由并行迁移的 src/pages/settings/ServerForm.tsx 提供，
  * ref 句柄语义以 legacy/pages/server-form.ts 的 ServerFormHandle 为准
@@ -24,16 +24,18 @@ import {
   useEffect, useLayoutEffect, useRef, useState,
   type CSSProperties, type DragEvent, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
-import type { AppState, Project, Server, XshellImportResult } from '../../types';
+import type { AppState, Project, Server } from '../../types';
 import {
   createProjectFolder, deleteProject, deleteProjectFolder, deleteServer, ensureProjectDirs,
-  getState, importXshellFromDir, importXshellSessions, openDialog, renameProjectFolder,
+  getState, getTaskProject, openDialog, renameProjectFolder,
   saveSettings, setUiExpanded, upsertProject, upsertServer,
 } from '../../api';
 import { attachCombo, confirmDialog, promptDialog, toast, uid } from '../../ui';
 import { Icon } from '../../shared/Icon';
 import { navigate } from '../../router';
 import { ServerForm, type ServerFormHandle } from '../settings/ServerForm';
+import { AiPanel } from '../workbench/ai/AiPanel';
+import type { AiPanelController } from '../workbench/ai/ai-engine';
 import '../welcome.css';
 
 const welcomeLogoUrl = new URL('../../assets/logo.svg', import.meta.url).href;
@@ -121,10 +123,12 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   /** 当前拖拽放置目标组（.drop-target 高亮，随 React 渲染管理） */
   const [dropTarget, setDropTarget] = useState<string | null>(null);
-  /** Xshell 导入进行态（按钮禁用 + 文案替换） */
+  /** 通用 SSH 工具迁移任务启动状态。 */
   const [importBusy, setImportBusy] = useState(false);
-  /** Xshell 导入后 needsAttention>0 时展示持久提示条；null = 隐藏 */
-  const [importNote, setImportNote] = useState<number | null>(null);
+  const [taskProject, setTaskProject] = useState<Project | null>(null);
+  const [taskError, setTaskError] = useState<string | null>(null);
+  const [taskAiReady, setTaskAiReady] = useState(false);
+  const taskAiRef = useRef<AiPanelController | null>(null);
 
   /* ---------- 项目模态框状态（新建 / 编辑） ---------- */
   const [modalOpen, setModalOpen] = useState(false);
@@ -606,35 +610,36 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
     toast(`已删除服务器「${server.name}」`, 'success');
   }
 
-  /* ---------- 从 Xshell 一键导入（自动扫描失败 → 目录选择器手动指定） ---------- */
-  async function importXshellFlow() {
-    // 导入结果落库并刷新（自动扫描与手动重试共用）
-    const applyResult = async (r: XshellImportResult) => {
-      setDb(await getState());
-      const projectNote = r.projectsCreated > 0 ? `，新建 ${r.projectsCreated} 个项目` : '';
-      toast(`Xshell 导入完成：新增 ${r.imported}，更新 ${r.updated}，未变化 ${r.unchanged}，跳过 ${r.skipped}${projectNote}`, 'success');
-      // needsAttention>0 时用页面内持久提示（toast 仅 2.2s 读不完长文案）；=0 时隐藏
-      setImportNote(r.needsAttention > 0 ? r.needsAttention : null);
-    };
+  /* ---------- AI 通用 SSH 配置迁移 ---------- */
+  async function importSshToolFlow() {
+    const toolName = await promptDialog({
+      title: '从其他 SSH 工具导入',
+      label: 'SSH 工具名称',
+      placeholder: '例如 XShell、SecureCRT、MobaXterm、FinalShell',
+      okText: '开始探查',
+    });
+    const name = (toolName ?? '').trim();
+    if (!name) return;
+    const controller = taskAiRef.current;
+    if (!controller || !taskProject) {
+      toast(taskError ?? 'AI 助手仍在初始化，请稍后重试', 'error');
+      return;
+    }
+    const prompt = `我要把「${name}」中的 SSH 配置迁移到 AIShell。请严格按以下流程执行：
+
+1. 首先读取并遵循已挂载的 python-script skill。当前是本地系统任务上下文，工作目录为 ${taskProject.path}，未绑定任何远程服务器。
+2. 第一阶段只能探查。使用只读 Python 检查环境变量与常见用户目录，定位「${name}」的安装目录、配置目录和 SSH 配置文件，扫描并解析必要结构。调用 py 前必须完整展示探查脚本及其只读影响，等待动作审批。
+3. 严禁读取、输出、解密或迁移密码、私钥正文、私钥短语、令牌等秘密。只收集并脱敏展示：配置路径、格式、条目数量、分组、名称、主机、端口、用户名、认证类型和私钥路径。
+4. 探查完成后停止操作，只用中文给出迁移方案：发现结果、字段映射、项目与服务器组织方式、按 host + port + username 去重的规则、预计新增/复用/跳过项、待用户补充的凭据及影响范围。必须等待我明确确认，确认前不得写文件、不得调用 aishell.config.import_project、不得修改 AIShell 配置。
+5. 我确认后，先完整展示最终 Python 迁移脚本及影响。脚本只能写入当前 tasks 工作目录，必须通过 from aishell import config 调用 config.import_project 等受控 SDK，禁止直接读取或编辑 aishell.json。随后调用 py 执行，并汇总新增、复用、跳过和待人工补凭据的结果。
+
+现在只开始第一阶段探查。`;
     setImportBusy(true);
     try {
-      await applyResult(await importXshellSessions());
+      await controller.startConversation(prompt);
+      toast(`已创建「${name}」配置迁移会话`, 'success');
     } catch (err) {
-      // 自动扫描失败（通常 Xshell 装在非默认位置）→ 弹目录选择器让用户手动指定会话目录重试
-      const dir = await openDialog({
-        directory: true,
-        title: '选择 Xshell 会话目录',
-      });
-      if (dir) {
-        setImportBusy(true);
-        try {
-          await applyResult(await importXshellFromDir(dir));
-        } catch (err2) {
-          toast(String(err2), 'error');
-        }
-      } else {
-        toast(String(err), 'error');
-      }
+      toast(`启动迁移会话失败：${String(err)}`, 'error');
     } finally {
       setImportBusy(false);
     }
@@ -655,6 +660,10 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
         }
       })
       .catch((err) => toast(String(err), 'error'));
+    void getTaskProject()
+      .then((p) => { setTaskProject(p); setTaskError(null); })
+      .catch((err) => setTaskError(String(err)));
+    return () => { taskAiRef.current = null; };
   }, []);
 
   /* 命令面板（Ctrl+T）等全局操作清空/变更数据后广播，此处重新拉取渲染 */
@@ -850,6 +859,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
   /* ---------- 页面骨架（DOM 结构 / 类名 / 文案与 legacy welcome.ts 一致） ---------- */
   return (
     <div className="welcome-page" style={PAGE_ROOT_STYLE}>
+      <div className="welcome-content">
       <main>
         <img className="welcome-logo-watermark" src={welcomeLogoUrl} alt="" aria-hidden="true" />
 
@@ -880,8 +890,8 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
             <button className={`icon-btn${viewMode === 'list' ? ' active' : ''}`} id="btn-view-list" title="列表视图"
               onClick={() => void switchView('list')}><Icon name="list" /></button>
           </div>
-          <button className="btn" id="btn-import-xshell" disabled={importBusy} onClick={() => void importXshellFlow()}>
-            {importBusy ? (<><Icon name="loader" /> 正在扫描 Xshell 会话…</>) : (<><Icon name="folder" /> 从 Xshell 导入</>)}
+          <button className="btn" id="btn-import-ssh-tool" disabled={importBusy || !taskProject || !taskAiReady} onClick={() => void importSshToolFlow()}>
+            {importBusy ? (<><Icon name="loader" /> 正在创建迁移会话…</>) : (<><Icon name="folder" /> 从其他 SSH 工具导入</>)}
           </button>
           <button className="btn" id="btn-new-folder" onClick={() => void createFolderFlow()}>
             <Icon name="folderPlus" /> 新建分类目录
@@ -889,12 +899,6 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
           <button className="btn primary" id="btn-new" onClick={() => openModal('new')}>
             <Icon name="plus" /> 新建项目
           </button>
-        </div>
-
-        <div className={`import-note${importNote === null ? ' hidden' : ''}`} role="status">
-          {importNote !== null && (
-            <><Icon name="alert" /> 已导入，但有 {importNote} 个会话需处理：Xshell 密码不会迁移；NSSSH 专用密钥请在 Xshell 的「工具 → 用户密钥管理器」中导出为无密码短语的 OpenSSH 私钥，再编辑服务器替换密钥路径</>
-          )}
         </div>
 
         <div id="proj-groups" onDragOver={onGroupsDragOver} onDrop={onGroupsDrop}>
@@ -942,6 +946,28 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
           <div>没有匹配的项目，试试其他关键词</div>
         </div>
       </main>
+      <aside className="welcome-ai" aria-label="AI 助手">
+        <div className="welcome-ai-head"><Icon name="bot" /><span>AI 助手</span><span className="tag">本地任务</span></div>
+        <div className="welcome-ai-body">
+          {taskProject ? (
+            <AiPanel
+              project={taskProject}
+              workbenchIntegration={false}
+              fixedWorkareaPath={taskProject.path ?? undefined}
+              lockedMode="agent"
+              onReady={(controller) => { taskAiRef.current = controller; setTaskAiReady(true); }}
+            />
+          ) : (
+            <div className="welcome-ai-empty">
+              <Icon name="alert" />
+              <strong>AI 助手暂不可用</strong>
+              <span>{taskError ?? '正在初始化任务工作区…'}</span>
+              <button className="btn" onClick={() => navigate('#/settings')}>前往设置</button>
+            </div>
+          )}
+        </div>
+      </aside>
+      </div>
 
       {/* 新建 / 编辑项目模态框（常驻挂载，.open 控制显隐，同 legacy 骨架） */}
       <div className={`modal-mask${modalOpen ? ' open' : ''}`} id="proj-modal"

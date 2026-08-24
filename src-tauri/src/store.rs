@@ -857,11 +857,41 @@ pub struct Store {
 }
 
 const STATE_FILE: &str = "aishell.json";
+/// 系统任务项目的保留 ID。该值参与 `<projectId>:<sessionId>` 会话 key，不能含冒号。
+pub const TASK_PROJECT_ID: &str = "system-tasks";
+const TASK_PROJECT_NAME: &str = "系统任务";
+
+fn is_task_project_id(project_id: &str) -> bool {
+    project_id == TASK_PROJECT_ID
+}
+
+/// 系统任务项目的固定目录：`<workspace>/.aishell/tasks`。
+fn task_project_for_workspace(workspace: &str) -> Project {
+    let path = PathBuf::from(workspace).join(".aishell").join("tasks");
+    Project {
+        id: TASK_PROJECT_ID.to_string(),
+        name: TASK_PROJECT_NAME.to_string(),
+        path: Some(path.to_string_lossy().into_owned()),
+        server_ids: Vec::new(),
+        quick_commands: Vec::new(),
+        folder: String::new(),
+        ai_mode: AiMode::Agent,
+    }
+}
+
+/// 内置技能播种代际：skills.rs 新增内置技能时 +1。记录值为 `<ws>#gen<N>`；
+/// 老记录是裸 `<ws>`（gen1，仅 skill-management 时代），不匹配新一代标记 →
+/// 老工作区会补种一次（seed_one_builtin_skill 文件级幂等，已有技能文件不覆盖）。
+const SEED_GENERATION: u32 = 2;
+
+/// 播种记录标记（`<ws>#gen<N>`）， seeded_skill_workspaces 按此精确匹配去重。
+fn seed_marker(ws: &str) -> String {
+    format!("{ws}#gen{SEED_GENERATION}")
+}
 
 /// 规范化 workspace 路径用于播种记录去重：目录存在时 canonicalize，否则原样（写入前会创建）。
 /// Windows canonicalize 的 `\\?\` verbatim 前缀统一剥掉，避免落盘记录形态不一致。
-fn normalize_ws(ws: &str) -> String {
-    let p = PathBuf::from(ws.trim());
+fn normalize_ws(ws: &str) -> String {    let p = PathBuf::from(ws.trim());
     let p = std::fs::canonicalize(&p).unwrap_or(p);
     #[cfg(windows)]
     let p = {
@@ -1036,9 +1066,10 @@ impl Store {
                 .filter(|w| !w.trim().is_empty())
             {
                 let ws = normalize_ws(ws);
-                if !s.seeded_skill_workspaces.contains(&ws) {
+                let marker = seed_marker(&ws);
+                if !s.seeded_skill_workspaces.contains(&marker) {
                     crate::skills::seed_builtin_skill_files(&ws)?;
-                    s.seeded_skill_workspaces.push(ws);
+                    s.seeded_skill_workspaces.push(marker);
                 }
             }
             s.settings = settings.clone();
@@ -1046,23 +1077,24 @@ impl Store {
         })
     }
 
-    /// 内置技能播种：workspace 非空且未记录时创建 `<workspace>/.aishell/skills/skill-management/SKILL.md`；
+    /// 内置技能播种：workspace 非空且未记录时创建 `<workspace>/.aishell/skills/<name>/SKILL.md`；
     /// 目标已存在则保留用户文件不覆盖；只有文件已存在或成功创建后才记录 workspace 并原子落盘。
     fn seed_builtin_skill(&self, workspace: &str) -> Result<(), String> {
         let ws = normalize_ws(workspace);
         if ws.is_empty() {
             return Ok(());
         }
+        let marker = seed_marker(&ws);
         {
             let guard = self.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
-            if guard.seeded_skill_workspaces.contains(&ws) {
+            if guard.seeded_skill_workspaces.contains(&marker) {
                 return Ok(());
             }
         }
         crate::skills::seed_builtin_skill_files(&ws)?;
         self.with_state(|s| {
-            if !s.seeded_skill_workspaces.contains(&ws) {
-                s.seeded_skill_workspaces.push(ws);
+            if !s.seeded_skill_workspaces.contains(&marker) {
+                s.seeded_skill_workspaces.push(marker);
             }
             Ok(())
         })
@@ -1434,6 +1466,9 @@ impl Store {
     }
 
     pub fn upsert_project(&self, project: Project) -> Result<(), String> {
+        if is_task_project_id(&project.id) {
+            return Err("系统任务项目不可修改".to_string());
+        }
         // 命令收藏非空 folder 自动注册进 command_folders、项目自身非空 folder 自动注册进
         // project_folders（前端手输新目录保存时无需先建目录）
         let folders: Vec<String> = project
@@ -1462,6 +1497,9 @@ impl Store {
 
     /// 删除项目并顺带清理该项目的 sessions。
     fn delete_project(&self, id: &str) -> Result<(), String> {
+        if is_task_project_id(id) {
+            return Err("系统任务项目不可删除".to_string());
+        }
         self.with_state(|s| {
             s.projects.retain(|p| p.id != id);
             s.sessions.remove(id);
@@ -1471,7 +1509,8 @@ impl Store {
 
     /// path 为 Some → 在该目录下创建 .aishell/；为 None → 用 <workspace_dir>/<name> 并创建（含 .aishell/）。
     /// 目录已存在不报错。返回最终项目路径。
-    fn ensure_project_dirs(&self, path: Option<&str>, name: &str) -> Result<String, String> {
+    /// pub(crate)：ai_actions 的 SDK 导入项目（路径留空时默认 workspace 下创建）复用。
+    pub(crate) fn ensure_project_dirs(&self, path: Option<&str>, name: &str) -> Result<String, String> {
         let project_dir = match path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
             _ => {
@@ -1699,8 +1738,27 @@ impl Store {
         Ok(root)
     }
 
-    /// 项目本地路径；未设置或项目不存在返回 None。
+    /// 系统任务项目：不落入 AppState.projects，按当前 workspace 合成并确保目录存在。
+    /// 任务项目固定使用 `<workspace>/.aishell/tasks`，没有 workspace 时返回可执行的中文错误。
+    pub fn task_project(&self) -> Result<Project, String> {
+        let workspace = self
+            .settings()
+            .workspace_dir
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "请先在设置中配置工作区目录".to_string())?;
+        let project = task_project_for_workspace(workspace.trim());
+        fs::create_dir_all(
+            PathBuf::from(project.path.as_deref().unwrap_or_default()).join(".aishell"),
+        )
+        .map_err(|e| format!("创建系统任务目录失败: {e}"))?;
+        Ok(project)
+    }
+
+    /// 项目本地路径；任务项目按 workspace 合成，普通项目未设置或不存在返回 None。
     pub fn project_path(&self, project_id: &str) -> Option<String> {
+        if is_task_project_id(project_id) {
+            return self.task_project().ok().and_then(|p| p.path);
+        }
         let guard = self.state.lock().ok()?;
         guard
             .projects
@@ -1709,14 +1767,39 @@ impl Store {
             .and_then(|p| p.path.clone())
     }
 
-    /// 项目配置（clone 返回）；不存在返回 None。
+    /// 项目配置（clone 返回）；系统任务项目按 workspace 合成，不写入 projects。
     pub fn project(&self, project_id: &str) -> Option<Project> {
+        if is_task_project_id(project_id) {
+            return self.task_project().ok();
+        }
         let guard = self.state.lock().ok()?;
         guard.projects.iter().find(|p| p.id == project_id).cloned()
     }
 
-    /// 项目 AI 模式；项目不存在返回 None。
+    /// 全部服务器配置（clone 返回；不含密码——密码在 keyring）。SDK 导入去重等用。
+    pub fn servers_all(&self) -> Vec<Server> {
+        self.state.lock().map(|g| g.servers.clone()).unwrap_or_default()
+    }
+
+    /// 全部普通项目（clone 返回）。系统任务合成项目永不暴露给项目列表或 SDK 导入。
+    pub fn projects_all(&self) -> Vec<Project> {
+        self.state
+            .lock()
+            .map(|g| {
+                g.projects
+                    .iter()
+                    .filter(|p| !is_task_project_id(&p.id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 项目 AI 模式；系统任务上下文固定为 Agent，普通项目不存在返回 None。
     pub fn ai_mode(&self, project_id: &str) -> Option<AiMode> {
+        if is_task_project_id(project_id) {
+            return Some(AiMode::Agent);
+        }
         let guard = self.state.lock().ok()?;
         guard
             .projects
@@ -1726,7 +1809,15 @@ impl Store {
     }
 
     /// 原子更新单个项目的 ai_mode（只改目标字段，不回传整个 Project）。
+    /// 系统任务上下文固定 Agent，拒绝任何试图打开 yolo 的调用。
     pub fn set_ai_mode(&self, project_id: &str, mode: AiMode) -> Result<(), String> {
+        if is_task_project_id(project_id) {
+            return if mode == AiMode::Agent {
+                Ok(())
+            } else {
+                Err("系统任务上下文固定为工作模式".to_string())
+            };
+        }
         self.with_state(|s| {
             let p = s
                 .projects
@@ -1942,6 +2033,12 @@ pub async fn get_state(store: State<'_, Arc<Store>>) -> Result<AppState, String>
         .lock()
         .map_err(|_| "store 状态锁损坏".to_string())?;
     Ok(guard.clone())
+}
+
+/// 返回欢迎页系统任务上下文；该合成项目不写入 AppState.projects。
+#[tauri::command]
+pub async fn get_task_project(store: State<'_, Arc<Store>>) -> Result<Project, String> {
+    store.task_project()
 }
 
 #[tauri::command]
@@ -2324,8 +2421,9 @@ mod tests {
                 );
                 m
             },
-            // 与 settings.workspace_dir 一致：reload 时视为已播种（不创建 D:\AIShellWorkspace，不破坏往返相等）
-            seeded_skill_workspaces: vec!["D:\\AIShellWorkspace".to_string()],
+            // 与 settings.workspace_dir 一致：reload 时视为已播种（不创建 D:\AIShellWorkspace，不破坏往返相等）。
+            // 记录值必须带当前播种代际标记（裸 workspace 是 gen1 旧记录，会触发补种写盘）
+            seeded_skill_workspaces: vec![seed_marker("D:\\AIShellWorkspace")],
             trace_enabled: false,
         }
     }
@@ -4335,6 +4433,102 @@ mod tests {
     }
 
     #[test]
+    fn task_project_is_synthetic_fixed_path_and_agent_only() {
+        let dir = temp_config_dir("task-project");
+        let workspace = std::env::temp_dir().join(format!(
+            "aishell-store-task-ws-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&workspace);
+        let store = test_store(dir.clone());
+        store
+            .save_settings(
+                Settings {
+                    workspace_dir: Some(workspace.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store.task_project().unwrap();
+        assert_eq!(task.id, TASK_PROJECT_ID);
+        assert!(!TASK_PROJECT_ID.contains(':'), "任务项目 ID 不能含冒号");
+        assert_eq!(task.name, "系统任务");
+        assert_eq!(
+            task.path.as_deref(),
+            Some(workspace.join(".aishell").join("tasks").to_str().unwrap())
+        );
+        assert!(workspace.join(".aishell").join("tasks").join(".aishell").is_dir());
+        assert_eq!(store.project(TASK_PROJECT_ID), Some(task.clone()));
+        assert_eq!(store.project_path(TASK_PROJECT_ID), task.path);
+        assert_eq!(store.ai_mode(TASK_PROJECT_ID), Some(AiMode::Agent));
+        assert!(store.projects_all().iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store.set_ai_mode(TASK_PROJECT_ID, AiMode::Agent).is_ok());
+        assert_eq!(
+            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Yolo).unwrap_err(),
+            "系统任务上下文固定为工作模式"
+        );
+        assert_eq!(
+            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Suggest).unwrap_err(),
+            "系统任务上下文固定为工作模式"
+        );
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn task_project_requires_workspace_and_reserved_id_rejected() {
+        let dir = temp_config_dir("task-project-reject");
+        let store = test_store(dir);
+        assert_eq!(store.task_project().unwrap_err(), "请先在设置中配置工作区目录");
+        let task = Project {
+            id: TASK_PROJECT_ID.to_string(),
+            name: "伪造任务项目".to_string(),
+            path: None,
+            server_ids: Vec::new(),
+            quick_commands: Vec::new(),
+            folder: String::new(),
+            ai_mode: AiMode::Yolo,
+        };
+        assert_eq!(store.upsert_project(task), Err("系统任务项目不可修改".to_string()));
+        assert_eq!(store.delete_project(TASK_PROJECT_ID), Err("系统任务项目不可删除".to_string()));
+        store
+            .with_state(|s| {
+                s.projects.push(Project {
+                    id: TASK_PROJECT_ID.to_string(),
+                    name: "历史任务项目".to_string(),
+                    path: None,
+                    server_ids: Vec::new(),
+                    quick_commands: Vec::new(),
+                    folder: String::new(),
+                    ai_mode: AiMode::Agent,
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.projects_all().iter().all(|p| p.id != TASK_PROJECT_ID));
+    }
+
+    #[test]
+    fn task_project_sessions_are_stored_without_project_record() {
+        let dir = temp_config_dir("task-sessions");
+        let store = test_store(dir.clone());
+        let session = ChatSession {
+            id: "task-session".to_string(),
+            title: "迁移探查".to_string(),
+            messages: vec![test_chat_msg("user", "只读探查")],
+            auto_title_triggered: false,
+            archived: false,
+        };
+        store.session_upsert(TASK_PROJECT_ID, session.clone()).unwrap();
+        assert_eq!(store.sessions_get(TASK_PROJECT_ID).unwrap(), vec![session]);
+        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        let reloaded = test_store(dir);
+        assert_eq!(reloaded.sessions_get(TASK_PROJECT_ID).unwrap().len(), 1);
+    }
+
+    #[test]
     fn set_ai_mode_updates_only_target_project() {
         let dir = temp_config_dir("ai-mode");
         let store = test_store(dir.clone());
@@ -4501,22 +4695,51 @@ mod tests {
             .unwrap();
         let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
         assert!(file.is_file(), "首次保存未播种内置技能");
+        let py_file = ws.join(".aishell").join("skills").join("python-script").join("SKILL.md");
+        assert!(py_file.is_file(), "首次保存未播种 python-script 内置技能");
         let content = fs::read_to_string(&file).unwrap();
         // 内容含两个目录、目录结构、scope/enabled 语义
         assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {content}");
         assert!(content.contains("<name>/SKILL.md"), "缺少目录结构: {content}");
         assert!(content.contains("## scope 语义"), "缺少 scope 语义: {content}");
         assert!(content.contains("enabled") && content.contains("scope"), "缺少字段 schema");
-        // 播种记录已落盘（记录的是 normalize_ws 规范化路径：canonicalize + 剥 verbatim 前缀）
+        // 播种记录已落盘（记录的是 normalize_ws 规范化路径 + 播种代际标记）
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
         let expected_ws = normalize_ws(&ws.to_string_lossy());
         assert_eq!(
             state.seeded_skill_workspaces,
-            vec![expected_ws],
+            vec![seed_marker(&expected_ws)],
             "播种记录不符: {:?}",
             state.seeded_skill_workspaces
         );
+    }
+
+    /// gen1 旧记录（裸 workspace，仅 skill-management 时代）：加载时按当前代际补种——
+    /// python-script 落盘、skill-management 文件级幂等不覆盖；旧记录保留并追加新代际标记。
+    #[test]
+    fn legacy_bare_seed_record_triggers_reseed() {
+        let dir = temp_config_dir("seed-gen1");
+        let ws = temp_config_dir("seed-gen1-ws");
+        let legacy = normalize_ws(&ws.to_string_lossy());
+        let state = AppState {
+            settings: Settings {
+                workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            seeded_skill_workspaces: vec![legacy.clone()],
+            ..Default::default()
+        };
+        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        let store = test_store(dir);
+        assert!(
+            ws.join(".aishell").join("skills").join("python-script").join("SKILL.md").is_file(),
+            "旧工作区未补种 python-script"
+        );
+        let records = store.state.lock().unwrap().seeded_skill_workspaces.clone();
+        assert_eq!(records.len(), 2, "旧记录保留 + 追加新代际标记: {records:?}");
+        assert!(records.contains(&legacy), "旧记录被改写: {records:?}");
+        assert!(records.contains(&seed_marker(&legacy)), "缺新代际标记: {records:?}");
     }
 
     /// 目标已存在不覆盖；用户删除后同 workspace 重启/再次保存不复活。
