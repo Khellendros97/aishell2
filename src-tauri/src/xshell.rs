@@ -46,7 +46,7 @@ fn decode_utf16(bytes: &[u8], little: bool) -> Option<String> {
     if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    let units = bytes.chunks_exact(2).map(move |c| {
+    let units = bytes.as_chunks::<2>().0.iter().map(|c| {
         if little {
             u16::from_le_bytes([c[0], c[1]])
         } else {
