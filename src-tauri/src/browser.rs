@@ -714,29 +714,32 @@ impl BrowserManager {
             .map_err(|e| format!("创建浏览器视图失败: {e}"))?;
         let _ = wv.hide();
 
-        // 页面回传通道：element（检查器选中）/ console（钩子）经 WebMessageReceived 进入
-        let mgr_msg = Arc::clone(self);
-        let view_id_msg = view_id.to_string();
-        let _ = wv.with_webview(move |pw| unsafe {
-            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
-            use windows::core::PWSTR;
-            use windows::Win32::System::Com::CoTaskMemFree;
-            let Ok(core) = pw.controller().CoreWebView2() else { return };
-            let handler = webview2_com::WebMessageReceivedEventHandler::create(Box::new(
-                move |_sender, args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
-                    let Some(args) = args else { return Ok(()) };
-                    let mut raw = PWSTR::null();
-                    if args.TryGetWebMessageAsString(&mut raw).is_ok() && !raw.is_null() {
-                        let msg = raw.to_string().unwrap_or_default();
-                        CoTaskMemFree(Some(raw.as_ptr().cast()));
-                        handle_page_message(&mgr_msg, &view_id_msg, &msg);
-                    }
-                    Ok(())
-                },
-            ));
-            let mut token = 0i64;
-            let _ = core.add_WebMessageReceived(&handler, &mut token);
-        });
+        // 页面回传通道：element（检查器选中）/ console（钩子）经 WebMessageReceived 进入（WebView2 仅 Windows）
+        #[cfg(windows)]
+        {
+            let mgr_msg = Arc::clone(self);
+            let view_id_msg = view_id.to_string();
+            let _ = wv.with_webview(move |pw| unsafe {
+                use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
+                use windows::core::PWSTR;
+                use windows::Win32::System::Com::CoTaskMemFree;
+                let Ok(core) = pw.controller().CoreWebView2() else { return };
+                let handler = webview2_com::WebMessageReceivedEventHandler::create(Box::new(
+                    move |_sender, args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
+                        let Some(args) = args else { return Ok(()) };
+                        let mut raw = PWSTR::null();
+                        if args.TryGetWebMessageAsString(&mut raw).is_ok() && !raw.is_null() {
+                            let msg = raw.to_string().unwrap_or_default();
+                            CoTaskMemFree(Some(raw.as_ptr().cast()));
+                            handle_page_message(&mgr_msg, &view_id_msg, &msg);
+                        }
+                        Ok(())
+                    },
+                ));
+                let mut token = 0i64;
+                let _ = core.add_WebMessageReceived(&handler, &mut token);
+            });
+        }
 
         {
             let mut views = self.views.lock().unwrap();
@@ -939,6 +942,7 @@ impl BrowserManager {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        #[cfg(windows)]
         let sent = wv.with_webview(move |pw| unsafe {
             use windows::core::PCWSTR;
             let Ok(core) = pw.controller().CoreWebView2() else { return };
@@ -966,6 +970,11 @@ impl BrowserManager {
                 &handler,
             );
         });
+        #[cfg(not(windows))]
+        let sent = {
+            let _ = tx.send(Err("内置浏览器截图仅支持 Windows".to_string()));
+            Ok::<(), std::io::Error>(())
+        };
         let outcome = match sent {
             Err(e) => Err(format!("调用截图接口失败: {e}")),
             Ok(()) => match tokio::time::timeout(Duration::from_secs(10), rx).await {
