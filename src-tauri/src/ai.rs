@@ -588,7 +588,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -1835,6 +1835,51 @@ async fn run_internal_action(
                 .await
                 .map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
         }
+        // py 工具：本机执行 Python 脚本。执行前起一次性 SDK 桥（127.0.0.1 ephemeral 端口 +
+        // 仅内存的随机 token），经环境变量注入 Python 进程；进程结束后销毁（成败都停），
+        // token 随之失效。脚本内 `import aishell` 即经此桥调用 ssh/sftp/数据库能力。
+        "run_py" => {
+            let code = payload
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let path = payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let args: Vec<String> = payload
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let timeout_seconds = match payload.get("timeoutSeconds") {
+                None => None,
+                Some(v) => match v.as_u64() {
+                    Some(seconds) => Some(seconds),
+                    None => {
+                        return json!({
+                            "ok": false,
+                            "error": "timeoutSeconds 必须是 1–3600 之间的整数秒"
+                        });
+                    }
+                },
+            };
+            let bridge = match crate::pysdk::PySdkBridge::start(actions.clone(), project_id, session_id).await {
+                Ok(b) => b,
+                Err(e) => return json!({"ok": false, "error": format!("SDK 通道启动失败：{e}")}),
+            };
+            let result = actions
+                .run_py(project_id, code, path, args, timeout_seconds, bridge.env_pairs())
+                .await;
+            bridge.stop().await;
+            result.map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
+        }
         "db_query" => {
             let server_id = str_field("serverId");
             let connection_id = str_field("connectionId");
@@ -2980,6 +3025,20 @@ mod tests {
         assert!(
             GUARD_EXT.contains("\"staging_restore\""),
             "staging_restore 应受控审批"
+        );
+        // py 工具探针：guard 注册 + 动作桥 run_py + 受控审批 + 仅 agent/yolo；
+        // 三处接线任一缺失都会让 AI 报「工具 py 不可用」（见 pi-tool-three-point-registration）
+        assert!(
+            GUARD_EXT.contains("\"py\""),
+            "guard 应注册 py 工具定义与受控列表"
+        );
+        assert!(
+            GUARD_EXT.contains("\"run_py\""),
+            "py 应走 run_py 动作桥"
+        );
+        assert!(
+            CONTROLLED_TOOLS.contains(&"py"),
+            "ai.rs CONTROLLED_TOOLS 应含 py（逐调用审批）"
         );
         let controlled_line = GUARD_EXT
             .lines()
