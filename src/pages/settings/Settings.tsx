@@ -4,8 +4,8 @@
  * 密码与 apiKey 表单留空提交 null（后端保持原值），显示位不打回明文；
  * 浏览按钮走 @tauri-apps/plugin-dialog（openDialog）；hint 外链经 @tauri-apps/plugin-opener 外部浏览器打开。
  * DOM id/class 与旧版一致，settings.css 直接复用；顶栏由 App.tsx 提供，本组件不渲染 Topbar。
- * 2026-08 起按用户要求新增左侧分类导航（外观/功能特性/API 接口，SETTINGS_NAV 三页），
- * 字段状态共享一份 SysFields，三页的保存按钮等价（整表单提交），此布局无 proto 对照。
+ * 2026-08 起按用户要求新增左侧分类导航（功能特性/外观/快捷键/API 接口，SETTINGS_NAV 四页），
+ * 字段状态共享一份 SysFields，三个可编辑页的保存按钮等价（整表单提交）；快捷键页只读，此布局无 proto 对照。
  * 历史说明：原「服务器配置」面板（服务器卡片/搜索/分组/拖拽/模态/从 Xshell 导入）已随
  * 项目-服务器单维度重构移除；xshell 导入已移至欢迎页按目录自动建项目，服务器在项目语义下管理。
  */
@@ -49,13 +49,89 @@ interface McpStatusLine {
   cls: string;
 }
 
-/** 左侧导航分类：功能特性 / 外观 / API 接口（MCP 是 AIShell 作为服务端供外部工具接入，归功能特性） */
-type SettingsPage = 'features' | 'appearance' | 'api';
+/** 左侧导航分类：MCP 是 AIShell 作为服务端供外部工具接入，归功能特性；快捷键页只读。 */
+type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api';
 
 const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'features', label: '功能特性', icon: 'zap' },
   { id: 'appearance', label: '外观', icon: 'monitor' },
+  { id: 'shortcuts', label: '快捷键', icon: 'key' },
   { id: 'api', label: 'API 接口', icon: 'plug' },
+];
+
+interface ShortcutItem {
+  action: string;
+  keys: string[];
+  detail?: string;
+}
+
+interface ShortcutGroup {
+  title: string;
+  items: ShortcutItem[];
+}
+
+/** 仅列 AIShell 明确实现的快捷操作，不展开输入框、网页、CodeMirror 或 Shell 自身的通用默认键。 */
+const SHORTCUT_GROUPS: ShortcutGroup[] = [
+  {
+    title: '全局',
+    items: [
+      { action: '打开或收起命令面板', keys: ['Ctrl+T', 'Ctrl+P'] },
+      { action: '打开开发者工具', keys: ['F12'] },
+      { action: '关闭当前菜单、弹层或对话框', keys: ['Esc'], detail: '仅在相应界面打开时生效' },
+    ],
+  },
+  {
+    title: '终端',
+    items: [
+      { action: '复制终端选区', keys: ['Ctrl+Shift+C'] },
+      { action: '粘贴到终端', keys: ['Ctrl+Shift+V'] },
+      { action: '有选区时复制，无选区时粘贴', keys: ['鼠标中键'], detail: 'vim、tmux 等接管鼠标时以终端程序行为为准' },
+    ],
+  },
+  {
+    title: '文档编辑器与笔记',
+    items: [
+      { action: '保存当前文档或笔记', keys: ['Ctrl+S'] },
+      { action: '将文档选区添加到 AI 对话', keys: ['Ctrl+L'], detail: '仅文档编辑器' },
+      { action: '查找 / 替换', keys: ['Ctrl+F', 'Ctrl+H'], detail: '仅文档编辑器' },
+      { action: '查找下一个 / 上一个 / 关闭查找栏', keys: ['Enter', 'Shift+Enter', 'Esc'], detail: '焦点位于查找栏时' },
+      { action: '有选区时复制，无选区时粘贴到点击位置', keys: ['鼠标中键'], detail: '仅文档编辑器' },
+    ],
+  },
+  {
+    title: 'AI 对话',
+    items: [
+      { action: '发送消息 / 输入换行', keys: ['Enter', 'Shift+Enter'], detail: '焦点位于 AI 输入框时' },
+      { action: '复制选中文字', keys: ['Ctrl+C'], detail: '输入框为空且当前工作标签为终端时，会向终端发送中断信号' },
+      { action: '移动补全项', keys: ['↑', '↓'], detail: '@ 补全列表打开时' },
+      { action: '选中补全项', keys: ['Enter', 'Tab'], detail: '@ 补全列表打开时' },
+      { action: '关闭补全列表', keys: ['Esc'], detail: '@ 补全列表打开时' },
+      { action: '复制选中文字，或粘贴到 AI 输入框', keys: ['鼠标中键'] },
+    ],
+  },
+  {
+    title: '本地文件管理器与 SFTP',
+    items: [
+      { action: '复制 / 剪切 / 粘贴', keys: ['Ctrl+C', 'Ctrl+X', 'Ctrl+V'], detail: '文件管理区域激活且未在输入时' },
+      { action: '重命名 / 删除', keys: ['F2', 'Delete'], detail: '选中文件或目录后' },
+      { action: '确认 / 取消行内输入', keys: ['Enter', 'Esc'], detail: '新建或重命名时' },
+    ],
+  },
+  {
+    title: '内置浏览器',
+    items: [
+      { action: '导航到输入地址', keys: ['Enter'], detail: '焦点位于地址栏时' },
+      { action: '退出网页元素检查', keys: ['Esc'], detail: '元素检查模式开启时' },
+      { action: '缩放网页', keys: ['Ctrl+鼠标滚轮'] },
+    ],
+  },
+  {
+    title: '其他操作',
+    items: [
+      { action: '保存命令收藏或技能', keys: ['Ctrl+Enter'], detail: '焦点位于对应的多行编辑框时' },
+      { action: '微调侧栏或 AI 面板宽度', keys: ['←', '→'], detail: '先聚焦工作台分隔条，每次调整 16 像素' },
+    ],
+  },
 ];
 
 export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
@@ -233,6 +309,38 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
             </div>
             <div className="form-actions">
               <button id="btn-save-system" className="btn primary" onClick={() => void save()}>保存</button>
+            </div>
+          </section>
+          )}
+          {page === 'shortcuts' && (
+          <section id="panel-shortcuts" className="settings-panel">
+            <div className="panel-head"><div className="panel-title">快捷键</div></div>
+            <div className="shortcuts-notice">
+              <Icon name="info" />
+              <div>
+                <strong>当前仅提供快捷键说明</strong>
+                <span>暂不支持修改快捷键。下列操作会根据当前焦点和所在界面生效。</span>
+              </div>
+            </div>
+            <div className="shortcut-groups">
+              {SHORTCUT_GROUPS.map((group) => (
+                <section key={group.title} className="shortcut-group">
+                  <h3>{group.title}</h3>
+                  <div className="shortcut-list">
+                    {group.items.map((item) => (
+                      <div key={`${group.title}-${item.action}`} className="shortcut-row">
+                        <div className="shortcut-description">
+                          <span className="shortcut-action">{item.action}</span>
+                          {item.detail && <span className="shortcut-detail">{item.detail}</span>}
+                        </div>
+                        <div className="shortcut-keys" aria-label={item.keys.join(' 或 ')}>
+                          {item.keys.map((key) => <kbd key={key}>{key}</kbd>)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              ))}
             </div>
           </section>
           )}

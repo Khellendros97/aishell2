@@ -115,23 +115,48 @@ pub(crate) const MAX_EDIT_BYTES: u64 = 5 * 1024 * 1024;
 /// 二进制探测字节数（sftp_read 复用同一约束）。
 pub(crate) const BINARY_SCAN_BYTES: usize = 8 * 1024;
 
-/// 读取文本文件；>5MB 或前 8KB 含 NUL 字节 → 报错（不可编辑）。
+enum EditableFile {
+    Text(String),
+    Directory,
+    Unsupported,
+}
+
+/// 按编辑器约束读取文件；真实访问错误保留为 Err，调用方区分目录与不可编辑文件。
+fn read_editable_text(file: &Path) -> Result<EditableFile, String> {
+    let meta = fs::metadata(file).map_err(|e| format!("无法访问「{}」：{e}", file.display()))?;
+    if meta.is_dir() {
+        return Ok(EditableFile::Directory);
+    }
+    if meta.len() > MAX_EDIT_BYTES {
+        return Ok(EditableFile::Unsupported);
+    }
+    let bytes = fs::read(file).map_err(|e| format!("读取「{}」失败：{e}", file.display()))?;
+    let head = &bytes[..bytes.len().min(BINARY_SCAN_BYTES)];
+    if head.contains(&0) {
+        return Ok(EditableFile::Unsupported);
+    }
+    Ok(match String::from_utf8(bytes) {
+        Ok(content) => EditableFile::Text(content),
+        Err(_) => EditableFile::Unsupported,
+    })
+}
+
+/// 判断文件能否作为 UTF-8 文本在编辑器中打开；目录、>5MB、二进制均返回 false。
+#[tauri::command]
+pub fn fs_is_text(path: String) -> Result<bool, String> {
+    let file = non_empty(&path)?;
+    read_editable_text(&file).map(|content| matches!(content, EditableFile::Text(_)))
+}
+
+/// 读取文本文件；>5MB、前 8KB 含 NUL 或非 UTF-8 → 报错（不可编辑）。
 #[tauri::command]
 pub fn fs_read(path: String) -> Result<String, String> {
     let file = non_empty(&path)?;
-    let meta = fs::metadata(&file).map_err(|e| format!("无法访问「{}」：{e}", file.display()))?;
-    if meta.is_dir() {
-        return Err("不能读取目录".to_string());
+    match read_editable_text(&file)? {
+        EditableFile::Text(content) => Ok(content),
+        EditableFile::Directory => Err("不能读取目录".to_string()),
+        EditableFile::Unsupported => Err("文件过大或为二进制，无法编辑".to_string()),
     }
-    if meta.len() > MAX_EDIT_BYTES {
-        return Err("文件过大或为二进制，无法编辑".to_string());
-    }
-    let bytes = fs::read(&file).map_err(|e| format!("读取「{}」失败：{e}", file.display()))?;
-    let head = &bytes[..bytes.len().min(BINARY_SCAN_BYTES)];
-    if head.contains(&0) {
-        return Err("文件过大或为二进制，无法编辑".to_string());
-    }
-    String::from_utf8(bytes).map_err(|_| "文件过大或为二进制，无法编辑".to_string())
 }
 
 /// 覆写文本文件（保存场景允许覆盖；目录目标报错）。
@@ -430,21 +455,35 @@ mod tests {
     }
 
     #[test]
-    fn read_rejects_binary_and_oversize() {
+    fn editable_text_probe_matches_read_constraints() {
         let dir = tmp_dir("read");
-        let bin = dir.join("bin.dat");
-        let mut blob = vec![b'a'; 100];
-        blob.push(0);
-        fs::write(&bin, blob).unwrap();
-        assert!(fs_read(bin.to_string_lossy().into_owned()).is_err());
-
-        let big = dir.join("big.txt");
-        fs::write(&big, vec![b'x'; (MAX_EDIT_BYTES + 1) as usize]).unwrap();
-        assert!(fs_read(big.to_string_lossy().into_owned()).is_err());
+        let path = |p: &Path| p.to_string_lossy().into_owned();
 
         let ok = dir.join("ok.txt");
         fs::write(&ok, "你好\n世界").unwrap();
-        assert_eq!(fs_read(ok.to_string_lossy().into_owned()).unwrap(), "你好\n世界");
+        assert!(fs_is_text(path(&ok)).unwrap());
+        assert_eq!(fs_read(path(&ok)).unwrap(), "你好\n世界");
+
+        let nul = dir.join("nul.dat");
+        let mut blob = vec![b'a'; 100];
+        blob.push(0);
+        fs::write(&nul, blob).unwrap();
+        assert!(!fs_is_text(path(&nul)).unwrap());
+        assert!(fs_read(path(&nul)).is_err());
+
+        let invalid_utf8 = dir.join("invalid.txt");
+        fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(!fs_is_text(path(&invalid_utf8)).unwrap());
+        assert!(fs_read(path(&invalid_utf8)).is_err());
+
+        let big = dir.join("big.txt");
+        fs::write(&big, vec![b'x'; (MAX_EDIT_BYTES + 1) as usize]).unwrap();
+        assert!(!fs_is_text(path(&big)).unwrap());
+        assert!(fs_read(path(&big)).is_err());
+
+        assert!(!fs_is_text(path(&dir)).unwrap());
+        assert_eq!(fs_read(path(&dir)).unwrap_err(), "不能读取目录");
+        assert!(fs_is_text(path(&dir.join("missing.txt"))).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
