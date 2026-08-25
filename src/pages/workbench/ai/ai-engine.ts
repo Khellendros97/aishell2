@@ -999,6 +999,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   bindEvents();
   panelRoot = container;
   container.addEventListener('keydown', onPanelKeydown, true);
+  container.addEventListener('mousedown', onMiddleMouseDown);
   void loadSessions();
   void loadEffort();
   if (panelOptions.workbenchIntegration) void refreshStagingNotice();
@@ -1064,7 +1065,11 @@ function cleanup(): void {
   cardEls.clear();
   closeMention();
   saveViewContext();
-  if (panelRoot) { panelRoot.removeEventListener('keydown', onPanelKeydown, true); panelRoot = null; }
+  if (panelRoot) {
+    panelRoot.removeEventListener('keydown', onPanelKeydown, true);
+    panelRoot.removeEventListener('mousedown', onMiddleMouseDown);
+    panelRoot = null;
+  }
   if (offSelectionChange) { offSelectionChange(); offSelectionChange = null; }
   closeSessionMenu();
   if (offSessionOutside) { offSessionOutside(); offSessionOutside = null; }
@@ -3208,6 +3213,47 @@ function onInputPaste(e: ClipboardEvent): void {
     e.preventDefault();
     document.execCommand('insertText', false, text);
   }
+}
+
+/** AI 消息区/输入区中键：有文字选区则复制，否则把纯文本粘贴到输入框。 */
+function onMiddleMouseDown(e: MouseEvent): void {
+  if (e.button !== 1) return;
+  const target = e.target as HTMLElement;
+  if (!input.contains(target) && !target.closest('.ai-text')) return;
+  e.preventDefault();
+  const sel = window.getSelection();
+  const selectionInside = !!sel && !!sel.anchorNode && !!sel.focusNode
+    && (chat.contains(sel.anchorNode) || input.contains(sel.anchorNode))
+    && (chat.contains(sel.focusNode) || input.contains(sel.focusNode));
+  const selectedText = selectionInside ? sel.toString() : '';
+  if (selectedText) {
+    void copyText(selectedText).catch(() => toast('复制到剪贴板失败', 'error'));
+    return;
+  }
+
+  const clickInInput = input.contains(e.target as Node);
+  const pointRange = clickInInput ? document.caretRangeFromPoint(e.clientX, e.clientY) : null;
+  void navigator.clipboard.readText().then((text) => {
+    if (!text || unmounted) return;
+    input.focus();
+    const next = pointRange && input.contains(pointRange.startContainer)
+      ? pointRange
+      : savedRange && input.contains(savedRange.startContainer) && input.contains(savedRange.endContainer)
+        ? savedRange.cloneRange()
+        : (() => {
+            const range = document.createRange();
+            range.selectNodeContents(input);
+            range.collapse(false);
+            return range;
+          })();
+    next.collapse(true);
+    const current = window.getSelection();
+    current?.removeAllRanges();
+    current?.addRange(next);
+    document.execCommand('insertText', false, text);
+    if (current?.rangeCount) savedRange = current.getRangeAt(0).cloneRange();
+    onInputInput();
+  }).catch(() => toast('读取剪贴板失败', 'error'));
 }
 
 /** 输入区拖放：①应用内 explorer/SFTP 拖拽载荷（DND_MIME，图片扩展名）②OS 文件拖入。

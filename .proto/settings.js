@@ -8,6 +8,26 @@
   const A = window.AIShell;
   let db = A.load();
 
+  // 旧原型数据迁移：每台服务器补一条凭据；密码字段立即从 JSON 状态移除。
+  db.credentials = db.credentials || [];
+  db.servers.forEach((server) => {
+    if (!server.credentialId) {
+      const id = `cred-${server.id}`;
+      if (!db.credentials.some((item) => item.id === id)) {
+        db.credentials.push({
+          id,
+          name: server.username ? `${server.username}@${server.host}` : server.host,
+          authType: server.authType,
+          username: server.username || '',
+          keyPath: server.keyPath || '',
+        });
+      }
+      server.credentialId = id;
+    }
+    delete server.password;
+  });
+  A.save(db);
+
   /* ---------- 页面骨架 ---------- */
   A.renderTopbar('settings');
 
@@ -18,6 +38,7 @@
 
   const navItems = document.querySelectorAll('#settings-nav .nav-item');
   const panels = {
+    credentials: document.getElementById('panel-credentials'),
     servers: document.getElementById('panel-servers'),
     system: document.getElementById('panel-system'),
   };
@@ -29,6 +50,73 @@
   }
   navItems.forEach((item) => {
     item.addEventListener('click', () => switchPanel(item.dataset.panel));
+  });
+
+  /* ============================================================
+     凭据库
+     ============================================================ */
+  const credentialGrid = document.getElementById('credential-grid');
+  const credentialEmpty = document.getElementById('credential-empty');
+  const credentialCount = document.getElementById('credential-count');
+  const credentialModal = document.getElementById('credential-modal');
+  let editingCredentialId = null;
+
+  function renderCredentials() {
+    credentialGrid.innerHTML = '';
+    credentialCount.textContent = String(db.credentials.length);
+    credentialEmpty.classList.toggle('hidden', db.credentials.length > 0);
+    db.credentials.forEach((credential) => {
+      const refs = db.servers.filter((server) => server.credentialId === credential.id);
+      const card = document.createElement('div');
+      card.className = 'card server-card';
+      card.innerHTML = `<div class="sc-head"><strong class="ellipsis"></strong><div class="sc-actions"><button class="icon-btn" data-act="edit">✎</button><button class="icon-btn danger" data-act="del">🗑</button></div></div><div class="sc-meta"><span class="tag">${credential.authType === 'key' ? '密钥' : '账号密码'}</span><span>👤 ${credential.username || '-'}</span></div><div class="hint">引用服务器 ${refs.length} 台${refs.length ? `：${refs.map((server) => server.name).join('、')}` : ''}</div>`;
+      card.querySelector('strong').textContent = credential.name;
+      card.querySelector('[data-act="edit"]').addEventListener('click', () => openCredentialModal(credential));
+      card.querySelector('[data-act="del"]').addEventListener('click', async () => {
+        if (refs.length) return A.toast(`仍被 ${refs.length} 台服务器引用，不能删除`, 'error');
+        if (!await A.confirmDialog({ title: '删除凭据', message: `确定删除「${credential.name}」吗？`, danger: true, okText: '删除' })) return;
+        db.credentials = db.credentials.filter((item) => item.id !== credential.id);
+        A.save(db); renderCredentials(); fillCredentialOptions();
+      });
+      credentialGrid.appendChild(card);
+    });
+  }
+
+  function openCredentialModal(credential) {
+    editingCredentialId = credential ? credential.id : null;
+    document.getElementById('credential-modal-title').textContent = credential ? '编辑凭据' : '新建凭据';
+    document.getElementById('c-name').value = credential ? credential.name : '';
+    document.getElementById('c-auth').value = credential ? credential.authType : 'password';
+    document.getElementById('c-username').value = credential ? credential.username : '';
+    document.getElementById('c-password').value = '';
+    document.getElementById('c-keypath').value = credential ? credential.keyPath : '';
+    syncCredentialAuth();
+    credentialModal.classList.remove('hidden');
+    requestAnimationFrame(() => credentialModal.classList.add('open'));
+  }
+  function closeCredentialModal() {
+    credentialModal.classList.remove('open');
+    setTimeout(() => credentialModal.classList.add('hidden'), 160);
+  }
+  function syncCredentialAuth() {
+    const auth = document.getElementById('c-auth').value;
+    credentialModal.querySelectorAll('[data-credential-auth]').forEach((field) => field.classList.toggle('hidden', field.dataset.credentialAuth !== auth));
+  }
+  document.getElementById('c-auth').addEventListener('change', syncCredentialAuth);
+  document.getElementById('btn-new-credential').addEventListener('click', () => openCredentialModal(null));
+  document.getElementById('credential-modal-close').addEventListener('click', closeCredentialModal);
+  document.getElementById('credential-modal-cancel').addEventListener('click', closeCredentialModal);
+  document.getElementById('credential-modal-save').addEventListener('click', () => {
+    const name = document.getElementById('c-name').value.trim();
+    const username = document.getElementById('c-username').value.trim();
+    const authType = document.getElementById('c-auth').value;
+    const keyPath = document.getElementById('c-keypath').value.trim();
+    if (!name || !username || (authType === 'key' && !keyPath)) return A.toast('请填写完整凭据信息', 'error');
+    const credential = { id: editingCredentialId || A.uid('cred'), name, authType, username, keyPath: authType === 'key' ? keyPath : '' };
+    const index = db.credentials.findIndex((item) => item.id === credential.id);
+    if (index >= 0) db.credentials[index] = credential; else db.credentials.push(credential);
+    db.servers.filter((server) => server.credentialId === credential.id).forEach((server) => Object.assign(server, { authType, username, keyPath: credential.keyPath }));
+    A.save(db); closeCredentialModal(); renderCredentials(); renderServers(); fillCredentialOptions();
   });
 
   /* ============================================================
@@ -145,11 +233,28 @@
   const fName = document.getElementById('f-name');
   const fHost = document.getElementById('f-host');
   const fPort = document.getElementById('f-port');
+  const fCredential = document.getElementById('f-credential');
   const fAuth = document.getElementById('f-auth');
   const fUsername = document.getElementById('f-username');
   const fPassword = document.getElementById('f-password');
   const fKeyPath = document.getElementById('f-keypath');
   let editingId = null;
+
+  function fillCredentialOptions() {
+    const selected = fCredential.value;
+    fCredential.innerHTML = '<option value="">新建凭据（保存服务器时创建）</option>';
+    db.credentials.forEach((credential) => fCredential.add(new Option(credential.name, credential.id)));
+    fCredential.value = db.credentials.some((credential) => credential.id === selected) ? selected : '';
+  }
+  fCredential.addEventListener('change', () => {
+    const credential = db.credentials.find((item) => item.id === fCredential.value);
+    if (!credential) return;
+    fAuth.value = credential.authType;
+    fUsername.value = credential.username;
+    fKeyPath.value = credential.keyPath;
+    fPassword.value = '';
+    syncAuthFields();
+  });
 
   function openServerModal(server) {
     editingId = server ? server.id : null;
@@ -157,9 +262,11 @@
     fName.value = server ? server.name : '';
     fHost.value = server ? server.host : '';
     fPort.value = server ? String(server.port) : '22';
+    fillCredentialOptions();
+    fCredential.value = server ? (server.credentialId || '') : '';
     fAuth.value = server ? server.authType : 'password';
     fUsername.value = server ? server.username : '';
-    fPassword.value = server ? server.password : '';
+    fPassword.value = ''; // 已保存密码永不回显，留空表示不修改
     fKeyPath.value = server ? server.keyPath : '';
     syncAuthFields();
     modal.classList.remove('hidden');
@@ -202,6 +309,7 @@
     const name = fName.value.trim();
     const host = fHost.value.trim();
     const port = parseInt(fPort.value, 10);
+    const credentialId = fCredential.value || null;
     const authType = fAuth.value;
     const username = fUsername.value.trim();
     const password = fPassword.value;
@@ -217,20 +325,36 @@
       return A.toast('请填写密钥文件路径', 'error');
     }
 
+    let finalCredentialId = credentialId;
+    const selected = credentialId && db.credentials.find((item) => item.id === credentialId);
+    const changedShared = selected && (selected.authType !== authType || selected.username !== username || selected.keyPath !== (authType === 'key' ? keyPath : ''));
+    if (changedShared) {
+      const update = confirm(`凭据「${selected.name}」可能被多台服务器引用。\n确定：更新共享凭据；取消：保存到新凭据。`);
+      if (update) {
+        Object.assign(selected, { authType, username, keyPath: authType === 'key' ? keyPath : '' });
+        db.servers.filter((item) => item.credentialId === selected.id).forEach((item) => Object.assign(item, { authType, username, keyPath: selected.keyPath }));
+      } else {
+        finalCredentialId = A.uid('cred');
+        db.credentials.push({ id: finalCredentialId, name: username ? `${username}@${host}` : host, authType, username, keyPath: authType === 'key' ? keyPath : '' });
+      }
+    } else if (!finalCredentialId) {
+      finalCredentialId = A.uid('cred');
+      db.credentials.push({ id: finalCredentialId, name: username ? `${username}@${host}` : host, authType, username, keyPath: authType === 'key' ? keyPath : '' });
+    }
     if (editingId) {
       const target = db.servers.find((s) => s.id === editingId);
-      if (target) Object.assign(target, { name, host, port, authType, username, password, keyPath });
+      if (target) Object.assign(target, { name, host, port, authType, username, keyPath: authType === 'key' ? keyPath : '', credentialId: finalCredentialId });
     } else {
       db.servers.push({
-        id: A.uid('srv'), name, host, port, authType,
-        username: authType === 'password' ? username : '',
-        password: authType === 'password' ? password : '',
-        keyPath: authType === 'key' ? keyPath : '',
+        id: A.uid('srv'), name, host, port, authType, username,
+        keyPath: authType === 'key' ? keyPath : '', credentialId: finalCredentialId,
       });
     }
     A.save(db);
     closeServerModal();
     renderServers();
+    renderCredentials();
+    fillCredentialOptions();
     A.toast(editingId ? '服务器已更新' : '服务器已创建', 'success');
   }
 
@@ -286,5 +410,7 @@
 
   /* ---------- 初始化 ---------- */
   loadSystemSettings();
+  renderCredentials();
+  fillCredentialOptions();
   renderServers();
 })();

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aishell_lib::ssh::SshManager;
-use aishell_lib::store::{AuthType, Server, Store};
+use aishell_lib::store::{test_store, AuthType, Server};
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelMsg};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -195,7 +195,7 @@ async fn shell_echo_roundtrip() {
                 .unwrap()
                 .as_millis()
         ));
-        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let store = Arc::new(test_store(config_dir));
         let ssh = Arc::new(SshManager::new(store));
 
         let server = Server {
@@ -206,6 +206,7 @@ async fn shell_echo_roundtrip() {
             auth_type: AuthType::Password,
             username: "test".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -283,7 +284,7 @@ async fn remote_exec_roundtrip() {
                 .unwrap()
                 .as_millis()
         ));
-        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let store = Arc::new(test_store(config_dir));
         let ssh = Arc::new(SshManager::new(store));
 
         let server = Server {
@@ -294,6 +295,7 @@ async fn remote_exec_roundtrip() {
             auth_type: AuthType::Password,
             username: "test".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -351,7 +353,7 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
                 .unwrap()
                 .as_millis()
         ));
-        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let store = Arc::new(test_store(config_dir));
         // 服务器登记进 Store 并锁定（upsert_server None = 不触碰 keyring）
         let server = Server {
             id: "s-lock".to_string(),
@@ -361,6 +363,7 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             auth_type: AuthType::Password,
             username: "test".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: true,
             is_bastion: false,
             bastion_id: None,
@@ -541,7 +544,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
                 .unwrap()
                 .as_millis()
         ));
-        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let store = Arc::new(test_store(config_dir));
         let ssh = Arc::new(SshManager::new(Arc::clone(&store)));
         let staging = Arc::new(aishell_lib::staging::RemoteStaging::new(
             std::env::temp_dir().join(format!("aishell-ssh-snap-staging-{}", std::process::id())),
@@ -563,6 +566,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             auth_type: AuthType::Password,
             username: "test".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -648,7 +652,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             serde_json::to_string(&seed_config).expect("序列化测试配置应成功"),
         )
         .expect("预写配置应成功");
-        let store2 = Arc::new(Store::new(config_dir_off).expect("Store::new 应成功"));
+        let store2 = Arc::new(test_store(config_dir_off));
         let ssh2 = Arc::new(SshManager::new(Arc::clone(&store2)));
         let staging2 = Arc::new(aishell_lib::staging::RemoteStaging::new(
             std::env::temp_dir().join(format!(
@@ -672,6 +676,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             auth_type: AuthType::Password,
             username: "test".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -853,7 +858,7 @@ async fn jump_target_exec_roundtrip_via_bastion() {
                 .unwrap()
                 .as_millis()
         ));
-        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let store = Arc::new(test_store(config_dir));
         let ssh = Arc::new(SshManager::new(Arc::clone(&store)));
 
         // 堡垒机 + 目标主机登记进 Store（走正式 upsert_server 校验；None = 不触碰 keyring）
@@ -867,6 +872,7 @@ async fn jump_target_exec_roundtrip_via_bastion() {
                     auth_type: AuthType::Password,
                     username: "test".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: true,
                     bastion_id: None,
@@ -884,6 +890,7 @@ async fn jump_target_exec_roundtrip_via_bastion() {
                     auth_type: AuthType::Password,
                     username: "test".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: Some("bastion".to_string()),

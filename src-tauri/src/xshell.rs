@@ -256,6 +256,7 @@ fn parse_session_file(
         auth_type,
         username: fields.username.unwrap_or_default(),
         key_path,
+        credential_id: None,
         // 新导入服务器默认未锁定（锁定是用户显式行为）
         locked: false,
         is_bastion: false,
@@ -821,9 +822,19 @@ mod tests {
         let r = store.merge_xshell_servers(&scanned).unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
         assert_eq!(r.projects_created, 0, "重复导入不重复建项目");
-        // 内存状态可通过生产只读 API 查询，避免测试跨模块触碰 Store 私有字段
-        assert_eq!(store.server(&web01.server.id), Some(web01.server.clone()));
-        assert_eq!(store.server(&web02.server.id), Some(web02.server.clone()));
+        // 导入后自动创建凭据并回填 credentialId；其余连接字段保持扫描结果。
+        for scanned in [web01, web02] {
+            let stored = store.server(&scanned.server.id).unwrap();
+            assert_eq!(
+                stored.credential_id.as_deref(),
+                Some(format!("credential-{}", scanned.server.id).as_str())
+            );
+            assert_eq!(stored.name, scanned.server.name);
+            assert_eq!(stored.host, scanned.server.host);
+            assert_eq!(stored.auth_type, scanned.server.auth_type);
+            assert_eq!(stored.username, scanned.server.username);
+            assert_eq!(stored.key_path, scanned.server.key_path);
+        }
     }
 
     #[test]

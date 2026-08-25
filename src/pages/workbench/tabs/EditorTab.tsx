@@ -806,7 +806,24 @@ export function EditorTab({ tab, active: _active }: TabProps): JSX.Element {
       e.preventDefault();
       showEditorMenu(e.clientX, e.clientY, entry, entry.path);
     };
+    const onMiddleMouseDown = (e: MouseEvent): void => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      const view = entry.view;
+      const { from, to, empty } = view.state.selection.main;
+      if (!empty && from !== to) {
+        void copyText(view.state.sliceDoc(from, to));
+        return;
+      }
+      const pos = view.posAtCoords({ x: e.clientX, y: e.clientY }) ?? from;
+      void navigator.clipboard.readText().then((text) => {
+        if (!text) return;
+        view.focus();
+        view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length } });
+      }).catch(() => toast('读取剪贴板失败', 'error'));
+    };
     entry.view.dom.addEventListener('contextmenu', onContextMenu);
+    entry.view.dom.addEventListener('mousedown', onMiddleMouseDown);
 
     /* 链式保留打开方传入的 onClose:先静默落盘未保存缓冲,再放行(原型语义) */
     const originalOnClose = tab.onClose;
@@ -835,6 +852,7 @@ export function EditorTab({ tab, active: _active }: TabProps): JSX.Element {
       offStaging();
       offTheme();
       entry.view.dom.removeEventListener('contextmenu', onContextMenu);
+      entry.view.dom.removeEventListener('mousedown', onMiddleMouseDown);
       entry.view.destroy();
       entries.delete(tab.id);
       tabApis.delete(tab.id);

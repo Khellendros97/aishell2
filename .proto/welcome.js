@@ -329,15 +329,25 @@
 
     const auth = els.miniAuth.value;
     const secret = els.miniSecret.value.trim();
+    const username = els.miniUser.value.trim();
+    const credential = {
+      id: AIShell.uid('cred'),
+      name: username ? `${username}@${host}` : host,
+      authType: auth,
+      username,
+      keyPath: auth === 'key' ? secret : '',
+    };
+    db.credentials = db.credentials || [];
+    db.credentials.push(credential);
     const srv = {
       id: AIShell.uid('srv'),
       name: name,
       host: host,
       port: port,
       authType: auth,
-      username: els.miniUser.value.trim(),
-      password: auth === 'password' ? secret : '',
+      username,
       keyPath: auth === 'key' ? secret : '',
+      credentialId: credential.id,
     };
 
     db.servers.push(srv);

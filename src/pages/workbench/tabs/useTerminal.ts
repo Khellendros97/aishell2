@@ -29,10 +29,11 @@ import '@xterm/xterm/css/xterm.css';
 
 import {
   SSH_AUTH_FAILED_PREFIX, getState, onTermData, onTermExit, openDialog, termClose, termCreate,
-  termInput, termRecordStart, termRecordStop, termResize, upsertProject, upsertServer,
+  termInput, termRecordStart, termRecordStop, termResize, upsertProject,
 } from '../../../api';
 import type { TermKind } from '../../../api';
 import type { QuickCommand, Server, ServerRef, TermSnapshot } from '../../../types';
+import { saveServerWithCredentialChoice } from '../../settings/server-save';
 import { icon } from '../../../icons';
 import { attachCombo, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { dbg } from '../../../debug';
@@ -318,6 +319,13 @@ class TermSession {
           : { label: '开始录制', iconName: 'circle', action: () => void this.startRecording() },
         { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
       ]);
+    });
+    /* 中键快捷复制/粘贴；终端应用启用鼠标追踪时交还给应用（vim/tmux 等）。 */
+    this.host.addEventListener('mousedown', (e) => {
+      if (e.button !== 1 || this.term.modes.mouseTrackingMode !== 'none') return;
+      e.preventDefault();
+      if (this.term.hasSelection()) this.copySelection();
+      else void this.pasteClipboard();
     });
     /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴；
        preventDefault 必须调：否则浏览器默认行为（Chromium 的粘贴为纯文本）会再粘贴一遍 */
@@ -1054,13 +1062,19 @@ async function showAuthFixDialog(serverId: string, errorMsg: string, onSaved: ()
     const passwordOrNull = authType === 'password' ? (password || null) : null;
     saveBtn.disabled = true;
     saveBtn.textContent = '保存中…';
+    let saved: Server | null;
     try {
-      await upsertServer(next, passwordOrNull);
+      saved = await saveServerWithCredentialChoice(next, passwordOrNull);
     } catch (err) {
       saveBtn.disabled = false;
       saveBtn.textContent = '保存并重连';
       errEl.textContent = String(err);
       toast(String(err), 'error');
+      return;
+    }
+    if (!saved) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = '保存并重连';
       return;
     }
     close();

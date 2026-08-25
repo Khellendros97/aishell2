@@ -79,14 +79,25 @@
 <div id="settings-layout">
   <!-- 左侧导航 -->
   <nav id="settings-nav">
-    <div class="nav-item active" data-panel="servers">🖥️ 服务器配置</div>
+    <div class="nav-item active" data-panel="credentials">🔑 凭据库</div>
+    <div class="nav-item" data-panel="servers">🖥️ 服务器配置</div>
     <div class="nav-item" data-panel="system">⚙️ 系统设置</div>
   </nav>
 
   <!-- 右侧内容 -->
   <main id="settings-content">
+    <!-- 凭据库：密码只接受本次输入，不回显、不进入 mock JSON -->
+    <section id="panel-credentials" class="settings-panel">
+      <div class="panel-head">
+        <div><div class="panel-title">凭据库 <span id="credential-count" class="tag">0</span></div><div class="hint">集中管理 SSH 登录信息；密码永不回显。</div></div>
+        <button id="btn-new-credential" class="btn primary">＋ 新建凭据</button>
+      </div>
+      <div id="credential-grid" class="server-grid"></div>
+      <div id="credential-empty" class="empty-state hidden"><div class="icon">🔑</div><div>暂无凭据</div></div>
+    </section>
+
     <!-- 服务器配置 -->
-    <section id="panel-servers" class="settings-panel">
+    <section id="panel-servers" class="settings-panel hidden">
       <div class="panel-head">
         <div class="panel-title">服务器 <span id="server-count" class="tag">0</span></div>
         <button id="btn-new-server" class="btn primary">＋ 新建服务器</button>
@@ -144,6 +155,21 @@
   </main>
 </div>
 
+<!-- 新建 / 编辑凭据模态框 -->
+<div id="credential-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head"><h3 id="credential-modal-title">新建凭据</h3><button id="credential-modal-close" class="icon-btn">✕</button></div>
+    <div class="modal-body">
+      <div class="field"><label>凭据名称<span class="req">*</span></label><input id="c-name" class="input" placeholder="例如：生产环境部署账号"></div>
+      <div class="field"><label>认证方式</label><select id="c-auth" class="select"><option value="password">账号密码</option><option value="key">密钥</option></select></div>
+      <div class="field"><label>账号<span class="req">*</span></label><input id="c-username" class="input"></div>
+      <div class="field" data-credential-auth="password"><label>密码</label><input id="c-password" type="password" class="input" placeholder="已保存密码不回显，留空表示不修改"></div>
+      <div class="field hidden" data-credential-auth="key"><label>密钥文件路径</label><input id="c-keypath" class="input mono"></div>
+    </div>
+    <div class="modal-foot"><button id="credential-modal-cancel" class="btn">取消</button><button id="credential-modal-save" class="btn primary">保存</button></div>
+  </div>
+</div>
+
 <!-- 新建 / 编辑服务器模态框 -->
 <div id="server-modal" class="modal-mask hidden">
   <div class="modal">
@@ -163,6 +189,11 @@
       <div class="field">
         <label>SSH 端口<span class="req">*</span></label>
         <input id="f-port" class="input mono" type="number" min="1" max="65535" value="22">
+      </div>
+      <div class="field">
+        <label>使用凭据</label>
+        <select id="f-credential" class="select"><option value="">新建凭据（保存服务器时创建）</option></select>
+        <div class="hint">选择已有凭据会回填认证信息；继续修改共享凭据时，保存需选择更新原凭据或保存到新凭据。</div>
       </div>
       <div class="field">
         <label>认证方式<span class="req">*</span></label>

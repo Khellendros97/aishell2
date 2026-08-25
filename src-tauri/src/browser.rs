@@ -638,6 +638,8 @@ impl BrowserManager {
             WebviewUrl::External(Url::parse("about:blank").map_err(|e| format!("初始地址非法: {e}"))?),
         )
         .initialization_script(INSPECTOR_JS)
+        // 子 webview 是独立原生表面，由 WebView2 直接处理 Ctrl+滚轮缩放
+        .zoom_hotkeys_enabled(true)
         // 保留 WebView2 原生拖放行为（拖入 HTML 文件可直接打开），不走 tauri 的 OLE 拦截
         .disable_drag_drop_handler()
         // 页面内链接 / JS 跳转到「空 host 的 file://」地址时，wry ipc 处理器会 panic

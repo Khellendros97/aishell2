@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -26,8 +26,11 @@ export const saveSettings = (settings: Settings, apiKey: string | null, braveKey
   call<void>('save_settings', { settings, apiKey, braveKey });
 /** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */
 export const setTheme = (theme: Theme) => call<void>('set_theme', { theme });
-export const upsertServer = (server: Server, password: string | null) =>
-  call<void>('upsert_server', { server, password });
+export const upsertServer = (server: Server, password: string | null, credentialMode: CredentialMode = 'ask') =>
+  call<ServerSaveResult>('upsert_server', { server, password, credentialMode });
+export const upsertCredential = (credential: Credential, password: string | null) =>
+  call<Credential>('upsert_credential', { credential, password });
+export const deleteCredential = (id: string) => call<void>('delete_credential', { id });
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
 /** 新建项目分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
 export const createProjectFolder = (name: string) => call<void>('create_project_folder', { name });
@@ -52,7 +55,7 @@ export const setSftpHistory = (serverId: string, paths: string[]) =>
 /** 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序，前端防抖后调用） */
 export const setSftpFavorites = (serverId: string, favorites: SftpFavorite[]) =>
   call<void>('set_sftp_favorites', { serverId, favorites });
-/** 清除全部服务器配置：清空服务器与分类目录、所有项目解绑、删除全部 keyring 密钥 */
+/** 清除全部服务器配置并让所有项目解绑；可复用凭据库保留。 */
 export const clearAllServers = () => call<void>('clear_all_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；
  *  密码永不迁移；无可用会话目录时 reject 中文错误串。 */
@@ -119,6 +122,8 @@ export const onTermExit = (id: string, cb: (code: number | null) => void): Promi
 
 /* ---------------- fs ---------------- */
 export const fsList = (path: string) => call<FsEntry[]>('fs_list', { path });
+/** 是否满足编辑器 UTF-8 文本约束；目录、>5MB、二进制返回 false。 */
+export const fsIsText = (path: string) => call<boolean>('fs_is_text', { path });
 /** >5MB 或二进制文件会 reject 错误串 */
 export const fsRead = (path: string) => call<string>('fs_read', { path });
 export const fsWrite = (path: string, content: string) => call<void>('fs_write', { path, content });
