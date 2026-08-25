@@ -367,7 +367,8 @@ impl SshManager {
                 server.name, server.host, server.port
             )
         })?;
-        self.authenticate_handle(handle, server, password_override).await
+        self.authenticate_handle(handle, server, password_override)
+            .await
     }
 
     /// 经堡垒机连接目标主机：堡垒机连接复用连接池，在堡垒机上开 direct-tcpip 通道指向
@@ -425,7 +426,8 @@ impl SshManager {
         .await
         .map_err(|_| format!("{via}连接目标主机「{}」超时（10s）", server.name))?
         .map_err(|e| format!("{via}连接目标主机「{}」失败：{e}", server.name))?;
-        self.authenticate_handle(handle, server, password_override).await
+        self.authenticate_handle(handle, server, password_override)
+            .await
     }
 
     /// 在已建立 SSH 会话的 handle 上完成用户认证（各 10s 超时）。
@@ -462,22 +464,25 @@ impl SshManager {
                 res.success()
             }
             store::AuthType::Key => {
-                let key = russh::keys::load_secret_key(&server.key_path, None).map_err(|e| match e {
-                    russh::keys::Error::KeyIsEncrypted => format!(
-                        "MVP 暂不支持带密码短语的密钥，请改用无短语密钥（{}:{}）",
-                        server.host, server.port
-                    ),
-                    other => format!(
-                        "读取服务器「{}」的密钥失败（{}）：{other}",
-                        server.name, server.key_path
-                    ),
-                })?;
+                let key =
+                    russh::keys::load_secret_key(&server.key_path, None).map_err(|e| match e {
+                        russh::keys::Error::KeyIsEncrypted => format!(
+                            "MVP 暂不支持带密码短语的密钥，请改用无短语密钥（{}:{}）",
+                            server.host, server.port
+                        ),
+                        other => format!(
+                            "读取服务器「{}」的密钥失败（{}）：{other}",
+                            server.name, server.key_path
+                        ),
+                    })?;
                 let key = russh::keys::PrivateKeyWithHashAlg::new(
                     Arc::new(key),
                     handle
                         .best_supported_rsa_hash()
                         .await
-                        .map_err(|e| format!("获取服务器「{}」的签名算法支持失败：{e}", server.name))?
+                        .map_err(|e| {
+                            format!("获取服务器「{}」的签名算法支持失败：{e}", server.name)
+                        })?
                         .flatten(),
                 );
                 let res = tokio::time::timeout(
@@ -645,10 +650,12 @@ mod tests {
     /// ssh_exec 的错误路径（不连真实服务器、不碰真实 keyring，走 test_store/MemorySecrets）。
     #[tokio::test]
     async fn ssh_exec_rejects_empty_command_and_unknown_server_without_network() {
-        let store_dir = std::env::temp_dir()
-            .join(format!("aishell-sshexec-store-test-{}", std::process::id()));
+        let store_dir =
+            std::env::temp_dir().join(format!("aishell-sshexec-store-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store_dir);
-        let manager = Arc::new(SshManager::new(Arc::new(store::test_store(store_dir.clone()))));
+        let manager = Arc::new(SshManager::new(Arc::new(store::test_store(
+            store_dir.clone(),
+        ))));
         let timeout = Duration::from_secs(5);
 
         // 空命令在建连前拒绝
@@ -695,7 +702,10 @@ mod tests {
     fn tcp_forward_hint_adds_actionable_guide_for_admin_prohibited() {
         // AdministrativelyProhibited（大小写不敏感）：给出 AllowTcpForwarding 排查指引
         let hint = tcp_forward_hint("Failed to open channel (AdministrativelyProhibited)");
-        assert!(hint.contains("AllowTcpForwarding"), "应提示转发开关: {hint}");
+        assert!(
+            hint.contains("AllowTcpForwarding"),
+            "应提示转发开关: {hint}"
+        );
         assert!(hint.contains("sshd_config"));
         // 其他错误：无附加提示
         assert_eq!(tcp_forward_hint("Connection reset by peer"), "");
@@ -704,10 +714,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_or_connect_rejects_invalid_jump_setups_before_network() {
-        let store_dir = std::env::temp_dir().join(format!(
-            "aishell-jump-store-test-{}",
-            std::process::id()
-        ));
+        let store_dir =
+            std::env::temp_dir().join(format!("aishell-jump-store-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store_dir);
         let store = Arc::new(store::test_store(store_dir.clone()));
 
@@ -774,7 +782,10 @@ mod tests {
             .await
             .err()
             .expect("链式跳板应拒绝");
-        assert!(err.contains("不能作为另一台堡垒机的目标主机"), "错误串不符: {err}");
+        assert!(
+            err.contains("不能作为另一台堡垒机的目标主机"),
+            "错误串不符: {err}"
+        );
 
         // 合法目标：错误发生在真实的堡垒机连接阶段（127.0.0.1:22 无 sshd），
         // 错误应指向堡垒机自身，证明先连堡垒机（而非直连目标机 10.0.0.9）

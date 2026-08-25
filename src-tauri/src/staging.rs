@@ -190,7 +190,11 @@ pub struct RemoteStaging {
 
 /// 非法 id 检查：projectId / sessionId / serverId 只允许字母数字与 `-` `_`。
 fn validate_id(id: &str, what: &str) -> Result<(), String> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(format!("非法{what}：仅允许字母、数字与 - _（实际：{id}）"));
     }
     Ok(())
@@ -238,7 +242,11 @@ async fn walk_remote_files(
     dir: &str,
     out: &mut Vec<String>,
 ) -> Result<(), String> {
-    async fn inner(sftp: &russh_sftp::client::SftpSession, dir: &str, out: &mut Vec<String>) -> Result<(), String> {
+    async fn inner(
+        sftp: &russh_sftp::client::SftpSession,
+        dir: &str,
+        out: &mut Vec<String>,
+    ) -> Result<(), String> {
         let rd = sftp
             .read_dir(dir)
             .await
@@ -299,12 +307,22 @@ impl RemoteStaging {
     }
 
     fn emit_progress(&self, p: &StagingProgress) {
-        if let Some(f) = self.progress.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        if let Some(f) = self
+            .progress
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
             f(p);
         }
     }
 
-    fn validate_session(&self, project_id: &str, session_id: &str, server_id: &str) -> Result<(), String> {
+    fn validate_session(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        server_id: &str,
+    ) -> Result<(), String> {
         validate_id(project_id, "项目 ID")?;
         validate_id(session_id, "会话 ID")?;
         validate_id(server_id, "服务器 ID")?;
@@ -312,7 +330,10 @@ impl RemoteStaging {
     }
 
     fn manifest_path(&self, project_id: &str, session_id: &str) -> PathBuf {
-        self.root.join(project_id).join(session_id).join("manifest.json")
+        self.root
+            .join(project_id)
+            .join(session_id)
+            .join("manifest.json")
     }
 
     fn session_dir(&self, project_id: &str, session_id: &str) -> PathBuf {
@@ -332,7 +353,12 @@ impl RemoteStaging {
     }
 
     /// 原子写 manifest：同目录 .tmp + rename（与 store.rs persist_locked 同模式）。
-    fn write_manifest(&self, project_id: &str, session_id: &str, entries: &[StagedFile]) -> Result<(), String> {
+    fn write_manifest(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        entries: &[StagedFile],
+    ) -> Result<(), String> {
         let dir = self.session_dir(project_id, session_id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("创建暂存目录失败（{}）：{e}", dir.display()))?;
@@ -340,14 +366,18 @@ impl RemoteStaging {
         let tmp = dir.join("manifest.json.tmp");
         let json = serde_json::to_string_pretty(entries)
             .map_err(|e| format!("序列化暂存清单失败: {e}"))?;
-        std::fs::write(&tmp, json).map_err(|e| format!("写入暂存清单临时文件失败（{}）：{e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("原子替换暂存清单失败（{}）：{e}", path.display()))?;
+        std::fs::write(&tmp, json)
+            .map_err(|e| format!("写入暂存清单临时文件失败（{}）：{e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("原子替换暂存清单失败（{}）：{e}", path.display()))?;
         Ok(())
     }
 
     fn lock_for(&self, key: &str) -> Arc<AsyncMutex<()>> {
         let mut map = self.locks.lock().unwrap_or_else(|p| p.into_inner());
-        map.entry(key.to_string()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// 同一会话的 manifest 是单文件读改写事务；所有写操作必须持有此锁，避免并发丢失更新。
@@ -374,7 +404,10 @@ impl RemoteStaging {
         let _manifest_guard = manifest_lock.lock().await;
 
         let mut entries = self.read_manifest(project_id, session_id)?;
-        if let Some(existing) = entries.iter().find(|e| e.server_id == server_id && e.remote_path == remote_path) {
+        if let Some(existing) = entries
+            .iter()
+            .find(|e| e.server_id == server_id && e.remote_path == remote_path)
+        {
             return Ok(existing.clone());
         }
         let sftp = self
@@ -384,16 +417,26 @@ impl RemoteStaging {
             .map_err(|e| format!("打开服务器 SFTP 会话失败：{e}"))?;
         let (blob_ref, size, mtime, sha256) = match sftp.metadata(&remote_path).await {
             Ok(md) if md.is_dir() => {
-                return Err(format!("无法确定目录内文件，不执行受保护写入：{remote_path}"));
+                return Err(format!(
+                    "无法确定目录内文件，不执行受保护写入：{remote_path}"
+                ));
             }
             Ok(_md) => self.store_remote_file(&sftp, &remote_path).await?,
             Err(e) if is_no_such_file(&e) => (None, None, None, None),
             Err(e) => return Err(format!("读取远端 {remote_path} 快照失败: {e}")),
         };
-        let original_state = if blob_ref.is_some() { StagedState::Existing } else { StagedState::Absent };
+        let original_state = if blob_ref.is_some() {
+            StagedState::Existing
+        } else {
+            StagedState::Absent
+        };
         let now = unix_ts();
         let entry = StagedFile {
-            entry_id: format!("{:x}", Sha256::digest(format!("{lock_key}:{now}").as_bytes()))[..24].to_string(),
+            entry_id: format!(
+                "{:x}",
+                Sha256::digest(format!("{lock_key}:{now}").as_bytes())
+            )[..24]
+                .to_string(),
             server_id: server_id.to_string(),
             remote_path: remote_path.clone(),
             original_state: original_state.clone(),
@@ -435,7 +478,9 @@ impl RemoteStaging {
             Err(e) => return Err(format!("读取远端 {remote_path} 状态失败: {e}")),
         };
         if !md.is_dir() {
-            let e = self.ensure_snapshot(project_id, session_id, server_id, &remote_path).await?;
+            let e = self
+                .ensure_snapshot(project_id, session_id, server_id, &remote_path)
+                .await?;
             return Ok(vec![e]);
         }
         let mut files: Vec<String> = Vec::new();
@@ -470,7 +515,10 @@ impl RemoteStaging {
                 total,
                 current_path: f.clone(),
             });
-            match self.ensure_snapshot(project_id, session_id, server_id, f).await {
+            match self
+                .ensure_snapshot(project_id, session_id, server_id, f)
+                .await
+            {
                 Ok(e) => out.push(e),
                 Err(e) => {
                     return Err(format!("暂存 {f} 失败（已暂存 {} 个文件）：{e}", out.len()));
@@ -502,7 +550,11 @@ impl RemoteStaging {
         let _manifest_guard = manifest_lock.lock().await;
         let entries = self.read_manifest(project_id, session_id)?;
         if entries.is_empty() {
-            return Ok(StagingClearOutcome { removed: Vec::new(), kept: Vec::new(), errors: Vec::new() });
+            return Ok(StagingClearOutcome {
+                removed: Vec::new(),
+                kept: Vec::new(),
+                errors: Vec::new(),
+            });
         }
         let mut removed: Vec<StagedFile> = Vec::new();
         let mut kept: Vec<StagedFile> = Vec::new();
@@ -577,7 +629,11 @@ impl RemoteStaging {
     }
 
     /// 列出某会话全部暂存条目（按暂存时间排序）。manifest 损坏 → 带路径错误。
-    pub async fn list(&self, project_id: &str, session_id: &str) -> Result<Vec<StagedFile>, String> {
+    pub async fn list(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<StagedFile>, String> {
         validate_id(project_id, "项目 ID")?;
         validate_id(session_id, "会话 ID")?;
         if !self.session_dir(project_id, session_id).is_dir() {
@@ -608,13 +664,26 @@ impl RemoteStaging {
         let entries = self.read_manifest(project_id, session_id)?;
         let entry = self.find_entry(&entries, entry_id)?;
         if entry.original_state == StagedState::Absent {
-            return Ok(StagingContent { text: None, meta: None, absent: true });
+            return Ok(StagingContent {
+                text: None,
+                meta: None,
+                absent: true,
+            });
         }
-        let blob_ref = entry.blob_ref.as_ref().ok_or_else(|| format!("暂存条目缺少 blob 引用：{entry_id}"))?;
+        let blob_ref = entry
+            .blob_ref
+            .as_ref()
+            .ok_or_else(|| format!("暂存条目缺少 blob 引用：{entry_id}"))?;
         let blob_path = self.root.join("blobs").join(blob_ref);
         let bytes = std::fs::read(&blob_path)
             .map_err(|e| format!("读取快照 blob 失败（{}）：{e}", blob_path.display()))?;
-        Ok(content_from_bytes(&bytes, entry.size, entry.mtime, entry.sha256.clone(), &self.store.known_secrets()))
+        Ok(content_from_bytes(
+            &bytes,
+            entry.size,
+            entry.mtime,
+            entry.sha256.clone(),
+            &self.store.known_secrets(),
+        ))
     }
 
     /// 读取当前侧内容：实时从远端读取（当前状态以远端为事实源）。
@@ -652,11 +721,19 @@ impl RemoteStaging {
                     .await
                     .ok()
                     .and_then(|md| md.mtime.map(|m| m as i64));
-                Ok(content_from_bytes(&bytes, Some(size), mtime, sha256, &self.store.known_secrets()))
+                Ok(content_from_bytes(
+                    &bytes,
+                    Some(size),
+                    mtime,
+                    sha256,
+                    &self.store.known_secrets(),
+                ))
             }
-            Err(e) if is_no_such_file(&e) => {
-                Ok(StagingContent { text: None, meta: None, absent: true })
-            }
+            Err(e) if is_no_such_file(&e) => Ok(StagingContent {
+                text: None,
+                meta: None,
+                absent: true,
+            }),
             Err(e) => Err(format!("读取远端 {} 当前内容失败: {e}", entry.remote_path)),
         }
     }
@@ -707,7 +784,10 @@ impl RemoteStaging {
         // 冲突校验：当前远端属性 vs 暂存记录的 current
         let current_remote = match sftp.metadata(&entry.remote_path).await {
             Ok(md) if md.is_dir() => {
-                return Err(format!("远端 {} 当前是目录，无法还原文件", entry.remote_path));
+                return Err(format!(
+                    "远端 {} 当前是目录，无法还原文件",
+                    entry.remote_path
+                ));
             }
             Ok(md) => Some((md.size, md.mtime.map(|m| m as i64))),
             Err(e) if is_no_such_file(&e) => None,
@@ -716,7 +796,11 @@ impl RemoteStaging {
         let conflict = restore_conflict(&entry, current_remote, &sftp, &entry.remote_path).await?;
         if let Some(c) = conflict {
             if !force {
-                return Ok(RestoreOutcome { restored: false, conflict: Some(c), entry: None });
+                return Ok(RestoreOutcome {
+                    restored: false,
+                    conflict: Some(c),
+                    entry: None,
+                });
             }
         }
 
@@ -726,12 +810,15 @@ impl RemoteStaging {
                 // 快照时文件不存在 → 还原 = 删除当前远程文件
                 match sftp.metadata(&entry.remote_path).await {
                     Ok(md) if !md.is_dir() => {
-                        sftp.remove_file(&entry.remote_path)
-                            .await
-                            .map_err(|e| format!("还原（删除）远端 {} 失败: {e}", entry.remote_path))?;
+                        sftp.remove_file(&entry.remote_path).await.map_err(|e| {
+                            format!("还原（删除）远端 {} 失败: {e}", entry.remote_path)
+                        })?;
                     }
                     Ok(_) => {
-                        return Err(format!("远端 {} 当前是目录，无法还原删除", entry.remote_path));
+                        return Err(format!(
+                            "远端 {} 当前是目录，无法还原删除",
+                            entry.remote_path
+                        ));
                     }
                     Err(e) if is_no_such_file(&e) => {}
                     Err(e) => return Err(format!("读取远端 {} 状态失败: {e}", entry.remote_path)),
@@ -745,7 +832,8 @@ impl RemoteStaging {
                 let blob_path = self.root.join("blobs").join(blob_ref);
                 let bytes = std::fs::read(&blob_path)
                     .map_err(|e| format!("读取快照 blob 失败（{}）：{e}", blob_path.display()))?;
-                self.write_remote_bytes(&sftp, &entry.remote_path, &bytes).await?;
+                self.write_remote_bytes(&sftp, &entry.remote_path, &bytes)
+                    .await?;
             }
         }
         // 还原后条目 current = 原始状态
@@ -758,7 +846,11 @@ impl RemoteStaging {
             *e = restored.clone();
         }
         self.write_manifest(project_id, session_id, &entries)?;
-        Ok(RestoreOutcome { restored: true, conflict: None, entry: Some(restored) })
+        Ok(RestoreOutcome {
+            restored: true,
+            conflict: None,
+            entry: Some(restored),
+        })
     }
 
     /// 行级 diff（文本）或元数据对比（二进制/超大）。diff 行已脱敏。
@@ -778,7 +870,11 @@ impl RemoteStaging {
         let current_absent = current.absent;
 
         // 两侧都可用文本（快照侧 Absent 视为空文本）→ 行级 diff；否则元数据对比
-        let snapshot_text = if snapshot.absent { Some(String::new()) } else { snapshot.text.clone() };
+        let snapshot_text = if snapshot.absent {
+            Some(String::new())
+        } else {
+            snapshot.text.clone()
+        };
         match (snapshot_text, current.text.clone()) {
             (Some(s), Some(c)) => {
                 let a: Vec<String> = s.lines().map(str::to_string).collect();
@@ -808,11 +904,18 @@ impl RemoteStaging {
                     size: entry.size,
                     mtime: entry.mtime,
                 };
-                let current_meta = current.meta.unwrap_or(StagingMeta { sha256: None, size: None, mtime: None });
+                let current_meta = current.meta.unwrap_or(StagingMeta {
+                    sha256: None,
+                    size: None,
+                    mtime: None,
+                });
                 Ok(StagingDiff {
                     left: Vec::new(),
                     right: Vec::new(),
-                    meta: Some(DiffMeta { snapshot: snapshot_meta, current: current_meta }),
+                    meta: Some(DiffMeta {
+                        snapshot: snapshot_meta,
+                        current: current_meta,
+                    }),
                     snapshot_absent,
                     current_absent,
                 })
@@ -833,7 +936,10 @@ impl RemoteStaging {
         let manifest_lock = self.manifest_lock(project_id, session_id);
         let _manifest_guard = manifest_lock.lock().await;
         let mut entries = self.read_manifest(project_id, session_id)?;
-        let Some(entry) = entries.iter_mut().find(|e| e.server_id == server_id && e.remote_path == remote_path) else {
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.server_id == server_id && e.remote_path == remote_path)
+        else {
             return Ok(StagedFile {
                 entry_id: String::new(),
                 server_id: server_id.to_string(),
@@ -1196,7 +1302,9 @@ impl RemoteStaging {
                 .await
                 .map_err(|e| format!("写入临时 blob 失败: {e}"))?;
         }
-        dst.flush().await.map_err(|e| format!("写入临时 blob 失败: {e}"))?;
+        dst.flush()
+            .await
+            .map_err(|e| format!("写入临时 blob 失败: {e}"))?;
         let sha = hex::encode(hasher.finalize());
         let final_path = blob_dir.join(&sha);
         if final_path.exists() {
@@ -1220,7 +1328,10 @@ impl RemoteStaging {
             .await
             .map_err(|e| format!("读取远端 {remote_path} 属性失败: {e}"))?;
         if md.size.unwrap_or(0) > CURRENT_HASH_CAP {
-            return Err(format!("远端 {remote_path} 超过 {} 字节，无法整读", CURRENT_HASH_CAP));
+            return Err(format!(
+                "远端 {remote_path} 超过 {} 字节，无法整读",
+                CURRENT_HASH_CAP
+            ));
         }
         let mut f = sftp
             .open(remote_path)
@@ -1312,10 +1423,18 @@ fn content_from_bytes(
         None
     };
     match text {
-        Some(t) => StagingContent { text: Some(t), meta: None, absent: false },
+        Some(t) => StagingContent {
+            text: Some(t),
+            meta: None,
+            absent: false,
+        },
         None => StagingContent {
             text: None,
-            meta: Some(StagingMeta { sha256, size, mtime }),
+            meta: Some(StagingMeta {
+                sha256,
+                size,
+                mtime,
+            }),
             absent: false,
         },
     }
@@ -1374,7 +1493,11 @@ async fn restore_conflict(
             if size_ok && mtime_ok && sha_ok {
                 Ok(None)
             } else {
-                Ok(Some(RestoreConflict { current_size: size, current_mtime: mtime, current_sha256: None }))
+                Ok(Some(RestoreConflict {
+                    current_size: size,
+                    current_mtime: mtime,
+                    current_sha256: None,
+                }))
             }
         }
     }
@@ -1631,7 +1754,9 @@ pub async fn staging_snapshot_read(
     session_id: String,
     entry_id: String,
 ) -> Result<StagingContent, String> {
-    staging.read_snapshot(&project_id, &session_id, &entry_id).await
+    staging
+        .read_snapshot(&project_id, &session_id, &entry_id)
+        .await
 }
 
 #[tauri::command]
@@ -1641,7 +1766,9 @@ pub async fn staging_current_read(
     session_id: String,
     entry_id: String,
 ) -> Result<StagingContent, String> {
-    staging.read_current(&project_id, &session_id, &entry_id).await
+    staging
+        .read_current(&project_id, &session_id, &entry_id)
+        .await
 }
 
 #[tauri::command]
@@ -1662,7 +1789,9 @@ pub async fn staging_restore(
     entry_id: String,
     force: bool,
 ) -> Result<RestoreOutcome, String> {
-    staging.restore(&project_id, &session_id, &entry_id, force).await
+    staging
+        .restore(&project_id, &session_id, &entry_id, force)
+        .await
 }
 
 #[tauri::command]
@@ -1702,11 +1831,20 @@ mod tests {
 
     #[test]
     fn canonical_remote_path_normalizes() {
-        assert_eq!(canonical_remote_path("/var/www/../etc/app.conf").unwrap(), "/var/etc/app.conf");
-        assert_eq!(canonical_remote_path("/var//www//app/config.json").unwrap(), "/var/www/app/config.json");
+        assert_eq!(
+            canonical_remote_path("/var/www/../etc/app.conf").unwrap(),
+            "/var/etc/app.conf"
+        );
+        assert_eq!(
+            canonical_remote_path("/var//www//app/config.json").unwrap(),
+            "/var/www/app/config.json"
+        );
         assert_eq!(canonical_remote_path("/a/./b/").unwrap(), "/a/b");
         assert_eq!(canonical_remote_path("/").unwrap(), "/");
-        assert!(canonical_remote_path("relative/path").is_err(), "相对路径应拒绝");
+        assert!(
+            canonical_remote_path("relative/path").is_err(),
+            "相对路径应拒绝"
+        );
         assert!(canonical_remote_path("").is_err());
     }
 
@@ -1720,10 +1858,16 @@ mod tests {
             Arc::clone(&store),
         );
         // 无目录 → 空
-        assert_eq!(staging.read_manifest("p1", "s1").unwrap(), Vec::<StagedFile>::new());
+        assert_eq!(
+            staging.read_manifest("p1", "s1").unwrap(),
+            Vec::<StagedFile>::new()
+        );
         // 写一个合法清单
         staging.write_manifest("p1", "s1", &[]).unwrap();
-        assert_eq!(staging.read_manifest("p1", "s1").unwrap(), Vec::<StagedFile>::new());
+        assert_eq!(
+            staging.read_manifest("p1", "s1").unwrap(),
+            Vec::<StagedFile>::new()
+        );
         // 损坏 → 带路径错误（不静默当空）
         let path = staging.manifest_path("p1", "s1");
         std::fs::write(&path, "not json").unwrap();
@@ -1858,9 +2002,13 @@ mod tests {
             current_sha256: None,
         };
         staging.write_manifest("p1", "s1", &[entry]).unwrap();
-        let found = staging.find_entry(&staging.read_manifest("p1", "s1").unwrap(), "e9").unwrap();
+        let found = staging
+            .find_entry(&staging.read_manifest("p1", "s1").unwrap(), "e9")
+            .unwrap();
         assert_eq!(found.remote_path, "/x");
-        let err = staging.find_entry(&staging.read_manifest("p1", "s1").unwrap(), "nope").unwrap_err();
+        let err = staging
+            .find_entry(&staging.read_manifest("p1", "s1").unwrap(), "nope")
+            .unwrap_err();
         assert!(err.contains("不存在"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1917,29 +2065,40 @@ mod tests {
         assert!(c.text.is_none());
         assert!(c.meta.is_some());
         // 文本含凭据 → 脱敏
-        let c = content_from_bytes(b"password=secret123", Some(18), Some(1), Some("h".into()), &[]);
+        let c = content_from_bytes(
+            b"password=secret123",
+            Some(18),
+            Some(1),
+            Some("h".into()),
+            &[],
+        );
         assert!(c.text.unwrap().contains("已脱敏"));
     }
 
     #[test]
     fn snapshot_unchanged_decides_consistent() {
-        let mk = |orig: StagedState, size: Option<u64>, mtime: Option<i64>, sha: Option<String>| StagedFile {
-            entry_id: "e".to_string(),
-            server_id: "s".to_string(),
-            remote_path: "/x".to_string(),
-            original_state: orig.clone(),
-            blob_ref: sha.clone(),
-            size,
-            mtime,
-            sha256: sha,
-            staged_at: 0,
-            current_state: orig,
-            current_size: size,
-            current_mtime: mtime,
-            current_sha256: None,
+        let mk = |orig: StagedState, size: Option<u64>, mtime: Option<i64>, sha: Option<String>| {
+            StagedFile {
+                entry_id: "e".to_string(),
+                server_id: "s".to_string(),
+                remote_path: "/x".to_string(),
+                original_state: orig.clone(),
+                blob_ref: sha.clone(),
+                size,
+                mtime,
+                sha256: sha,
+                staged_at: 0,
+                current_state: orig,
+                current_size: size,
+                current_mtime: mtime,
+                current_sha256: None,
+            }
         };
         // 原始不存在且远端不存在 → 无变更（可清理）
-        assert!(snapshot_unchanged(&mk(StagedState::Absent, None, None, None), None));
+        assert!(snapshot_unchanged(
+            &mk(StagedState::Absent, None, None, None),
+            None
+        ));
         // 原始不存在但远端出现 → 有变更（保留）
         assert!(!snapshot_unchanged(
             &mk(StagedState::Absent, None, None, None),
@@ -1947,22 +2106,42 @@ mod tests {
         ));
         // 原始存在、远端 size/mtime/hash 全同 → 无变更
         assert!(snapshot_unchanged(
-            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            &mk(
+                StagedState::Existing,
+                Some(10),
+                Some(5),
+                Some("h".to_string())
+            ),
             Some((Some(10), Some(5), Some("h".to_string())))
         ));
         // 同 size 同 mtime 但内容不同（hash 不同）→ 有变更
         assert!(!snapshot_unchanged(
-            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            &mk(
+                StagedState::Existing,
+                Some(10),
+                Some(5),
+                Some("h".to_string())
+            ),
             Some((Some(10), Some(5), Some("x".to_string())))
         ));
         // mtime 变 → 有变更
         assert!(!snapshot_unchanged(
-            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            &mk(
+                StagedState::Existing,
+                Some(10),
+                Some(5),
+                Some("h".to_string())
+            ),
             Some((Some(10), Some(6), Some("h".to_string())))
         ));
         // 远端不存在（文件被删除）→ 有变更
         assert!(!snapshot_unchanged(
-            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            &mk(
+                StagedState::Existing,
+                Some(10),
+                Some(5),
+                Some("h".to_string())
+            ),
             None
         ));
         // 超大文件（快照无 hash）只信 size/mtime
@@ -1976,7 +2155,12 @@ mod tests {
         ));
         // 快照有 hash 但远端超大（未计算 hash）→ 只看 size/mtime，保守同 restore 语义
         assert!(snapshot_unchanged(
-            &mk(StagedState::Existing, Some(10), Some(5), Some("h".to_string())),
+            &mk(
+                StagedState::Existing,
+                Some(10),
+                Some(5),
+                Some("h".to_string())
+            ),
             Some((Some(10), Some(5), None))
         ));
     }

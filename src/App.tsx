@@ -12,6 +12,7 @@ import { useHashRoute } from './shared/useHashRoute';
 import { Topbar } from './components/Topbar';
 import { Welcome } from './pages/welcome/Welcome';
 import { Settings } from './pages/settings/Settings';
+import { Account } from './pages/account/Account';
 import Workbench from './pages/workbench/Workbench';
 
 interface WbInstance {
@@ -66,6 +67,11 @@ export default function App(): JSX.Element {
             <>
               <Topbar activePage="settings" workbenchProjectId={wb?.projectId ?? null} />
               <Settings params={route.params} />
+            </>
+          ) : route.name === '/account' ? (
+            <>
+              <Topbar activePage="account" workbenchProjectId={wb?.projectId ?? null} />
+              <Account params={route.params} />
             </>
           ) : (
             <>

@@ -11,13 +11,16 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
-import type { AppState, LlmConfig, Settings as AppSettings, Theme } from '../../types';
-import { getMcpStatus, getState, openDialog, saveSettings, setMcpPort, setTheme } from '../../api';
-import { toast } from '../../ui';
+import type { AppState, CloudMode, CloudStatus, LlmConfig, Settings as AppSettings, Theme, UpdateStatus } from '../../types';
+import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, saveSettings, setMcpPort, setTheme, updateCheck, updateDownload, updateInstall } from '../../api';
+import { navigate } from '../../router';
+import { toast, confirmDialog } from '../../ui';
 import { Icon } from '../../shared/Icon';
 import type { IconName } from '../../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../../theme';
+import { onUpdateStatus } from '../../updates';
+import { useWorkbench } from '../../stores/workbench';
 import '../settings.css';
 
 /** 表单字段（与旧版 f-* 元素一一对应；apiKey / braveKey 只存本次输入，加载时恒为空串） */
@@ -34,6 +37,8 @@ interface SysFields {
   approvalMode: AppSettings['approvalMode'];
   autoBackup: boolean;
   mcpPort: string;
+  kbAutoInject: boolean;
+  kbInjectCount: string;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -41,6 +46,7 @@ const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '',
+  kbAutoInject: false, kbInjectCount: '5',
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -49,14 +55,20 @@ interface McpStatusLine {
   cls: string;
 }
 
-/** 左侧导航分类：功能特性 / 外观 / API 接口（MCP 是 AIShell 作为服务端供外部工具接入，归功能特性） */
-type SettingsPage = 'features' | 'appearance' | 'api';
+/** 左侧导航分类：功能特性 / 外观 / API 接口 / 关于与更新（MCP 是 AIShell 作为服务端供外部工具接入，归功能特性） */
+type SettingsPage = 'features' | 'appearance' | 'api' | 'about';
 
 const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'features', label: '功能特性', icon: 'zap' },
   { id: 'appearance', label: '外观', icon: 'monitor' },
   { id: 'api', label: 'API 接口', icon: 'plug' },
+  { id: 'about', label: '关于与更新', icon: 'info' },
 ];
+
+function pageFromParams(params: URLSearchParams): SettingsPage {
+  const requested = params.get('page');
+  return SETTINGS_NAV.some((item) => item.id === requested) ? (requested as SettingsPage) : 'features';
+}
 
 export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   /* 后端状态快照（get_state / aishell:data-changed 刷新）；表单字段独立于它：
@@ -66,13 +78,31 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const mcpPortRef = useRef<HTMLInputElement>(null);
 
   const [fields, setFields] = useState<SysFields>(EMPTY_FIELDS);
-  const [page, setPage] = useState<SettingsPage>('features');
+  const requestedPage = pageFromParams(params);
+  const [page, setPage] = useState<SettingsPage>(requestedPage);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [braveKeyVisible, setBraveKeyVisible] = useState(false);
   const [mcpStatus, setMcpStatus] = useState<McpStatusLine>({ text: '加载中…', cls: 'mcp-status-line' });
+  /* 托管模式形态（CR-2.2）：模型下拉/只读说明的切换；登录/登出/模式切换后即时刷新 */
+  const [cloudMode, setCloudMode] = useState<CloudMode>('personal');
+  const [cloudModels, setCloudModels] = useState<string[]>([]);
+  const hosted = cloudMode === 'hosted';
+  /* 关于与更新：状态来自全局更新总线（Topbar 徽标同源，不重复检查） */
+  const [upd, setUpd] = useState<UpdateStatus | null>(null);
 
   /* reason=missing-config：顶部黄色提示条（同 .proto/settings.js） */
   const warnShown = params.get('reason') === 'missing-config';
+
+  useEffect(() => setPage(requestedPage), [requestedPage]);
+
+  const selectPage = (next: SettingsPage): void => {
+    setPage(next);
+    const nextParams = new URLSearchParams(params);
+    if (next === 'features') nextParams.delete('page');
+    else nextParams.set('page', next);
+    const query = nextParams.toString();
+    navigate(`#/settings${query ? `?${query}` : ''}`);
+  };
 
   /** MCP 服务状态行：运行中/未运行/端口占用原因（与服务器 MCP 弹窗同源） */
   const refreshMcpStatus = async (): Promise<void> => {
@@ -106,6 +136,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       approvalMode: s.settings.approvalMode ?? 'smart',
       autoBackup: s.settings.autoBackupRemoteFiles ?? true,
       mcpPort: String(s.mcp?.port ?? 8945),
+      kbAutoInject: s.settings.knowledge?.autoInject ?? true,
+      kbInjectCount: String(s.settings.knowledge?.injectCount ?? 5),
     });
     void refreshMcpStatus();
   };
@@ -137,6 +169,23 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     return offTheme;
   }, []);
 
+  /* 更新状态总线订阅（已有快照立即回调；卸载退订） */
+  useEffect(() => onUpdateStatus(setUpd), []);
+
+  /* 托管/个人模式（CR-2.2）：账号页切换后本页表单形态即时刷新；
+     同时刷新 dbRef（保存时 settings.cloud 原样带回，需最新值） */
+  useEffect(() => {
+    const applyCloudStatus = (s: CloudStatus): void => {
+      setCloudMode(s.mode);
+      setCloudModels(s.capabilities?.models ?? []);
+      void getState().then((st) => { dbRef.current = st; }).catch(() => {});
+    };
+    let un: (() => void) | null = null;
+    void cloudStatus().then(applyCloudStatus).catch(() => {});
+    void onCloudChanged(applyCloudStatus).then((u) => { un = u; }).catch(() => {});
+    return () => { un?.(); };
+  }, []);
+
   /* Workspace 浏览…：真实目录选择 */
   const browseWorkspace = async (): Promise<void> => {
     const path = await openDialog({ directory: true });
@@ -163,7 +212,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     const workspaceDir = fields.workspace.trim();
     if (!workspaceDir) {
       toast('请填写 Workspace 目录', 'error');
-      setPage('features');
+      selectPage('features');
       workspaceRef.current?.focus();
       return;
     }
@@ -172,24 +221,38 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     const mcpPort = Number(fields.mcpPort);
     if (!Number.isInteger(mcpPort) || mcpPort < 1024 || mcpPort > 65535) {
       toast('MCP 端口必须在 1024–65535 之间', 'error');
-      setPage('features');
+      selectPage('features');
       mcpPortRef.current?.focus();
       return;
     }
+    /* 自动注入条数：1–20（与前端数字输入上下界、后端序列化一致） */
+    const kbInjectCount = Number(fields.kbInjectCount);
+    if (!Number.isInteger(kbInjectCount) || kbInjectCount < 1 || kbInjectCount > 20) {
+      toast('自动注入条数必须在 1–20 之间', 'error');
+      return;
+    }
+    const hosted = cloudMode === 'hosted';
     const llm: LlmConfig = {
       modelId: fields.modelId.trim(),
-      baseUrl: fields.baseUrl.trim(),
+      /* 托管模式：baseUrl 由服务器接管，此处保持原值不覆盖 */
+      baseUrl: hosted ? (dbRef.current?.settings.llm.baseUrl || '') : fields.baseUrl.trim(),
       effort: fields.effort,
     };
-    const apiKey = fields.apiKey.trim();
-    const braveKey = fields.braveKey.trim();
+    /* 托管模式：密钥输入区隐藏，不修改 keyring（传 null） */
+    const apiKey = hosted ? null : (fields.apiKey.trim() || null);
+    const braveKey = hosted ? null : (fields.braveKey.trim() || null);
     /* theme 带内存当前值:避免本页打开期间顶栏切换的主题被表单旧值覆盖;
-       projectView 由欢迎页视图切换维护,本页保存时原样保留 */
+       projectView 由欢迎页视图切换维护,本页保存时原样保留;
+       cloud 段原样带回（账号页/云状态管理，本表单不覆盖） */
     const settings: AppSettings = {
-      workspaceDir, llm, search: { enabled: fields.searchEnabled }, theme: currentTheme(),
+      workspaceDir, llm,
+      search: { enabled: hosted ? (dbRef.current?.settings.search?.enabled ?? false) : fields.searchEnabled },
+      theme: currentTheme(),
       autoSwitchAiWorkdir: fields.aiWorkdir, projectView: dbRef.current?.settings.projectView ?? 'card',
       approvalMode: fields.approvalMode,
+      cloud: dbRef.current?.settings.cloud ?? { mode: 'personal', user: null, capabilities: null },
       autoBackupRemoteFiles: fields.autoBackup,
+      knowledge: { autoInject: fields.kbAutoInject, injectCount: kbInjectCount },
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -200,6 +263,59 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     } catch (err) {
       toast(String(err), 'error');
     }
+  };
+
+  /* ---------- 关于与更新 ---------- */
+
+  const fmtTime = (ms?: number | null): string => (ms ? new Date(ms).toLocaleString() : '');
+  const fmtDate = (s?: string | null): string => {
+    if (!s) return '';
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? s : d.toLocaleString();
+  };
+  const fmtBytes = (n?: number | null): string =>
+    typeof n === 'number' && n > 0 ? `${(n / 1048576).toFixed(1)} MB` : '';
+
+  /** 检查结果行文案/配色（后端状态机的展示映射；错误信息后端已脱敏为中文） */
+  const updResult = (): { text: string; cls: string } => {
+    if (!upd) return { text: '加载中…', cls: 'mcp-status-line' };
+    const checked = upd.lastCheckedAt ? `（${fmtTime(upd.lastCheckedAt)} 检查）` : '';
+    switch (upd.state) {
+      case 'idle': return { text: '尚未检查更新', cls: 'mcp-status-line' };
+      case 'checking': return { text: '正在检查更新…', cls: 'mcp-status-line' };
+      case 'error': return { text: `检查失败：${upd.error ?? '未知错误'}`, cls: 'mcp-status-line err' };
+      case 'not_available': return { text: `已是最新版本${checked}`, cls: 'mcp-status-line ok' };
+      case 'downloading': return { text: `正在下载 v${upd.availableVersion ?? ''}…`, cls: 'mcp-status-line' };
+      case 'ready': return { text: `新版本 v${upd.availableVersion ?? ''} 已就绪，重启后生效`, cls: 'mcp-status-line ok' };
+      case 'installing': return { text: '正在安装更新，应用即将退出…', cls: 'mcp-status-line' };
+      case 'available': return upd.signatureMissing
+        ? { text: `发现新版本 v${upd.availableVersion ?? ''}（该版本未提供更新签名，需手动下载安装）`, cls: 'mcp-status-line err' }
+        : { text: `发现新版本 v${upd.availableVersion ?? ''}`, cls: 'mcp-status-line ok' };
+    }
+  };
+
+  const doCheckUpdate = async (): Promise<void> => {
+    try { await updateCheck(); } catch (err) { toast(String(err), 'error'); }
+  };
+
+  const doDownloadUpdate = async (): Promise<void> => {
+    try { await updateDownload(); } catch (err) { toast(String(err), 'error'); }
+  };
+
+  /** 重启并更新：先确认活动任务风险（终端/SSH/SFTP 会话会被断开），再交后端安装重启 */
+  const doInstallUpdate = async (): Promise<void> => {
+    const tabs = useWorkbench.getState().tabs;
+    const active = tabs.filter((t) => t.type === 'terminal' || t.type === 'sftp').length;
+    const ok = await confirmDialog({
+      title: '重启并更新',
+      message: active > 0
+        ? `更新将退出并重启应用，当前有 ${active} 个终端/SSH/SFTP 会话将被断开，未保存的编辑内容可能丢失。确定继续吗？`
+        : '更新将退出并重启应用，未保存的编辑内容可能丢失。确定继续吗？',
+      okText: '重启并更新',
+    });
+    if (!ok) return;
+    // Windows 上安装器拉起后应用即退出，本调用不会返回；失败（如版本被撤回）reject 中文错误
+    void updateInstall().catch((err) => toast(String(err), 'error'));
   };
 
   return (
@@ -213,7 +329,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
             <button
               key={item.id}
               className={`settings-nav-item${page === item.id ? ' active' : ''}`}
-              onClick={() => setPage(item.id)}
+              onClick={() => selectPage(item.id)}
             >
               <Icon name={item.icon} /> {item.label}
             </button>
@@ -328,50 +444,69 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
             <div className="panel-head"><div className="panel-title">API 接口</div></div>
             <fieldset className="llm-group">
               <legend>大模型配置</legend>
-              <div className="field">
+              {hosted ? (
+                <div className="hint" id="cloud-hosted-llm-note">托管模式下模型与密钥由公司服务器统一管理（<a href="#/account" onClick={(e) => { e.preventDefault(); navigate('#/account'); }}>前往账号页</a>）</div>
+              ) : null}
+              <div className="field" id="llm-model-field">
                 <label>模型 ID</label>
-                <input
-                  id="f-model-id"
-                  className="input"
-                  placeholder="deepseek-v4-flash-vision-exp"
-                  value={fields.modelId}
-                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
-                />
-              </div>
-              <div className="field">
-                <label>Base URL</label>
-                <input
-                  id="f-base-url"
-                  className="input mono"
-                  placeholder="https://api.deepseek.com/v1"
-                  value={fields.baseUrl}
-                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, baseUrl: v })); }}
-                />
-              </div>
-              <div className="field">
-                <label>API Key</label>
-                <div className="input-row">
-                  <input
-                    id="f-api-key"
-                    className="input mono"
-                    type={apiKeyVisible ? 'text' : 'password'}
-                    placeholder="已保存则不显示，留空表示不修改"
-                    value={fields.apiKey}
-                    onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, apiKey: v })); }}
-                  />
-                  <button
-                    id="btn-toggle-key"
-                    className="icon-btn"
-                    title={apiKeyVisible ? '显示 / 隐藏' : '隐藏 / 显示'}
-                    onClick={() => setApiKeyVisible((v) => !v)}
+                {hosted && cloudModels.length > 0 ? (
+                  /* 模型下拉：以服务端能力为准，选择值仍写入 llm.modelId */
+                  <select
+                    id="f-model-id"
+                    className="select"
+                    value={fields.modelId}
+                    onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
                   >
-                    <Icon name={apiKeyVisible ? 'eye' : 'eyeOff'} />
-                  </button>
-                </div>
-                <div className="hint">
-                  获取 API Key：<a href="https://platform.deepseek.com/api_keys" data-open-url="https://platform.deepseek.com/api_keys" onClick={onOpenUrl}>platform.deepseek.com/api_keys</a>
-                </div>
+                    {cloudModels.map((m) => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                ) : (
+                  <input
+                    id="f-model-id"
+                    className="input"
+                    placeholder="deepseek-v4-flash"
+                    value={fields.modelId}
+                    onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
+                  />
+                )}
               </div>
+              {!hosted ? (
+                <>
+                  <div className="field" id="llm-base-field">
+                    <label>Base URL</label>
+                    <input
+                      id="f-base-url"
+                      className="input mono"
+                      placeholder="https://api.deepseek.com/v1"
+                      value={fields.baseUrl}
+                      onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, baseUrl: v })); }}
+                    />
+                  </div>
+                  <div className="field" id="llm-key-field">
+                    <label>API Key</label>
+                    <div className="input-row">
+                      <input
+                        id="f-api-key"
+                        className="input mono"
+                        type={apiKeyVisible ? 'text' : 'password'}
+                        placeholder="已保存则不显示，留空表示不修改"
+                        value={fields.apiKey}
+                        onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, apiKey: v })); }}
+                      />
+                      <button
+                        id="btn-toggle-key"
+                        className="icon-btn"
+                        title={apiKeyVisible ? '显示 / 隐藏' : '隐藏 / 显示'}
+                        onClick={() => setApiKeyVisible((v) => !v)}
+                      >
+                        <Icon name={apiKeyVisible ? 'eye' : 'eyeOff'} />
+                      </button>
+                    </div>
+                    <div className="hint">
+                      获取 API Key：<a href="https://platform.deepseek.com/api_keys" data-open-url="https://platform.deepseek.com/api_keys" onClick={onOpenUrl}>platform.deepseek.com/api_keys</a>
+                    </div>
+                  </div>
+                </>
+              ) : null}
               <div className="field">
                 <label>思考强度</label>
                 <select
@@ -394,38 +529,149 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   id="f-search-enabled"
                   type="checkbox"
                   checked={fields.searchEnabled}
+                  disabled={hosted}
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, searchEnabled: checked })); }}
                 />
                 <div className="hint">启用后 AI 助手可通过 Brave Search 获取最新信息（问时效性问题时自动使用）</div>
               </div>
+              {hosted ? (
+                <div className="hint" id="cloud-hosted-search-note">搜索由公司服务器代理，本地无需配置 Brave Key</div>
+              ) : (
+                <div className="field" id="search-key-field">
+                  <label>Brave Search API Key</label>
+                  <div className="input-row">
+                    <input
+                      id="f-brave-key"
+                      className="input mono"
+                      type={braveKeyVisible ? 'text' : 'password'}
+                      placeholder="已保存则不显示，留空表示不修改"
+                      value={fields.braveKey}
+                      onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, braveKey: v })); }}
+                    />
+                    <button
+                      id="btn-toggle-brave"
+                      className="icon-btn"
+                      title={braveKeyVisible ? '显示 / 隐藏' : '隐藏 / 显示'}
+                      onClick={() => setBraveKeyVisible((v) => !v)}
+                    >
+                      <Icon name={braveKeyVisible ? 'eye' : 'eyeOff'} />
+                    </button>
+                  </div>
+                  <div className="hint">
+                    免费额度 2000 次/月，<a href="https://api-dashboard.search.brave.com/app/keys" data-open-url="https://api-dashboard.search.brave.com/app/keys" onClick={onOpenUrl}>获取 Brave Search API Key</a>
+                  </div>
+                </div>
+              )}
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>知识库</legend>
               <div className="field">
-                <label>Brave Search API Key</label>
-                <div className="input-row">
-                  <input
-                    id="f-brave-key"
-                    className="input mono"
-                    type={braveKeyVisible ? 'text' : 'password'}
-                    placeholder="已保存则不显示，留空表示不修改"
-                    value={fields.braveKey}
-                    onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, braveKey: v })); }}
-                  />
-                  <button
-                    id="btn-toggle-brave"
-                    className="icon-btn"
-                    title={braveKeyVisible ? '显示 / 隐藏' : '隐藏 / 显示'}
-                    onClick={() => setBraveKeyVisible((v) => !v)}
-                  >
-                    <Icon name={braveKeyVisible ? 'eye' : 'eyeOff'} />
-                  </button>
-                </div>
-                <div className="hint">
-                  免费额度 2000 次/月，<a href="https://api-dashboard.search.brave.com/app/keys" data-open-url="https://api-dashboard.search.brave.com/app/keys" onClick={onOpenUrl}>获取 Brave Search API Key</a>
-                </div>
+                <label>开启知识库自动注入</label>
+                <input
+                  id="f-kb-auto-inject"
+                  type="checkbox"
+                  checked={fields.kbAutoInject}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, kbAutoInject: checked })); }}
+                />
+                <div className="hint">开启自动注入会降低 AI 响应速度</div>
               </div>
+              <div className="field">
+                <label>自动注入条数</label>
+                <input
+                  id="f-kb-inject-count"
+                  className="input mono"
+                  type="number"
+                  min={1}
+                  max={20}
+                  placeholder="5"
+                  value={fields.kbInjectCount}
+                  onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, kbInjectCount: v })); }}
+                />
+              </div>
+              {hosted ? (
+                <div className="hint">开启后发消息前自动检索企业知识库，把相关度最高的对应条数命中注入到 AI 上下文中；AI 助手亦可随时主动调用知识库检索工具</div>
+              ) : (
+                <div className="hint" id="cloud-hosted-kb-note">知识库由公司服务器提供，需登录云服务后使用</div>
+              )}
             </fieldset>
             <div className="form-actions">
               <button className="btn primary" onClick={() => void save()}>保存</button>
             </div>
+          </section>
+          )}
+          {page === 'about' && (
+          <section id="panel-about" className="settings-panel">
+            <div className="panel-head"><div className="panel-title">关于与更新</div></div>
+            <div className="field">
+              <label>当前版本</label>
+              <div className="mcp-status-line" id="upd-current">
+                AIShell v{upd?.currentVersion ?? '…'}（stable 频道）
+              </div>
+            </div>
+            {!upd ? (
+              <div className="field">
+                <div className="mcp-status-line">正在获取更新状态…</div>
+              </div>
+            ) : !upd.enabled ? (
+              <div className="field">
+                <div className="mcp-status-line">当前构建未接入云服务更新（个人构建不检查更新）</div>
+              </div>
+            ) : (
+              <>
+                <div className="field">
+                  <label>检查结果</label>
+                  <div id="upd-result-line" className={updResult().cls}>{updResult().text}</div>
+                </div>
+                <div className="field">
+                  <label>&nbsp;</label>
+                  <button
+                    id="btn-update-check"
+                    className="btn small"
+                    disabled={['checking', 'downloading', 'installing'].includes(upd?.state ?? 'idle')}
+                    onClick={() => void doCheckUpdate()}
+                  >检查更新</button>
+                </div>
+                {upd?.availableVersion ? (
+                  <div className="upd-card">
+                    <div className="upd-version">
+                      v{upd.availableVersion}
+                      {upd.publishedAt ? <span className="upd-date">{fmtDate(upd.publishedAt)} 发布</span> : null}
+                      {upd.state === 'ready' && upd.progress ? <span className="upd-date">{fmtBytes(upd.progress.total ?? null)}</span> : null}
+                    </div>
+                    {upd.notes ? <pre className="upd-notes">{upd.notes}</pre> : null}
+                    {upd.state === 'downloading' && upd.progress ? (
+                      <div className="upd-progress">
+                        <div className="bar">
+                          <i style={{ width: upd.progress.total ? `${Math.min(100, (upd.progress.downloaded / upd.progress.total) * 100)}%` : '0%' }}></i>
+                        </div>
+                        <div className="text">
+                          {fmtBytes(upd.progress.downloaded)}
+                          {upd.progress.total ? ` / ${fmtBytes(upd.progress.total)}` : ''}
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="upd-actions">
+                      {upd.state === 'available' && !upd.signatureMissing ? (
+                        <button id="btn-update-download" className="btn small primary" onClick={() => void doDownloadUpdate()}>下载更新</button>
+                      ) : null}
+                      {upd.state === 'ready' ? (
+                        <button id="btn-update-install" className="btn small primary" onClick={() => void doInstallUpdate()}>重启并更新</button>
+                      ) : null}
+                      {upd.signatureMissing && upd.downloadUrl ? (
+                        <>
+                          <button
+                            id="btn-update-open-download"
+                            className="btn small"
+                            onClick={() => void openUrl(upd.downloadUrl!).catch((err) => toast(`无法打开下载页: ${String(err)}`, 'error'))}
+                          >打开下载页</button>
+                          <span className="hint">该版本未提供更新签名，不会标记为「安全可更新」，请在下载后手动安装</span>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            )}
           </section>
           )}
         </main>

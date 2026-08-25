@@ -10,12 +10,12 @@
  * - panes 常驻挂载(keep-alive),active 仅切显隐 —— 终端/SSH/AI 会话不随标签切换销毁。
  * 项目装载失败自行导航回欢迎页并 onFail();实例销毁(换项目)时关闭全部标签并复位 store。
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent, RefObject } from 'react';
-import { getState } from '../../api';
+import { cloudStatus, getState, onCloudChanged } from '../../api';
 import { navigate } from '../../router';
 import { toast, promptDialog, showContextMenu, uid, type CtxMenuItems } from '../../ui';
-import type { Project, ServerRef } from '../../types';
+import type { CloudStatus, Project, ServerRef } from '../../types';
 import { Topbar } from '../../components/Topbar';
 import { Icon } from '../../shared/Icon';
 import {
@@ -194,6 +194,23 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     s.reset();
   }, []);
 
+  /* ---------- 云账号入口(CR-1.1b):activity-bar 最底部,未接入云服务时隐藏 ---------- */
+  const [avatar, setAvatar] = useState<{ url: string | null; name: string | null; visible: boolean }>({ url: null, name: null, visible: false });
+  const [avatarFailed, setAvatarFailed] = useState<string | null>(null);
+  useEffect(() => {
+    const render = (s: CloudStatus): void => {
+      if (!s.serverUrl) { setAvatar({ url: null, name: null, visible: false }); return; }
+      setAvatar({
+        url: s.loggedIn && s.user?.avatar ? s.user.avatar : null,
+        name: s.user?.name ?? null,
+        visible: true,
+      });
+    };
+    let un: (() => void) | null = null;
+    void cloudStatus().then(render).catch(() => {});
+    void onCloudChanged(render).then((u) => { un = u; }).catch(() => {});
+    return () => { un?.(); };
+  }, []);
   /* ---------- 保活隐藏联动:路由离开工作台(设置/欢迎页)时工作台 display:none,
      浏览器子 webview 必须跟随隐藏,否则永远浮在主 webview 上盖住其他页面 ---------- */
   useEffect(() => {
@@ -218,7 +235,6 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     if (!iconEl) return;
     const p = iconEl.getAttribute('data-panel');
     const s = useWorkbench.getState();
-    if (p === 'ai') { s.setAiVisible(!s.aiVisible); return; }
     if (p === 'browser') {
       // 浏览器是中央标签页(非侧栏面板):固定 id 单实例,openTab 同 id 去重激活
       s.openTab({ id: 'browser', type: 'browser', title: '浏览器' });
@@ -270,8 +286,20 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
             <div className={`activity-icon${panel === 'servers' ? ' active' : ''}`} data-panel="servers" title="服务器列表"><Icon name="monitor" /></div>
             <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
             <div className={`activity-icon${panel === 'skills' ? ' active' : ''}`} data-panel="skills" title="Skill"><Icon name="sparkles" /></div>
-            <div className={`activity-icon${panel === 'notes' ? ' active' : ''}`} data-panel="notes" title="笔记"><Icon name="note" /></div>
+<div className={`activity-icon${panel === 'notes' ? ' active' : ''}`} data-panel="notes" title="笔记"><Icon name="pencil" /></div>
             <div className="activity-icon" data-panel="browser" title="浏览器(在标签页中打开)"><Icon name="globe" /></div>
+            {avatar.visible ? (
+              <div
+                className="activity-icon avatar-entry"
+                data-nav-account
+                title={avatar.url ? `${avatar.name}(点击进入账号页)` : '登录公司账号'}
+                onClick={() => navigate('#/account')}
+              >
+                {avatar.url && avatar.url !== avatarFailed
+                  ? <img className="avatar-img" alt="" src={avatar.url} onError={() => setAvatarFailed(avatar.url)} />
+                  : <Icon name="user" />}
+              </div>
+            ) : null}
           </div>
         <div id="sidebar" ref={sidebarRef}>
           <div id="sidebar-head">

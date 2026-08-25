@@ -59,12 +59,14 @@ use std::thread;
 use base64::Engine as _;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ai_actions::{AiActions, SftpDownloadItem, SftpUploadItem, MAX_SFTP_BATCH_ITEMS};
-use crate::ai_impact::{analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan};
+use crate::ai_impact::{
+    analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan,
+};
 use crate::skills::{SkillOrigin, SkillSummary};
-use crate::store::{AiMode, ApprovalMode, Store};
+use crate::store::{AiMode, ApprovalMode, CloudMode, Store};
 
 /// suggest 模式的系统提示（保持现状：无 bash，写仅 .aishell/）。
 const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
@@ -90,7 +92,6 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - 远程文件读写：read/grep/find/ls/write/edit/delete_path 都支持可选 serverId 参数（先用 list_servers 确认 serverId；不传则操作本地项目目录）。远程文件的内容查看/修改**优先用这些工具**，不要用 run_command 的 cat/sed/echo/tee 等命令读写远程文件内容——基础工具的远程写入/删除会自动进入会话暂存（自动备份原始快照，可 diff/还原）；run_command 用于服务管理、进程、包管理等非文件内容操作。远程路径可用绝对路径（/ 开头）或相对服务器登录目录的相对路径；不支持盘符形态。
 - db_query：受管数据库查询（mysql/postgres/clickhouse/redis）。参数 serverId + connectionId + command（SQL 或单条 redis 命令）；凭据由系统代管，你**看不到也拿不到密码**。只允许执行该连接配置白名单内的命令（默认只读：SELECT/SHOW/DESC/EXPLAIN、redis 的 GET/KEYS/SCAN 等）；白名单外的命令会被拒绝。用户在白名单中加入的写命令（如 UPDATE/DELETE）需用户人工审批。
 - request_db_connection：当任务需要查询数据库、但 list_servers 显示目标服务器没有可用的数据库连接时，调用该工具申请添加连接。把已知的连接信息填进参数（serverId 取自 list_servers；名称、类型、主机、端口、用户名、默认库），主机相对该服务器（数据库在服务器本机填 127.0.0.1）；申请理由（reason）用一句中文说明用途。用户会在审批对话框里补密码并勾选查询权限，批准后工具结果会直接返回 connectionId，用它继续 db_query；被拒绝时不要反复重试，向用户说明需要哪些信息或请其在「服务器设置-数据库连接」中手动配置。
-- py：在本机执行 Python 脚本（code 内联脚本 / path 项目内 .py 文件，二选一；args 传命令行参数；默认 60 秒超时，可用 timeoutSeconds 覆盖）。脚本内可 `import aishell` 使用内置 SDK 调用服务器能力——servers.list() 服务器清单、ssh.exec() 远程命令、sftp.* 远程文件操作、db.connections()/db.query() 数据库管道；用法详见 python-script 技能（用 read 读取该技能的 SKILL.md）。适合批量/程序化操作（遍历多台服务器执行同一命令、批量传输、结果加工）；单次简单操作仍优先用对应的专用工具。SDK 调用受同样的服务器锁与数据库白名单约束，凭据由系统代管、脚本拿不到密码。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
 - 远程文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff（仅返回 unified diff 差异块及每块前后 3 行上下文）、按用户要求把远程文件还原到首次修改前的内容。**应用更新补丁前应先用 staging_add 主动暂存目标文件/目录**（目录递归暂存全部文件，作为可还原的备份）。staging_clear 只清理「远端现状与首次快照完全一致」的条目（备份已冗余）；仍有变更的条目自动保留。**不能接受（清除）仍有变更的暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
@@ -123,16 +124,23 @@ const GUARD_EXT: &str = include_str!("pi_ext/aishell-guard.ts");
 /// 联网搜索扩展源码（web_search 工具，Brave Search；spawn 时重写进 agent_dir）。
 const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 
+/// 知识库检索扩展源码（kb_search 工具，云平台只读中转；spawn 时重写进 agent_dir）。
+/// 托管模式且平台启用 knowledge 能力时挂载，不受自动注入开关影响（自动注入是前置客户端检索）。
+const KB_EXT: &str = include_str!("pi_ext/aishell-kb.ts");
+
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot";
+const BASE_TOOLS: &str =
+    "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
 /// staging_list / staging_diff 只读不入审批（guard 侧不在 CONTROLLED_TOOLS），但执行时
 /// 仍经动作桥并在 ai.rs 侧渲染小字活动行；staging_restore 两侧都要（审批 + 卡片）。
 /// staging_add（主动备份，只读远端）/ staging_clear（只清无变更条目）同样不入审批。
-const CONTROLLED_TOOLS: [&str; 8] = [
+/// feedback_submit（用户反馈，对外提交到云平台）两侧都要：agent 模式人工确认后发送。
+/// py（py 工具运行，main 侧）同样两侧都要；并集保留两者。
+const CONTROLLED_TOOLS: [&str; 9] = [
     "write",
     "edit",
     "delete_path",
@@ -141,6 +149,7 @@ const CONTROLLED_TOOLS: [&str; 8] = [
     "sftp_download",
     "staging_restore",
     "py",
+    "feedback_submit",
 ];
 
 /// 影响计划跟踪条目（tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费）。
@@ -177,7 +186,12 @@ fn impact_fingerprint(command: &str, target: &str, server_id: &str, cwd: &str) -
 /// 必然误报。按工具关键字段判定（登记 args 无 action 字段，动作桥 payload 有）；
 /// 其余动作按全量序列化（serde_json 的 Map 为 BTreeMap，对象键序无关）。
 fn payload_fingerprint(p: &serde_json::Value) -> String {
-    let get = |k: &str| p.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let get = |k: &str| {
+        p.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let core = if p.get("command").is_some() && p.get("target").is_some() {
         // run_command：命令/目标/服务器/超时
         format!(
@@ -185,7 +199,9 @@ fn payload_fingerprint(p: &serde_json::Value) -> String {
             get("command"),
             get("target"),
             get("serverId"),
-            p.get("timeoutSeconds").map(|v| v.to_string()).unwrap_or_default()
+            p.get("timeoutSeconds")
+                .map(|v| v.to_string())
+                .unwrap_or_default()
         )
     } else if p.get("localPath").is_some() && p.get("remoteDir").is_some() {
         // sftp_upload 单项：服务器/本地源/远端目录/覆盖开关
@@ -194,7 +210,9 @@ fn payload_fingerprint(p: &serde_json::Value) -> String {
             get("serverId"),
             get("localPath"),
             get("remoteDir"),
-            p.get("overwrite").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            p.get("overwrite")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
         )
     } else if p.get("remotePath").is_some() && p.get("localDir").is_some() {
         // sftp_download 单项：服务器/远端源/本地目录
@@ -255,6 +273,8 @@ pub struct AiProc {
     /// 启动时技能快照指纹（origin|name|enabled|scope|正文 稳定序列化）；ai_chat 发现
     /// 该项目指纹变化时 kill/wait/摘除后按同一 session 文件重生，下一条消息即生效。
     skill_fingerprint: String,
+    /// 最近一次发送的 user prompt（已脱敏）；读取线程在回合结束时上报记忆沉淀用。
+    last_prompt: Arc<Mutex<String>>,
 }
 
 /// AI 进程管理器：每 key 一个长驻 pi 进程，进程生命周随工作台（ai_kill_project / Drop）结束。
@@ -269,6 +289,8 @@ pub struct AiManager {
     actions: Arc<AiActions>,
     /// 最近一次 load_skills 中被项目同名技能覆盖的全局技能（name + 路径），ai_debug_info 输出用。
     covered_skills: Mutex<Vec<String>>,
+    /// 云会话（托管模式记忆沉淀上报用）；测试/个人构建为 None。
+    cloud: Option<Arc<crate::cloud::CloudManager>>,
 }
 
 /// 最终启用技能集合：先分别过滤 enabled=true，再按「项目技能在前、全局技能在后；各组按 name 排序」。
@@ -279,7 +301,8 @@ fn select_enabled_skills(
     project: Vec<SkillSummary>,
 ) -> (Vec<SkillSummary>, Vec<SkillSummary>) {
     let mut global_enabled: Vec<SkillSummary> = global.into_iter().filter(|s| s.enabled).collect();
-    let mut project_enabled: Vec<SkillSummary> = project.into_iter().filter(|s| s.enabled).collect();
+    let mut project_enabled: Vec<SkillSummary> =
+        project.into_iter().filter(|s| s.enabled).collect();
     global_enabled.sort_by(|a, b| a.name.cmp(&b.name));
     project_enabled.sort_by(|a, b| a.name.cmp(&b.name));
     let project_names: HashSet<&str> = project_enabled.iter().map(|s| s.name.as_str()).collect();
@@ -336,15 +359,25 @@ struct LoadedSkills {
     global_root: PathBuf,
 }
 
+/// 托管模式 LLM 代理端点：{serverUrl}/api/proxy/llm/v1（开放 API 文档 §2）。
+/// 独立成纯函数便于单测（server_url 来自编译期注入，测试环境不可用）。
+fn hosted_llm_base(server_url: &str) -> String {
+    format!("{}/api/proxy/llm/v1", server_url.trim_end_matches('/'))
+}
+
 /// 构造 pi 的 models.json 内容（providers.deepseek + 单模型）。
 /// reasoning：v4 系列与 reasoner 支持思考档位，deepseek-chat 等旧模型不支持（pi 会强制 thinking off）。
 /// input：vision 模型声明图片输入能力（pi 默认 input=["text"]，不声明时 RPC images 会被拒）；
-/// 启发式与前端 ai-engine.ts supportsVision 保持一致（模型 id 小写含 "vision"）。
-fn models_json_for(cfg: &crate::store::LlmConfig) -> serde_json::Value {
+/// 启发式与前端 ai-engine.ts supportsVision 保持一致（模型 id 小写含 "vision"；
+/// 云分支补充：托管代理的 deepseek-v4-flash 上游已切换为多模态模型、对外 id 未变，同样视为支持图片）。
+/// hosted_base：托管模式传云服务器地址（Some），baseUrl/apiKey/compat 走公司代理；
+/// 个人模式传 None，维持本地 baseUrl + $DEEPSEEK_API_KEY。
+fn models_json_for(cfg: &crate::store::LlmConfig, hosted_base: Option<&str>) -> serde_json::Value {
     let model_id = &cfg.model_id;
     let id_lower = model_id.to_lowercase();
     let reasoning = id_lower.contains("reasoner") || id_lower.contains("v4");
-    let input_images = id_lower.contains("vision");
+    let hosted = hosted_base.is_some();
+    let input_images = id_lower.contains("vision") || (hosted && id_lower == "deepseek-v4-flash");
     let mut model = json!({
         "id": model_id,
         "name": model_id,
@@ -354,12 +387,27 @@ fn models_json_for(cfg: &crate::store::LlmConfig) -> serde_json::Value {
     if input_images {
         model["input"] = json!(["text", "image"]);
     }
+    let (base_url, api_key_env) = match hosted_base {
+        Some(server) => (hosted_llm_base(server), "$AISHELL_CLOUD_TOKEN"),
+        None => (
+            cfg.base_url.trim_end_matches('/').to_string(),
+            "$DEEPSEEK_API_KEY",
+        ),
+    };
     json!({
         "providers": {
             "deepseek": {
-                "baseUrl": cfg.base_url.trim_end_matches('/'),
+                "baseUrl": base_url,
                 "api": "openai-completions",
-                "apiKey": "$DEEPSEEK_API_KEY",
+                "apiKey": api_key_env,
+                // 托管模式：云平台服务端不接受 developer role（实测 400 unknown variant），
+                // pi docs models.md：compat.supportsDeveloperRole=false → 系统提示走 system role；
+                // 个人模式保持默认（DeepSeek 官方支持 developer）
+                "compat": if hosted {
+                    json!({"supportsDeveloperRole": false})
+                } else {
+                    json!({})
+                },
                 "models": [model],
             }
         }
@@ -367,6 +415,8 @@ fn models_json_for(cfg: &crate::store::LlmConfig) -> serde_json::Value {
 }
 
 impl AiManager {
+    // 两侧分支（云会话 / 内置浏览器）各加一个参数后共 8 个；与 ai_actions::run_command 同惯例
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         pi_dir: PathBuf,
@@ -375,6 +425,7 @@ impl AiManager {
         staging: Arc<crate::staging::RemoteStaging>,
         browser: Arc<crate::browser::BrowserManager>,
         pi_debug: String,
+        cloud: Option<Arc<crate::cloud::CloudManager>>,
     ) -> Self {
         let actions = Arc::new(AiActions::new(Arc::clone(&store), ssh, staging, browser));
         AiManager {
@@ -382,6 +433,7 @@ impl AiManager {
             pi_dir,
             agent_dir,
             pi_debug,
+            cloud,
             procs: Arc::new(Mutex::new(HashMap::new())),
             actions,
             covered_skills: Mutex::new(Vec::new()),
@@ -411,12 +463,31 @@ impl AiManager {
             .iter()
             .map(|s| format!("{}（{}）", s.name, s.path))
             .collect();
-        Ok(LoadedSkills { final_list, fingerprint, global_root })
+        Ok(LoadedSkills {
+            final_list,
+            fingerprint,
+            global_root,
+        })
     }
 
     /// 重写 <agent_dir>/models.json（每次 spawn 都重写，内容与 settings 同步）。
     fn write_models_json(&self) -> Result<(), String> {
-        let models = models_json_for(&self.store.llm_config());
+        // 托管模式（CR-3.1）：provider 指向公司服务器代理端点，apiKey 用 $AISHELL_CLOUD_TOKEN
+        // （spawn 时注入当前 access_token）；个人模式维持现状（本地 baseUrl + $DEEPSEEK_API_KEY）。
+        // 已知限制：开放 API 文档 §2.1/§6.6 建议 LLM 请求体顶层携带 sessionId/projectName 以便
+        // 服务端按会话聚合自动沉淀记忆，但 pi 的 provider 配置不支持注入任意请求体字段
+        // （仅 baseUrl/apiKey/headers，session-affinity 走请求头与 prompt_cache_key，非 body 顶层）。
+        // memoryScope 服务端可推断，客户端不传。待云服务端新增「对话历史」专用接口后另行对接
+        // （届时由 ai.rs 按 key 的 sessionId 维度上报，见服务端变更）。
+        let hosted_base = if self.store.cloud_mode() == CloudMode::Hosted {
+            Some(
+                crate::cloud::server_url()
+                    .ok_or_else(|| "当前构建未配置云服务，无法使用托管模式".to_string())?,
+            )
+        } else {
+            None
+        };
+        let models = models_json_for(&self.store.llm_config(), hosted_base.as_deref());
         std::fs::create_dir_all(&self.agent_dir)
             .map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
         let text = serde_json::to_string_pretty(&models).map_err(|e| e.to_string())?;
@@ -427,7 +498,15 @@ impl AiManager {
 
     /// 为 key 拉起 pi 进程并启动 stdout 读取线程（读线程负责 done/error 事件、审批转发、
     /// 内部动作执行与异常退出摘除）。
-    fn spawn(&self, app: &AppHandle, key: &str, project_id: &str) -> Result<(), String> {
+    /// `cloud_token`：托管模式下的 access_token（ai_chat 在 spawn 前 async 续期保证未过期）；
+    /// 个人模式传 None。
+    fn spawn(
+        &self,
+        app: &AppHandle,
+        key: &str,
+        project_id: &str,
+        cloud_token: Option<String>,
+    ) -> Result<(), String> {
         let pi_bin = self.pi_dir.join(PI_BIN_NAME);
         if !pi_bin.is_file() {
             return Err(format!(
@@ -437,10 +516,16 @@ impl AiManager {
             ));
         }
         self.write_models_json()?;
-        let api_key = self
-            .store
-            .read_secret("llm:apikey")
-            .map_err(|_| "请先在设置中配置 DeepSeek API Key".to_string())?;
+        let hosted = self.store.cloud_mode() == CloudMode::Hosted;
+        // 托管模式：LLM 走公司服务器代理（token 由调用方续期传入，缺失即登录失效）
+        let api_key = if hosted {
+            cloud_token
+                .ok_or_else(|| "登录已过期，请前往账号页重新登录后使用公司服务".to_string())?
+        } else {
+            self.store
+                .read_secret("llm:apikey")
+                .map_err(|_| "请先在设置中配置 DeepSeek API Key".to_string())?
+        };
         let cfg = self.store.llm_config();
         let effort = serde_json::to_string(&cfg.effort)
             .map_err(|e| format!("effort 序列化失败: {e}"))?
@@ -464,15 +549,37 @@ impl AiManager {
             .project_path(project_id)
             .unwrap_or_else(|| self.agent_dir.to_string_lossy().into_owned());
         // 门控扩展落盘（每次 spawn 重写，内容与仓库内源码同步）
-        std::fs::create_dir_all(&self.agent_dir).map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
+        std::fs::create_dir_all(&self.agent_dir)
+            .map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
         let guard_path = self.agent_dir.join("aishell-guard.ts");
         std::fs::write(&guard_path, GUARD_EXT).map_err(|e| format!("写入门控扩展失败: {e}"))?;
         // 联网搜索扩展落盘（enabled 开关决定是否挂载，与 key 是否配置无关）
         let search_path = self.agent_dir.join("aishell-search.ts");
         std::fs::write(&search_path, SEARCH_EXT).map_err(|e| format!("写入搜索扩展失败: {e}"))?;
-        let search_enabled = self.store.settings().search.enabled;
+        // 知识库检索扩展落盘（托管且 knowledge 能力时挂载，与 auto_inject 无关）
+        let kb_path = self.agent_dir.join("aishell-kb.ts");
+        std::fs::write(&kb_path, KB_EXT).map_err(|e| format!("写入知识库扩展失败: {e}"))?;
+        // 搜索能力：托管模式以服务端能力清单为准（CR-4.3）；个人模式按本地设置。
         // 搜索 key 未配置时不注入 env：工具仍挂载，调用时由扩展返回中文引导错误
-        let brave_key = self.store.read_secret("brave:apikey").ok();
+        let (search_enabled, brave_key) = if hosted {
+            let caps = self.store.cloud_profile().1;
+            (caps.map(|c| c.search).unwrap_or(false), None)
+        } else {
+            (
+                self.store.settings().search.enabled,
+                self.store.read_secret("brave:apikey").ok(),
+            )
+        };
+        // 知识库能力：仅托管模式，以服务端能力清单为准；本地无知识库，故个人模式不挂载。
+        // 按需求「无论是否开启自动注入，始终给 AI 助手提供知识库检索工具」——只要托管且平台
+        // 启用了 knowledge 能力即挂载，auto_inject 开关不影响挂载；云端需刷新能力清单使标记生效。
+        let kb_enabled = hosted
+            && self
+                .store
+                .cloud_profile()
+                .1
+                .map(|c| c.knowledge)
+                .unwrap_or(false);
 
         // 初始工具集按模式下发（agent/yolo 直接启用变更工具，避免依赖扩展加载期 setActiveTools）；
         // 热切换仍由 /aishell-mode 命令 + 扩展 applyToolset 增量同步。
@@ -481,10 +588,18 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection")
         };
         if search_enabled {
             tools.push_str(",web_search");
+        }
+        if kb_enabled {
+            tools.push_str(",kb_search");
+        }
+        // 用户反馈工具：仅托管模式（令牌在 keyring，由动作桥取用；个人模式无云账号不挂载）。
+        // 工具注册在 guard 扩展（常驻加载），这里只控制模型可见性。
+        if hosted {
+            tools.push_str(",feedback_submit");
         }
 
         // 会话持久化（每 key 固定路径）：pi 自动把对话条目落盘到此 jsonl；
@@ -512,8 +627,11 @@ impl AiManager {
         .args(["--no-extensions", "--extension"])
         .arg(&guard_path)
         .args(["--extension"])
-        .arg(&search_path)
-        .args(["--no-approve", "--session"])
+        .arg(&search_path);
+        if kb_enabled {
+            cmd.args(["--extension"]).arg(&kb_path);
+        }
+        cmd.args(["--no-approve", "--session"])
         .arg(&session_path)
         .args([
             "--no-context-files",
@@ -546,10 +664,30 @@ impl AiManager {
             .collect();
         let global_skills = vec![loaded.global_root.to_string_lossy().into_owned()];
         let enc = |v: &[String]| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
-        cmd.env("AISHELL_SKILL_DIRS", enc(&skill_dirs))
+        cmd.env("PI_CODING_AGENT_DIR", &self.agent_dir)
+            .env("AISHELL_AI_MODE", mode.as_str())
+            .env("AISHELL_SKILL_DIRS", enc(&skill_dirs))
             .env("AISHELL_GLOBAL_SKILLS_DIR", enc(&global_skills));
-        if let Some(key) = brave_key {
-            cmd.env("BRAVE_API_KEY", key);
+        if hosted {
+            // 托管模式（CR-3.1 / CR-4.1）：models.json 引用 $AISHELL_CLOUD_TOKEN；
+            // 搜索扩展读 $AISHELL_SEARCH_URL + $AISHELL_SEARCH_TOKEN 走公司服务器代理
+            cmd.env("AISHELL_CLOUD_TOKEN", &api_key);
+            if let Some(server) = crate::cloud::server_url() {
+                cmd.env("AISHELL_SEARCH_URL", format!("{server}/api/proxy/search"));
+            }
+            cmd.env("AISHELL_SEARCH_TOKEN", &api_key);
+            // 知识库扩展读 $AISHELL_KB_URL + $AISHELL_KB_TOKEN（仅 knowledge 能力时注入）
+            if kb_enabled {
+                if let Some(server) = crate::cloud::server_url() {
+                    cmd.env("AISHELL_KB_URL", format!("{server}/api/kb/search"));
+                }
+                cmd.env("AISHELL_KB_TOKEN", &api_key);
+            }
+        } else {
+            cmd.env("DEEPSEEK_API_KEY", &api_key);
+            if let Some(key) = brave_key {
+                cmd.env("BRAVE_API_KEY", key);
+            }
         }
         cmd.current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -563,9 +701,15 @@ impl AiManager {
         }
         let mut child = cmd.spawn().map_err(|e| format!("启动 pi 进程失败: {e}"))?;
         let stdin = Arc::new(Mutex::new(
-            child.stdin.take().ok_or_else(|| "pi 进程 stdin 不可用".to_string())?,
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "pi 进程 stdin 不可用".to_string())?,
         ));
-        let stdout = child.stdout.take().ok_or_else(|| "pi 进程 stdout 不可用".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "pi 进程 stdout 不可用".to_string())?;
 
         // trace：提示词注入全量记录（系统提示词/技能作用域/目录/模式/模型/工具集）
         crate::trace::log(key, "prompt_inject", json!({
@@ -587,6 +731,7 @@ impl AiManager {
         let busy = Arc::new(AtomicBool::new(false));
         let killed = Arc::new(AtomicBool::new(false));
         let approvals: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let last_prompt = Arc::new(Mutex::new(String::new()));
         let app2 = app.clone();
         let key2 = key.to_string();
         let event = format!("ai:event:{key2}");
@@ -600,6 +745,8 @@ impl AiManager {
         let project_id2 = project_id.to_string();
         let session_id2 = session_id.to_string();
         let store2 = Arc::clone(&self.store);
+        let cloud2 = self.cloud.clone();
+        let last_prompt2 = Arc::clone(&last_prompt);
         thread::spawn(move || {
             // 影响计划跟踪：tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费
             let mut impact_tracker: HashMap<String, ImpactEntry> = HashMap::new();
@@ -616,6 +763,8 @@ impl AiManager {
             let mut tool_starts: HashMap<String, (String, String, u64)> = HashMap::new();
             // trace：本回合助手输出聚合缓冲（done/终态错误/进程退出时落一条 assistant_output）
             let mut output_buf = String::new();
+            // 当前回合 assistant 文本累计（跨工具循环 turn 累积；回合结束上报沉淀后清空）
+            let mut turn_text = String::new();
             // 内部动作需要 async 执行：懒建 tokio runtime（进程内动作次数极少）
             let mut rt: Option<tokio::runtime::Runtime> = None;
             let reader = BufReader::new(stdout);
@@ -640,12 +789,17 @@ impl AiManager {
                 };
                 match ty {
                     "message_update" => {
-                        let Some(ae) = ev.get("assistantMessageEvent") else { continue };
+                        let Some(ae) = ev.get("assistantMessageEvent") else {
+                            continue;
+                        };
                         match ae.get("type").and_then(serde_json::Value::as_str) {
                             // 文本增量
                             Some("text_delta") => {
-                                if let Some(delta) = ae.get("delta").and_then(serde_json::Value::as_str) {
+                                if let Some(delta) =
+                                    ae.get("delta").and_then(serde_json::Value::as_str)
+                                {
                                     text_started = true;
+                                    turn_text.push_str(delta);
                                     output_buf.push_str(delta);
                                     // 瞬时错误（限流/过载/5xx）后 pi 自动重试成功、流式恢复：
                                     // 重置终态抑制，否则回合结束 agent_settled 不再发 done、
@@ -682,6 +836,19 @@ impl AiManager {
                         if !terminal_emitted {
                             terminal_emitted = true;
                             let _ = app2.emit(&event, json!({"type": "done"}));
+                            // 托管模式回合结束：上报本回合对话历史触发云记忆自动沉淀
+                            // （服务器按 sessionId 聚合缓冲，客户端只推送、不感知缓存细节）
+                            let user = last_prompt2.lock().map(|g| g.clone()).unwrap_or_default();
+                            report_sediment(
+                                &mut rt,
+                                &cloud2,
+                                &store2,
+                                &project_id2,
+                                &key2,
+                                &user,
+                                &turn_text,
+                            );
+                            turn_text.clear();
                         }
                     }
                     // 瞬时错误自动重试（pi retry.enabled 默认开：429/过载/5xx）。重试期间
@@ -699,7 +866,10 @@ impl AiManager {
                     // 工具活动：受控工具在 agent/yolo 下以动作卡（actionStart/actionEnd）呈现，
                     // 其余工具仍走瞬时小字行（tool）。
                     "tool_execution_start" => {
-                        let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let tool = ev
+                            .get("toolName")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
                         // trace：工具调用起点登记（start/end 配对算耗时；args 剥 content）
                         {
                             let trace_id = ev
@@ -735,7 +905,12 @@ impl AiManager {
                                 if !raw.is_empty() {
                                     let abs = std::path::absolute(Path::new(&cwd2).join(raw))
                                         .map(|p| p.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|_| Path::new(&cwd2).join(raw).to_string_lossy().into_owned());
+                                        .unwrap_or_else(|_| {
+                                            Path::new(&cwd2)
+                                                .join(raw)
+                                                .to_string_lossy()
+                                                .into_owned()
+                                        });
                                     let id = ev
                                         .get("toolCallId")
                                         .and_then(serde_json::Value::as_str)
@@ -793,11 +968,17 @@ impl AiManager {
                                 })
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("");
-                            let _ = app2.emit(&event, json!({"type": "tool", "tool": tool, "label": label}));
+                            let _ = app2.emit(
+                                &event,
+                                json!({"type": "tool", "tool": tool, "label": label}),
+                            );
                         }
                     }
                     "tool_execution_end" => {
-                        let tool = ev.get("toolName").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let tool = ev
+                            .get("toolName")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
                         // trace：start/end 配对落一条 tool_call（状态 + 耗时 + 参数/结果全文）
                         {
                             let trace_id = ev
@@ -832,7 +1013,10 @@ impl AiManager {
                         }
                         // AI 写文件成功落盘 → 全局广播，前端刷新已打开的对应编辑器标签
                         if (tool == "write" || tool == "edit")
-                            && !ev.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                            && !ev
+                                .get("isError")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
                         {
                             let id = ev
                                 .get("toolCallId")
@@ -849,7 +1033,10 @@ impl AiManager {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            let is_error = ev.get("isError").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            let is_error = ev
+                                .get("isError")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
                             // 结果正文：优先 result.content[0].text；错误时回退 errorMessage
                             let result = ev
                                 .get("result")
@@ -858,7 +1045,9 @@ impl AiManager {
                                 .and_then(|arr| arr.first())
                                 .and_then(|b| b.get("text"))
                                 .and_then(serde_json::Value::as_str)
-                                .or_else(|| ev.get("errorMessage").and_then(serde_json::Value::as_str))
+                                .or_else(|| {
+                                    ev.get("errorMessage").and_then(serde_json::Value::as_str)
+                                })
                                 .unwrap_or(if is_error { "动作执行失败" } else { "" })
                                 .to_string();
                             let _ = app2.emit(
@@ -934,7 +1123,10 @@ impl AiManager {
                             settled = true;
                             trace_flush_output(&key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
-                            let _ = app2.emit(&event, json!({"type": "error", "message": err_message(&ev)}));
+                            let _ = app2.emit(
+                                &event,
+                                json!({"type": "error", "message": err_message(&ev)}),
+                            );
                         }
                     }
                     // 扩展 UI 请求：`AISHELL_APPROVAL:` confirm 转发前端审批；
@@ -948,6 +1140,7 @@ impl AiManager {
                             &approvals2,
                             &actions,
                             &store2,
+                            &cloud2,
                             &project_id2,
                             &session_id2,
                             &mut impact_tracker,
@@ -980,7 +1173,10 @@ impl AiManager {
             trace_flush_output(&key2, &mut output_buf);
             busy2.store(false, Ordering::SeqCst);
             if !settled && !killed2.load(Ordering::SeqCst) {
-                let _ = app2.emit(&event, json!({"type": "error", "message": "pi 进程异常退出"}));
+                let _ = app2.emit(
+                    &event,
+                    json!({"type": "error", "message": "pi 进程异常退出"}),
+                );
             }
             procs2
                 .lock()
@@ -988,20 +1184,18 @@ impl AiManager {
                 .remove(&key2);
         });
 
-        self.procs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                key.to_string(),
-                AiProc {
-                    child,
-                    stdin,
-                    busy,
-                    killed,
-                    approvals,
-                    skill_fingerprint: loaded.fingerprint,
-                },
-            );
+        self.procs.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            key.to_string(),
+            AiProc {
+                child,
+                stdin,
+                busy,
+                killed,
+                approvals,
+                skill_fingerprint: loaded.fingerprint,
+                last_prompt,
+            },
+        );
         Ok(())
     }
 
@@ -1082,16 +1276,27 @@ fn handle_extension_ui_request(
     approvals2: &Arc<Mutex<HashMap<String, String>>>,
     actions: &Arc<AiActions>,
     store2: &Arc<Store>,
+    cloud2: &Option<Arc<crate::cloud::CloudManager>>,
     project_id: &str,
     session_id: &str,
     impact_tracker: &mut HashMap<String, ImpactEntry>,
     rt: &mut Option<tokio::runtime::Runtime>,
 ) {
-    let Some(id) = ev.get("id").and_then(serde_json::Value::as_str).map(str::to_string) else {
+    let Some(id) = ev
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
         return;
     };
-    let method = ev.get("method").and_then(serde_json::Value::as_str).unwrap_or("");
-    let title = ev.get("title").and_then(serde_json::Value::as_str).unwrap_or("");
+    let method = ev
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let title = ev
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let trace_key = format!("{project_id}:{session_id}");
 
     if method == "input" && title.starts_with("AISHELL_ACTION:") {
@@ -1112,6 +1317,7 @@ fn handle_extension_ui_request(
         let result = runtime.block_on(run_internal_action(
             actions,
             store2,
+            cloud2,
             project_id,
             session_id,
             &tool_call_id,
@@ -1136,7 +1342,10 @@ fn handle_extension_ui_request(
                 "detail": format!("动作={action_name} toolCallId={tool_call_id} {outcome}"),
             }));
         }
-        write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}));
+        write_stdin_json(
+            stdin2,
+            &json!({"type": "extension_ui_response", "id": id, "value": result.to_string()}),
+        );
     } else if method == "input" && title.starts_with("AISHELL_TRACE:") {
         // guard 扩展 trace 上报（validate 门禁拒绝等 Rust 侧不可见的事件）：直接落日志，回写空串
         let info: serde_json::Value = ev
@@ -1160,7 +1369,11 @@ fn handle_extension_ui_request(
             .get("message")
             .and_then(serde_json::Value::as_str)
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-            .and_then(|v| v.get("reason").and_then(serde_json::Value::as_str).map(str::to_string))
+            .and_then(|v| {
+                v.get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
         crate::trace::log(&trace_key, "guard", json!({
             "kind": "mode_request",
@@ -1234,9 +1447,21 @@ fn handle_extension_ui_request(
             .and_then(serde_json::Value::as_str)
             .and_then(|m| serde_json::from_str(m).ok())
             .unwrap_or_else(|| json!({}));
-        let action = info.get("action").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        let intent = info.get("intent").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        let summary = info.get("summary").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        let action = info
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let intent = info
+            .get("intent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let summary = info
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
         crate::trace::log(&trace_key, "guard", json!({
             "kind": "approval_request",
             "detail": format!("动作={action} 意图={intent} 摘要={summary}"),
@@ -1291,18 +1516,19 @@ fn handle_extension_ui_request(
             }
         }
 
-        // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）。
-        // 系统任务上下文是受控迁移任务，必须逐调用人工确认，不能被全局 smart 自动放行。
-        if should_use_smart_approval(project_id, store2.approval_mode()) {
+        // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）
+        if store2.approval_mode() == ApprovalMode::Smart {
             let runtime = rt.get_or_insert_with(|| {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("创建智能审批 runtime 失败")
             });
-            let (command, target, server_id, cwd) = approval_context(impact_tracker.get(&tool_call_id), &action);
+            let cloud_mgr = app2.state::<Arc<crate::cloud::CloudManager>>();
+            let (command, target, server_id, cwd) =
+                approval_context(impact_tracker.get(&tool_call_id), &action);
             let judge_result = runtime.block_on(crate::smart_approval::judge(
-                store2, &action, &intent, &summary, &command, &target, &server_id, &cwd,
+                store2, &cloud_mgr, &action, &intent, &summary, &command, &target, &server_id, &cwd,
             ));
             match judge_result {
                 Ok(out) => {
@@ -1358,7 +1584,9 @@ fn handle_extension_ui_request(
                             effective_plan
                                 .as_ref()
                                 .map(|p| p.reason.clone())
-                                .unwrap_or_else(|| "命令影响范围无法完整确定，不保证完整备份".to_string()),
+                                .unwrap_or_else(|| {
+                                    "命令影响范围无法完整确定，不保证完整备份".to_string()
+                                }),
                         );
                     }
                     // 落盘计划（人工确认后执行时消费；unbounded 由用户确认后放行）
@@ -1416,16 +1644,8 @@ fn handle_extension_ui_request(
     // 其余 UI 请求（notify/setStatus 等）不转发也不响应（fire-and-forget）
 }
 
-/// 任务上下文必须人工审批；普通项目才允许按全局设置进入智能审批。
-fn should_use_smart_approval(project_id: &str, mode: ApprovalMode) -> bool {
-    project_id != crate::store::TASK_PROJECT_ID && mode == ApprovalMode::Smart
-}
-
 /// 审批上下文：run_command 取命令/目标/服务器/工作目录（LLM 判定输入）；其余动作空串。
-fn approval_context(
-    entry: Option<&ImpactEntry>,
-    action: &str,
-) -> (String, String, String, String) {
+fn approval_context(entry: Option<&ImpactEntry>, action: &str) -> (String, String, String, String) {
     if action == "run_command" {
         if let Some(e) = entry {
             let strf = |k: &str| {
@@ -1435,7 +1655,12 @@ fn approval_context(
                     .unwrap_or("")
                     .to_string()
             };
-            return (strf("command"), strf("target"), strf("serverId"), e.cwd.clone().unwrap_or_default());
+            return (
+                strf("command"),
+                strf("target"),
+                strf("serverId"),
+                e.cwd.clone().unwrap_or_default(),
+            );
         }
     }
     (String::new(), String::new(), String::new(), String::new())
@@ -1491,7 +1716,10 @@ fn compute_approval_impact(
             let plan = runtime.block_on(actions.upload_impact_batch(project_id, &server_id, &items));
             match plan {
                 Ok(p) => (Some(p), None),
-                Err(e) => (Some(ImpactPlan::unbounded(&format!("无法枚举批量上传覆盖范围：{e}"))), None),
+                Err(e) => (
+                    Some(ImpactPlan::unbounded(&format!("无法枚举批量上传覆盖范围：{e}"))),
+                    None,
+                ),
             }
         }
         _ => (None, None),
@@ -1505,13 +1733,17 @@ fn compute_approval_impact(
 async fn run_internal_action(
     actions: &Arc<AiActions>,
     store: &Arc<Store>,
+    cloud: &Option<Arc<crate::cloud::CloudManager>>,
     project_id: &str,
     session_id: &str,
     tool_call_id: &str,
     impact_tracker: &mut HashMap<String, ImpactEntry>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
-    let action = payload.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+    let action = payload
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let str_field = |k: &str| {
         payload
             .get(k)
@@ -1553,7 +1785,16 @@ async fn run_internal_action(
                 },
             };
             // 执行环境：复用审批阶段解析的工作目录（保证分析与 exec 一致）；无登记时现取
-            let (cwd, plan) = resolve_exec_plan(actions, &entry, &command, &target, &server_id, session_id, auto_backup).await;
+            let (cwd, plan) = resolve_exec_plan(
+                actions,
+                &entry,
+                &command,
+                &target,
+                &server_id,
+                session_id,
+                auto_backup,
+            )
+            .await;
             let (cwd, plan) = match (cwd, plan) {
                 (Ok(c), Ok(p)) => (c, p),
                 (Err(e), _) | (_, Err(e)) => {
@@ -1570,7 +1811,10 @@ async fn run_internal_action(
                 }
             }
             // yolo + 自动备份 + unbounded：直接拒绝，避免绕过保护（agent 已在审批卡确认放行）
-            if auto_backup && plan.effect == Effect::Unbounded && store.ai_mode(project_id) == Some(AiMode::Yolo) {
+            if auto_backup
+                && plan.effect == Effect::Unbounded
+                && store.ai_mode(project_id) == Some(AiMode::Yolo)
+            {
                 return json!({
                     "ok": false,
                     "error": "该命令的影响范围无法完整确定（不保证完整备份），已拒绝自动执行。请改用受管文件操作（sftp_upload 等），或切换到工作模式由用户确认后执行"
@@ -1599,51 +1843,6 @@ async fn run_internal_action(
                 .db_query(server_id, connection_id, command)
                 .await
                 .map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
-        }
-        // py 工具：本机执行 Python 脚本。执行前起一次性 SDK 桥（127.0.0.1 ephemeral 端口 +
-        // 仅内存的随机 token），经环境变量注入 Python 进程；进程结束后销毁（成败都停），
-        // token 随之失效。脚本内 `import aishell` 即经此桥调用 ssh/sftp/数据库能力。
-        "run_py" => {
-            let code = payload
-                .get("code")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string);
-            let path = payload
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string);
-            let args: Vec<String> = payload
-                .get("args")
-                .and_then(serde_json::Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let timeout_seconds = match payload.get("timeoutSeconds") {
-                None => None,
-                Some(v) => match v.as_u64() {
-                    Some(seconds) => Some(seconds),
-                    None => {
-                        return json!({
-                            "ok": false,
-                            "error": "timeoutSeconds 必须是 1–3600 之间的整数秒"
-                        });
-                    }
-                },
-            };
-            let bridge = match crate::pysdk::PySdkBridge::start(actions.clone(), project_id, session_id).await {
-                Ok(b) => b,
-                Err(e) => return json!({"ok": false, "error": format!("SDK 通道启动失败：{e}")}),
-            };
-            let result = actions
-                .run_py(project_id, code, path, args, timeout_seconds, bridge.env_pairs())
-                .await;
-            bridge.stop().await;
-            result.map(|r| json!({"ok": true, "text": assemble_command_text(store, r)}))
         }
         "sftp_upload" => {
             let server_id = str_field("serverId");
@@ -1843,7 +2042,11 @@ async fn run_internal_action(
         }
         "browser_read" => {
             let selector = str_field("selector");
-            let sel = if selector.is_empty() { None } else { Some(selector.as_str()) };
+            let sel = if selector.is_empty() {
+                None
+            } else {
+                Some(selector.as_str())
+            };
             actions
                 .browser()
                 .read_page(sel)
@@ -1851,7 +2054,10 @@ async fn run_internal_action(
                 .map(|text| json!({"ok": true, "text": text}))
         }
         "browser_console" => {
-            let limit = payload.get("limit").and_then(serde_json::Value::as_u64).map(|l| l as usize);
+            let limit = payload
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .map(|l| l as usize);
             Ok(json!({"ok": true, "text": actions.browser().console_text(limit)}))
         }
         "browser_screenshot" => {
@@ -1863,6 +2069,19 @@ async fn run_internal_action(
                 .screenshot(std::path::Path::new(&dir))
                 .await
                 .map(|text| json!({"ok": true, "text": text}))
+        }
+        // 用户反馈（对外提交到云平台；仅文本，附件由用户在账号页补充）：
+        // 令牌由 cloud.rs 从 keyring 取并续期，不经 pi 环境变量
+        "feedback_submit" => {
+            let category = str_field("category");
+            let title = str_field("title");
+            let content = str_field("content");
+            match cloud {
+                Some(c) => crate::cloud::feedback_submit_for_ai(c, store, &category, &title, &content)
+                    .await
+                    .map(|text| json!({"ok": true, "text": text})),
+                None => Err("云服务不可用，无法提交反馈".to_string()),
+            }
         }
         other => Err(format!("未知动作：{other}")),
     };
@@ -1888,7 +2107,12 @@ async fn resolve_exec_plan(
     }
     let sid = match server_id {
         Some(s) => s.clone(),
-        None => return (Err("远程目标必须提供 serverId".to_string()), Err("远程目标必须提供 serverId".to_string())),
+        None => {
+            return (
+                Err("远程目标必须提供 serverId".to_string()),
+                Err("远程目标必须提供 serverId".to_string()),
+            )
+        }
     };
     match entry {
         Some(e) if e.tool == "run_command" => {
@@ -1898,7 +2122,10 @@ async fn resolve_exec_plan(
             };
             match cwd {
                 Ok(c) => {
-                    let plan = e.plan.clone().unwrap_or_else(|| analyze_remote_command(command, &c));
+                    let plan = e
+                        .plan
+                        .clone()
+                        .unwrap_or_else(|| analyze_remote_command(command, &c));
                     (Ok(c), Ok(plan))
                 }
                 Err(err) => {
@@ -1907,18 +2134,16 @@ async fn resolve_exec_plan(
                 }
             }
         }
-        _ => {
-            match actions.remote_home(&sid).await {
-                Ok(c) => {
-                    let plan = analyze_remote_command(command, &c);
-                    (Ok(c), Ok(plan))
-                }
-                Err(err) => {
-                    let e2 = err.clone();
-                    (Err(err), Err(e2))
-                }
+        _ => match actions.remote_home(&sid).await {
+            Ok(c) => {
+                let plan = analyze_remote_command(command, &c);
+                (Ok(c), Ok(plan))
             }
-        }
+            Err(err) => {
+                let e2 = err.clone();
+                (Err(err), Err(e2))
+            }
+        },
     }
 }
 
@@ -1938,7 +2163,9 @@ fn assemble_command_text(store: &Arc<Store>, r: crate::ai_actions::CommandResult
     let (masked, redacted) = crate::redact::redact_secrets(&text, &store.known_secrets());
     text = masked;
     if redacted > 0 {
-        text.push_str(&format!("\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"));
+        text.push_str(&format!(
+            "\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"
+        ));
     }
     if text.len() > MAX_RESULT_CHARS {
         text.truncate(MAX_RESULT_CHARS);
@@ -1955,7 +2182,8 @@ fn assemble_command_text(store: &Arc<Store>, r: crate::ai_actions::CommandResult
 }
 
 /// 向 pi stdin 写一条 JSONL（严格单个 LF 结尾；不手拼 JSON）。
-fn write_stdin_json(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {    let mut buf = serde_json::to_vec(value).unwrap_or_default();
+fn write_stdin_json(stdin: &Arc<Mutex<ChildStdin>>, value: &serde_json::Value) {
+    let mut buf = serde_json::to_vec(value).unwrap_or_default();
     buf.push(b'\n');
     if let Ok(mut w) = stdin.lock() {
         let _ = w.write_all(&buf);
@@ -1982,8 +2210,56 @@ fn cancel_approvals(proc: &mut AiProc) {
 /// 提取 `response` 事件里 error 字段原文。
 fn err_message(ev: &serde_json::Value) -> String {
     match ev.get("error") {
-        Some(v) => v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()),
+        Some(v) => v
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string()),
         None => "未知错误".to_string(),
+    }
+}
+
+/// 托管模式回合结束：把本回合（脱敏后的 user prompt + assistant 全文）上报云记忆沉淀接口
+/// （POST /api/memories/sediment，默认 flush=true；服务器按 sessionId 聚合缓冲去重）。
+/// 仅托管模式且云会话存在时上报；失败只记诊断日志，绝不打断对话或影响前端。
+fn report_sediment(
+    rt: &mut Option<tokio::runtime::Runtime>,
+    cloud: &Option<Arc<crate::cloud::CloudManager>>,
+    store: &Arc<Store>,
+    project_id: &str,
+    key: &str,
+    user_text: &str,
+    assistant_text: &str,
+) {
+    let Some(cloud) = cloud else { return };
+    if store.cloud_mode() != CloudMode::Hosted {
+        return;
+    }
+    let user_text = user_text.trim();
+    if user_text.is_empty() {
+        return;
+    }
+    let session_id = key.split_once(':').map(|(_, s)| s.to_string());
+    let project_name = store.project(project_id).map(|p| p.name);
+    let mut messages = vec![json!({"role": "user", "content": user_text})];
+    let assistant = assistant_text.trim();
+    if !assistant.is_empty() {
+        messages.push(json!({"role": "assistant", "content": assistant}));
+    }
+    let rt = rt.get_or_insert_with(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("构建记忆沉淀上报 runtime 失败")
+    });
+    let res = rt.block_on(crate::cloud::sediment_dialogue(
+        cloud,
+        store,
+        messages,
+        session_id.as_deref(),
+        project_name.as_deref(),
+    ));
+    if let Err(e) = res {
+        crate::term::diag(&format!("[cloud] 记忆沉淀上报失败: {e}"));
     }
 }
 
@@ -2001,6 +2277,7 @@ pub struct PromptImage {
 #[tauri::command]
 pub async fn ai_chat(
     mgr: State<'_, Arc<AiManager>>,
+    cloud: State<'_, Arc<crate::cloud::CloudManager>>,
     app: AppHandle,
     key: String,
     prompt: String,
@@ -2021,32 +2298,65 @@ pub async fn ai_chat(
         masked
     };
 
-    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
-    // 旧进程已死但读取线程尚未摘除时，先清理再重起
-    if let Some(p) = procs.get_mut(&key) {
-        if let Ok(Some(_)) = p.child.try_wait() {
-            procs.remove(&key);
+    // 进程就绪检查：guard 限定在块内，避免跨 await 持有（MutexGuard 非 Send）
+    let need_spawn = {
+        let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        // 旧进程已死但读取线程尚未摘除时，先清理再重起
+        if let Some(p) = procs.get_mut(&key) {
+            if let Ok(Some(_)) = p.child.try_wait() {
+                procs.remove(&key);
+            }
         }
+        !procs.contains_key(&key)
+    };
+    if need_spawn {
+        // 托管模式：spawn 前确保 access_token 有效（CR-1.6 请求前续期，避免请求中途 401）；
+        // 刷新失败（吊销/禁用）在此返回中文引导错误（CR-3.4）
+        let cloud_token = if mgr.store.cloud_mode() == crate::store::CloudMode::Hosted {
+            Some(cloud.valid_access_token(&mgr.store).await?)
+        } else {
+            None
+        };
+        mgr.spawn(&app, &key, &project_id, cloud_token)?;
     }
-    // 技能快照指纹：UI/AI 修改、启停、增删技能后下一条消息即生效；工作区域切换不影响指纹。
-    // 锁外计算（文件 I/O），锁内仅比较。
-    let fingerprint = mgr.load_skills(&project_id)?.fingerprint;
-    let needs_restart = match procs.get(&key) {
-        None => true,
-        Some(p) => p.skill_fingerprint != fingerprint,
+    // 进程就绪与技能快照指纹判断：guard 收进块内，await（token 续期/spawn）前全部释放
+    // （MutexGuard 非 Send，不能跨 await 持有）。指纹：UI/AI 修改、启停、增删技能后
+    // 下一条消息即生效；工作区域切换不影响指纹。
+    let needs_restart = {
+        let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        // 旧进程已死但读取线程尚未摘除时，先清理再重起
+        if let Some(p) = procs.get_mut(&key) {
+            if let Ok(Some(_)) = p.child.try_wait() {
+                procs.remove(&key);
+            }
+        }
+        // 锁外计算指纹（文件 I/O），锁内仅比较
+        let fingerprint = mgr.load_skills(&project_id)?.fingerprint;
+        match procs.get(&key) {
+            None => true,
+            Some(p) => p.skill_fingerprint != fingerprint,
+        }
     };
     if needs_restart {
-        // 沿用 kill_keys 的取消审批 + kill/wait + 摘除流程；随后释放锁，按同一 session 文件 spawn
-        if let Some(mut old) = procs.remove(&key) {
-            cancel_approvals(&mut old);
-            old.killed.store(true, Ordering::SeqCst);
-            let _ = old.child.kill();
-            let _ = old.child.wait();
+        // 沿用 kill_keys 的取消审批 + kill/wait + 摘除流程；随后按同一 session 文件 spawn
+        {
+            let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+            if let Some(mut old) = procs.remove(&key) {
+                cancel_approvals(&mut old);
+                old.killed.store(true, Ordering::SeqCst);
+                let _ = old.child.kill();
+                let _ = old.child.wait();
+            }
         }
-        drop(procs);
-        mgr.spawn(&app, &key, &project_id)?;
-        procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        // 托管模式：spawn 前同样确保 access_token 有效（与首次 spawn 同语义）
+        let cloud_token = if mgr.store.cloud_mode() == crate::store::CloudMode::Hosted {
+            Some(cloud.valid_access_token(&mgr.store).await?)
+        } else {
+            None
+        };
+        mgr.spawn(&app, &key, &project_id, cloud_token)?;
     }
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     let Some(proc) = procs.get_mut(&key) else {
         return Err("pi 进程未就绪".to_string());
     };
@@ -2091,6 +2401,8 @@ pub async fn ai_chat(
     let mut buf = serde_json::to_vec(&payload)
         .map_err(|e| e.to_string())?;
     buf.push(b'\n');
+    // 记录本次脱敏后的 user prompt：回合结束时读取线程上报记忆沉淀用
+    *proc.last_prompt.lock().map_err(|e| e.to_string())? = prompt.clone();
     proc.stdin
         .lock()
         .map_err(|e| e.to_string())?
@@ -2116,20 +2428,23 @@ pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(),
 /// 附带最近一次技能装载中被项目同名技能覆盖的全局技能（避免 pi「同名保留第一个」依赖未声明顺序）。
 #[tauri::command]
 pub async fn ai_debug_info(mgr: State<'_, Arc<AiManager>>) -> Result<String, String> {
-    let covered = mgr
-        .covered_skills
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let covered = mgr.covered_skills.lock().unwrap_or_else(|p| p.into_inner());
     let mut out = mgr.pi_debug.clone();
     if !covered.is_empty() {
-        out.push_str(&format!("\n被项目同名技能覆盖的全局技能: {}\n", covered.join(", ")));
+        out.push_str(&format!(
+            "\n被项目同名技能覆盖的全局技能: {}\n",
+            covered.join(", ")
+        ));
     }
     Ok(out)
 }
 
 /// 工作台卸载/切换项目时调用：杀掉该项目全部 pi 进程。
 #[tauri::command]
-pub async fn ai_kill_project(mgr: State<'_, Arc<AiManager>>, project_id: String) -> Result<(), String> {
+pub async fn ai_kill_project(
+    mgr: State<'_, Arc<AiManager>>,
+    project_id: String,
+) -> Result<(), String> {
     mgr.kill_project(&project_id);
     Ok(())
 }
@@ -2154,7 +2469,11 @@ pub async fn ai_set_thinking(
             let mut buf = msg.clone();
             buf.push(b'\n');
             // 写失败（进程已死）忽略，读取线程会自行摘除
-            let _ = proc.stdin.lock().ok().and_then(|mut w| w.write_all(&buf).ok());
+            let _ = proc
+                .stdin
+                .lock()
+                .ok()
+                .and_then(|mut w| w.write_all(&buf).ok());
         }
     }
     Ok(())
@@ -2194,7 +2513,11 @@ pub async fn set_ai_mode(
             let mut buf = msg.clone();
             buf.push(b'\n');
             // 写失败（进程已死）忽略，读取线程会自行摘除
-            let _ = proc.stdin.lock().ok().and_then(|mut w| w.write_all(&buf).ok());
+            let _ = proc
+                .stdin
+                .lock()
+                .ok()
+                .and_then(|mut w| w.write_all(&buf).ok());
         }
     }
     Ok(())
@@ -2231,7 +2554,8 @@ pub async fn ai_respond_approval(
     }))
     .map_err(|e| e.to_string())?;
     buf.push(b'\n');
-    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    w.write_all(&buf)
+        .map_err(|e| format!("pi 进程已退出: {e}"))?;
     Ok(())
 }
 
@@ -2262,7 +2586,8 @@ pub async fn ai_respond_db_request(
     }))
     .map_err(|e| e.to_string())?;
     buf.push(b'\n');
-    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    w.write_all(&buf)
+        .map_err(|e| format!("pi 进程已退出: {e}"))?;
     Ok(())
 }
 
@@ -2271,6 +2596,111 @@ pub async fn ai_respond_db_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{test_store, CloudCapabilities, CloudUser};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("aishell-ai-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn manager(store: Arc<Store>, tag: &str) -> AiManager {
+        let agent_dir = temp_dir(tag);
+        let staging = Arc::new(crate::staging::RemoteStaging::new(
+            temp_dir(&format!("staging-{tag}")),
+            Arc::new(crate::ssh::SshManager::new(Arc::clone(&store))),
+            Arc::clone(&store),
+        ));
+        AiManager::new(
+            store.clone(),
+            PathBuf::from("pi-unused"),
+            agent_dir,
+            Arc::new(crate::ssh::SshManager::new(store)),
+            staging,
+            Arc::new(crate::browser::BrowserManager::new()),
+            String::new(),
+            None, // 测试构造不注入云会话
+        )
+    }
+
+    /// CR-3.1：托管模式代理端点拼接（serverUrl 可能带尾斜杠，需规范化）。
+    #[test]
+    fn hosted_llm_base_normalizes_server_url() {
+        assert_eq!(
+            hosted_llm_base("https://cloud.example.com"),
+            "https://cloud.example.com/api/proxy/llm/v1"
+        );
+        assert_eq!(
+            hosted_llm_base("http://localhost:8080/"),
+            "http://localhost:8080/api/proxy/llm/v1",
+            "尾斜杠应去除，避免双斜杠"
+        );
+    }
+
+    /// CR-3.1：托管模式但构建未注入 serverUrl → write_models_json 报错（云功能未接入）。
+    /// 注：注入源 = 环境变量或 release.env（build.rs），此测试仅在本机无任何注入时成立，
+    /// 已由 hosted_llm_base 纯函数测试覆盖拼接语义，此处保留托管态 smoke（编译期行为）。
+    #[test]
+    fn write_models_json_hosted_mode_smoke() {
+        let store = Arc::new(test_store(temp_dir("models-hosted-smoke")));
+        store.cloud_set_tokens("acc", "ref").unwrap();
+        store
+            .cloud_login_info(
+                CloudUser {
+                    id: None,
+                    name: "张三".into(),
+                    avatar: None,
+                    dept: None,
+                },
+                CloudCapabilities::default(),
+            )
+            .unwrap();
+        let ai = manager(store, "models-hosted-smoke");
+        // 注入存在（本机 release.env）→ 成功写出代理配置；缺失 → 报「未配置云服务」。
+        // 两条路径均不 panic，验证托管分支可执行。
+        match ai.write_models_json() {
+            Ok(()) => {
+                let text = std::fs::read_to_string(ai.agent_dir.join("models.json")).unwrap();
+                assert!(
+                    text.contains("/api/proxy/llm/v1") || text.contains("$AISHELL_CLOUD_TOKEN"),
+                    "托管模式应指向代理端点或使用 token env: {text}"
+                );
+            }
+            Err(e) => assert!(e.contains("未配置云服务"), "报错应为未注入: {e}"),
+        }
+    }
+
+    /// CR-3.1：个人模式 models.json 维持本地 baseUrl + $DEEPSEEK_API_KEY，不含代理痕迹。
+    #[test]
+    fn write_models_json_personal_keeps_local_config() {
+        let store = Arc::new(test_store(temp_dir("models-personal")));
+        let ai = manager(store, "models-personal");
+        ai.write_models_json().unwrap();
+        let text = std::fs::read_to_string(ai.agent_dir.join("models.json")).unwrap();
+        assert!(
+            text.contains("https://api.deepseek.com/v1"),
+            "个人模式 baseUrl 保持本地: {text}"
+        );
+        assert!(text.contains("$DEEPSEEK_API_KEY"));
+        assert!(!text.contains("AISHELL_CLOUD_TOKEN"));
+        assert!(
+            !text.contains("/api/proxy/"),
+            "个人模式不应出现代理地址: {text}"
+        );
+    }
+
+    /// 托管模式不注入无意义类型（构造 smoke：类型可编译、SshManager 空实例可构造）。
+    #[test]
+    fn manager_constructs_with_cloud_config_types() {
+        let store = Arc::new(test_store(temp_dir("smoke")));
+        store
+            .cloud_set_mode(crate::store::CloudMode::Hosted)
+            .unwrap();
+        let _ = manager(store, "smoke");
+    }
+
+    // ---------------------------------------------------------------- 技能纯函数测试
 
     fn summary(name: &str, enabled: bool, scope: &[&str], origin: SkillOrigin) -> SkillSummary {
         SkillSummary {
@@ -2298,7 +2728,11 @@ mod tests {
         let (final_list, covered) = select_enabled_skills(global, project);
         let names: Vec<&str> = final_list.iter().map(|s| s.name.as_str()).collect();
         // 项目在前、全局在后，各组按 name 排序；禁用项不进候选
-        assert_eq!(names, vec!["b-proj", "a-global", "z-global"], "顺序/过滤不符: {names:?}");
+        assert_eq!(
+            names,
+            vec!["b-proj", "a-global", "z-global"],
+            "顺序/过滤不符: {names:?}"
+        );
         assert!(covered.is_empty(), "不应有覆盖");
     }
 
@@ -2326,16 +2760,30 @@ mod tests {
         assert_eq!(scope_prompt(&[]), "", "空集合不应产生提示区");
         let skills = vec![
             summary("skill-a", true, &["local", "all"], SkillOrigin::Global),
-            summary("skill-b", true, &["remote:生产-Web-01"], SkillOrigin::Project),
+            summary(
+                "skill-b",
+                true,
+                &["remote:生产-Web-01"],
+                SkillOrigin::Project,
+            ),
         ];
         let prompt = scope_prompt(&skills);
-        assert!(prompt.contains("skill-a => local, all"), "缺少 skill-a: {prompt}");
-        assert!(prompt.contains("skill-b => remote:生产-Web-01"), "缺少 skill-b: {prompt}");
+        assert!(
+            prompt.contains("skill-a => local, all"),
+            "缺少 skill-a: {prompt}"
+        );
+        assert!(
+            prompt.contains("skill-b => remote:生产-Web-01"),
+            "缺少 skill-b: {prompt}"
+        );
         assert!(prompt.contains("不是权限或加载过滤"), "缺少语义说明");
         assert!(prompt.contains("Server.name"), "缺少 remote 语义");
         // 不得包含技能正文或任意密钥值
         assert!(!prompt.contains("SKILL.md"));
-        assert!(!prompt.contains("apiKey") && !prompt.contains("描述"), "提示区泄漏了摘要外内容: {prompt}");
+        assert!(
+            !prompt.contains("apiKey") && !prompt.contains("描述"),
+            "提示区泄漏了摘要外内容: {prompt}"
+        );
     }
 
     #[test]
@@ -2346,7 +2794,10 @@ mod tests {
         assert_eq!(fp1, skill_fingerprint(&skills, &["正文1".to_string()]));
         // scope 改动改变指纹
         let skills_scope = vec![summary("a", true, &["local"], SkillOrigin::Global)];
-        assert_ne!(fp1, skill_fingerprint(&skills_scope, &["正文1".to_string()]));
+        assert_ne!(
+            fp1,
+            skill_fingerprint(&skills_scope, &["正文1".to_string()])
+        );
         // 正文改动改变指纹
         assert_ne!(fp1, skill_fingerprint(&skills, &["正文2".to_string()]));
         // enabled 改动改变指纹
@@ -2357,30 +2808,43 @@ mod tests {
             summary("a", true, &["all"], SkillOrigin::Global),
             summary("b", true, &["all"], SkillOrigin::Project),
         ];
-        assert_ne!(fp1, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
+        assert_ne!(
+            fp1,
+            skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()])
+        );
         // 同 list 序稳定（skill_fingerprint 固定字段顺序，不依赖 hash 随机性）
         let fp_repeated = skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]);
-        assert_eq!(fp_repeated, skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()]));
-    }
-
-    #[test]
-    fn task_project_never_uses_smart_approval() {
-        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::Smart));
-        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::All));
-        assert!(should_use_smart_approval("proj-1", ApprovalMode::Smart));
-        assert!(!should_use_smart_approval("proj-1", ApprovalMode::All));
+        assert_eq!(
+            fp_repeated,
+            skill_fingerprint(&skills2, &["正文1".to_string(), "正文2".to_string()])
+        );
     }
 
     #[test]
     fn impact_fingerprint_is_stable_and_input_sensitive() {
         let fp1 = impact_fingerprint("echo x > f", "remote", "srv-a", "/root");
         // 稳定：同输入同指纹
-        assert_eq!(fp1, impact_fingerprint("echo x > f", "remote", "srv-a", "/root"));
+        assert_eq!(
+            fp1,
+            impact_fingerprint("echo x > f", "remote", "srv-a", "/root")
+        );
         // 任一维度变化 → 指纹变化（审批/执行绑定）
-        assert_ne!(fp1, impact_fingerprint("echo x > g", "remote", "srv-a", "/root"));
-        assert_ne!(fp1, impact_fingerprint("echo x > f", "local", "srv-a", "/root"));
-        assert_ne!(fp1, impact_fingerprint("echo x > f", "remote", "srv-b", "/root"));
-        assert_ne!(fp1, impact_fingerprint("echo x > f", "remote", "srv-a", "/var/www"));
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > g", "remote", "srv-a", "/root")
+        );
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > f", "local", "srv-a", "/root")
+        );
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > f", "remote", "srv-b", "/root")
+        );
+        assert_ne!(
+            fp1,
+            impact_fingerprint("echo x > f", "remote", "srv-a", "/var/www")
+        );
     }
 
     #[test]
@@ -2396,17 +2860,26 @@ mod tests {
             "command": "cd /var/www/app && : > config.json",
             "target": "remote", "sessionId": "sess-1", "serverId": "srv-a", "timeoutSeconds": 10,
         });
-        assert_eq!(payload_fingerprint(&registered), payload_fingerprint(&bridge));
+        assert_eq!(
+            payload_fingerprint(&registered),
+            payload_fingerprint(&bridge)
+        );
         // 关键字段变化 → 指纹不同（防篡改）
         let tampered = json!({
             "action": "run_command", "command": "cd /var/www/app && : > other.json",
             "target": "remote", "serverId": "srv-a",
         });
-        assert_ne!(payload_fingerprint(&registered), payload_fingerprint(&tampered));
+        assert_ne!(
+            payload_fingerprint(&registered),
+            payload_fingerprint(&tampered)
+        );
         // sftp_upload：登记（无 action/sessionId）与桥 payload 同指纹；overwrite 缺省=false
         let reg_up = json!({ "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp" });
         let bridge_up = json!({ "action": "sftp_upload", "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp", "sessionId": "x", "overwrite": false });
-        assert_eq!(payload_fingerprint(&reg_up), payload_fingerprint(&bridge_up));
+        assert_eq!(
+            payload_fingerprint(&reg_up),
+            payload_fingerprint(&bridge_up)
+        );
         let overwrite = json!({ "serverId": "s", "localPath": "a.txt", "remoteDir": "/tmp", "overwrite": true });
         assert_ne!(payload_fingerprint(&reg_up), payload_fingerprint(&overwrite));
         // 批量登记与动作桥只允许桥接字段变化；任一项路径或覆盖策略变化都必须改指纹。
@@ -2473,17 +2946,41 @@ mod tests {
     #[test]
     fn guard_extension_has_staging_tools_but_never_accept() {
         // 探针：AI 工具清单有 staging_list/diff/restore/add/clear，绝无 staging_accept（接受只在前端面板）
-        assert!(GUARD_EXT.contains("staging_list"), "guard 应注册 staging_list");
-        assert!(GUARD_EXT.contains("staging_diff"), "guard 应注册 staging_diff");
-        assert!(GUARD_EXT.contains("staging_restore"), "guard 应注册 staging_restore");
-        assert!(GUARD_EXT.contains("staging_add"), "guard 应注册 staging_add");
-        assert!(GUARD_EXT.contains("staging_clear"), "guard 应注册 staging_clear");
+        assert!(
+            GUARD_EXT.contains("staging_list"),
+            "guard 应注册 staging_list"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_diff"),
+            "guard 应注册 staging_diff"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_restore"),
+            "guard 应注册 staging_restore"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_add"),
+            "guard 应注册 staging_add"
+        );
+        assert!(
+            GUARD_EXT.contains("staging_clear"),
+            "guard 应注册 staging_clear"
+        );
         // 探针核心：AI 工具清单/受控列表绝无 staging_accept（引号形态 = 工具/列表注册；
         // 注释里的裸词说明文字不算注册）
-        assert!(!GUARD_EXT.contains("\"staging_accept\""), "guard 绝不可注册 staging_accept");
-        assert!(!GUARD_EXT.contains("staging_accept\"}"), "guard 绝不可出现 staging_accept 工具定义");
+        assert!(
+            !GUARD_EXT.contains("\"staging_accept\""),
+            "guard 绝不可注册 staging_accept"
+        );
+        assert!(
+            !GUARD_EXT.contains("staging_accept\"}"),
+            "guard 绝不可出现 staging_accept 工具定义"
+        );
         // 还原属受控工具（逐调用审批）；只读列表/diff、主动暂存/清理无变更不入审批
-        assert!(GUARD_EXT.contains("\"staging_restore\""), "staging_restore 应受控审批");
+        assert!(
+            GUARD_EXT.contains("\"staging_restore\""),
+            "staging_restore 应受控审批"
+        );
         let controlled_line = GUARD_EXT
             .lines()
             .find(|l| l.contains("const CONTROLLED_TOOLS"))
@@ -2494,7 +2991,10 @@ mod tests {
         );
         // suggest 模式不提供受控远程工具（工具集变量中无 staging_*）
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
-        assert!(!tools_suggest.contains("staging_"), "suggest 工具集不应含暂存工具");
+        assert!(
+            !tools_suggest.contains("staging_"),
+            "suggest 工具集不应含暂存工具"
+        );
         let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,py");
         assert!(tools_agent.contains("staging_list"));
         assert!(tools_agent.contains("staging_restore"));
@@ -2502,30 +3002,9 @@ mod tests {
         assert!(tools_agent.contains("staging_clear"));
         // ai.rs 侧动作卡列表：staging_restore 有卡片，但接受类动作绝不入列
         assert!(CONTROLLED_TOOLS.contains(&"staging_restore"));
-        assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("staging_accept")));
-    }
-
-    #[test]
-    fn guard_extension_registers_py_tool() {
-        // py 工具探针：guard 注册 + 动作桥 run_py + 受控审批 + 仅 agent/yolo；
-        // ai.rs 侧工具白名单（agent/yolo）含 py、suggest 不含，受控列表含 py
-        assert!(GUARD_EXT.contains("name: \"py\""), "guard 应注册 py 工具");
-        assert!(GUARD_EXT.contains("\"run_py\""), "py 应走 run_py 动作桥");
-        let controlled_line = GUARD_EXT
-            .lines()
-            .find(|l| l.contains("const CONTROLLED_TOOLS"))
-            .unwrap_or_default();
-        assert!(controlled_line.contains("\"py\""), "py 应受控审批");
-        let ai_only_line = GUARD_EXT
-            .lines()
-            .find(|l| l.contains("const AI_ONLY_TOOLS"))
-            .unwrap_or_default();
-        assert!(ai_only_line.contains("\"py\""), "py 应仅 agent/yolo 可用");
-        assert!(CONTROLLED_TOOLS.contains(&"py"));
-        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py");
-        assert!(tools_agent.contains(",py"), "agent/yolo 工具集应含 py");
-        let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
-        assert!(!tools_suggest.contains(",py"), "suggest 工具集不应含 py");
+        assert!(!CONTROLLED_TOOLS
+            .iter()
+            .any(|t| t.contains("staging_accept")));
     }
 
     #[test]
@@ -2538,16 +3017,40 @@ mod tests {
         assert!(GUARD_EXT.contains("createLsTool"), "guard 应覆盖 ls");
         assert!(GUARD_EXT.contains("createFindTool"), "guard 应覆盖 find");
         assert!(GUARD_EXT.contains("createGrepTool"), "guard 应覆盖 grep");
-        assert!(GUARD_EXT.contains("SERVER_ID_PARAM"), "guard 应定义 serverId 参数");
-        assert!(GUARD_EXT.contains("remote_grep"), "grep 远程分支应走 remote_grep 动作");
-        assert!(GUARD_EXT.contains("remote_write"), "写远程应经 remote_write 动作");
-        assert!(GUARD_EXT.contains("remote_read"), "读远程应经 remote_read 动作");
-        assert!(GUARD_EXT.contains("remote_delete"), "远程删除应经 remote_delete 动作");
+        assert!(
+            GUARD_EXT.contains("SERVER_ID_PARAM"),
+            "guard 应定义 serverId 参数"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_grep"),
+            "grep 远程分支应走 remote_grep 动作"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_write"),
+            "写远程应经 remote_write 动作"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_read"),
+            "读远程应经 remote_read 动作"
+        );
+        assert!(
+            GUARD_EXT.contains("remote_delete"),
+            "远程删除应经 remote_delete 动作"
+        );
         // suggest 阻止文案（远程能力仅 agent/yolo）
-        assert!(GUARD_EXT.contains("仅建议模式不能操作远程文件"), "suggest 远程调用应被阻止");
+        assert!(
+            GUARD_EXT.contains("仅建议模式不能操作远程文件"),
+            "suggest 远程调用应被阻止"
+        );
         // 覆盖后仍保留本地分支：委托本地实例执行
-        assert!(GUARD_EXT.contains("localRead.execute"), "无 serverId 应委托本地 read");
-        assert!(GUARD_EXT.contains("localGrep.execute"), "无 serverId 应委托本地 grep");
+        assert!(
+            GUARD_EXT.contains("localRead.execute"),
+            "无 serverId 应委托本地 read"
+        );
+        assert!(
+            GUARD_EXT.contains("localGrep.execute"),
+            "无 serverId 应委托本地 grep"
+        );
     }
 
     #[test]
@@ -2567,25 +3070,60 @@ mod tests {
     /// apiKey 永远是 $DEEPSEEK_API_KEY 占位（真实密钥只经环境变量进 pi）。
     #[test]
     fn models_json_declares_image_input_for_vision_models() {
-        let vision = models_json_for(&crate::store::LlmConfig {
-            model_id: "deepseek-v4-flash-vision-exp".to_string(),
-            base_url: "https://api.deepseek.com/v1/".to_string(),
-            effort: crate::store::Effort::Low,
-        });
+        let vision = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-v4-flash-vision-exp".to_string(),
+                base_url: "https://api.deepseek.com/v1/".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            None,
+        );
         let model = &vision["providers"]["deepseek"]["models"][0];
         assert_eq!(model["input"], json!(["text", "image"]), "vision 模型应声明图片输入");
         assert_eq!(model["id"], "deepseek-v4-flash-vision-exp");
         assert_eq!(vision["providers"]["deepseek"]["baseUrl"], "https://api.deepseek.com/v1", "尾部斜杠应去除");
         assert_eq!(vision["providers"]["deepseek"]["apiKey"], "$DEEPSEEK_API_KEY");
 
-        let text_only = models_json_for(&crate::store::LlmConfig {
-            model_id: "deepseek-chat".to_string(),
-            base_url: "https://api.deepseek.com/v1".to_string(),
-            effort: crate::store::Effort::Low,
-        });
+        let text_only = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-chat".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            None,
+        );
         let model = &text_only["providers"]["deepseek"]["models"][0];
         assert!(model.get("input").is_none(), "非 vision 模型不应带 input 字段");
         assert_eq!(model["reasoning"], false, "deepseek-chat 不支持思考档位");
         assert_eq!(vision["providers"]["deepseek"]["models"][0]["reasoning"], true, "v4 系列支持思考档位");
+
+        // 云分支：托管代理的 deepseek-v4-flash（对外 id 未变，上游已支持识图）应声明图片输入；
+        // 同名模型在个人模式直连官方 API 时仍视为纯文本。
+        let hosted = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-v4-flash".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            Some("https://cloud.example.com/"),
+        );
+        let model = &hosted["providers"]["deepseek"]["models"][0];
+        assert_eq!(model["input"], json!(["text", "image"]), "托管默认模型应声明图片输入");
+        assert_eq!(hosted["providers"]["deepseek"]["baseUrl"], "https://cloud.example.com/api/proxy/llm/v1");
+        assert_eq!(hosted["providers"]["deepseek"]["apiKey"], "$AISHELL_CLOUD_TOKEN");
+        assert_eq!(hosted["providers"]["deepseek"]["compat"]["supportsDeveloperRole"], false);
+
+        let personal = models_json_for(
+            &crate::store::LlmConfig {
+                model_id: "deepseek-v4-flash".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                effort: crate::store::Effort::Low,
+            },
+            None,
+        );
+        assert!(
+            personal["providers"]["deepseek"]["models"][0].get("input").is_none(),
+            "个人模式 deepseek-v4-flash（官方上游）不应声明图片输入"
+        );
     }
 }

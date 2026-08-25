@@ -8,9 +8,9 @@
  *     (配置抄 ai-engine.ts:429);切到预览前先把未保存内容落盘;
  *   - 脏标记 ● + 800ms 防抖自动保存 + Ctrl+S + 关闭时静默落盘;
  *   - onFsChanged 模块级订阅:同路径无脏改动重载,有脏改动 toast 提示(照 EditorTab.tsx:882)。
+ *   - 工具栏「发布日志」:落盘后开 PublishReportModal(发布钉钉日志,见 ../notes/PublishReportModal.tsx)。
  * keep-alive 契约:effect 依赖 [tab.id](硬约束 9:tab 对象引用会被 setTabTitle 换,不可作依赖)。
- * 接口点:fs_read / fs_write / fs:changed;预览外链显式调用 opener openUrl;
- * 外部入口 openNote(tab id = note:<path> 去重激活)。
+ * 接口点:fs_read / fs_write / fs:changed;外部入口 openNote(tab id = note:<path> 去重激活)。
  */
 import { useEffect, useRef, useState, type MouseEvent } from 'react';
 import { EditorState, Prec, StateEffect, type Extension } from '@codemirror/state';
@@ -19,13 +19,14 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirro
 import { LanguageDescription, indentUnit } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
 import MarkdownIt from 'markdown-it';
-import { openUrl } from '@tauri-apps/plugin-opener';
 import { fsRead, fsWrite, onFsChanged } from '../../../api';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { toast } from '../../../ui';
 import { useWorkbench, tabApis, type Tab, type TabProps } from '../../../stores/workbench';
 import { onThemeChange } from '../../../theme';
 import { Icon } from '../../../shared/Icon';
 import { reconfigureTheme, editorCmThemeExt } from './EditorTab';
+import { openPublishReportModal } from '../notes/PublishReportModal';
 import './note.css';
 
 /* Markdown 预览渲染器:配置抄 ai-engine.ts(html:false 转义原始 HTML 防 XSS,
@@ -217,10 +218,16 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
     setMode(next);
   };
 
-  const previewHtml = mode === 'preview'
-    ? md.render(entryRef.current?.view.state.doc.toString() ?? '')
-    : '';
+  /* 发布钉钉日志:先落盘(后端 generate 按路径读文件),再开发布模态框 */
+  const publishReport = (): void => {
+    const entry = entryRef.current;
+    if (!entry) return;
+    const open = (): void => openPublishReportModal({ notePath: entry.path, noteName: entry.baseTitle });
+    if (entry.dirty) void queueSave(entry, true).then(open);
+    else open();
+  };
 
+  /* 预览外链显式走系统浏览器（main 侧引入）：Markdown 预览里的 http/mailto 链接不被页面接管 */
   const onPreviewClick = (e: MouseEvent<HTMLDivElement>): void => {
     const target = e.target;
     const link = target instanceof Element ? target.closest('a[href]') : null;
@@ -230,6 +237,10 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
     e.preventDefault();
     void openUrl(url.href).catch((err) => toast(`无法打开链接: ${String(err)}`, 'error'));
   };
+
+  const previewHtml = mode === 'preview'
+    ? md.render(entryRef.current?.view.state.doc.toString() ?? '')
+    : '';
 
   return (
     <div className="note-root">
@@ -244,6 +255,9 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
             onClick={() => switchMode('preview')}
           ><Icon name="eye" /> 预览</button>
         </div>
+        <button className="btn small" title="将笔记整理后发布为钉钉日志" onClick={publishReport}>
+          <Icon name="upload" /> 发布日志
+        </button>
         <span className="note-path ellipsis" title={String(tab.data.path ?? '')}>
           {String(tab.data.path ?? '')}
         </span>

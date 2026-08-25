@@ -10,6 +10,7 @@ import { createRoot } from 'react-dom/client';
 import { getState, isConfigComplete, openDevtools } from './api';
 import { initCommandPanel } from './command-panel';
 import { initDebug } from './debug';
+import { initUpdates } from './updates';
 import { navigate } from './router';
 import { applyTheme } from './theme';
 import { ErrorBoundary } from './shared/ErrorBoundary';
@@ -51,5 +52,7 @@ document.addEventListener('keydown', (e) => {
 initCommandPanel();
 /* Debug 日志总线:启动即订阅后端 debug:log(面板未开也留历史) */
 void initDebug();
+/* 更新状态总线:拉一次 update_status 并订阅事件(Topbar 徽标/设置页「关于与更新」共用) */
+initUpdates();
 
 void boot();

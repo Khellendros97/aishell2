@@ -1,5 +1,16 @@
 /* Skill 面板样式 —— 分组卡片视觉复制 commands.css（.wbs-content 共享规则自声明），
    启用开关复制 servers.css 的 .db-switch。 */
+.wbs-skills-head-actions { display: inline-flex; align-items: center; gap: 6px; }
+.wbs-skillhub-btn {
+  display: inline-flex; align-items: center; gap: 4px; color: #fff;
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #d946ef 100%);
+  border: 0;
+}
+.btn.wbs-skillhub-btn:hover {
+  color: #fff; background: linear-gradient(135deg, #7075f5 0%, #9967fa 55%, #e45cf1 100%);
+  border-color: transparent; filter: brightness(1.08);
+}
+.wbs-skillhub-btn svg { font-size: 13px; }
 .wbs-content { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
 .wbs-skills-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 

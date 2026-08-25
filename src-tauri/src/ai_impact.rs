@@ -53,15 +53,27 @@ pub struct ImpactPlan {
 
 impl ImpactPlan {
     pub fn none(reason: &str) -> Self {
-        ImpactPlan { effect: Effect::None, changes: Vec::new(), reason: reason.to_string() }
+        ImpactPlan {
+            effect: Effect::None,
+            changes: Vec::new(),
+            reason: reason.to_string(),
+        }
     }
 
     pub fn unbounded(reason: &str) -> Self {
-        ImpactPlan { effect: Effect::Unbounded, changes: Vec::new(), reason: reason.to_string() }
+        ImpactPlan {
+            effect: Effect::Unbounded,
+            changes: Vec::new(),
+            reason: reason.to_string(),
+        }
     }
 
     pub fn bounded(changes: Vec<FileChange>, reason: &str) -> Self {
-        ImpactPlan { effect: Effect::Bounded, changes, reason: reason.to_string() }
+        ImpactPlan {
+            effect: Effect::Bounded,
+            changes,
+            reason: reason.to_string(),
+        }
     }
 }
 
@@ -81,7 +93,9 @@ impl std::str::FromStr for Effect {
             "none" => Ok(Effect::None),
             "bounded" => Ok(Effect::Bounded),
             "unbounded" => Ok(Effect::Unbounded),
-            _ => Err(format!("非法 filesystemEffect：{s}（应为 none|bounded|unbounded）")),
+            _ => Err(format!(
+                "非法 filesystemEffect：{s}（应为 none|bounded|unbounded）"
+            )),
         }
     }
 }
@@ -94,7 +108,9 @@ impl std::str::FromStr for Operation {
             "modify" => Ok(Operation::Modify),
             "delete" => Ok(Operation::Delete),
             "rename" => Ok(Operation::Rename),
-            _ => Err(format!("非法 operation：{s}（应为 create|modify|delete|rename）")),
+            _ => Err(format!(
+                "非法 operation：{s}（应为 create|modify|delete|rename）"
+            )),
         }
     }
 }
@@ -125,7 +141,11 @@ pub fn merge_plans(deterministic: &ImpactPlan, llm: &ImpactPlan) -> ImpactPlan {
     } else {
         format!("{}；{}", deterministic.reason, llm.reason)
     };
-    ImpactPlan { effect, changes, reason }
+    ImpactPlan {
+        effect,
+        changes,
+        reason,
+    }
 }
 
 /// 校验（LLM 提供的）计划：effect=bounded 必须有非空 changes、每个路径都是绝对路径、
@@ -190,7 +210,9 @@ fn normalize_abs(p: &str) -> String {
 /// 把重定向目标/工具文件参数解析为规范化绝对路径；含动态成分返回 Err（→ unbounded）。
 fn resolve_path(target: &str, cwd: &str) -> Result<String, String> {
     if is_dynamic(target) {
-        return Err(format!("路径包含变量/命令替换/通配符，无法静态确定：{target}"));
+        return Err(format!(
+            "路径包含变量/命令替换/通配符，无法静态确定：{target}"
+        ));
     }
     let joined = if target.starts_with('/') {
         target.to_string()
@@ -244,7 +266,10 @@ fn tokenize(command: &str) -> Vec<Segment> {
                 words.push(std::mem::take(&mut cur));
             }
             if !words.is_empty() {
-                segments.push(Segment { words: std::mem::take(&mut words), after_pipe: $pipe });
+                segments.push(Segment {
+                    words: std::mem::take(&mut words),
+                    after_pipe: $pipe,
+                });
             }
         }};
     }
@@ -382,7 +407,9 @@ fn split_redirect(w: &str) -> Option<(bool, &str)> {
 }
 
 /// 已知可分析工具名（含绝对路径形态 `/bin/rm` 等取 basename 判定）。
-const KNOWN_TOOLS: [&str; 9] = ["tee", "sed", "perl", "truncate", "rm", "mv", "cp", "install", "cd"];
+const KNOWN_TOOLS: [&str; 9] = [
+    "tee", "sed", "perl", "truncate", "rm", "mv", "cp", "install", "cd",
+];
 
 fn is_known_tool(first: &str) -> bool {
     let base = basename(first);
@@ -390,10 +417,19 @@ fn is_known_tool(first: &str) -> bool {
 }
 
 /// 追加一条文件变更（去伪 fs、解析绝对路径）。
-fn push_change(changes: &mut Vec<FileChange>, op: Operation, target: &str, cwd: &str) -> Result<(), String> {
+fn push_change(
+    changes: &mut Vec<FileChange>,
+    op: Operation,
+    target: &str,
+    cwd: &str,
+) -> Result<(), String> {
     let path = resolve_path(target, cwd)?;
     if !is_pseudo_fs(&path) {
-        changes.push(FileChange { operation: op, path, destination: None });
+        changes.push(FileChange {
+            operation: op,
+            path,
+            destination: None,
+        });
     }
     Ok(())
 }
@@ -450,11 +486,16 @@ fn analyze_statement(words: &[String], cwd: &str) -> Result<Vec<FileChange>, Str
         return Err("循环/分支结构无法静态确定执行范围".to_string());
     }
     // 纯 shell 关键字：跳过（真正命令在后续段）
-    if matches!(first, "do" | "done" | "then" | "else" | "elif" | "fi" | "esac" | "{" | "}" | "if") {
+    if matches!(
+        first,
+        "do" | "done" | "then" | "else" | "elif" | "fi" | "esac" | "{" | "}" | "if"
+    ) {
         return Ok(changes);
     }
     if is_dynamic(first) {
-        return Err(format!("命令名包含变量/命令替换，无法确定影响范围：{first}"));
+        return Err(format!(
+            "命令名包含变量/命令替换，无法确定影响范围：{first}"
+        ));
     }
     // 可执行路径（含 / 或 . 开头）且不是已知工具 → 外部脚本
     if (first.contains('/') || first.starts_with('.')) && !is_known_tool(first) {
@@ -471,7 +512,8 @@ fn analyze_statement(words: &[String], cwd: &str) -> Result<Vec<FileChange>, Str
         "cp" => handle_cp(&cmd_words, cwd, &mut changes)?,
         "install" => handle_install(&cmd_words, cwd, &mut changes)?,
         // 解释器：即使不写文件也无法证明，一律无法确定（perl -i 已在上方分支处理）
-        "bash" | "sh" | "zsh" | "dash" | "ksh" | "python" | "python3" | "ruby" | "node" | "php" | "expect" => {
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "python" | "python3" | "ruby" | "node" | "php"
+        | "expect" => {
             return Err(format!("解释器执行脚本（{first}），无法确定影响范围"));
         }
         _ => {
@@ -599,7 +641,11 @@ fn handle_perl(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Re
 }
 
 /// truncate [OPTION]... FILE...：非选项参数即修改目标。
-fn handle_truncate(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Result<(), String> {
+fn handle_truncate(
+    words: &[String],
+    cwd: &str,
+    changes: &mut Vec<FileChange>,
+) -> Result<(), String> {
     let mut i = 1;
     while i < words.len() {
         let w = &words[i];
@@ -611,7 +657,10 @@ fn handle_truncate(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -
             i += 1;
             continue;
         }
-        if (w.starts_with("-s") && w.len() > 2) || (w.starts_with("--size=") ) || (w.starts_with("--reference=")) {
+        if (w.starts_with("-s") && w.len() > 2)
+            || (w.starts_with("--size="))
+            || (w.starts_with("--reference="))
+        {
             i += 1;
             continue;
         }
@@ -672,7 +721,10 @@ fn handle_mv(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Resu
     while i < words.len() {
         let w = &words[i];
         if w == "-t" || w == "--target-directory" {
-            dest_dir = words.get(i + 1).cloned().map(|d| d.trim_end_matches('/').to_string());
+            dest_dir = words
+                .get(i + 1)
+                .cloned()
+                .map(|d| d.trim_end_matches('/').to_string());
             i += 2;
             continue;
         }
@@ -698,7 +750,11 @@ fn handle_mv(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Resu
         let src_path = resolve_path(src, cwd)?;
         let dest_path = resolve_path(dest, cwd)?;
         if !is_pseudo_fs(&src_path) || !is_pseudo_fs(&dest_path) {
-            changes.push(FileChange { operation: Operation::Rename, path: src_path, destination: Some(dest_path) });
+            changes.push(FileChange {
+                operation: Operation::Rename,
+                path: src_path,
+                destination: Some(dest_path),
+            });
         }
         Ok(())
     };
@@ -741,7 +797,10 @@ fn handle_cp(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Resu
             continue;
         }
         if w == "-t" || w == "--target-directory" {
-            dest_dir = words.get(i + 1).cloned().map(|d| d.trim_end_matches('/').to_string());
+            dest_dir = words
+                .get(i + 1)
+                .cloned()
+                .map(|d| d.trim_end_matches('/').to_string());
             i += 2;
             continue;
         }
@@ -768,7 +827,12 @@ fn handle_cp(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Resu
     }
     if let Some(dir) = &dest_dir {
         for src in &args {
-            push_change(changes, Operation::Modify, &join_remote(dir, basename(src)), cwd)?;
+            push_change(
+                changes,
+                Operation::Modify,
+                &join_remote(dir, basename(src)),
+                cwd,
+            )?;
         }
         return Ok(());
     }
@@ -792,14 +856,21 @@ fn handle_cp(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Resu
 }
 
 /// install [OPTION]... SOURCE DEST / install -t DIR SOURCE... / install -d DIR...。
-fn handle_install(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) -> Result<(), String> {
+fn handle_install(
+    words: &[String],
+    cwd: &str,
+    changes: &mut Vec<FileChange>,
+) -> Result<(), String> {
     let mut args: Vec<String> = Vec::new();
     let mut i = 1;
     let mut dest_dir: Option<String> = None;
     while i < words.len() {
         let w = &words[i];
         if w == "-t" || w == "--target-directory" {
-            dest_dir = words.get(i + 1).cloned().map(|d| d.trim_end_matches('/').to_string());
+            dest_dir = words
+                .get(i + 1)
+                .cloned()
+                .map(|d| d.trim_end_matches('/').to_string());
             i += 2;
             continue;
         }
@@ -831,7 +902,12 @@ fn handle_install(words: &[String], cwd: &str, changes: &mut Vec<FileChange>) ->
     }
     if let Some(dir) = &dest_dir {
         for src in &args {
-            push_change(changes, Operation::Modify, &join_remote(dir, basename(src)), cwd)?;
+            push_change(
+                changes,
+                Operation::Modify,
+                &join_remote(dir, basename(src)),
+                cwd,
+            )?;
         }
         return Ok(());
     }
@@ -946,8 +1022,14 @@ mod tests {
     #[test]
     fn dynamic_cd_is_unbounded() {
         // 需求验收：动态 cd "$APP_DIR" → unbounded，不得猜路径
-        assert_eq!(plan("cd \"$APP_DIR\" && : > config.json", "/root").effect, Effect::Unbounded);
-        assert_eq!(plan("cd $APP_DIR && rm config.json", "/root").effect, Effect::Unbounded);
+        assert_eq!(
+            plan("cd \"$APP_DIR\" && : > config.json", "/root").effect,
+            Effect::Unbounded
+        );
+        assert_eq!(
+            plan("cd $APP_DIR && rm config.json", "/root").effect,
+            Effect::Unbounded
+        );
         assert_eq!(plan("cd ~ && : > f", "/root").effect, Effect::Unbounded);
         assert_eq!(plan("cd && : > f", "/root").effect, Effect::Unbounded);
         assert_eq!(plan("cd - && : > f", "/root").effect, Effect::Unbounded);
@@ -992,7 +1074,10 @@ mod tests {
         assert_eq!(p.changes[0].path, "/etc/app.conf");
         let p = plan("sed -i.bak s/x/y/g /etc/app.conf", "/");
         assert_eq!(p.changes[0].path, "/etc/app.conf");
-        let p = plan("sed -i -e 's/a/b/' -e 's/c/d/' /etc/a.conf /etc/b.conf", "/");
+        let p = plan(
+            "sed -i -e 's/a/b/' -e 's/c/d/' /etc/a.conf /etc/b.conf",
+            "/",
+        );
         assert_eq!(p.changes.len(), 2);
         assert_eq!(p.changes[1].path, "/etc/b.conf");
         // sed 无 -i：读不改
@@ -1027,15 +1112,24 @@ mod tests {
         assert_eq!(p.changes[0].destination.as_deref(), Some("/etc/b.conf"));
         // 移动到目录（尾斜杠）：落地名 = 目录 + 源文件名
         let p = plan("mv /tmp/out.txt /var/backup/", "/");
-        assert_eq!(p.changes[0].destination.as_deref(), Some("/var/backup/out.txt"));
+        assert_eq!(
+            p.changes[0].destination.as_deref(),
+            Some("/var/backup/out.txt")
+        );
         // mv -t
         let p = plan("mv -t /var/backup /tmp/a.txt", "/");
-        assert_eq!(p.changes[0].destination.as_deref(), Some("/var/backup/a.txt"));
+        assert_eq!(
+            p.changes[0].destination.as_deref(),
+            Some("/var/backup/a.txt")
+        );
 
         let p = plan("cp /etc/a.conf /etc/b.conf", "/");
         assert_eq!(p.changes[0].operation, Operation::Modify);
         assert_eq!(p.changes[0].path, "/etc/b.conf");
-        assert_eq!(plan("cp -r /var/www /backup", "/").effect, Effect::Unbounded);
+        assert_eq!(
+            plan("cp -r /var/www /backup", "/").effect,
+            Effect::Unbounded
+        );
         let p = plan("cp /etc/a.conf /backup/", "/");
         assert_eq!(p.changes[0].path, "/backup/a.conf");
 
@@ -1053,13 +1147,28 @@ mod tests {
         assert_eq!(plan("rm \"$FILE\"", "/").effect, Effect::Unbounded);
         assert_eq!(plan("rm $(cat list)", "/").effect, Effect::Unbounded);
         assert_eq!(plan("rm /var/log/app/*.log", "/").effect, Effect::Unbounded);
-        assert_eq!(plan("rm /var/log/app/[ab].log", "/").effect, Effect::Unbounded);
+        assert_eq!(
+            plan("rm /var/log/app/[ab].log", "/").effect,
+            Effect::Unbounded
+        );
         assert_eq!(plan("bash deploy.sh", "/").effect, Effect::Unbounded);
         assert_eq!(plan("./deploy.sh", "/").effect, Effect::Unbounded);
-        assert_eq!(plan("python3 /srv/scripts/migrate.py", "/").effect, Effect::Unbounded);
-        assert_eq!(plan("for f in /var/log/*.log; do : > \"$f\"; done", "/").effect, Effect::Unbounded);
-        assert_eq!(plan("while true; do : > /tmp/x; done", "/").effect, Effect::Unbounded);
-        assert_eq!(plan("(cd /tmp && echo x > f)", "/").effect, Effect::Unbounded);
+        assert_eq!(
+            plan("python3 /srv/scripts/migrate.py", "/").effect,
+            Effect::Unbounded
+        );
+        assert_eq!(
+            plan("for f in /var/log/*.log; do : > \"$f\"; done", "/").effect,
+            Effect::Unbounded
+        );
+        assert_eq!(
+            plan("while true; do : > /tmp/x; done", "/").effect,
+            Effect::Unbounded
+        );
+        assert_eq!(
+            plan("(cd /tmp && echo x > f)", "/").effect,
+            Effect::Unbounded
+        );
     }
 
     #[test]
@@ -1119,7 +1228,11 @@ mod tests {
     #[test]
     fn validate_plan_rules() {
         let ok = ImpactPlan::bounded(
-            vec![FileChange { operation: Operation::Modify, path: "/a/b".into(), destination: None }],
+            vec![FileChange {
+                operation: Operation::Modify,
+                path: "/a/b".into(),
+                destination: None,
+            }],
             "x",
         );
         assert!(validate_impact_plan(&ok).is_ok());
@@ -1127,18 +1240,34 @@ mod tests {
         assert!(validate_impact_plan(&ImpactPlan::bounded(vec![], "x")).is_err());
         // 非绝对路径 → Err
         let rel = ImpactPlan::bounded(
-            vec![FileChange { operation: Operation::Modify, path: "a/b".into(), destination: None }],
+            vec![FileChange {
+                operation: Operation::Modify,
+                path: "a/b".into(),
+                destination: None,
+            }],
             "x",
         );
         assert!(validate_impact_plan(&rel).is_err());
         // rename 缺 destination → Err
         let bad_rename = ImpactPlan::bounded(
-            vec![FileChange { operation: Operation::Rename, path: "/a".into(), destination: None }],
+            vec![FileChange {
+                operation: Operation::Rename,
+                path: "/a".into(),
+                destination: None,
+            }],
             "x",
         );
         assert!(validate_impact_plan(&bad_rename).is_err());
         // none 携带 changes → Err
-        let bad_none = ImpactPlan { effect: Effect::None, changes: vec![FileChange { operation: Operation::Modify, path: "/a".into(), destination: None }], reason: "x".into() };
+        let bad_none = ImpactPlan {
+            effect: Effect::None,
+            changes: vec![FileChange {
+                operation: Operation::Modify,
+                path: "/a".into(),
+                destination: None,
+            }],
+            reason: "x".into(),
+        };
         assert!(validate_impact_plan(&bad_none).is_err());
         // none / unbounded 空 changes 合法
         assert!(validate_impact_plan(&ImpactPlan::none("x")).is_ok());
@@ -1148,13 +1277,25 @@ mod tests {
     #[test]
     fn merge_takes_severity_max_and_unions_changes() {
         let d = ImpactPlan::bounded(
-            vec![FileChange { operation: Operation::Modify, path: "/a".into(), destination: None }],
+            vec![FileChange {
+                operation: Operation::Modify,
+                path: "/a".into(),
+                destination: None,
+            }],
             "d",
         );
         let l = ImpactPlan::bounded(
             vec![
-                FileChange { operation: Operation::Modify, path: "/a".into(), destination: None },
-                FileChange { operation: Operation::Modify, path: "/b".into(), destination: None },
+                FileChange {
+                    operation: Operation::Modify,
+                    path: "/a".into(),
+                    destination: None,
+                },
+                FileChange {
+                    operation: Operation::Modify,
+                    path: "/b".into(),
+                    destination: None,
+                },
             ],
             "l",
         );
@@ -1172,4 +1313,3 @@ mod tests {
         assert_eq!(m4.effect, Effect::Unbounded);
     }
 }
-

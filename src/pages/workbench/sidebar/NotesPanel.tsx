@@ -6,6 +6,7 @@
  * - 懒加载:fsList 逐目录展开,展开状态经 setUiExpanded('notes', …) 持久化(全局 key);
  * - 拖拽仅树内(source='notes',目录行 drop 拒绝其它 source/自身/祖先);
  * - CRUD 复用 fs_* 命令(base = notesRoot());双击 .md 开 NoteTab,其它文件走 openLocalFile;
+ * - 笔记右键「发布钉钉日志」开 PublishReportModal(见 ../notes/PublishReportModal.tsx);
  * - 订阅 wbEvents 'notes-changed'(归档写笔记后由 ai-engine 广播)保持展开集合刷新。
  * 接口点:src/api.ts notes 段(notesRoot/notesList)+ fs 段(fsList/fsCreate/fsMove/fsDelete)。
  */
@@ -19,6 +20,7 @@ import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
 import { openNote } from '../tabs/NoteTab';
 import { openLocalFile } from '../tabs/EditorTab';
+import { openPublishReportModal } from '../notes/PublishReportModal';
 import './notes.css';
 
 /** 树节点:path 为相对 notes 根的路径('/' 分隔;根为空串 '') */
@@ -225,6 +227,9 @@ function NotesPanelBody(): JSX.Element {
     const abs = `${rootAbs}/${node.path}`;
     showContextMenu(e.clientX, e.clientY, [
       { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => openNode(node) },
+      ...(!node.isDir && node.name.toLowerCase().endsWith('.md') ? [
+        { label: '发布钉钉日志', iconName: 'upload', action: () => openPublishReportModal({ notePath: abs, noteName: node.name }) } as CtxItem,
+      ] : []),
       ...(node.isDir ? [
         'sep' as const,
         { label: '新建笔记', iconName: 'note', action: () => panelApi?.startCreate(false, node.path) } as CtxItem,

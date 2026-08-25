@@ -3,22 +3,25 @@ pub mod ai_actions;
 pub mod ai_images;
 pub mod ai_impact;
 pub mod browser;
+pub mod cloud;
+pub mod dws;
+pub mod fsops;
 pub mod mcp;
 pub mod notes;
 pub mod redact;
 pub mod session_title;
-pub mod smart_approval;
-pub mod staging;
 #[cfg(windows)]
 pub mod gitinstall;
 pub mod pythoninstall;
 pub mod pysdk;
-pub mod fsops;
 pub mod sftp;
 pub mod skills;
+pub mod smart_approval;
 pub mod ssh;
+pub mod staging;
 pub mod store;
 pub mod term;
+pub mod update;
 pub mod trace;
 pub mod xshell;
 
@@ -55,15 +58,22 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        // 客户端自动更新（update.rs）：公钥经插件初始化注入（endpoints 运行期按
+        // AISHELL_SERVER_URL 拼接，不落在静态配置里）；JS 侧不走插件命令，无需 capability
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(update::UPDATER_PUBKEY)
+                .build(),
+        )
         // 内置浏览器本地 HTML 协议（browser.rs serve_local_html）：
         // 本地文件统一走 localhtml://，规避 file:// 空 host 触发的 wry ipc 处理器崩溃
-        .register_uri_scheme_protocol("localhtml", |_ctx, request| browser::serve_local_html(request))
+        .register_uri_scheme_protocol("localhtml", |_ctx, request| {
+            browser::serve_local_html(request)
+        })
         .setup(|app| {
             let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-            let store = Arc::new(
-                store::Store::new(config_dir.clone())
-                    .map_err(std::io::Error::other)?,
-            );
+            let store =
+                Arc::new(store::Store::new(config_dir.clone()).map_err(std::io::Error::other)?);
             let ssh = Arc::new(ssh::SshManager::new(store.clone()));
             // 会话级远程文件暂存（自动备份）：config_dir/remote-staging
             let staging = Arc::new(staging::RemoteStaging::new(
@@ -121,6 +131,7 @@ pub fn run() {
                 }
                 s
             };
+let cloud_mgr = Arc::new(cloud::CloudManager::default());
             // 内置浏览器（主窗口内嵌多子 webview，按页面懒创建）：先注入 AppHandle（事件发射/建视图用），
             // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一管理器（多页面共享）
             browser::set_app(app.handle().clone());
@@ -133,6 +144,7 @@ pub fn run() {
                 staging.clone(),
                 browser.clone(),
                 pi_debug,
+                Some(cloud_mgr.clone()),
             ));
             // MCP 服务端：按已启用设备自动监听 127.0.0.1:<port>/mcp（见 mcp.rs）
             let mcp = Arc::new(mcp::McpService::new(
@@ -147,6 +159,15 @@ pub fn run() {
             app.manage(terms);
             app.manage(ai.clone());
             app.manage(staging);
+            // 云服务 OAuth2 会话（登录 state + 令牌内存缓存；令牌权威存储在 keyring）
+            app.manage(cloud_mgr);
+            // 启动异步刷新：已登录则重拉 me（用户资料/能力清单），服务端配置变更无需重登
+            let cloud_mgr = app.state::<Arc<cloud::CloudManager>>().inner().clone();
+            let store2 = app.state::<Arc<store::Store>>().inner().clone();
+            let app2 = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                cloud::refresh_on_startup(&app2, &store2, &cloud_mgr).await;
+            });
             app.manage(mcp.clone());
             app.manage(browser);
             // 启动时按持久化配置同步监听（有已启用设备则自动拉起）
@@ -154,6 +175,14 @@ pub fn run() {
                 mcp.sync().await;
             });
             term::set_debug_app(app.handle().clone());
+            // 客户端自动更新状态机（update.rs）：命令 + 事件 + 延迟后台检查（未注入
+            // AISHELL_SERVER_URL 的个人构建内部自动禁用）
+            let updater = Arc::new(update::UpdateManager::new(
+                app.handle().clone(),
+                config_dir.clone(),
+            ));
+            app.manage(updater.clone());
+            update::start_background(app.handle().clone());
             // AI 会话 trace：启动 7 天过期清理任务（启动即清一次 + 每 24h）
             trace::spawn_cleanup_task();
             // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
@@ -270,6 +299,11 @@ pub fn run() {
             skills::skill_save,
             skills::skill_delete,
             skills::skill_set_enabled,
+            skills::skill_pack_upload,
+            cloud::skillhub_list,
+            cloud::skillhub_detail,
+            cloud::skillhub_version_detail,
+            cloud::skillhub_download,
             ai::ai_chat,
             ai::ai_abort,
             ai::ai_debug_info,
@@ -279,11 +313,34 @@ pub fn run() {
             ai_images::ai_read_image,
             ai::set_ai_mode,
             ai::ai_respond_approval,
+            cloud::cloud_begin_login,
+            cloud::cloud_cancel_login,
+            cloud::cloud_logout,
+            cloud::cloud_status,
+            cloud::cloud_set_mode,
+            cloud::cloud_usage,
+            cloud::memories_list,
+            cloud::memory_create,
+            cloud::memory_update,
+            cloud::memory_delete,
+            cloud::memory_history,
+            cloud::memory_search,
+            cloud::memory_promote,
+            cloud::kb_search,
+            cloud::feedback_submit,
+            cloud::feedback_list,
+            cloud::feedback_detail,
+            cloud::feedback_download_attachment,
             ai::ai_respond_db_request,
             session_title::ai_generate_session_title,
             notes::notes_root_cmd,
             notes::notes_list_cmd,
             notes::session_archive,
+            notes::session_note,
+            dws::dws_auth_status,
+            dws::dws_report_templates,
+            dws::dws_report_generate,
+            dws::dws_report_submit,
             trace::trace_status,
             trace::trace_set_enabled,
             trace::trace_read,
@@ -308,6 +365,11 @@ pub fn run() {
             browser::browser_set_inspect,
             browser::browser_open_devtools,
             browser::browser_close_view,
+            browser::browser_publish_skillhub,
+            update::update_status,
+            update::update_check,
+            update::update_download,
+            update::update_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

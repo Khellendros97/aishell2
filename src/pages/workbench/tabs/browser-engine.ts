@@ -112,6 +112,14 @@ function syncRect(): void {
   void browserSetRect(p.id, r.x, r.y, r.width, r.height).catch(() => { /* 标签切换竞态可忽略 */ });
 }
 
+/** 原生子 WebView 的层级高于主 WebView；全屏遮罩和右键菜单出现时必须临时隐藏它。 */
+function hasBlockingOverlay(): boolean {
+  return Array.from(document.body.children).some(
+    (n) => n instanceof HTMLElement
+      && (n.classList.contains('modal-mask') || n.classList.contains('ctx-menu')),
+  );
+}
+
 function applyVisibility(): void {
   // 四重条件:页面活跃 && 标签激活 && 工作台可见(路由停留) && 无全屏遮罩 && 已发生导航
   const base = tabActive && workbenchActive && !overlayOpen;
@@ -159,26 +167,20 @@ function setInspectState(on: boolean, silent = false): void {
 
 /* ---------- 导航 ---------- */
 
-async function navigatePage(p: PageState, input: string): Promise<string> {
-  const value = input.trim();
-  if (!value) throw new Error('地址不能为空');
-  await browserEnsure(p.id);
-  const normalized = await browserNavigate(p.id, value);
-  p.url = normalized;
-  p.hasNavigated = true;
-  updateHint();
-  applyVisibility();
-  syncRect();
-  updateAddress();
-  renderPagesBar();
-  return normalized;
-}
-
 async function navigate(input: string): Promise<void> {
   const p = activePage();
-  if (!p || !input.trim()) return;
+  const value = input.trim();
+  if (!p || !value) return;
   try {
-    await navigatePage(p, input);
+    await browserEnsure(p.id);
+    const normalized = await browserNavigate(p.id, value);
+    p.url = normalized;
+    p.hasNavigated = true;
+    updateHint();
+    applyVisibility();
+    syncRect();
+    updateAddress();
+    renderPagesBar();
   } catch (err) {
     toast(`无法打开: ${String(err)}`, 'error');
   }
@@ -198,7 +200,16 @@ export async function openInActivePage(input: string): Promise<string> {
   if (!value) throw new Error('地址不能为空');
   let p = activePage();
   if (!p) p = newPage();
-  return navigatePage(p, value);
+  await browserEnsure(p.id);
+  const normalized = await browserNavigate(p.id, value);
+  p.url = normalized;
+  p.hasNavigated = true;
+  updateHint();
+  applyVisibility();
+  syncRect();
+  updateAddress();
+  renderPagesBar();
+  return normalized;
 }
 
 /* ---------- 页面增删切换 ---------- */
@@ -414,16 +425,10 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
   if (viewEl) ro.observe(viewEl);
   window.addEventListener('resize', syncRect);
 
-  /* 遮罩避让:modal-mask / ctx-menu 挂 body 直下,出现/移除时重算可见性 */
-  overlayOpen = Array.from(document.body.children).some(
-    (n) => n instanceof HTMLElement
-      && (n.classList.contains('modal-mask') || n.classList.contains('ctx-menu')),
-  );
+  /* 子 WebView 会盖住主页面的模态与菜单；它们出现/移除时重算可见性。 */
+  overlayOpen = hasBlockingOverlay();
   const overlayObserver = new MutationObserver(() => {
-    const open = Array.from(document.body.children).some(
-      (n) => n instanceof HTMLElement
-        && (n.classList.contains('modal-mask') || n.classList.contains('ctx-menu')),
-    );
+    const open = hasBlockingOverlay();
     if (open !== overlayOpen) {
       overlayOpen = open;
       applyVisibility();
@@ -449,10 +454,23 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     } else if (ev.kind === 'ai-navigate' && ev.url) {
       toast(`AI 正在打开: ${ev.url}`);
     } else if (ev.kind === 'new-window' && ev.url) {
+      /* 新窗口拦截（main 侧引入）：后端拒绝弹窗并把地址经 browser:event new-window 送来，这里开新标签页 */
       const target = newPage();
-      void navigatePage(target, ev.url).catch((err) => {
-        toast(`无法在新页面打开: ${String(err)}`, 'error');
-      });
+      void (async () => {
+        try {
+          await browserEnsure(target.id);
+          const normalized = await browserNavigate(target.id, ev.url!);
+          target.url = normalized;
+          target.hasNavigated = true;
+          updateHint();
+          applyVisibility();
+          syncRect();
+          updateAddress();
+          renderPagesBar();
+        } catch (err) {
+          toast(`无法在新页面打开: ${String(err)}`, 'error');
+        }
+      })();
     } else if (ev.kind === 'element') {
       handleElementSelected(ev);
     }

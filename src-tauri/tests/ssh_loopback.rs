@@ -374,7 +374,12 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             Arc::clone(&ssh),
             Arc::clone(&store),
         ));
-        let actions = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store), Arc::clone(&ssh), staging, std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()));
+        let actions = aishell_lib::ai_actions::AiActions::new(
+            Arc::clone(&store),
+            Arc::clone(&ssh),
+            staging,
+            std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()),
+        );
 
         // AI 远程命令：锁检查先于任何网络请求（服务器从未被连接过，直接返回固定错误）
         let project_dir = std::env::temp_dir().join(format!(
@@ -418,15 +423,34 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
         );
         // AI SFTP 上传 / 下载同样在连接前被拒
         let err = actions
-            .sftp_upload("p-lock", "sess-1", "s-lock".to_string(), "a.txt".to_string(), "/tmp".to_string(), false, None)
+            .sftp_upload(
+                "p-lock",
+                "sess-1",
+                "s-lock".to_string(),
+                "a.txt".to_string(),
+                "/tmp".to_string(),
+                false,
+                None,
+            )
             .await
             .expect_err("锁定服务器应拒绝 AI 上传");
-        assert!(err.contains("已锁定，AI 无权执行远程操作"), "错误串不符: {err}");
+        assert!(
+            err.contains("已锁定，AI 无权执行远程操作"),
+            "错误串不符: {err}"
+        );
         let err = actions
-            .sftp_download("p-lock", "s-lock".to_string(), "/tmp/a.txt".to_string(), project_dir.to_string_lossy().into_owned())
+            .sftp_download(
+                "p-lock",
+                "s-lock".to_string(),
+                "/tmp/a.txt".to_string(),
+                project_dir.to_string_lossy().into_owned(),
+            )
             .await
             .expect_err("锁定服务器应拒绝 AI 下载");
-        assert!(err.contains("已锁定，AI 无权执行远程操作"), "错误串不符: {err}");
+        assert!(
+            err.contains("已锁定，AI 无权执行远程操作"),
+            "错误串不符: {err}"
+        );
 
         // 用户手动路径不受锁影响：connect_direct + open_shell / open_sftp 仍可连接
         ssh.connect_direct(server, Some("test"))
@@ -461,7 +485,9 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             .await
             .expect("锁定服务器的手动 SFTP 应可用");
         // 解锁后 AI 远程命令恢复（同一连接池，无需重连）
-        store.set_server_locked("s-lock", false).expect("解锁应成功");
+        store
+            .set_server_locked("s-lock", false)
+            .expect("解锁应成功");
         let result = actions
             .run_command(
                 "p-lock",
@@ -522,7 +548,12 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             Arc::clone(&ssh),
             Arc::clone(&store),
         ));
-        let actions = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store), Arc::clone(&ssh), staging, std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()));
+        let actions = aishell_lib::ai_actions::AiActions::new(
+            Arc::clone(&store),
+            Arc::clone(&ssh),
+            staging,
+            std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()),
+        );
 
         let server = Server {
             id: "s1".to_string(),
@@ -536,12 +567,15 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             is_bastion: false,
             bastion_id: None,
         };
-        store.upsert_server(server.clone(), None).expect("登记服务器应成功");
+        store
+            .upsert_server(server.clone(), None)
+            .expect("登记服务器应成功");
         ssh.connect_direct(server, Some("test"))
             .await
             .expect("连接 + 密码认证应成功");
 
-        let project_dir = std::env::temp_dir().join(format!("aishell-ssh-snap-proj-{}", std::process::id()));
+        let project_dir =
+            std::env::temp_dir().join(format!("aishell-ssh-snap-proj-{}", std::process::id()));
         std::fs::create_dir_all(&project_dir).expect("创建项目目录应成功");
         store
             .upsert_project(aishell_lib::store::Project {
@@ -617,11 +651,19 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
         let store2 = Arc::new(Store::new(config_dir_off).expect("Store::new 应成功"));
         let ssh2 = Arc::new(SshManager::new(Arc::clone(&store2)));
         let staging2 = Arc::new(aishell_lib::staging::RemoteStaging::new(
-            std::env::temp_dir().join(format!("aishell-ssh-snap-off-staging-{}", std::process::id())),
+            std::env::temp_dir().join(format!(
+                "aishell-ssh-snap-off-staging-{}",
+                std::process::id()
+            )),
             Arc::clone(&ssh2),
             Arc::clone(&store2),
         ));
-        let actions2 = aishell_lib::ai_actions::AiActions::new(Arc::clone(&store2), Arc::clone(&ssh2), staging2, std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()));
+        let actions2 = aishell_lib::ai_actions::AiActions::new(
+            Arc::clone(&store2),
+            Arc::clone(&ssh2),
+            staging2,
+            std::sync::Arc::new(aishell_lib::browser::BrowserManager::new()),
+        );
         let server2 = Server {
             id: "s2".to_string(),
             name: "loopback-off".to_string(),
@@ -634,7 +676,9 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             is_bastion: false,
             bastion_id: None,
         };
-        store2.upsert_server(server2.clone(), None).expect("登记服务器应成功");
+        store2
+            .upsert_server(server2.clone(), None)
+            .expect("登记服务器应成功");
         ssh2.connect_direct(server2, Some("test"))
             .await
             .expect("连接 + 密码认证应成功");

@@ -1,19 +1,22 @@
 /**
- * 会话归档对话框(命令式 DOM 模态,照 AiDbApproval.tsx 形态:自包含、不经 React 受控状态,
- * 由 ai-engine.ts 右键菜单「归档会话」消费)。
- * 三个模式单选:
+ * 会话归档/生成笔记对话框(命令式 DOM 模态,照 AiDbApproval.tsx 形态:自包含、不经 React 受控状态,
+ * 由 ai-engine.ts 右键菜单「归档会话」/「生成笔记」消费)。
+ * variant='archive'(默认)三个模式单选:
  *   - 新建笔记(默认):标题输入框(默认会话标题) + 目录下拉(根目录 + notesList().dirs + 「+ 新建目录…」展开文本框);
  *   - 更新笔记:笔记下拉(显示相对路径;列表为空时禁用);
  *   - 仅归档:说明文案(不生成笔记)。
+ * variant='note' 仅前两个模式(生成笔记不归档),标题/按钮文案换成「生成笔记」「生成」。
  * 确认后按钮区换成 spinner「正在生成笔记,可能需要一分钟左右…」,期间禁用 Esc/遮罩关闭;
  * 失败回到表单并显示错误;成功关闭并回调 onDone(notePath)。
- * 接口点:src/api.ts notesList(下拉候选);sessionArchive 由调用方传入 onConfirm 执行(引擎持有 transcript)。
+ * 接口点:src/api.ts notesList(下拉候选);sessionArchive/sessionNote 由调用方传入 onConfirm 执行(引擎持有 transcript)。
  */
 import { icon } from '../../../icons';
 import { notesList } from '../../../api';
 import type { ArchiveMode } from '../../../types';
 
 export interface ArchiveModalOpts {
+  /** archive = 归档会话(含仅归档模式);note = 仅生成笔记(不归档) */
+  variant?: 'archive' | 'note';
   sessionTitle: string;
   /** 执行归档(由 ai-engine 注入:拼 transcript 后调 sessionArchive);
    *  resolve = 笔记绝对路径(仅归档模式为空串);reject = 失败(弹窗保留并展示错误) */
@@ -109,6 +112,17 @@ export function openArchiveModal(opts: ArchiveModalOpts): void {
   const foot = root.querySelector<HTMLElement>('[data-f=foot]')!;
   titleInput.value = opts.sessionTitle;
 
+  /* 生成笔记变体:标题/按钮换文案,移除「仅归档」模式(生成笔记必落盘笔记) */
+  const isNote = opts.variant === 'note';
+  const okLabel = isNote ? '生成' : '归档';
+  if (isNote) {
+    root.querySelector('h3')!.textContent = '生成笔记';
+    root.querySelectorAll('.archive-mode').forEach((el) => {
+      if (el.querySelector<HTMLInputElement>('input')?.value === 'only') el.remove();
+    });
+    (root.querySelector('[data-act=ok]') as HTMLButtonElement).textContent = okLabel;
+  }
+
   /* 候选目录/笔记下拉(失败时仅根目录可用,错误在确认时由后端兜底) */
   void notesList().then((listing) => {
     for (const d of listing.dirs) {
@@ -192,10 +206,10 @@ export function openArchiveModal(opts: ArchiveModalOpts): void {
         busy = false;
         foot.innerHTML = `
           <button class="btn" data-act="cancel">取消</button>
-          <button class="btn primary" data-act="ok">归档</button>`;
+          <button class="btn primary" data-act="ok">${okLabel}</button>`;
         foot.querySelector('[data-act=cancel]')?.addEventListener('click', close);
         foot.querySelector('[data-act=ok]')?.addEventListener('click', confirmHandler);
-        errorEl.textContent = String(err) || '归档失败';
+        errorEl.textContent = String(err) || (isNote ? '生成笔记失败' : '归档失败');
         errorEl.classList.remove('hidden');
       },
     );

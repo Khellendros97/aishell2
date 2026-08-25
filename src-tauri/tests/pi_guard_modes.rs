@@ -107,14 +107,12 @@ fn final_payload_streaming() -> String {
         })
         .to_string(),
     ));
-    s.push_str(&sse(
-        &json!({
-            "id": "chatcmpl-final", "object": "chat.completion.chunk", "created": now_ts(),
-            "model": "test-model",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        })
-        .to_string(),
-    ));
+    s.push_str(&sse(&json!({
+        "id": "chatcmpl-final", "object": "chat.completion.chunk", "created": now_ts(),
+        "model": "test-model",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })
+    .to_string()));
     s.push_str("data: [DONE]\n\n");
     s
 }
@@ -143,24 +141,20 @@ fn toolcall_payload_streaming(spec: &str) -> String {
         })
         .to_string(),
     ));
-    s.push_str(&sse(
-        &json!({
-            "id": "chatcmpl-tool", "object": "chat.completion.chunk", "created": now_ts(),
-            "model": "test-model",
-            "choices": [{"index": 0, "delta": {"tool_calls": [
-                {"index": 0, "function": {"arguments": arguments}}
-            ]}, "finish_reason": null}],
-        })
-        .to_string(),
-    ));
-    s.push_str(&sse(
-        &json!({
-            "id": "chatcmpl-tool", "object": "chat.completion.chunk", "created": now_ts(),
-            "model": "test-model",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-        })
-        .to_string(),
-    ));
+    s.push_str(&sse(&json!({
+        "id": "chatcmpl-tool", "object": "chat.completion.chunk", "created": now_ts(),
+        "model": "test-model",
+        "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": arguments}}
+        ]}, "finish_reason": null}],
+    })
+    .to_string()));
+    s.push_str(&sse(&json!({
+        "id": "chatcmpl-tool", "object": "chat.completion.chunk", "created": now_ts(),
+        "model": "test-model",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    })
+    .to_string()));
     s.push_str("data: [DONE]\n\n");
     s
 }
@@ -192,7 +186,9 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
                 .lines()
                 .find_map(|l| {
                     let lower = l.to_lowercase();
-                    lower.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().ok())
+                    lower
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().ok())
                 })
                 .flatten();
             let body_start = pos + 4;
@@ -208,7 +204,11 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
             }
             let body = String::from_utf8_lossy(&body).into_owned();
             state.requests.fetch_add(1, Ordering::SeqCst);
-            eprintln!("[mock] request #{} len={}", state.requests.load(Ordering::SeqCst), body.len());
+            eprintln!(
+                "[mock] request #{} len={}",
+                state.requests.load(Ordering::SeqCst),
+                body.len()
+            );
 
             let req: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
             // 工具 schema 顶层类型校验（与真实 OpenAI 一致：parameters 必须是
@@ -245,7 +245,10 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
                 .unwrap_or_default();
             eprintln!("[mock] request tools={tools:?}");
             let messages = req["messages"].as_array().cloned().unwrap_or_default();
-            let last_role = messages.last().and_then(|m| m["role"].as_str()).unwrap_or("");
+            let last_role = messages
+                .last()
+                .and_then(|m| m["role"].as_str())
+                .unwrap_or("");
             // 记录 role=tool 的消息内容（工具执行/拒绝结果，供断言）
             for m in &messages {
                 if m["role"] == "tool" {
@@ -292,7 +295,10 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 payload.len()
             );
-            eprintln!("[mock] respond last_role={last_role} payload_len={}", payload.len());
+            eprintln!(
+                "[mock] respond last_role={last_role} payload_len={}",
+                payload.len()
+            );
             stream.write_all(header.as_bytes()).await?;
             stream.write_all(payload.as_bytes()).await?;
             stream.flush().await?;
@@ -331,7 +337,10 @@ impl Pi {
         extra_env: &[(&str, &str)],
     ) -> Option<Pi> {
         if !Path::new(PI_EXE).is_file() {
-            eprintln!("跳过：pi.exe 不存在（{}），先运行 scripts/fetch-pi.sh", PI_EXE);
+            eprintln!(
+                "跳过：pi.exe 不存在（{}），先运行 scripts/fetch-pi.sh",
+                PI_EXE
+            );
             return None;
         }
         std::fs::create_dir_all(agent_dir).ok()?;
@@ -351,7 +360,11 @@ impl Pi {
                 }
             }
         });
-        std::fs::write(agent_dir.join("models.json"), serde_json::to_string_pretty(&models).unwrap()).ok()?;
+        std::fs::write(
+            agent_dir.join("models.json"),
+            serde_json::to_string_pretty(&models).unwrap(),
+        )
+        .ok()?;
         std::fs::write(agent_dir.join("aishell-guard.ts"), GUARD_EXT).ok()?;
         eprintln!(
             "[pi] spawn mode={mode} cwd={} agent={} mock={}",
@@ -368,11 +381,16 @@ impl Pi {
             "read,write,edit,ls,find,grep,delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore".to_string()
         };
         cmd.args([
-            "--mode", "rpc",
-            "--provider", "mock",
-            "--model", "test-model",
-            "--thinking", "off",
-            "--tools", &tools,
+            "--mode",
+            "rpc",
+            "--provider",
+            "mock",
+            "--model",
+            "test-model",
+            "--thinking",
+            "off",
+            "--tools",
+            &tools,
             "--no-extensions",
             "--extension",
         ])
@@ -386,9 +404,9 @@ impl Pi {
             cmd.env(k, v);
         }
         cmd.current_dir(project_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("启动 pi 失败");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -428,7 +446,13 @@ impl Pi {
                 q2.push(ev);
             }
         });
-        Some(Pi { child, stdin, queue, confirm_count, action_count })
+        Some(Pi {
+            child,
+            stdin,
+            queue,
+            confirm_count,
+            action_count,
+        })
     }
 
     fn write(&mut self, v: &Value) {
@@ -451,18 +475,30 @@ impl Pi {
     }
 
     fn wait_event(&self, pred: impl Fn(&Value) -> bool) -> Value {
-        self.queue.wait_event(TURN_TIMEOUT, pred).unwrap_or_else(|| {
-            let archive = self.queue.archive.lock().unwrap();
-            let types: Vec<String> = archive.iter().map(|v| {
-                let t = v["type"].as_str().unwrap_or("?");
-                if t == "extension_ui_request" {
-                    format!("{t}:{}:{}", v["method"].as_str().unwrap_or(""), v["title"].as_str().unwrap_or(""))
-                } else {
-                    t.to_string()
-                }
-            }).collect();
-            panic!("等待 pi 事件超时（{TURN_TIMEOUT:?}）。已收事件：\n{}", types.join("\n"));
-        })
+        self.queue
+            .wait_event(TURN_TIMEOUT, pred)
+            .unwrap_or_else(|| {
+                let archive = self.queue.archive.lock().unwrap();
+                let types: Vec<String> = archive
+                    .iter()
+                    .map(|v| {
+                        let t = v["type"].as_str().unwrap_or("?");
+                        if t == "extension_ui_request" {
+                            format!(
+                                "{t}:{}:{}",
+                                v["method"].as_str().unwrap_or(""),
+                                v["title"].as_str().unwrap_or("")
+                            )
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .collect();
+                panic!(
+                    "等待 pi 事件超时（{TURN_TIMEOUT:?}）。已收事件：\n{}",
+                    types.join("\n")
+                );
+            })
     }
 
     fn wait_settled(&self) {
@@ -473,7 +509,10 @@ impl Pi {
         self.wait_event(|ev| {
             ev["type"] == "extension_ui_request"
                 && ev["method"].as_str() == Some("confirm")
-                && ev["title"].as_str().unwrap_or("").starts_with("AISHELL_APPROVAL:")
+                && ev["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("AISHELL_APPROVAL:")
         })
     }
 
@@ -503,7 +542,9 @@ struct Env {
 
 /// 起 mock 服务 + pi 进程（suggest/agent/yolo 模式）。
 async fn setup(mode: &str, script: &[&str]) -> (Env, Option<Pi>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("绑定 mock 端口失败");
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 mock 端口失败");
     let addr = listener.local_addr().unwrap();
     let state = Arc::new(MockState::default());
     *state.script.lock().unwrap() = script.iter().map(|s| s.to_string()).collect();
@@ -531,7 +572,10 @@ async fn setup(mode: &str, script: &[&str]) -> (Env, Option<Pi>) {
     let base = std::env::temp_dir().join(format!(
         "aishell-pi-guard-{}-{}-{}",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
         SEQ.fetch_add(1, Ordering::SeqCst),
     ));
     let project_dir = base.join("proj");
@@ -539,8 +583,17 @@ async fn setup(mode: &str, script: &[&str]) -> (Env, Option<Pi>) {
     std::fs::create_dir_all(project_dir.join(".aishell")).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
 
-    let pi = Pi::spawn(&project_dir, &agent_dir, &format!("http://127.0.0.1:{}", addr.port()), mode);
-    let env = Env { mock_state: state, project_dir, _agent_dir: agent_dir };
+    let pi = Pi::spawn(
+        &project_dir,
+        &agent_dir,
+        &format!("http://127.0.0.1:{}", addr.port()),
+        mode,
+    );
+    let env = Env {
+        mock_state: state,
+        project_dir,
+        _agent_dir: agent_dir,
+    };
     (env, pi)
 }
 
@@ -553,15 +606,23 @@ fn assert_tool_error(env: &Env, needle: &str) {
     );
 }
 
-const WRITE_OUTSIDE: &str = r#"{"name":"write","arguments":"{\"path\":\"../outside.txt\",\"content\":\"pwned\"}"}"#;
+const WRITE_OUTSIDE: &str =
+    r#"{"name":"write","arguments":"{\"path\":\"../outside.txt\",\"content\":\"pwned\"}"}"#;
 const LIST_SERVERS: &str = r#"{"name":"list_servers","arguments":"{}"}"#;
-const WRITE_AISHELL_NOTE: &str = r#"{"name":"write","arguments":"{\"path\":\".aishell/note.md\",\"content\":\"hi\"}"}"#;
-const WRITE_PROJECT_TXT: &str = r#"{"name":"write","arguments":"{\"path\":\"project.txt\",\"content\":\"w\"}"}"#;
-const WRITE_BLOCKED_TXT: &str = r#"{"name":"write","arguments":"{\"path\":\"blocked.txt\",\"content\":\"x\"}"}"#;
-const WRITE_ALLOWED_TXT: &str = r#"{"name":"write","arguments":"{\"path\":\"allowed.txt\",\"content\":\"y\"}"}"#;
-const WRITE_AUTO_TXT: &str = r#"{"name":"write","arguments":"{\"path\":\"auto.txt\",\"content\":\"z\"}"}"#;
-const WRITE_SECOND_TXT: &str = r#"{"name":"write","arguments":"{\"path\":\"second.txt\",\"content\":\"s\"}"}"#;
-const DELETE_OUTSIDE2: &str = r#"{"name":"delete_path","arguments":"{\"path\":\"../outside2.txt\"}"}"#;
+const WRITE_AISHELL_NOTE: &str =
+    r#"{"name":"write","arguments":"{\"path\":\".aishell/note.md\",\"content\":\"hi\"}"}"#;
+const WRITE_PROJECT_TXT: &str =
+    r#"{"name":"write","arguments":"{\"path\":\"project.txt\",\"content\":\"w\"}"}"#;
+const WRITE_BLOCKED_TXT: &str =
+    r#"{"name":"write","arguments":"{\"path\":\"blocked.txt\",\"content\":\"x\"}"}"#;
+const WRITE_ALLOWED_TXT: &str =
+    r#"{"name":"write","arguments":"{\"path\":\"allowed.txt\",\"content\":\"y\"}"}"#;
+const WRITE_AUTO_TXT: &str =
+    r#"{"name":"write","arguments":"{\"path\":\"auto.txt\",\"content\":\"z\"}"}"#;
+const WRITE_SECOND_TXT: &str =
+    r#"{"name":"write","arguments":"{\"path\":\"second.txt\",\"content\":\"s\"}"}"#;
+const DELETE_OUTSIDE2: &str =
+    r#"{"name":"delete_path","arguments":"{\"path\":\"../outside2.txt\"}"}"#;
 const DELETE_AUTO: &str = r#"{"name":"delete_path","arguments":"{\"path\":\"auto.txt\"}"}"#;
 
 // ---------------------------------------------------------------- 测试用例
@@ -569,7 +630,11 @@ const DELETE_AUTO: &str = r#"{"name":"delete_path","arguments":"{\"path\":\"auto
 /// suggest：越界写被拒且磁盘不变，.aishell/ 内放行；list_servers 不可用；全程无审批。
 #[tokio::test(flavor = "multi_thread")]
 async fn suggest_mode_blocks_outside_writes_but_allows_aishell() {
-    let (env, pi) = setup("suggest", &[WRITE_OUTSIDE, WRITE_AISHELL_NOTE, LIST_SERVERS]).await;
+    let (env, pi) = setup(
+        "suggest",
+        &[WRITE_OUTSIDE, WRITE_AISHELL_NOTE, LIST_SERVERS],
+    )
+    .await;
     let Some(mut pi) = pi else { return };
 
     pi.prompt("请写入 ../outside.txt");
@@ -602,7 +667,10 @@ async fn agent_mode_asks_approval_per_tool_call() {
     // 第一轮：拒绝
     pi.prompt("写入 blocked.txt");
     let req = pi.wait_confirm_request();
-    assert!(req["title"].as_str().unwrap().starts_with("AISHELL_APPROVAL:"));
+    assert!(req["title"]
+        .as_str()
+        .unwrap()
+        .starts_with("AISHELL_APPROVAL:"));
     pi.respond_confirm(req["id"].as_str().unwrap(), false);
     pi.wait_settled();
     assert!(
@@ -635,7 +703,10 @@ async fn yolo_mode_auto_executes_without_approval_and_blocks_escape() {
 
     pi.prompt("写入 auto.txt");
     pi.wait_settled();
-    assert!(env.project_dir.join("auto.txt").is_file(), "yolo 应自动执行写入");
+    assert!(
+        env.project_dir.join("auto.txt").is_file(),
+        "yolo 应自动执行写入"
+    );
 
     pi.prompt("删除 ../outside2.txt");
     pi.wait_settled();
@@ -653,7 +724,11 @@ async fn yolo_mode_auto_executes_without_approval_and_blocks_escape() {
     );
 
     assert_eq!(pi.confirm_count(), 0, "yolo 不应产生任何审批请求");
-    assert_eq!(pi.action_count(), 0, "delete_path 在扩展内执行，不应有动作桥请求");
+    assert_eq!(
+        pi.action_count(),
+        0,
+        "delete_path 在扩展内执行，不应有动作桥请求"
+    );
 }
 
 /// /aishell-mode 热切换：非法值保持原模式；合法值立即生效（suggest→agent 后出现审批）。
@@ -709,7 +784,9 @@ async fn setup_skills(
     script: &[&str],
     invalid_env: bool,
 ) -> (Env, Option<Pi>, PathBuf) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("绑定 mock 端口失败");
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 mock 端口失败");
     let addr = listener.local_addr().unwrap();
     let state = Arc::new(MockState::default());
     *state.script.lock().unwrap() = script.iter().map(|s| s.to_string()).collect();
@@ -735,7 +812,10 @@ async fn setup_skills(
     let base = std::env::temp_dir().join(format!(
         "aishell-pi-skills-{}-{}-{}",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
         SEQ2.fetch_add(1, Ordering::SeqCst),
     ));
     let project_dir = base.join("proj");
@@ -752,11 +832,19 @@ async fn setup_skills(
         std::fs::write(dir.join("SKILL.md"), skill_doc(name)).unwrap();
     }
     std::fs::create_dir_all(global_root.join("skill-managementX")).unwrap();
-    std::fs::write(global_root.join("skill-managementX").join("SKILL.md"), skill_doc("x")).unwrap();
+    std::fs::write(
+        global_root.join("skill-managementX").join("SKILL.md"),
+        skill_doc("x"),
+    )
+    .unwrap();
     // 项目技能
     let proj_skills = project_dir.join(".aishell").join("skills");
     std::fs::create_dir_all(proj_skills.join("proj-skill")).unwrap();
-    std::fs::write(proj_skills.join("proj-skill").join("SKILL.md"), skill_doc("proj-skill")).unwrap();
+    std::fs::write(
+        proj_skills.join("proj-skill").join("SKILL.md"),
+        skill_doc("proj-skill"),
+    )
+    .unwrap();
     // workspace 相邻文件（越界目标）
     std::fs::write(workspace.join("neighbor.txt"), "n").unwrap();
 
@@ -788,7 +876,11 @@ async fn setup_skills(
         ));
         extra_env.push((
             "AISHELL_GLOBAL_SKILLS_DIR",
-            Box::leak(serde_json::to_string(&[&global_root_str]).unwrap().into_boxed_str()),
+            Box::leak(
+                serde_json::to_string(&[&global_root_str])
+                    .unwrap()
+                    .into_boxed_str(),
+            ),
         ));
     }
 
@@ -800,7 +892,11 @@ async fn setup_skills(
         &extra_args,
         &extra_env,
     );
-    let env = Env { mock_state: state, project_dir, _agent_dir: agent_dir };
+    let env = Env {
+        mock_state: state,
+        project_dir,
+        _agent_dir: agent_dir,
+    };
     (env, pi, global_root)
 }
 
@@ -820,7 +916,12 @@ async fn suggest_skills_read_write_allowed_neighbors_rejected() {
     let (env, pi, global_root) = setup_skills("suggest", &[], false).await;
     let Some(mut pi) = pi else { return };
     let skill_file = global_root.join("skill-management").join("SKILL.md");
-    let neighbor = env.project_dir.parent().unwrap().join("workspace").join("neighbor.txt");
+    let neighbor = env
+        .project_dir
+        .parent()
+        .unwrap()
+        .join("workspace")
+        .join("neighbor.txt");
     let prefix_file = global_root.join("skill-managementX").join("SKILL.md");
     let write_target = global_root.join("skill-management").join("notes.md");
     let p = |path: &PathBuf| path.to_string_lossy().replace('\\', "/");
@@ -847,7 +948,7 @@ async fn suggest_skills_read_write_allowed_neighbors_rejected() {
     assert!(write_target.is_file(), "suggest 写全局技能根应放行");
     assert_eq!(pi.confirm_count(), 0, "suggest 全局技能根内写无需审批");
     assert_tool_error(&env, "权限边界"); // 伪前缀 + 邻居至少一次被拒
-    // 伪前缀目录不在 AISHELL_SKILL_DIRS 内 → 读被拒（路径原文出现在拒绝理由里）
+                                         // 伪前缀目录不在 AISHELL_SKILL_DIRS 内 → 读被拒（路径原文出现在拒绝理由里）
     assert_tool_error(&env, "skill-managementX");
     assert_tool_error(&env, "neighbor.txt");
 }
@@ -858,7 +959,9 @@ async fn agent_global_skill_write_needs_approval() {
     let (env, pi, global_root) = setup_skills("agent", &[], false).await;
     let Some(mut pi) = pi else { return };
     let write_target = global_root.join("skill-management").join("notes.md");
-    let script = [write_abs(&write_target.to_string_lossy().replace('\\', "/"))];
+    let script = [write_abs(
+        &write_target.to_string_lossy().replace('\\', "/"),
+    )];
     {
         let mut s = env.mock_state.script.lock().unwrap();
         *s = script.iter().map(|x| x.to_string()).collect();
@@ -877,7 +980,12 @@ async fn yolo_delete_global_skill_allowed_escape_rejected() {
     let (env, pi, global_root) = setup_skills("yolo", &[], false).await;
     let Some(mut pi) = pi else { return };
     let delete_dir = global_root.join("to-delete");
-    let escape = env.project_dir.parent().unwrap().join("workspace").join("neighbor.txt");
+    let escape = env
+        .project_dir
+        .parent()
+        .unwrap()
+        .join("workspace")
+        .join("neighbor.txt");
     let script = [
         delete_abs(&delete_dir.to_string_lossy().replace('\\', "/")),
         delete_abs(&escape.to_string_lossy().replace('\\', "/")),
@@ -926,10 +1034,25 @@ async fn invalid_skill_env_fails_closed() {
 /// 但绝无 staging_accept——接受只在前端面板，绝不进 AI 工具/动作桥。
 #[test]
 fn guard_registers_staging_tools_but_never_accept() {
-    assert!(GUARD_EXT.contains("staging_list"), "guard 应注册 staging_list");
-    assert!(GUARD_EXT.contains("staging_diff"), "guard 应注册 staging_diff");
-    assert!(GUARD_EXT.contains("staging_restore"), "guard 应注册 staging_restore");
+    assert!(
+        GUARD_EXT.contains("staging_list"),
+        "guard 应注册 staging_list"
+    );
+    assert!(
+        GUARD_EXT.contains("staging_diff"),
+        "guard 应注册 staging_diff"
+    );
+    assert!(
+        GUARD_EXT.contains("staging_restore"),
+        "guard 应注册 staging_restore"
+    );
     // 引号形态 = 工具/列表注册；注释里的裸词说明不算
-    assert!(!GUARD_EXT.contains("\"staging_accept\""), "guard 绝不可注册 staging_accept");
-    assert!(!GUARD_EXT.contains("name: \"staging_accept\""), "guard 绝不可定义 staging_accept 工具");
+    assert!(
+        !GUARD_EXT.contains("\"staging_accept\""),
+        "guard 绝不可注册 staging_accept"
+    );
+    assert!(
+        !GUARD_EXT.contains("name: \"staging_accept\""),
+        "guard 绝不可定义 staging_accept 工具"
+    );
 }

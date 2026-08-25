@@ -5,7 +5,16 @@ export function uid(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export function toast(msg: string, type?: 'error' | 'success' | 'info', durationMs?: number): void {
+export interface ToastOptions {
+  onClick?: () => void;
+}
+
+export function toast(
+  msg: string,
+  type?: 'error' | 'success' | 'info',
+  durationMs?: number,
+  options: ToastOptions = {},
+): void {
   let root = document.getElementById('toast-root');
   if (!root) {
     root = document.createElement('div');
@@ -16,11 +25,34 @@ export function toast(msg: string, type?: 'error' | 'success' | 'info', duration
   el.className = `toast${type ? ` ${type}` : ''}`;
   el.textContent = msg;
   root.appendChild(el);
-  setTimeout(() => {
+
+  let dismissing = false;
+  const dismiss = (): void => {
+    if (dismissing) return;
+    dismissing = true;
     el.style.opacity = '0';
     el.style.transition = 'opacity .2s';
     setTimeout(() => el.remove(), 220);
-  }, durationMs ?? 2200);
+  };
+  const timeout = window.setTimeout(dismiss, durationMs ?? 2200);
+
+  if (options.onClick) {
+    el.classList.add('clickable');
+    el.setAttribute('role', 'button');
+    el.tabIndex = 0;
+    const activate = (): void => {
+      if (dismissing) return;
+      window.clearTimeout(timeout);
+      dismiss();
+      options.onClick?.();
+    };
+    el.addEventListener('click', activate);
+    el.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      activate();
+    });
+  }
 }
 
 export interface ConfirmOptions {

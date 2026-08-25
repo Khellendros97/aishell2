@@ -10,20 +10,27 @@
 //!   重复顶层键直接报错（serde_yaml_ng 的 Value 反序列化会拒绝重复键）；
 //! - `skill_save` 只文本级替换/插入 frontmatter 顶层 `scope` 序列，`skill_set_enabled` 只文本级
 //!   替换/插入顶层 `enabled` 布尔标量 —— 正文、注释、字段顺序与未知字段字节保持不变；
+//! - `skill_pack_upload` 仅生成同一工作区 `.aishell/tmp/skillhub-upload/` 下的受限临时 ZIP；
+//!   浏览器发布成功后由 browser.rs 用本模块受限 helper 清理，手动回退时保留原包；
 //! - 所有写操作走同目录 `SKILL.md.tmp`：目标已存在时「.tmp → 原文件改 .bak → .tmp 改名正式 →
 //!   删 .bak」，任一步失败回滚 .bak，绝不破坏原文件；
 //! - 路径安全：拒绝空名、`..`、路径分隔符、符号链接技能目录/SKILL.md；技能根自身是符号链接时
 //!   取其 canonical 目标为受信根；已存在目标 canonicalize、待创建目标 canonicalize 最近已存在
 //!   父目录后用 Path::starts_with 复核（Windows 大小写不敏感，与 aishell-guard.ts 同语义）。
 //!
-//! 命令注册由主 agent 在集成阶段统一做（lib.rs 的 generate_handler），本模块只暴露命令函数与类型。
+//! 命令由 lib.rs 的 generate_handler 登记；本模块仅暴露受限命令与供 browser.rs 复用的安全 helper。
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{self, Cursor, Read};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::store::Store;
 
@@ -75,12 +82,10 @@ pub const SKILL_MANAGEMENT_NAME: &str = "skill-management";
 pub const SKILL_PYTHON_SCRIPT_NAME: &str = "python-script";
 
 /// 内置 skill-management 模板（include_str! 嵌入，不修改 Tauri bundle resources）。
-pub const BUILTIN_SKILL_MANAGEMENT: &str =
-    include_str!("builtin_skills/skill-management/SKILL.md");
+pub const BUILTIN_SKILL_MANAGEMENT: &str = include_str!("builtin_skills/skill-management/SKILL.md");
 
-/// 内置 python-script 模板（py 工具 + aishell SDK 用法指导）。
-pub const BUILTIN_SKILL_PYTHON_SCRIPT: &str =
-    include_str!("builtin_skills/python-script/SKILL.md");
+/// 内置 python-script 模板（main 侧引入：py 工具 + aishell SDK 用法指导）。
+pub const BUILTIN_SKILL_PYTHON_SCRIPT: &str = include_str!("builtin_skills/python-script/SKILL.md");
 
 // ---------------------------------------------------------------- 根目录推导
 
@@ -167,7 +172,8 @@ fn trusted_root(root: &Path) -> Result<PathBuf, String> {
     if !root.exists() {
         return Ok(root.to_path_buf());
     }
-    let meta = std::fs::metadata(root).map_err(|e| format!("技能根读取失败（{}）: {e}", root.display()))?;
+    let meta = std::fs::metadata(root)
+        .map_err(|e| format!("技能根读取失败（{}）: {e}", root.display()))?;
     if !meta.is_dir() {
         return Err(format!("技能根不是目录（{}）", root.display()));
     }
@@ -186,7 +192,9 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
     }
     let re = regex::Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").expect("技能名称正则编译失败");
     if !re.is_match(name) {
-        return Err(format!("技能名称只能包含小写字母、数字与连字符（形如 my-skill）：{name}"));
+        return Err(format!(
+            "技能名称只能包含小写字母、数字与连字符（形如 my-skill）：{name}"
+        ));
     }
     Ok(())
 }
@@ -198,6 +206,13 @@ fn resolve_in_root(root: &Path, child: &str) -> Result<(PathBuf, PathBuf), Strin
     validate_skill_name(child)?;
     let trusted = trusted_root(root)?;
     let target = trusted.join(child);
+    if target.exists() {
+        let meta = std::fs::symlink_metadata(&target)
+            .map_err(|e| format!("技能路径读取失败（{}）：{e}", target.display()))?;
+        if is_link_or_reparse(&meta) {
+            return Err(format!("技能目录不能是符号链接或重解析点：{}", target.display()));
+        }
+    }
     let canonical = if target.exists() {
         normalize_win_path(
             std::fs::canonicalize(&target)
@@ -251,7 +266,11 @@ struct FmSplit<'a> {
 /// 拆分 SKILL.md：文档必须以 `---` 行开头并有闭合 `---` 行；兼容 LF/CRLF。
 fn split_frontmatter(content: &str) -> Result<FmSplit<'_>, String> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let nl = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let nl = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let Some(open_end) = content.find(nl) else {
         return Err("Skill 文档缺少 frontmatter（必须以 --- 行开头）".to_string());
     };
@@ -274,7 +293,13 @@ fn split_frontmatter(content: &str) -> Result<FmSplit<'_>, String> {
     let fm = &after_open[..close_rel];
     let closing = &after_open[close_rel..];
     let body = &after_open[close_rel + closing.len()..];
-    Ok(FmSplit { nl, prefix, fm, closing, body })
+    Ok(FmSplit {
+        nl,
+        prefix,
+        fm,
+        closing,
+        body,
+    })
 }
 
 fn parse_fm_value(fm: &str) -> Result<serde_yaml_ng::Value, String> {
@@ -326,13 +351,15 @@ fn validate_fm_common(v: &serde_yaml_ng::Value) -> Result<ParsedCommon, String> 
     };
     let name = get_str("name")?.ok_or_else(|| "Skill frontmatter 缺少 name 字段".to_string())?;
     validate_skill_name(&name)?;
-    let description = get_str("description")?
-        .ok_or_else(|| format!("Skill「{name}」缺少 description 字段"))?;
+    let description =
+        get_str("description")?.ok_or_else(|| format!("Skill「{name}」缺少 description 字段"))?;
     if description.trim().is_empty() {
         return Err(format!("Skill「{name}」的 description 不能为空"));
     }
     if description.len() > 1024 {
-        return Err(format!("Skill「{name}」的 description 过长（最多 1024 字符）"));
+        return Err(format!(
+            "Skill「{name}」的 description 过长（最多 1024 字符）"
+        ));
     }
     let enabled = match map.get(serde_yaml_ng::Value::String("enabled".to_string())) {
         None => true,
@@ -340,7 +367,11 @@ fn validate_fm_common(v: &serde_yaml_ng::Value) -> Result<ParsedCommon, String> 
             .as_bool()
             .ok_or_else(|| format!("Skill「{name}」的 enabled 必须是布尔值（true/false）"))?,
     };
-    Ok(ParsedCommon { name, description, enabled })
+    Ok(ParsedCommon {
+        name,
+        description,
+        enabled,
+    })
 }
 
 /// 完整校验（读取场景）：基础校验 + scope 逐项校验并规范化（缺失/空 → ["all"]，去重保序）。
@@ -355,9 +386,9 @@ fn validate_fm(v: &serde_yaml_ng::Value) -> Result<(ParsedCommon, Vec<String>), 
             let mut seen: HashSet<String> = HashSet::new();
             let mut out: Vec<String> = Vec::new();
             for item in seq {
-                let s = item.as_str().ok_or_else(|| {
-                    format!("Skill「{}」的 scope 元素必须是字符串", common.name)
-                })?;
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| format!("Skill「{}」的 scope 元素必须是字符串", common.name))?;
                 validate_scope_item(&common.name, s)?;
                 if seen.insert(s.to_string()) {
                     out.push(s.to_string());
@@ -392,7 +423,8 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
 fn scope_block(scope: &[String], nl: &str) -> Result<String, String> {
     let mut block = String::from("scope:");
     for item in scope {
-        let item_yaml = serde_yaml_ng::to_string(item).map_err(|e| format!("scope 序列化失败: {e}"))?;
+        let item_yaml =
+            serde_yaml_ng::to_string(item).map_err(|e| format!("scope 序列化失败: {e}"))?;
         for line in item_yaml.trim_end().lines() {
             block.push_str(nl);
             block.push_str("  - ");
@@ -474,7 +506,11 @@ fn set_enabled_text(fm: &str, enabled: bool, nl: &str) -> Result<String, String>
             nl.to_string()
         };
         out.push_str(&suffix);
-        out.push_str(if enabled { "enabled: true" } else { "enabled: false" });
+        out.push_str(if enabled {
+            "enabled: true"
+        } else {
+            "enabled: false"
+        });
         out.push_str(nl);
     }
     Ok(out)
@@ -524,7 +560,11 @@ fn parse_skill_doc(
 
 /// 扫描单个技能根：无 SKILL.md 的普通文件夹忽略；有 SKILL.md 但 frontmatter 非法或目录名不一致、
 /// 目录/SKILL.md 是符号链接 → 整次请求返回带路径的中文错误（防止 UI 把损坏技能误显示为已删除）。
-fn scan_root(root: &Path, origin: SkillOrigin, project_id: &str) -> Result<Vec<SkillSummary>, String> {
+fn scan_root(
+    root: &Path,
+    origin: SkillOrigin,
+    project_id: &str,
+) -> Result<Vec<SkillSummary>, String> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -533,8 +573,7 @@ fn scan_root(root: &Path, origin: SkillOrigin, project_id: &str) -> Result<Vec<S
         .map_err(|e| format!("技能根读取失败（{}）: {e}", trusted.display()))?;
     let mut out = Vec::new();
     for entry in rd {
-        let entry =
-            entry.map_err(|e| format!("技能根读取失败（{}）: {e}", trusted.display()))?;
+        let entry = entry.map_err(|e| format!("技能根读取失败（{}）: {e}", trusted.display()))?;
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
@@ -560,8 +599,398 @@ fn scan_root(root: &Path, origin: SkillOrigin, project_id: &str) -> Result<Vec<S
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
+const MAX_SKILLHUB_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
+const MAX_SKILLHUB_EXTRACTED_BYTES: u64 = 100 * 1024 * 1024;
 
-/// 解析并完整校验一个已存在的技能目录，返回规范化目录路径（删除/改名/编辑共用）。
+/// 上传临时包固定落在技能所属工作区的 `.aishell/tmp/skillhub-upload`，与 Skill 根同源推导。
+fn upload_package_dir(
+    store: &Store,
+    project_id: &str,
+    origin: SkillOrigin,
+) -> Result<PathBuf, String> {
+    let root = skills_root(store, project_id, origin)?;
+    let base = root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("技能根路径无效：{}", root.display()))?;
+    Ok(base.join(".aishell").join("tmp").join("skillhub-upload"))
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    meta.file_type().is_symlink() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_or_reparse(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+/// 归档条目。目录名始终使用 `/` 结尾，保证跨平台 ZIP 表示一致。
+enum UploadEntry {
+    Dir(String),
+    File { name: String, path: PathBuf },
+}
+
+impl UploadEntry {
+    fn name(&self) -> &str {
+        match self {
+            Self::Dir(name) | Self::File { name, .. } => name,
+        }
+    }
+}
+
+/// 遍历已规范化的技能目录，只接受非隐藏的普通目录/文件；遇到链接、reparse point 或越界立即失败。
+fn collect_upload_entries(
+    skill_root: &Path,
+    current: &Path,
+    entries: &mut Vec<UploadEntry>,
+) -> Result<(), String> {
+    for item in std::fs::read_dir(current)
+        .map_err(|e| format!("读取技能目录失败（{}）：{e}", current.display()))?
+    {
+        let item = item.map_err(|e| format!("读取技能目录失败（{}）：{e}", current.display()))?;
+        let name = item.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = item.path();
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("读取技能条目失败（{}）：{e}", path.display()))?;
+        if is_link_or_reparse(&meta) {
+            return Err(format!("技能上传包不允许符号链接或重解析点：{}", path.display()));
+        }
+        let canonical = normalize_win_path(
+            std::fs::canonicalize(&path)
+                .map_err(|e| format!("解析技能条目失败（{}）：{e}", path.display()))?,
+        );
+        if !path_starts_with(skill_root, &canonical) {
+            return Err(format!("技能上传包条目越界：{}", path.display()));
+        }
+        let rel = canonical
+            .strip_prefix(skill_root)
+            .map_err(|_| format!("技能上传包条目越界：{}", path.display()))?;
+        if rel.as_os_str().is_empty()
+            || rel.components().any(|part| {
+                matches!(
+                    part,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                ) || part.as_os_str().to_string_lossy().starts_with('.')
+            })
+        {
+            return Err(format!("技能上传包条目路径不安全：{}", path.display()));
+        }
+        let zip_name = rel.to_string_lossy().replace('\\', "/");
+        if meta.is_dir() {
+            entries.push(UploadEntry::Dir(format!("{zip_name}/")));
+            collect_upload_entries(skill_root, &canonical, entries)?;
+        } else if meta.is_file() {
+            entries.push(UploadEntry::File {
+                name: zip_name,
+                path: canonical,
+            });
+        } else {
+            return Err(format!("技能上传包不允许非普通文件：{}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// 将本地 Skill 打成 SkillHub 接受的根级 ZIP；失败时只清理本次临时包，绝不修改源 Skill。
+pub fn pack_skill_for_upload(
+    store: &Store,
+    project_id: &str,
+    origin: SkillOrigin,
+    name: &str,
+) -> Result<String, String> {
+    let root = skills_root(store, project_id, origin)?;
+    let skill_dir = validated_skill_dir(&root, origin, project_id, name)?;
+    let package_dir = upload_package_dir(store, project_id, origin)?;
+    std::fs::create_dir_all(&package_dir)
+        .map_err(|e| format!("创建 SkillHub 上传目录失败（{}）：{e}", package_dir.display()))?;
+    let package_dir = normalize_win_path(
+        std::fs::canonicalize(&package_dir)
+            .map_err(|e| format!("解析 SkillHub 上传目录失败（{}）：{e}", package_dir.display()))?,
+    );
+    let package = package_dir.join(format!(
+        "{name}-{}.zip",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("生成上传包文件名失败：{e}"))?
+            .as_nanos()
+    ));
+    let result = (|| {
+        let skill_dir = normalize_win_path(
+            std::fs::canonicalize(&skill_dir)
+                .map_err(|e| format!("解析技能目录失败（{}）：{e}", skill_dir.display()))?,
+        );
+        let dir_meta = std::fs::symlink_metadata(&skill_dir)
+            .map_err(|e| format!("读取技能目录失败（{}）：{e}", skill_dir.display()))?;
+        if !dir_meta.is_dir() || is_link_or_reparse(&dir_meta) {
+            return Err(format!("技能目录不能是符号链接或重解析点：{}", skill_dir.display()));
+        }
+
+        let skill_file = skill_dir.join(SKILL_FILE);
+        let file_meta = std::fs::symlink_metadata(&skill_file)
+            .map_err(|e| format!("读取 SKILL.md 失败（{}）：{e}", skill_file.display()))?;
+        if !file_meta.is_file() || is_link_or_reparse(&file_meta) {
+            return Err(format!("SKILL.md 不能是符号链接或重解析点：{}", skill_file.display()));
+        }
+
+        let mut entries = Vec::new();
+        collect_upload_entries(&skill_dir, &skill_dir, &mut entries)?;
+        entries.sort_by(|a, b| a.name().cmp(b.name()));
+
+        let file = File::create(&package)
+            .map_err(|e| format!("创建 SkillHub 上传包失败（{}）：{e}", package.display()))?;
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for entry in entries {
+            match entry {
+                UploadEntry::Dir(name) => zip
+                    .add_directory(name, options)
+                    .map_err(|e| format!("写入 SkillHub 上传目录失败（{}）：{e}", package.display()))?,
+                UploadEntry::File { name, path } => {
+                    zip.start_file(name, options).map_err(|e| {
+                        format!("写入 SkillHub 上传文件失败（{}）：{e}", path.display())
+                    })?;
+                    let mut input = File::open(&path)
+                        .map_err(|e| format!("读取技能附件失败（{}）：{e}", path.display()))?;
+                    io::copy(&mut input, &mut zip)
+                        .map_err(|e| format!("压缩技能附件失败（{}）：{e}", path.display()))?;
+                }
+            }
+        }
+        let file = zip
+            .finish()
+            .map_err(|e| format!("完成 SkillHub 上传包失败（{}）：{e}", package.display()))?;
+        let size = file
+            .metadata()
+            .map_err(|e| format!("读取 SkillHub 上传包失败（{}）：{e}", package.display()))?
+            .len();
+        if size > MAX_SKILLHUB_ARCHIVE_BYTES as u64 {
+            return Err("SkillHub 上传包过大（上限 50 MiB）".to_string());
+        }
+        Ok(normalize_win_path(
+            std::fs::canonicalize(&package)
+                .map_err(|e| format!("解析 SkillHub 上传包失败（{}）：{e}", package.display()))?,
+        )
+        .to_string_lossy()
+        .into_owned())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&package);
+    }
+    result
+}
+
+/// 限制浏览器自动化只能使用本次技能根对应上传目录中的真实 ZIP。
+pub fn validate_upload_package_path(
+    store: &Store,
+    project_id: &str,
+    origin: SkillOrigin,
+    path: &Path,
+) -> Result<PathBuf, String> {
+    let allowed = upload_package_dir(store, project_id, origin)?;
+    let allowed = normalize_win_path(
+        std::fs::canonicalize(&allowed)
+            .map_err(|e| format!("SkillHub 上传目录不可用（{}）：{e}", allowed.display()))?,
+    );
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("读取 SkillHub 上传包失败（{}）：{e}", path.display()))?;
+    if !meta.is_file() || is_link_or_reparse(&meta) {
+        return Err(format!("SkillHub 上传包必须是普通 ZIP 文件：{}", path.display()));
+    }
+    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+        return Err(format!("SkillHub 上传包不是 ZIP 文件：{}", path.display()));
+    }
+    let canonical = normalize_win_path(
+        std::fs::canonicalize(path)
+            .map_err(|e| format!("解析 SkillHub 上传包失败（{}）：{e}", path.display()))?,
+    );
+    if !path_starts_with(&allowed, &canonical) {
+        return Err(format!("SkillHub 上传包路径越界：{}", path.display()));
+    }
+    Ok(canonical)
+}
+
+/// 仅删除通过同一受限路径校验的成功发布临时包。
+pub fn remove_upload_package(
+    store: &Store,
+    project_id: &str,
+    origin: SkillOrigin,
+    path: &Path,
+) -> Result<(), String> {
+    let path = validate_upload_package_path(store, project_id, origin, path)?;
+    std::fs::remove_file(&path)
+        .map_err(|e| format!("清理 SkillHub 上传包失败（{}）：{e}", path.display()))
+}
+
+/// 安全解压 SkillHub ZIP，并复用既有 Skill 写入校验，避免路径穿越或覆盖已有用户技能。
+pub fn install_skillhub_zip(
+    store: &Store,
+    project_id: &str,
+    origin: SkillOrigin,
+    slug: &str,
+    zip_bytes: &[u8],
+) -> Result<SkillSummary, String> {
+    if zip_bytes.len() > MAX_SKILLHUB_ARCHIVE_BYTES {
+        return Err("SkillHub 安装包过大（上限 50 MiB）".to_string());
+    }
+    validate_skill_name(slug)?;
+
+    let root = skills_root(store, project_id, origin)?;
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("创建 Skill 目录失败（{}）：{e}", root.display()))?;
+    let target = root.join(slug);
+    if target.exists() {
+        return Err(format!("Skill 已存在，未覆盖原文件：{}", target.display()));
+    }
+
+    let staging = root.join(format!(
+        ".skillhub-{}-{}",
+        slug,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("生成临时目录名失败：{e}"))?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&staging)
+        .map_err(|e| format!("创建 Skill 临时目录失败（{}）：{e}", staging.display()))?;
+
+    let result = (|| {
+        let mut archive = ZipArchive::new(Cursor::new(zip_bytes))
+            .map_err(|e| format!("读取 SkillHub ZIP 失败：{e}"))?;
+        let mut extracted = 0_u64;
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|e| format!("读取 SkillHub ZIP 条目失败：{e}"))?;
+            let raw_name = entry.name().replace('\\', "/");
+            let rel = Path::new(&raw_name);
+            if raw_name.is_empty()
+                || rel.is_absolute()
+                || rel.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(format!("SkillHub ZIP 含不安全路径：{raw_name}"));
+            }
+            let mut components = rel.components();
+            let first = components
+                .next()
+                .ok_or_else(|| "SkillHub ZIP 含空路径".to_string())?;
+            let first = first.as_os_str().to_string_lossy();
+            let relative = if first == slug {
+                components.as_path().to_path_buf()
+            } else {
+                rel.to_path_buf()
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let output = staging.join(&relative);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&output)
+                    .map_err(|e| format!("解压 SkillHub 目录失败（{}）：{e}", output.display()))?;
+                continue;
+            }
+            let declared_size = entry.size();
+            if declared_size > MAX_SKILLHUB_EXTRACTED_BYTES.saturating_sub(extracted) {
+                return Err("SkillHub 解压内容过大（上限 100 MiB）".to_string());
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("创建 SkillHub 解压目录失败（{}）：{e}", parent.display())
+                })?;
+            }
+            let mut file = File::create(&output)
+                .map_err(|e| format!("创建 SkillHub 文件失败（{}）：{e}", output.display()))?;
+            let remaining = MAX_SKILLHUB_EXTRACTED_BYTES - extracted;
+            let mut limited = (&mut entry).take(remaining.saturating_add(1));
+            let written = io::copy(&mut limited, &mut file)
+                .map_err(|e| format!("写入 SkillHub 文件失败（{}）：{e}", output.display()))?;
+            if written > remaining {
+                return Err("SkillHub 解压内容过大（上限 100 MiB）".to_string());
+            }
+            extracted += written;
+        }
+
+        let skill_dir = if staging.join(SKILL_FILE).is_file() {
+            staging.clone()
+        } else {
+            let mut dirs = std::fs::read_dir(&staging)
+                .map_err(|e| format!("读取 SkillHub 解压目录失败：{e}"))?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir());
+            let only = dirs
+                .next()
+                .ok_or_else(|| "SkillHub ZIP 内缺少 SKILL.md".to_string())?;
+            if dirs.next().is_some() || !only.join(SKILL_FILE).is_file() {
+                return Err("SkillHub ZIP 根目录必须直接包含 SKILL.md".to_string());
+            }
+            only
+        };
+        let content = std::fs::read_to_string(skill_dir.join(SKILL_FILE))
+            .map_err(|e| format!("读取 SkillHub SKILL.md 失败：{e}"))?;
+        let split =
+            split_frontmatter(&content).map_err(|e| format!("SkillHub SKILL.md 解析失败：{e}"))?;
+        let value =
+            parse_fm_value(split.fm).map_err(|e| format!("SkillHub SKILL.md 解析失败：{e}"))?;
+        let (common, _) =
+            validate_fm(&value).map_err(|e| format!("SkillHub SKILL.md 校验失败：{e}"))?;
+        if common.name != slug {
+            return Err(format!(
+                "SkillHub 包内名称与下载项不一致：{} != {slug}",
+                common.name
+            ));
+        }
+        if skill_dir != staging {
+            let entries = std::fs::read_dir(&skill_dir)
+                .map_err(|e| format!("整理 SkillHub 文件失败：{e}"))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("整理 SkillHub 文件失败：{e}"))?;
+            for entry in entries {
+                let name = entry
+                    .file_name()
+                    .ok_or_else(|| "SkillHub ZIP 条目名称为空".to_string())?;
+                let destination = staging.join(name);
+                if destination.exists() {
+                    return Err(format!(
+                        "SkillHub ZIP 根目录存在重复条目：{}",
+                        destination.display()
+                    ));
+                }
+                std::fs::rename(&entry, &destination).map_err(|e| {
+                    format!("整理 SkillHub 文件失败（{}）：{e}", destination.display())
+                })?;
+            }
+            std::fs::remove_dir(&skill_dir).map_err(|e| {
+                format!("清理 SkillHub 临时目录失败（{}）：{e}", skill_dir.display())
+            })?;
+        }
+        std::fs::rename(&staging, &target)
+            .map_err(|e| format!("安装 SkillHub Skill 失败（{}）：{e}", target.display()))?;
+        let file = target.join(SKILL_FILE);
+        let content = std::fs::read_to_string(&file)
+            .map_err(|e| format!("读取已安装 Skill 失败（{}）：{e}", file.display()))?;
+        parse_skill_doc(&target, &file, &content, origin, project_id)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    result
+}
+
 fn validated_skill_dir(
     root: &Path,
     origin: SkillOrigin,
@@ -570,8 +999,16 @@ fn validated_skill_dir(
 ) -> Result<PathBuf, String> {
     let (_trusted, canonical) = resolve_in_root(root, name)?;
     let file = canonical.join(SKILL_FILE);
-    if !file.is_file() {
+    if !file.exists() {
         return Err(format!("技能不存在：{name}（{}）", canonical.display()));
+    }
+    let file_meta = std::fs::symlink_metadata(&file)
+        .map_err(|e| format!("SKILL.md 读取失败（{}）: {e}", file.display()))?;
+    if !file_meta.is_file() {
+        return Err(format!("技能不存在：{name}（{}）", canonical.display()));
+    }
+    if is_link_or_reparse(&file_meta) {
+        return Err(format!("SKILL.md 不能是符号链接或重解析点：{}", file.display()));
     }
     let content = std::fs::read_to_string(&file)
         .map_err(|e| format!("SKILL.md 读取失败（{}）: {e}", file.display()))?;
@@ -585,7 +1022,8 @@ fn validated_skill_dir(
 /// 任一步失败回滚 .bak，绝不破坏原文件。目标不存在时直接 .tmp → 正式。
 fn write_skill_file(path: &Path, content: &str) -> Result<(), String> {
     let tmp = path.with_file_name(format!("{SKILL_FILE}.tmp"));
-    std::fs::write(&tmp, content).map_err(|e| format!("写入临时文件失败（{}）: {e}", tmp.display()))?;
+    std::fs::write(&tmp, content)
+        .map_err(|e| format!("写入临时文件失败（{}）: {e}", tmp.display()))?;
     if path.exists() {
         let bak = path.with_file_name(format!("{SKILL_FILE}.bak"));
         std::fs::rename(path, &bak).map_err(|e| {
@@ -612,7 +1050,11 @@ fn write_skill_file(path: &Path, content: &str) -> Result<(), String> {
 /// 分别扫描全局、项目技能根（根不存在返回空，不创建目录）。
 pub fn list_skills(store: &Store, project_id: &str) -> Result<Vec<SkillSummary>, String> {
     let mut out = Vec::new();
-    out.extend(scan_root(&global_skills_root(store)?, SkillOrigin::Global, project_id)?);
+    out.extend(scan_root(
+        &global_skills_root(store)?,
+        SkillOrigin::Global,
+        project_id,
+    )?);
     out.extend(scan_root(
         &project_skills_root(store, project_id)?,
         SkillOrigin::Project,
@@ -662,7 +1104,10 @@ pub fn save_skill(
         scope.to_vec()
     };
     let final_content = set_scope_text(split.fm, &effective_scope, split.nl)?;
-    let final_content = format!("{}{final_content}{}{}", split.prefix, split.closing, split.body);
+    let final_content = format!(
+        "{}{final_content}{}{}",
+        split.prefix, split.closing, split.body
+    );
     let trusted = trusted_root(&root)?;
 
     match original_name {
@@ -699,7 +1144,11 @@ pub fn save_skill(
                 return Err(format!("技能已存在：{new_name}"));
             }
             std::fs::rename(&old_dir, &new_dir).map_err(|e| {
-                format!("重命名技能目录失败（{} → {}）: {e}", old_dir.display(), new_dir.display())
+                format!(
+                    "重命名技能目录失败（{} → {}）: {e}",
+                    old_dir.display(),
+                    new_dir.display()
+                )
             })?;
             let file = new_dir.join(SKILL_FILE);
             if let Err(e) = write_skill_file(&file, &final_content) {
@@ -719,7 +1168,7 @@ pub fn save_skill(
     }
 }
 
-/// 解析 SKILL.md 内容 frontmatter 的 name（SDK 导入判断新增/覆盖用）。
+/// 解析 SKILL.md 内容 frontmatter 的 name（main 侧引入：SDK 导入判断新增/覆盖用）。
 pub(crate) fn skill_name_of(content: &str) -> Result<String, String> {
     let split = split_frontmatter(content)?;
     let v = parse_fm_value(split.fm)?;
@@ -855,7 +1304,10 @@ fn seed_one_builtin_skill(workspace: &str, name: &str, content: &str) -> Result<
 // 命令名/参数名与 src/api.ts 的 skills 段逐一对应（Tauri snake_case→camelCase 自动映射）。
 
 #[tauri::command]
-pub fn skills_list(store: State<'_, Arc<Store>>, project_id: String) -> Result<Vec<SkillSummary>, String> {
+pub fn skills_list(
+    store: State<'_, Arc<Store>>,
+    project_id: String,
+) -> Result<Vec<SkillSummary>, String> {
     list_skills(&store, &project_id)
 }
 
@@ -878,7 +1330,14 @@ pub fn skill_save(
     content: String,
     scope: Vec<String>,
 ) -> Result<SkillSummary, String> {
-    save_skill(&store, &project_id, origin, original_name.as_deref(), &content, &scope)
+    save_skill(
+        &store,
+        &project_id,
+        origin,
+        original_name.as_deref(),
+        &content,
+        &scope,
+    )
 }
 
 #[tauri::command]
@@ -902,12 +1361,23 @@ pub fn skill_set_enabled(
     set_skill_enabled(&store, &project_id, origin, &name, enabled)
 }
 
+/// 打包本地 Skill 供内置浏览器上传；仅返回受限临时 ZIP 的规范化绝对路径。
+#[tauri::command]
+pub fn skill_pack_upload(
+    store: State<'_, Arc<Store>>,
+    project_id: String,
+    origin: SkillOrigin,
+    name: String,
+) -> Result<String, String> {
+    pack_skill_for_upload(&store, &project_id, origin, &name)
+}
+
 // ---------------------------------------------------------------- tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{Project, Settings, test_store};
+    use crate::store::{test_store, Project, Settings};
 
     /// 独立临时基目录（pid + 序号，测试间不冲突；结束不清理由系统临时目录兜底）。
     fn tmp_base(tag: &str) -> PathBuf {
@@ -962,19 +1432,6 @@ mod tests {
     }
 
     #[test]
-    fn task_project_skills_root_uses_synthetic_store_project() {
-        let (store, ws) = store_with_workspace("task-root");
-        let root = project_skills_root(&store, crate::store::TASK_PROJECT_ID).unwrap();
-        assert_eq!(
-            root,
-            ws.join(".aishell")
-                .join("tasks")
-                .join(".aishell")
-                .join("skills")
-        );
-    }
-
-    #[test]
     fn roots_derive_from_workspace_and_project() {
         let (store, ws) = store_with_workspace("roots");
         assert_eq!(
@@ -998,10 +1455,16 @@ mod tests {
         let store_no_ws = test_store(tmp_base("roots-nows"));
         project(&store_no_ws, "p3", "x", Some("C:\\some\\path"));
         let err = global_skills_root(&store_no_ws).unwrap_err();
-        assert!(err.contains("请先在设置中配置工作区目录"), "错误串不符: {err}");
+        assert!(
+            err.contains("请先在设置中配置工作区目录"),
+            "错误串不符: {err}"
+        );
         project(&store_no_ws, "p4", "y", None);
         let err = project_skills_root(&store_no_ws, "p4").unwrap_err();
-        assert!(err.contains("请先在设置中配置工作区目录"), "错误串不符: {err}");
+        assert!(
+            err.contains("请先在设置中配置工作区目录"),
+            "错误串不符: {err}"
+        );
         let err = project_skills_root(&store_no_ws, "nope").unwrap_err();
         assert!(err.contains("项目不存在"), "错误串不符: {err}");
     }
@@ -1009,7 +1472,7 @@ mod tests {
     #[test]
     fn missing_root_returns_empty_without_creating() {
         let (store, _ws) = store_with_workspace("missing-root");
-        // 全局根已被播种（存在内置技能）：改用项目根验证「根不存在 → 空且不创建」
+        // 全局根已被播种（存在 skill-management）：改用项目根验证「根不存在 → 空且不创建」
         project(&store, "p1", "my-proj", None);
         let root = project_skills_root(&store, "p1").unwrap();
         let list = list_skills(&store, "p1").unwrap();
@@ -1030,8 +1493,15 @@ mod tests {
         let (store, ws) = store_with_workspace("roundtrip");
         project(&store, "p1", "my-proj", None);
         let content = skill_md("alpha", "阿尔法技能", "# 顶层注释\ncustom_field: 保留值\n");
-        let saved = save_skill(&store, "p1", SkillOrigin::Project, None, &content, &["all".into(), "remote:测试机".into()])
-            .unwrap();
+        let saved = save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            &content,
+            &["all".into(), "remote:测试机".into()],
+        )
+        .unwrap();
         assert_eq!(saved.name, "alpha");
         assert_eq!(saved.scope, vec!["all", "remote:测试机"]);
         assert!(saved.enabled);
@@ -1040,17 +1510,42 @@ mod tests {
 
         let doc = read_skill(&store, "p1", SkillOrigin::Project, "alpha").unwrap();
         // 正文与未知字段/注释逐字节保持；只有 scope 被替换
-        assert!(doc.content.contains("# 顶层注释\ncustom_field: 保留值\n"), "未知字段丢失: {}", doc.content);
-        assert!(doc.content.contains("# alpha\n正文第一行。"), "正文变化: {}", doc.content);
-        assert!(doc.content.contains("scope:\n  - all\n  - remote:测试机"), "scope 未按显式值重写: {}", doc.content);
-        assert!(doc.content.contains("第二行：```bash\necho hi\n```"), "正文围栏丢失: {}", doc.content);
+        assert!(
+            doc.content.contains("# 顶层注释\ncustom_field: 保留值\n"),
+            "未知字段丢失: {}",
+            doc.content
+        );
+        assert!(
+            doc.content.contains("# alpha\n正文第一行。"),
+            "正文变化: {}",
+            doc.content
+        );
+        assert!(
+            doc.content.contains("scope:\n  - all\n  - remote:测试机"),
+            "scope 未按显式值重写: {}",
+            doc.content
+        );
+        assert!(
+            doc.content.contains("第二行：```bash\necho hi\n```"),
+            "正文围栏丢失: {}",
+            doc.content
+        );
         // .tmp/.bak 无残留
-        let dir = ws.join("my-proj").join(".aishell").join("skills").join("alpha");
+        let dir = ws
+            .join("my-proj")
+            .join(".aishell")
+            .join("skills")
+            .join("alpha");
         let names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(!names.iter().any(|n| n.ends_with(".tmp") || n.ends_with(".bak")), "临时文件残留: {names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.ends_with(".tmp") || n.ends_with(".bak")),
+            "临时文件残留: {names:?}"
+        );
         assert_eq!(names, vec!["SKILL.md"]);
     }
 
@@ -1064,17 +1559,39 @@ mod tests {
         let doc = read_skill(&store, "p1", SkillOrigin::Project, "plain").unwrap();
         assert_eq!(doc.summary.scope, vec!["all"]);
         // save 显式空 scope 也写 ["all"]
-        assert!(doc.content.contains("scope:\n  - all"), "空 scope 未写成 all: {}", doc.content);
+        assert!(
+            doc.content.contains("scope:\n  - all"),
+            "空 scope 未写成 all: {}",
+            doc.content
+        );
         // 显式空数组 scope
         let empty_scope = "---\nname: es\ndescription: 空数组\nscope: []\nenabled: true\n---\n";
-        save_skill(&store, "p1", SkillOrigin::Project, None, empty_scope, &["all".into()]).unwrap();
+        save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            empty_scope,
+            &["all".into()],
+        )
+        .unwrap();
         let doc = read_skill(&store, "p1", SkillOrigin::Project, "es").unwrap();
         assert_eq!(doc.summary.scope, vec!["all"]);
         // 去重保序
         let dup = "---\nname: dup\ndescription: 去重\nscope:\n  - local\n  - all\n  - local\nenabled: true\n---\n";
-        std::fs::create_dir_all(ws.join("my-proj").join(".aishell").join("skills").join("dup")).unwrap();
+        std::fs::create_dir_all(
+            ws.join("my-proj")
+                .join(".aishell")
+                .join("skills")
+                .join("dup"),
+        )
+        .unwrap();
         std::fs::write(
-            ws.join("my-proj").join(".aishell").join("skills").join("dup").join("SKILL.md"),
+            ws.join("my-proj")
+                .join(".aishell")
+                .join("skills")
+                .join("dup")
+                .join("SKILL.md"),
             dup,
         )
         .unwrap();
@@ -1093,7 +1610,15 @@ mod tests {
         assert!(err.contains("小写字母"), "错误串不符: {err}");
         // 非法 scope
         let bad_scope = skill_md("s1", "d", "scope:\n  - nope\n");
-        let err = save_skill(&store, "p1", SkillOrigin::Project, None, &bad_scope, &["weird".into()]).unwrap_err();
+        let err = save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            &bad_scope,
+            &["weird".into()],
+        )
+        .unwrap_err();
         assert!(err.contains("scope 取值非法"), "错误串不符: {err}");
         // 空 description
         let no_desc = "---\nname: s2\ndescription: \"\"\n---\n";
@@ -1105,7 +1630,11 @@ mod tests {
         assert!(err.contains("frontmatter"), "错误串不符: {err}");
         // 目录名与 name 不一致（损坏技能 → 列表整次报错且带路径）
         std::fs::create_dir_all(root.join("mismatch")).unwrap();
-        std::fs::write(root.join("mismatch").join("SKILL.md"), skill_md("other", "d", "")).unwrap();
+        std::fs::write(
+            root.join("mismatch").join("SKILL.md"),
+            skill_md("other", "d", ""),
+        )
+        .unwrap();
         let err = list_skills(&store, "p1").unwrap_err();
         assert!(err.contains("不一致"), "错误串不符: {err}");
         assert!(err.contains("mismatch"), "缺少路径: {err}");
@@ -1120,7 +1649,10 @@ mod tests {
         std::fs::remove_dir_all(root.join("mismatch")).unwrap();
         std::fs::create_dir_all(root.join("plain-folder")).unwrap();
         let list = list_skills(&store, "p1").unwrap();
-        assert!(list.iter().all(|s| s.name != "plain-folder"), "普通文件夹不应出现");
+        assert!(
+            list.iter().all(|s| s.name != "plain-folder"),
+            "普通文件夹不应出现"
+        );
     }
 
     #[test]
@@ -1130,7 +1662,15 @@ mod tests {
         let root = ws.join("my-proj").join(".aishell").join("skills");
         // 路径穿越：名称不能含 .. 或分隔符（validate_skill_name 层拒绝）
         for bad in ["..", "../evil", "a/b", "a\\b", "a..b"] {
-            let err = save_skill(&store, "p1", SkillOrigin::Project, None, &skill_md(bad, "d", ""), &[]).unwrap_err();
+            let err = save_skill(
+                &store,
+                "p1",
+                SkillOrigin::Project,
+                None,
+                &skill_md(bad, "d", ""),
+                &[],
+            )
+            .unwrap_err();
             assert!(err.contains("小写字母"), "名称 {bad} 未被拒: {err}");
         }
         // 解析层防御：resolve_in_root 对分隔符名称拒绝
@@ -1194,24 +1734,72 @@ mod tests {
     fn create_conflict_and_rename_conflict_rejected() {
         let (store, _ws) = store_with_workspace("conflict");
         project(&store, "p1", "my-proj", None);
-        save_skill(&store, "p1", SkillOrigin::Project, None, &skill_md("alpha", "a", ""), &[]).unwrap();
+        save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            &skill_md("alpha", "a", ""),
+            &[],
+        )
+        .unwrap();
         // 新增重名
-        let err = save_skill(&store, "p1", SkillOrigin::Project, None, &skill_md("alpha", "b", ""), &[]).unwrap_err();
+        let err = save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            &skill_md("alpha", "b", ""),
+            &[],
+        )
+        .unwrap_err();
         assert!(err.contains("已存在"), "错误串不符: {err}");
         // 编辑改名冲突：目标已存在
-        save_skill(&store, "p1", SkillOrigin::Project, None, &skill_md("beta", "b", ""), &[]).unwrap();
-        let err = save_skill(&store, "p1", SkillOrigin::Project, Some("alpha"), &skill_md("beta", "x", ""), &[])
-            .unwrap_err();
+        save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            &skill_md("beta", "b", ""),
+            &[],
+        )
+        .unwrap();
+        let err = save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            Some("alpha"),
+            &skill_md("beta", "x", ""),
+            &[],
+        )
+        .unwrap_err();
         assert!(err.contains("已存在"), "错误串不符: {err}");
         // 改名成功：附属资源随目录迁移
         let root = project_skills_root(&store, "p1").unwrap();
         std::fs::create_dir_all(root.join("alpha").join("scripts")).unwrap();
-        std::fs::write(root.join("alpha").join("scripts").join("run.sh"), "#!/bin/sh\n").unwrap();
-        let saved = save_skill(&store, "p1", SkillOrigin::Project, Some("alpha"), &skill_md("alpha-renamed", "新", ""), &[])
-            .unwrap();
+        std::fs::write(
+            root.join("alpha").join("scripts").join("run.sh"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let saved = save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            Some("alpha"),
+            &skill_md("alpha-renamed", "新", ""),
+            &[],
+        )
+        .unwrap();
         assert_eq!(saved.name, "alpha-renamed");
         assert!(!root.join("alpha").exists(), "旧目录未迁移");
-        assert!(root.join("alpha-renamed").join("scripts").join("run.sh").is_file(), "附属资源未保留");
+        assert!(
+            root.join("alpha-renamed")
+                .join("scripts")
+                .join("run.sh")
+                .is_file(),
+            "附属资源未保留"
+        );
     }
 
     #[test]
@@ -1219,28 +1807,59 @@ mod tests {
         let (store, _ws) = store_with_workspace("enabled");
         project(&store, "p1", "my-proj", None);
         let content = "---\n# 技能注释\nname: t1\ndescription: 描述 # 行内注释\nscope:\n  - local\nenabled: true # 原注释\n---\n# 正文标题\n保留字节。\n";
-        save_skill(&store, "p1", SkillOrigin::Project, None, content, &["all".into()]).unwrap();
+        save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            content,
+            &["all".into()],
+        )
+        .unwrap();
         let s = set_skill_enabled(&store, "p1", SkillOrigin::Project, "t1", false).unwrap();
         assert!(!s.enabled);
         let doc = read_skill(&store, "p1", SkillOrigin::Project, "t1").unwrap();
-        assert!(doc.content.contains("enabled: false # 原注释"), "注释丢失: {}", doc.content);
+        assert!(
+            doc.content.contains("enabled: false # 原注释"),
+            "注释丢失: {}",
+            doc.content
+        );
         assert!(doc.content.contains("# 技能注释\nname: t1"), "注释行丢失");
-        assert!(doc.content.contains("description: 描述 # 行内注释"), "行内注释丢失");
+        assert!(
+            doc.content.contains("description: 描述 # 行内注释"),
+            "行内注释丢失"
+        );
         assert!(doc.content.contains("# 正文标题\n保留字节。"), "正文变化");
         assert!(doc.content.contains("scope:\n  - all"), "scope 被无关改动");
         // 非布尔标量 → 报错且原文件不变
         let dir = project_skills_root(&store, "p1").unwrap().join("t1");
-        std::fs::write(dir.join("SKILL.md"), content.replace("enabled: true", "enabled: maybe")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            content.replace("enabled: true", "enabled: maybe"),
+        )
+        .unwrap();
         let before = std::fs::read(dir.join("SKILL.md")).unwrap();
         let err = set_skill_enabled(&store, "p1", SkillOrigin::Project, "t1", true).unwrap_err();
         assert!(err.contains("必须是布尔值"), "错误串不符: {err}");
-        assert_eq!(std::fs::read(dir.join("SKILL.md")).unwrap(), before, "失败时文件被改动");
+        assert_eq!(
+            std::fs::read(dir.join("SKILL.md")).unwrap(),
+            before,
+            "失败时文件被改动"
+        );
         // enabled 缺失 → 插入
-        std::fs::write(dir.join("SKILL.md"), "---\nname: t1\ndescription: d\n---\n正文\n").unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: t1\ndescription: d\n---\n正文\n",
+        )
+        .unwrap();
         let s = set_skill_enabled(&store, "p1", SkillOrigin::Project, "t1", false).unwrap();
         assert!(!s.enabled);
         let doc = read_skill(&store, "p1", SkillOrigin::Project, "t1").unwrap();
-        assert!(doc.content.contains("enabled: false"), "缺失未插入: {}", doc.content);
+        assert!(
+            doc.content.contains("enabled: false"),
+            "缺失未插入: {}",
+            doc.content
+        );
     }
 
     #[test]
@@ -1248,14 +1867,30 @@ mod tests {
         let (store, _ws) = store_with_workspace("crlf");
         project(&store, "p1", "my-proj", None);
         let content = "---\r\nname: crlf-skill\r\ndescription: CRLF 技能\r\nenabled: true\r\n---\r\n\r\n正文行。\r\n";
-        save_skill(&store, "p1", SkillOrigin::Project, None, content, &["local".into(), "all".into()]).unwrap();
+        save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            content,
+            &["local".into(), "all".into()],
+        )
+        .unwrap();
         let doc = read_skill(&store, "p1", SkillOrigin::Project, "crlf-skill").unwrap();
         assert!(doc.content.contains("\r\n"), "CRLF 被破坏");
-        assert!(doc.content.contains("scope:\r\n  - local\r\n  - all"), "scope 块换行风格不符: {:?}", doc.content);
+        assert!(
+            doc.content.contains("scope:\r\n  - local\r\n  - all"),
+            "scope 块换行风格不符: {:?}",
+            doc.content
+        );
         let s = set_skill_enabled(&store, "p1", SkillOrigin::Project, "crlf-skill", false).unwrap();
         assert!(!s.enabled);
         let doc = read_skill(&store, "p1", SkillOrigin::Project, "crlf-skill").unwrap();
-        assert!(doc.content.contains("enabled: false\r\n"), "enabled 换行风格不符: {:?}", doc.content);
+        assert!(
+            doc.content.contains("enabled: false\r\n"),
+            "enabled 换行风格不符: {:?}",
+            doc.content
+        );
         assert!(doc.content.contains("\r\n\r\n正文行。\r\n"), "正文被破坏");
     }
 
@@ -1263,7 +1898,15 @@ mod tests {
     fn delete_removes_recursively_and_errors_on_missing() {
         let (store, _ws) = store_with_workspace("delete");
         project(&store, "p1", "my-proj", None);
-        save_skill(&store, "p1", SkillOrigin::Project, None, &skill_md("gone", "d", ""), &[]).unwrap();
+        save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            &skill_md("gone", "d", ""),
+            &[],
+        )
+        .unwrap();
         let root = project_skills_root(&store, "p1").unwrap();
         std::fs::create_dir_all(root.join("gone").join("assets")).unwrap();
         delete_skill(&store, "p1", SkillOrigin::Project, "gone").unwrap();
@@ -1299,7 +1942,12 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(!names.iter().any(|n| n.contains(".tmp") || n.contains(".bak")), "临时文件残留: {names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains(".tmp") || n.contains(".bak")),
+            "临时文件残留: {names:?}"
+        );
     }
 
     #[test]
@@ -1360,5 +2008,200 @@ mod tests {
             "无侧车的异内容文件不应被覆盖"
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+    #[test]
+    fn skillhub_zip_install_supports_nested_root_and_rejects_overwrite() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let (store, _ws) = store_with_workspace("skillhub-install");
+        project(&store, "p1", "my-proj", None);
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        writer.start_file("hub-skill/SKILL.md", options).unwrap();
+        writer
+            .write_all("---\nname: hub-skill\ndescription: SkillHub\n---\n正文\n".as_bytes())
+            .unwrap();
+        writer
+            .start_file("hub-skill/scripts/run.sh", options)
+            .unwrap();
+        writer.write_all(b"echo ok\n").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let installed =
+            install_skillhub_zip(&store, "p1", SkillOrigin::Project, "hub-skill", &bytes).unwrap();
+        assert_eq!(installed.name, "hub-skill");
+        let root = project_skills_root(&store, "p1").unwrap();
+        assert!(root.join("hub-skill/SKILL.md").is_file());
+        assert!(root.join("hub-skill/scripts/run.sh").is_file());
+
+        let err = install_skillhub_zip(&store, "p1", SkillOrigin::Project, "hub-skill", &bytes)
+            .unwrap_err();
+        assert!(err.contains("未覆盖"), "错误串不符: {err}");
+    }
+
+    #[test]
+    fn pack_skill_for_upload_keeps_root_layout_and_excludes_hidden_entries() {
+        let (store, ws) = store_with_workspace("pack-upload");
+        project(&store, "p1", "my-proj", None);
+        let content = skill_md("uploadable", "可上传", "");
+        save_skill(
+            &store,
+            "p1",
+            SkillOrigin::Project,
+            None,
+            &content,
+            &["all".to_string()],
+        )
+        .unwrap();
+        let skill = project_skills_root(&store, "p1").unwrap().join("uploadable");
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::write(skill.join("references/guide.txt"), "逐字节附件").unwrap();
+        std::fs::write(skill.join("blob.bin"), [0, 1, 2, 255]).unwrap();
+        std::fs::create_dir_all(skill.join(".clawhub")).unwrap();
+        std::fs::write(skill.join(".env"), "secret").unwrap();
+        std::fs::write(skill.join(".clawhub/state"), "local state").unwrap();
+
+        let package = PathBuf::from(
+            pack_skill_for_upload(&store, "p1", SkillOrigin::Project, "uploadable").unwrap(),
+        );
+        let mut archive = ZipArchive::new(File::open(&package).unwrap()).unwrap();
+        let mut names = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "SKILL.md".to_string(),
+                "blob.bin".to_string(),
+                "references/".to_string(),
+                "references/guide.txt".to_string(),
+            ]
+        );
+        let mut guide = String::new();
+        archive
+            .by_name("references/guide.txt")
+            .unwrap()
+            .read_to_string(&mut guide)
+            .unwrap();
+        assert_eq!(guide, "逐字节附件");
+        let mut blob = Vec::new();
+        archive.by_name("blob.bin").unwrap().read_to_end(&mut blob).unwrap();
+        assert_eq!(blob, [0, 1, 2, 255]);
+        let expected_dir = normalize_win_path(
+            std::fs::canonicalize(ws.join("my-proj/.aishell/tmp/skillhub-upload")).unwrap(),
+        );
+        assert!(package.starts_with(expected_dir));
+    }
+
+    #[test]
+    fn upload_packages_are_unique_and_cleanup_is_restricted() {
+        let (store, _ws) = store_with_workspace("pack-upload-cleanup");
+        project(&store, "p1", "my-proj", None);
+        let content = skill_md("uploadable", "可上传", "");
+        save_skill(&store, "p1", SkillOrigin::Global, None, &content, &[]).unwrap();
+        let first = PathBuf::from(
+            pack_skill_for_upload(&store, "p1", SkillOrigin::Global, "uploadable").unwrap(),
+        );
+        let second = PathBuf::from(
+            pack_skill_for_upload(&store, "p1", SkillOrigin::Global, "uploadable").unwrap(),
+        );
+        assert_ne!(first, second, "并发点击不能覆盖同一上传包");
+        assert_eq!(
+            validate_upload_package_path(&store, "p1", SkillOrigin::Global, &first).unwrap(),
+            first
+        );
+        remove_upload_package(&store, "p1", SkillOrigin::Global, &first).unwrap();
+        assert!(!first.exists());
+
+        let outside = tmp_base("pack-upload-outside").join("outside.zip");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"zip").unwrap();
+        assert!(
+            validate_upload_package_path(&store, "p1", SkillOrigin::Global, &outside).is_err()
+        );
+        let non_zip = second.with_extension("txt");
+        std::fs::write(&non_zip, b"not zip").unwrap();
+        assert!(
+            validate_upload_package_path(&store, "p1", SkillOrigin::Global, &non_zip).is_err()
+        );
+    }
+
+    #[test]
+    fn pack_skill_for_upload_rejects_invalid_source_without_creating_package() {
+        let (store, _ws) = store_with_workspace("pack-upload-invalid");
+        project(&store, "p1", "my-proj", None);
+        let root = project_skills_root(&store, "p1").unwrap();
+        let skill = root.join("broken");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join(SKILL_FILE), "---\nname: broken\n---\n").unwrap();
+        let err = pack_skill_for_upload(&store, "p1", SkillOrigin::Project, "broken").unwrap_err();
+        assert!(err.contains("description"), "错误串不符：{err}");
+        let uploads = upload_package_dir(&store, "p1", SkillOrigin::Project).unwrap();
+        assert!(
+            !uploads.exists() || std::fs::read_dir(&uploads).unwrap().next().is_none(),
+            "失败时不应残留上传包"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pack_skill_for_upload_rejects_windows_symlink_when_available() {
+        use std::os::windows::fs::symlink_file;
+
+        let (store, _ws) = store_with_workspace("pack-upload-link");
+        project(&store, "p1", "my-proj", None);
+        let content = skill_md("linked", "可上传", "");
+        save_skill(&store, "p1", SkillOrigin::Project, None, &content, &[]).unwrap();
+        let skill = project_skills_root(&store, "p1").unwrap().join("linked");
+        let target = skill.join("target.txt");
+        let link = skill.join("link.txt");
+        std::fs::write(&target, "target").unwrap();
+        if symlink_file(&target, &link).is_err() {
+            return; // 未启用开发者模式时 Windows 不授予创建链接权限，无法构造该输入。
+        }
+        let err = pack_skill_for_upload(&store, "p1", SkillOrigin::Project, "linked").unwrap_err();
+        assert!(err.contains("符号链接") || err.contains("重解析点"), "错误串不符：{err}");
+    }
+
+    #[test]
+    fn pack_skill_for_upload_rejects_archives_over_fifty_mib() {
+        use std::io::Write;
+
+        let (store, _ws) = store_with_workspace("pack-upload-large");
+        project(&store, "p1", "my-proj", None);
+        let content = skill_md("large-upload", "可上传", "");
+        save_skill(&store, "p1", SkillOrigin::Project, None, &content, &[]).unwrap();
+        let large = project_skills_root(&store, "p1")
+            .unwrap()
+            .join("large-upload")
+            .join("attachment.bin");
+        let mut output = File::create(&large).unwrap();
+        let mut state = 0x9e37_79b9_u32;
+        let mut buffer = [0_u8; 8192];
+        for _ in 0..((51 * 1024 * 1024) / buffer.len()) {
+            for byte in &mut buffer {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = state as u8;
+            }
+            output.write_all(&buffer).unwrap();
+        }
+        drop(output);
+
+        let err = pack_skill_for_upload(&store, "p1", SkillOrigin::Project, "large-upload")
+            .unwrap_err();
+        assert!(
+            err.contains("SkillHub 上传包过大（上限 50 MiB）"),
+            "错误串不符：{err}"
+        );
+        let uploads = upload_package_dir(&store, "p1", SkillOrigin::Project).unwrap();
+        assert!(
+            !uploads.exists() || std::fs::read_dir(&uploads).unwrap().next().is_none(),
+            "超限失败后残留上传包"
+        );
     }
 }
