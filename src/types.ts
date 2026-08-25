@@ -13,11 +13,38 @@ export interface SearchConfig {
   enabled: boolean;
 }
 
+/** 知识库配置（云端只读中转，开放 API 文档 §4）：autoInject 只控制「发消息前自动把分数最高的前 N 条命中注入用户输入」；
+ *  kb_search 工具挂载不受它影响（托管模式且平台启用 knowledge 能力时始终提供给 AI 助手）。 */
+export interface KnowledgeConfig {
+  /** 是否开启知识库自动注入（开启会降低 AI 响应速度） */
+  autoInject: boolean;
+  /** 自动注入的命中条数（1–20） */
+  injectCount: number;
+}
+
+/** 知识库语义检索命中（开放 API 文档 §4.1，响应为顶层命中数组）。字段为上游原生 snake_case
+ *  （KbHit 是云平台只读透传结构，未做 camelCase 重命名，故此处保持 snake_case 与 Rust 对齐）。 */
+export interface KbHit {
+  chunk_id: number | null;
+  document_id: number | null;
+  document_title: string;
+  heading_path: string;
+  score: number;
+  snippet: string;
+  content_preview: string;
+  content: string;
+  workspace_id: number | null;
+  workspace_name: string;
+  retrieval_type: string;
+}
+
 export interface Settings {
   workspaceDir: string | null;
   llm: LlmConfig;
   /** 联网搜索配置；旧配置无此字段时按关闭处理 */
   search: SearchConfig;
+  /** 知识库配置；旧配置无此字段时按默认开启自动注入处理 */
+  knowledge: KnowledgeConfig;
   theme: Theme;
   /** 自动切换 AI 工作区域：开启后 AI 输入框显示固定工作区域标签，随激活终端自动切换；旧配置无此字段按开启 */
   autoSwitchAiWorkdir: boolean;
@@ -25,8 +52,187 @@ export interface Settings {
   projectView: 'card' | 'list';
   /** 审批模式（智能审批/全部审批）；旧配置无此字段按智能审批 */
   approvalMode: 'smart' | 'all';
+  /** 云服务接入（公司服务器托管）；旧配置无此字段按未接入处理 */
+  cloud: CloudConfig;
   /** 自动备份远程文件：开启后 AI 会话第一次修改某远程文件前保存原始快照（会话级暂存区）；旧配置无此字段按开启 */
   autoBackupRemoteFiles: boolean;
+}
+
+/** 云服务接入模式（与 store.rs CloudMode serde lowercase 对齐） */
+export type CloudMode = 'hosted' | 'personal';
+
+/** 登录用户展示资料（token 永不进 JSON、永不返回前端） */
+export interface CloudUser {
+  /** 平台用户数字 id（/api/auth/me 带回；记忆卡片权限判断用） */
+  id: number | null;
+  name: string;
+  avatar: string | null;
+  dept: string | null;
+}
+
+/** 服务端能力清单（登录后缓存，供托管模式 UI 使用） */
+export interface CloudCapabilities {
+  models: string[];
+  search: boolean;
+  knowledge: boolean;
+  latestVersion: string | null;
+}
+
+/** 云服务配置段（aishell.json）：只存非敏感资料，token 在 keyring */
+export interface CloudConfig {
+  mode: CloudMode;
+  user: CloudUser | null;
+  capabilities: CloudCapabilities | null;
+}
+
+/** cloud_status 返回值 / cloud:changed 事件载荷（与 Rust cloud.rs CloudStatus 对齐；token 不在此） */
+export interface CloudStatus {
+  loggedIn: boolean;
+  user: CloudUser | null;
+  capabilities: CloudCapabilities | null;
+  /** 构建期注入的服务器地址；null = 未接入云服务（一切云功能隐藏） */
+  serverUrl: string | null;
+  mode: CloudMode;
+}
+
+/* ---------- 用量报表（GET /api/usage，开放 API 文档 §4.1） ---------- */
+
+/** 汇总指标（summary 段） */
+export interface UsageSummary {
+  requests: number;
+  llmRequests: number;
+  searchRequests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  averageLatencyMs: number;
+  errorCount: number;
+}
+
+/** 单日统计（daily 段，按查询天数补齐连续日期） */
+export interface UsageDaily {
+  date: string;
+  requests: number;
+  llmRequests: number;
+  searchRequests: number;
+  promptTokens: number;
+  completionTokens: number;
+  errorCount: number;
+}
+
+/** 单模型统计（models 段，仅 LLM） */
+export interface UsageModel {
+  model: string;
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/** cloud_usage 返回值（与 Rust cloud.rs UsageReport serde camelCase 对齐） */
+export interface UsageReport {
+  from: string;
+  to: string;
+  timezone: string;
+  summary: UsageSummary;
+  daily: UsageDaily[];
+  models: UsageModel[];
+}
+
+/* ---------- 记忆卡片（记忆卡片 API 文档 §1.2） ---------- */
+
+/** 共享记忆卡片对象 */
+export interface MemoryCard {
+  id: string;
+  content: string;
+  category: string;
+  tags: string[];
+  creatorId: number | null;
+  creatorName: string;
+  dept: string;
+  /** manual = 主动提交（原文保存）；auto = 对话流量 AI 自动沉淀 */
+  source: 'manual' | 'auto' | string;
+  /** shared（团队共享）/ personal（仅本人可见）；存量旧卡片可能为空，按共享处理 */
+  scope: 'shared' | 'personal' | string | null;
+  /** 自动沉淀卡片元数据（手动卡片通常无） */
+  projectName: string | null;
+  sessionId: string | null;
+  date: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 卡片变更历史事件（§6）：event = ADD / UPDATE */
+export interface MemoryEvent {
+  event: string;
+  value: string;
+  ts: string;
+  actor: string;
+  note: string;
+}
+
+/** 记忆卡片作用域：shared（团队共享）/ personal（仅本人可见） */
+export type MemoryScope = 'all' | 'shared' | 'personal';
+
+/** 语义检索命中（§7.2）：卡片 + 相关度（数组按相关度降序） */
+export interface MemoryHit {
+  id: string;
+  content: string;
+  category: string;
+  tags: string[];
+  creatorId: number | null;
+  creatorName: string;
+  dept: string;
+  source: string;
+  scope: 'shared' | 'personal' | string | null;
+  projectName: string | null;
+  sessionId: string | null;
+  date: string | null;
+  createdAt: string;
+  updatedAt: string;
+  score: number;
+}
+
+/* ---------- 用户反馈（用户反馈 API 文档 §1.2/§3.2，与 cloud.rs serde camelCase 对齐） ---------- */
+
+/** 反馈分类（创建必填白名单） */
+export type FeedbackCategory = 'bug' | 'suggestion' | 'question' | 'other';
+/** 反馈状态（用户只读，由管理员后台流转） */
+export type FeedbackStatus = 'pending' | 'processing' | 'resolved' | 'closed';
+
+/** 反馈附件元数据（§1.3）；downloadURL 为需鉴权的相对下载地址 */
+export interface FeedbackAttachment {
+  id: number;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  sha256: string;
+  createdAt: string;
+  downloadURL: string;
+}
+
+/** 反馈对象：创建响应 / 详情 / 列表条目同构 */
+export interface Feedback {
+  id: number;
+  reporterId: number | null;
+  reporterName: string | null;
+  reporterDept: string | null;
+  category: FeedbackCategory;
+  title: string;
+  content: string;
+  status: FeedbackStatus;
+  attachments: FeedbackAttachment[];
+  attachmentCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 分页响应（§3.2）：total 为过滤条件下本人反馈总数 */
+export interface FeedbackPage {
+  items: Feedback[];
+  page: number;
+  pageSize: number;
+  total: number;
 }
 
 /** MCP 服务全局配置（AppState 顶层字段）—— 与 store.rs McpServiceConfig serde camelCase 对齐。
@@ -303,6 +509,40 @@ export interface NotesListing {
 /** session_archive 归档模式：new = 新建笔记 / update = 整合进既有笔记 / only = 仅归档不生成笔记 */
 export type ArchiveMode = 'new' | 'update' | 'only';
 
+/** dws 认证状态（dws_auth_status 返回；installed=false 表示本机未安装 dws CLI） */
+export interface DwsAuthStatus {
+  installed: boolean;
+  authenticated: boolean;
+  userName: string;
+  corpName: string;
+}
+
+/** 钉钉日志模版（dws_report_templates 返回） */
+export interface DwsTemplate {
+  id: string;
+  name: string;
+}
+
+/** 日志内容项（与 dws report entry submit --contents 数组元素对齐；发布预览可编辑 content） */
+export interface DwsReportContent {
+  key: string;
+  sort: string;
+  content: string;
+  contentType: string;
+  type: string;
+}
+
+/** dws_report_generate 返回：解析出的模版 id + LLM 整理的 contents JSON 字符串（pretty） */
+export interface DwsReportDraft {
+  templateId: string;
+  contents: string;
+}
+
+/** dws_report_submit 返回：openUrl = 钉钉日志跳转链接（dws 缺失时为 null） */
+export interface DwsSubmitResult {
+  openUrl?: string | null;
+}
+
 /** sessions: projectId -> ChatSession[] */
 export interface AppState {
   settings: Settings;
@@ -440,6 +680,70 @@ export interface SkillDocument {
   content: string;
 }
 
+/** SkillHub 本地发布终态：published 时临时 ZIP 已删除；manual 时保留路径供当前浏览器页面手动选择。 */
+export interface SkillHubPublishOutcome {
+  status: 'published' | 'manual';
+  packagePath: string;
+  message: string;
+}
+
+/* ---------------- SkillHub（与 cloud.rs SkillHub API serde camelCase 对齐） ---------------- */
+export interface SkillHubVersion {
+  id: number;
+  version: string;
+  status: string;
+  changelog: string;
+  fileCount: number;
+  totalSize: number;
+  publishedAt: string;
+  downloadAvailable: boolean;
+  metadata: Record<string, unknown>;
+  body: string;
+}
+
+export interface SkillHubItem {
+  id: number;
+  namespace: string;
+  slug: string;
+  displayName: string;
+  summary: string;
+  tags: Record<string, string>;
+  labels: string[];
+  downloads: number;
+  stars: number;
+  downloadCount: number;
+  starCount: number;
+  ratingAvg: number;
+  ratingCount: number;
+  createdAt: number;
+  updatedAt: number;
+  latestVersion: string;
+  changelog: string;
+  license: string;
+  ownerId: string;
+  ownerDisplayName: string;
+  visibility: string;
+  status: string;
+  hidden: boolean;
+  headlineVersion?: SkillHubVersion | null;
+  publishedVersion?: SkillHubVersion | null;
+  ownerPreviewVersion?: SkillHubVersion | null;
+  resolutionMode: string;
+}
+
+export interface SkillHubList {
+  items: SkillHubItem[];
+  nextCursor: string;
+}
+
+export interface SkillHubDetail {
+  skill: SkillHubItem;
+}
+
+export interface SkillHubVersionDetail {
+  version: SkillHubVersion;
+}
+
 /* ---------------- 会话级远程文件暂存（与 staging.rs serde camelCase 对齐） ---------------- */
 
 /** 原始/当前存在状态 —— 与 staging.rs StagedState serde lowercase 对齐 */
@@ -543,6 +847,51 @@ export interface StagingProgress {
   done: number;
   total: number;
   currentPath: string;
+}
+
+/* ---------------- 客户端自动更新（Rust update.rs，serde camelCase 对齐） ---------------- */
+
+/** 更新状态机（与 update.rs UpdateState serde snake_case 对齐） */
+export type UpdateState =
+  | 'idle'
+  | 'checking'
+  | 'not_available'
+  | 'available'
+  | 'downloading'
+  | 'ready'
+  | 'installing'
+  | 'error';
+
+/** 下载进度（update:download-progress 事件载荷） */
+export interface UpdateProgress {
+  downloaded: number;
+  total?: number | null;
+}
+
+/** update_status 返回值与 update:status-changed 事件载荷 */
+export interface UpdateStatus {
+  state: UpdateState;
+  currentVersion: string;
+  availableVersion?: string | null;
+  notes?: string | null;
+  publishedAt?: string | null;
+  progress?: UpdateProgress | null;
+  /** 最近检查时间（epoch 毫秒，前端按本地时区格式化） */
+  lastCheckedAt?: number | null;
+  error?: string | null;
+  /** 构建是否接入更新服务（未注入 AISHELL_SERVER_URL 的个人构建恒 false） */
+  enabled: boolean;
+  /** 无签名迁移期：manifest 有新版本但缺签名 → 只允许手动下载 */
+  signatureMissing: boolean;
+  /** 制品直链（公开 URL，无 token；「打开下载页」用） */
+  downloadUrl?: string | null;
+}
+
+/** update:ready 事件载荷（下载验签完成，提示用户重启生效） */
+export interface UpdateReadyInfo {
+  version: string;
+  notes?: string | null;
+  publishedAt?: string | null;
 }
 
 /** SFTP 传输进度（sftp:progress 事件；与 sftp.rs SftpProgress serde camelCase 对齐）。

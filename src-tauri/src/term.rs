@@ -81,13 +81,23 @@ fn diag_tx() -> Option<&'static std::sync::mpsc::Sender<String>> {
                     .map(|h| format!("{h}/Library/Application Support/com.aishell.app/logs"))
                     .unwrap_or_else(|_| "logs".to_string());
                 let _ = std::fs::create_dir_all(&dir);
-                std::path::Path::new(&dir).join("term-diag.log").to_string_lossy().into_owned()
+                std::path::Path::new(&dir)
+                    .join("term-diag.log")
+                    .to_string_lossy()
+                    .into_owned()
             }
         };
-        if std::fs::metadata(&path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false) {
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > 2 * 1024 * 1024)
+            .unwrap_or(false)
+        {
             let _ = std::fs::remove_file(&path);
         }
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             use std::io::BufWriter;
@@ -171,7 +181,12 @@ impl TermHandle {
             TermBackend::Local { master, .. } => master
                 .lock()
                 .map_err(|e| e.to_string())?
-                .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
                 .map_err(|e| format!("PTY 尺寸调整失败: {e}")),
             TermBackend::Ssh { write_half } => write_half
                 .window_change(cols as u32, rows as u32, 0, 0)
@@ -369,12 +384,22 @@ impl TermManager {
     }
 
     /// 本地分支：portable-pty 起本地 shell（--login -i），cwd 缺省用用户 home。
-    fn create_local(self: &Arc<Self>, app: AppHandle, id: String, cwd: Option<String>) -> Result<(), String> {
+    fn create_local(
+        self: &Arc<Self>,
+        app: AppHandle,
+        id: String,
+        cwd: Option<String>,
+    ) -> Result<(), String> {
         let shell = find_shell().ok_or_else(shell_missing_msg)?;
 
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| format!("PTY 创建失败: {e}"))?;
 
         let mut cmd = CommandBuilder::new(shell);
@@ -401,7 +426,9 @@ impl TermManager {
         let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().ok();
         let writer = Arc::new(Mutex::new(
-            pair.master.take_writer().map_err(|e| format!("获取 PTY 写入端失败: {e}"))?,
+            pair.master
+                .take_writer()
+                .map_err(|e| format!("获取 PTY 写入端失败: {e}"))?,
         ));
         let master = Arc::new(Mutex::new(pair.master));
         let child = Arc::new(Mutex::new(child));
@@ -495,9 +522,7 @@ impl TermManager {
         // 迷你终端等场景要求登录后直接落到指定目录：shell 就绪前写入 PTY 缓冲即可
         if let Some(dir) = cwd.as_deref().filter(|d| !d.trim().is_empty()) {
             let quoted = format!("'{}'", dir.replace('\'', "'\\''"));
-            let _ = write_half
-                .data_bytes(format!("cd {quoted}\r"))
-                .await;
+            let _ = write_half.data_bytes(format!("cd {quoted}\r")).await;
         }
 
         let handle = Arc::new(TermHandle {
@@ -573,7 +598,9 @@ impl TermManager {
 
     fn handle(&self, id: &str) -> Result<Arc<TermHandle>, String> {
         let map = self.map.lock().map_err(|e| e.to_string())?;
-        map.get(id).cloned().ok_or_else(|| format!("终端不存在: {id}"))
+        map.get(id)
+            .cloned()
+            .ok_or_else(|| format!("终端不存在: {id}"))
     }
 
     pub async fn input(&self, id: &str, data: &str) -> Result<(), String> {
@@ -619,7 +646,10 @@ impl TermManager {
         if records.contains_key(id) {
             return Err("该终端正在录制中".to_string());
         }
-        records.insert(id.to_string(), Recorder::create(PathBuf::from(path), header)?);
+        records.insert(
+            id.to_string(),
+            Recorder::create(PathBuf::from(path), header)?,
+        );
         Ok(())
     }
 
@@ -639,14 +669,20 @@ impl TermManager {
 /// （排除 System32 的 WSL bash）。pub(crate)：ai_actions 本地命令复用。
 #[cfg(windows)]
 pub(crate) fn find_shell() -> Option<String> {
-    if let Some(p) = std::env::var("AISHELL_GIT_BASH").ok().map(|s| s.trim().to_string()) {
+    if let Some(p) = std::env::var("AISHELL_GIT_BASH")
+        .ok()
+        .map(|s| s.trim().to_string())
+    {
         if !p.is_empty() && PathBuf::from(&p).is_file() {
             return Some(p);
         }
     }
     for var in ["PROGRAMFILES", "PROGRAMFILES(X86)"] {
         if let Ok(pf) = std::env::var(var) {
-            let p = format!(r"{}\Git\bin\bash.exe", pf.trim_end_matches(|c| ['\\', '/'].contains(&c)));
+            let p = format!(
+                r"{}\Git\bin\bash.exe",
+                pf.trim_end_matches(|c| ['\\', '/'].contains(&c))
+            );
             if PathBuf::from(&p).is_file() {
                 return Some(p);
             }
@@ -765,10 +801,7 @@ pub async fn term_resize(
 }
 
 #[tauri::command]
-pub async fn term_close(
-    manager: State<'_, Arc<TermManager>>,
-    id: String,
-) -> Result<(), String> {
+pub async fn term_close(manager: State<'_, Arc<TermManager>>, id: String) -> Result<(), String> {
     manager.close(&id).await
 }
 
@@ -833,7 +866,10 @@ mod tests {
     fn recorder_create_duplicate_is_error() {
         let dir = tmp_dir("duplicate");
         let path = dir.join("dup.log");
-        assert!(Recorder::create(path.clone(), "h1").is_ok(), "首次创建应成功");
+        assert!(
+            Recorder::create(path.clone(), "h1").is_ok(),
+            "首次创建应成功"
+        );
         let err = Recorder::create(path.clone(), "h2").expect_err("重复 create 应报错");
         assert!(!err.is_empty(), "错误文案不应为空");
         // 原文件内容不受第二次 create 影响
@@ -858,7 +894,8 @@ mod tests {
         assert_eq!(String::from_utf8(p1).unwrap(), "$ ls ");
         assert_eq!(String::from_utf8(p2).unwrap(), "green normal\r\n");
         // 括号粘贴模式 + OSC 标题(BEL 与 ST 两种收尾) + 字符集选择 + 单字符转义
-        let p3 = s.strip("\u{1b}[?2004h\u{1b}]0;标题\u{7}\u{1b}]8;;https://x\u{1b}\\\u{1b}(0\u{1b}ctext");
+        let p3 = s
+            .strip("\u{1b}[?2004h\u{1b}]0;标题\u{7}\u{1b}]8;;https://x\u{1b}\\\u{1b}(0\u{1b}ctext");
         assert_eq!(String::from_utf8(p3).unwrap(), "text");
         // OSC 跨分片
         let p4 = s.strip("\u{1b}]0;win");

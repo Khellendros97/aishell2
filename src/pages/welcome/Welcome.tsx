@@ -24,12 +24,13 @@ import {
   useEffect, useLayoutEffect, useRef, useState,
   type CSSProperties, type DragEvent, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
-import type { AppState, Project, Server } from '../../types';
+import type { AppState, CloudStatus, Project, Server } from '../../types';
 import {
-  createProjectFolder, deleteProject, deleteProjectFolder, deleteServer, ensureProjectDirs,
-  getState, getTaskProject, openDialog, renameProjectFolder,
-  saveSettings, setUiExpanded, upsertProject, upsertServer,
+  cloudBeginLogin, cloudStatus, createProjectFolder, deleteProject, deleteProjectFolder, deleteServer,
+  ensureProjectDirs, getState, getTaskProject, onCloudChanged,
+  openDialog, renameProjectFolder, saveSettings, setUiExpanded, upsertProject, upsertServer,
 } from '../../api';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { attachCombo, confirmDialog, promptDialog, toast, uid } from '../../ui';
 import { Icon } from '../../shared/Icon';
 import { navigate } from '../../router';
@@ -50,7 +51,9 @@ const EMPTY_STATE: AppState = {
     autoSwitchAiWorkdir: true,
     projectView: 'card',
     approvalMode: 'smart',
+    cloud: { mode: 'personal', user: null, capabilities: null },
     autoBackupRemoteFiles: true,
+    knowledge: { autoInject: true, injectCount: 5 },
   },
   servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
@@ -109,6 +112,17 @@ function computeGroups(db: AppState, q: string): {
 }
 
 export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
+  /* ---------- 云登录快捷通道（CR-1.9）：未登录且构建注入了 serverUrl 时显示 ----------
+     登录成功后 cloud:changed 驱动隐藏,无需等待回调 */
+  const [cloudBarVisible, setCloudBarVisible] = useState(false);
+  useEffect(() => {
+    const render = (s: CloudStatus): void => setCloudBarVisible(!!s.serverUrl && !s.loggedIn);
+    let un: (() => void) | null = null;
+    void cloudStatus().then(render).catch(() => {});
+    void onCloudChanged(render).then((u) => { un = u; }).catch(() => {});
+    return () => { un?.(); };
+  }, []);
+
   /* ---------- 渲染相关状态 ---------- */
   const [db, setDb] = useState<AppState>(EMPTY_STATE);
   /** 首次 getState 装载完成前不展示空态（legacy 骨架中空态初始为 hidden，装载后才计算） */
@@ -867,6 +881,21 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
           <h2>我的项目</h2>
           <span className="tag" id="proj-count">{projects.length} 个项目</span>
         </div>
+
+        {cloudBarVisible ? (
+          <div id="cloud-login-bar" className="cloud-login-bar">
+            <span>登录公司账号，免配置使用 AI</span>
+            <button
+              className="btn primary small" id="btn-cloud-login"
+              onClick={() => {
+                cloudBeginLogin()
+                  .then((url) => openUrl(url))
+                  .then(() => toast('请在浏览器中完成授权…', 'info'))
+                  .catch((err) => toast(`登录发起失败: ${String(err)}`, 'error'));
+              }}
+            >登录</button>
+          </div>
+        ) : null}
 
         <div className="welcome-toolbar">
           <input className="input" id="proj-search" placeholder="搜索项目名 / 路径 / 所属目录…"

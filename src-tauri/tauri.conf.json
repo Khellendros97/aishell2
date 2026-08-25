@@ -29,6 +29,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+"createUpdaterArtifacts": true,
     "resources": ["resources/pi", "resources/git", "resources/python", "resources/pysdk"],
     "icon": [
       "icons/32x32.png",
@@ -41,6 +42,11 @@
       "wix": {
         "language": "zh-CN"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE4Q0NBNkI2ODVDOUY2MkIKUldRcjlzbUZ0cWJNR08vN3lvNUV0czlCa2hEamllSHVSeUZzc2NZL3liQXdXcFZvR3FPdGp5c3MK"
     }
   }
 }

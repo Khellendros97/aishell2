@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -20,7 +20,7 @@ export const openDevtools = () => call<void>('open_devtools');
    apiKey / braveKey / password 传 null 表示「不修改已保存的密钥」。 */
 export const isConfigComplete = () => call<boolean>('is_config_complete');
 export const getState = () => call<AppState>('get_state');
-/** 欢迎页 AI 的系统任务上下文；不进入普通项目列表。 */
+/** 当前工作区的系统任务项目（main 侧引入）：按 workspace 合成，用于「任务」会话默认绑定 */
 export const getTaskProject = () => call<Project>('get_task_project');
 export const saveSettings = (settings: Settings, apiKey: string | null, braveKey: string | null) =>
   call<void>('save_settings', { settings, apiKey, braveKey });
@@ -248,6 +248,74 @@ export const aiRespondDbRequest = (key: string, requestId: string, response: { a
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 
+/* ---------------- cloud（云服务 OAuth2，CR-1） ----------------
+   协议以 docs/AIShell云服务-OAuth2接入文档.md 为准；token 永不返回前端。 */
+/** 发起登录：返回授权 URL（系统浏览器打开）；后端同时起本地回环回调监听。
+ *  未注入云配置的构建返回中文错误（正常路径不调用）。 */
+export const cloudBeginLogin = () => call<string>('cloud_begin_login');
+/** 取消进行中的登录（作废 state 并关闭回调监听） */
+export const cloudCancelLogin = () => call<void>('cloud_cancel_login');
+/** 退出登录：尽力吊销服务端 refresh_token，本地清 keyring + cloud 段 */
+export const cloudLogout = () => call<void>('cloud_logout');
+/** 当前云状态（登录态/用户/能力/服务器地址/模式；token 不在此） */
+export const cloudStatus = () => call<CloudStatus>('cloud_status');
+/** 切换托管/个人模式 */
+export const cloudSetMode = (mode: CloudMode) => call<void>('cloud_set_mode', { mode });
+/** 登录/登出/登录失效/模式切换后广播（载荷 = CloudStatus） */
+export const onCloudChanged = (cb: (s: CloudStatus) => void): Promise<UnlistenFn> =>
+  listen<CloudStatus>('cloud:changed', (e) => cb(e.payload));
+
+/* ---------------- 用量报表 / 记忆卡片（token 全程留在 Rust 端，前端只收结构化数据） ---------------- */
+/** 个人用量报表（GET /api/usage）；days 1–90 默认 14；kind llm|search；model 仅 LLM 过滤 */
+export const cloudUsage = (days?: number, kind?: string, model?: string) =>
+  call<UsageReport>('cloud_usage', { days: days ?? null, kind: kind ?? '', model: model ?? '' });
+/** 记忆卡片（GET /api/memories）；scope：缺省/all = 共享+我的个人，shared 仅共享，personal 仅我的个人 */
+export const memoriesList = (scope?: MemoryScope) =>
+  call<MemoryCard[]>('memories_list', { scope: scope ?? '' });
+/** 主动提交记忆（POST /api/memories，原文保存）；scope 默认 shared，个人记录用 personal */
+export const memoryCreate = (content: string, category: string, tags: string[], scope?: MemoryScope) =>
+  call<MemoryCard>('memory_create', { content, category, tags, scope: scope ?? '' });
+/** 编辑/纠正卡片（PUT /api/memories/{id}）；note 可选纠正说明 */
+export const memoryUpdate = (id: string, content: string, category: string, tags: string[], note?: string) =>
+  call<void>('memory_update', { id, content, category, tags, note: note ?? '' });
+/** 删除卡片（DELETE /api/memories/{id}，不可恢复） */
+export const memoryDelete = (id: string) => call<void>('memory_delete', { id });
+/** 单卡变更历史（GET /api/memories/{id}/history） */
+export const memoryHistory = (id: string) => call<MemoryEvent[]>('memory_history', { id });
+/** 语义检索记忆（POST /api/memories/search）；topK 默认 10 */
+export const memorySearch = (query: string, topK?: number, scope?: MemoryScope) =>
+  call<MemoryHit[]>('memory_search', { query, topK: topK ?? null, scope: scope ?? '' });
+/** 个人卡片提升为共享（POST /api/memories/{id}/promote）；返回新共享卡片 id */
+export const memoryPromote = (id: string) => call<string>('memory_promote', { id });
+/** 知识库语义检索（GET /api/kb/search，开放 API 文档 §4.1）：只读透传，命中带相关度 score
+ *  供前端「自动注入」客户端检索用；AI 工具侧的 kb_search 走 pi 扩展。 */
+export const kbSearch = (query: string, limit?: number, workspaceId?: number | null) =>
+  call<KbHit[]>('kb_search', { query, limit: limit ?? null, workspaceId: workspaceId ?? null });
+
+/* ---------------- 用户反馈（用户反馈 API 文档；token 全程留在 Rust 端） ----------------
+   提交为 multipart/form-data（附件传本地文件绝对路径，由后端读取上传）；
+   列表/详情只返回本人反馈，状态由管理员后台流转（用户只读）。 */
+/** 提交反馈（POST /api/feedback）；attachmentPaths 为本地文件绝对路径（最多 10 个，单个 ≤20MB） */
+export const feedbackSubmit = (
+  category: FeedbackCategory,
+  title: string,
+  content: string,
+  attachmentPaths?: string[],
+) => call<Feedback>('feedback_submit', { category, title, content, attachmentPaths: attachmentPaths ?? null });
+/** 分页查询本人反馈（GET /api/feedback）；status/category 传 '' 或 undefined = 不过滤 */
+export const feedbackList = (page?: number, pageSize?: number, status?: FeedbackStatus | '', category?: FeedbackCategory | '') =>
+  call<FeedbackPage>('feedback_list', {
+    page: page ?? null,
+    pageSize: pageSize ?? null,
+    status: status ?? '',
+    category: category ?? '',
+  });
+/** 反馈详情（GET /api/feedback/:id） */
+export const feedbackDetail = (id: number) => call<Feedback>('feedback_detail', { id });
+/** 下载本人反馈附件到指定本地路径（savePath 由保存对话框取得） */
+export const feedbackDownloadAttachment = (id: number, attachmentId: number, savePath: string) =>
+  call<void>('feedback_download_attachment', { id, attachmentId, savePath });
+
 /* ---------------- AI 会话 trace（Rust trace.rs） ----------------
    开关持久化在 AppState.traceEnabled（命令面板 `trace on/off`）；日志按会话分文件落盘
    （<config>/ai-trace/<日期>/<项目>__<会话>.jsonl），7 天过期由后端定时清理。
@@ -284,6 +352,9 @@ export const browserSetInspect = (viewId: string, enabled: boolean) =>
 export const browserOpenDevtools = (viewId: string) => call<void>('browser_open_devtools', { viewId });
 /** 关闭页面：释放该页面的子 webview 与 Rust 侧状态 */
 export const browserCloseView = (viewId: string) => call<void>('browser_close_view', { viewId });
+/** 驱动受限本地 ZIP 走可见的 SkillHub 页面流程；只返回终态，不额外广播进度事件。 */
+export const browserPublishSkillhub = (projectId: string, origin: SkillOrigin, packagePath: string) =>
+  call<SkillHubPublishOutcome>('browser_publish_skillhub', { projectId, origin, packagePath });
 export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
   listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
 
@@ -353,6 +424,33 @@ export const sessionArchive = (args: {
   noteRel?: string | null;
   transcript: string;
 }) => call<string>('session_archive', args);
+/** 仅生成笔记（不归档、不杀会话进程）：与 session_archive 共用生成/落盘逻辑，仅支持 new/update 模式。
+ *  返回笔记绝对路径；失败整体 Err，不写文件。 */
+export const sessionNote = (args: {
+  mode: Exclude<ArchiveMode, 'only'>;
+  /** new 模式必填（笔记标题，后端清洗非法字符） */
+  title?: string | null;
+  /** new 模式可选（目标目录相对路径，空 = 根目录） */
+  dirRel?: string | null;
+  /** update 模式必填（既有笔记相对路径） */
+  noteRel?: string | null;
+  transcript: string;
+}) => call<string>('session_note', args);
+
+/* ---------------- 钉钉日志发布（Rust dws.rs，经本机 dws CLI） ----------------
+   流程：dwsAuthStatus 检测认证 → dwsReportTemplates 列模版 → dwsReportGenerate
+   （后端读笔记 + 查模版字段 + LLM 整理为 contents JSON，前端预览可编辑）→
+   dwsReportSubmit（后端写临时 report.json 调 dws 提交，无论成败即删临时文件）。 */
+/** 检测 dws 认证状态；installed=false 表示未安装 dws CLI，由前端展示引导 */
+export const dwsAuthStatus = () => call<DwsAuthStatus>('dws_auth_status');
+/** 列出当前用户可用的日志模版 */
+export const dwsReportTemplates = () => call<DwsTemplate[]>('dws_report_templates');
+/** LLM 整理笔记为日志 contents JSON；返回模版 id + contents 字符串（pretty，供预览编辑） */
+export const dwsReportGenerate = (templateName: string, notePath: string) =>
+  call<DwsReportDraft>('dws_report_generate', { templateName, notePath });
+/** 按模版提交日志；contentsJson 须为 DwsReportContent 数组的 JSON 串 */
+export const dwsReportSubmit = (templateId: string, contentsJson: string) =>
+  call<DwsSubmitResult>('dws_report_submit', { templateId, contentsJson });
 
 /* ---------------- skills ---------------- *//** 分别扫描全局、项目技能根；目录内有 SKILL.md 但 frontmatter 非法时返回带路径的中文错误 */
 export const skillsList = (projectId: string) => call<SkillSummary[]>('skills_list', { projectId });
@@ -373,6 +471,44 @@ export const skillDelete = (projectId: string, origin: SkillOrigin, name: string
 /** 启停（只改 frontmatter 顶层 enabled 标量） */
 export const skillSetEnabled = (projectId: string, origin: SkillOrigin, name: string, enabled: boolean) =>
   call<SkillSummary>('skill_set_enabled', { projectId, origin, name, enabled });
+/** 打包本地 Skill 为仅供 browserPublishSkillhub 使用的临时 ZIP，返回规范化绝对路径。 */
+export const skillPackUpload = (projectId: string, origin: SkillOrigin, name: string) =>
+  call<string>('skill_pack_upload', { projectId, origin, name });
+
+/* ---------------- SkillHub（云端技能市场） ---------------- */
+export const skillHubList = (q: string, cursor: string | null, size = 24) =>
+  call<SkillHubList>('skillhub_list', { q: q || null, cursor, size });
+export const skillHubDetail = (namespace: string, slug: string) =>
+  call<SkillHubDetail>('skillhub_detail', { namespace, slug });
+export const skillHubVersionDetail = (namespace: string, slug: string, version: string) =>
+  call<SkillHubVersionDetail>('skillhub_version_detail', { namespace, slug, version });
+export const skillHubDownload = (
+  projectId: string,
+  origin: SkillOrigin,
+  namespace: string,
+  slug: string,
+  version: string,
+) => call<SkillSummary>('skillhub_download', { projectId, origin, namespace, slug, version });
+
+/* ---------------- update（客户端自动更新，Rust update.rs） ----------------
+   后端持有唯一更新任务；检查/下载不带任何用户 token，公钥内置于客户端。 */
+/** 当前更新状态快照（此后以 update:status-changed 事件为准） */
+export const updateStatus = () => call<UpdateStatus>('update_status');
+/** 手动检查更新；失败 reject 中文错误（后台检查失败只写 debug 日志不弹错） */
+export const updateCheck = () => call<UpdateStatus>('update_check');
+/** 下载并由 Tauri updater 验签；完成后 state=ready 并广播 update:ready */
+export const updateDownload = () => call<UpdateStatus>('update_download');
+/** 重启并安装（用户确认后）。Windows 上安装器拉起后应用即退出，本调用不会 resolve。 */
+export const updateInstall = () => call<void>('update_install');
+/** 状态切换（载荷 = UpdateStatus 全量快照） */
+export const onUpdateStatusChanged = (cb: (s: UpdateStatus) => void): Promise<UnlistenFn> =>
+  listen<UpdateStatus>('update:status-changed', (e) => cb(e.payload));
+/** 下载进度（downloaded 字节 / total 可选总量） */
+export const onUpdateDownloadProgress = (cb: (p: UpdateProgress) => void): Promise<UnlistenFn> =>
+  listen<UpdateProgress>('update:download-progress', (e) => cb(e.payload));
+/** 新版本就绪（提示用户「重启并更新」） */
+export const onUpdateReady = (cb: (info: UpdateReadyInfo) => void): Promise<UnlistenFn> =>
+  listen<UpdateReadyInfo>('update:ready', (e) => cb(e.payload));
 
 /* ---------------- misc ---------------- */
 export { open as openDialog } from '@tauri-apps/plugin-dialog';

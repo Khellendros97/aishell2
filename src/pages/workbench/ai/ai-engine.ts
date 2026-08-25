@@ -37,7 +37,7 @@
  * - 旧 Tab.api 字段（openTab 返回的渲染器句柄）→ tabApis 注册表（tabApis.get(tab.id)）；
  * - MutationObserver 容器移除守卫删除：React keep-alive 常驻挂载，卸载由 useEffect cleanup
  *   调 mountAiPanel 返回的清理函数完成；
- * - mountAiPanel(container, options) 返回面板控制器（cleanup + 程序化新会话发送）。
+ * - mountAiPanel(container) 返回清理函数（原为 void，靠 observer 触发 cleanup）。
  * 瞬时错误自动重试：pi 默认对限流/过载瞬时错误自动重试，失败尝试的错误气泡会被重试
  * 恢复的流式内容取代（delta 分支复活错误 pending）；重试以「自动重试」瞬时工具行提示，
  * 回合结束仍会收到 done（ai.rs 在 delta 恢复时重置终态抑制）。停止键不等后端事件，
@@ -60,11 +60,11 @@
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
+import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon, type IconName } from '../../../icons';
 import {
-  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
-  sessionArchive, sessionUpsert, sessionsGet, setAiMode, stagingList, traceStatus,
+  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, kbSearch, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
+  sessionArchive, sessionNote, sessionUpsert, sessionsGet, setAiMode, stagingAccept, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
 } from '../../../api';
@@ -507,7 +507,6 @@ const ACTION_NAMES: Record<string, string> = {
   staging_add: '主动暂存文件',
   staging_clear: '清理无变更暂存',
   request_db_connection: '申请数据库连接',
-  py: '执行 Python 脚本',
 };
 
 const ACTION_STATUS: Record<ActionCard['status'], string> = {
@@ -561,13 +560,6 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `主动暂存 ${String(args.remotePath ?? '')}（服务器 ${String(args.serverId ?? '')}）`;
     case 'staging_clear':
       return '清理暂存区无变更条目';
-    case 'py': {
-      const p = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
-      if (p) return `执行 Python 脚本 ${p}`;
-      const code = typeof args.code === 'string' ? args.code.trim() : '';
-      const lines = code ? code.split('\n').length : 0;
-      return `执行内联 Python 脚本（${lines} 行）`;
-    }
     default:
       return '';
   }
@@ -607,23 +599,6 @@ function cloneChatSession(s: ChatSession): ChatSession {
   };
 }
 
-export interface AiPanelOptions {
-  /** 显式 AI 上下文；工作台不传时沿用 zustand 当前项目。 */
-  project?: Project;
-  /** 是否接入工作台标签、暂存区和 wbHandles；欢迎页任务上下文关闭。 */
-  workbenchIntegration?: boolean;
-  /** 固定本地工作区域说明；设置后不跟随工作台标签切换。 */
-  fixedWorkareaPath?: string;
-  /** 锁定模式选择；系统任务上下文固定为工作模式。 */
-  lockedMode?: AiMode;
-}
-
-export interface AiPanelController {
-  cleanup(): void;
-  /** 新建独立会话并发送首条纯文本消息。 */
-  startConversation(prompt: string): Promise<void>;
-}
-
 interface ProjectContext {
   project: Project;
   sessions: Map<string, ChatSession>;
@@ -647,6 +622,7 @@ const projectContexts = new Map<string, ProjectContext>();
 let viewContext: ProjectContext | null = null;
 let eventContext: ProjectContext | null = null;
 let project: Project | null = null;
+/** 面板挂载选项（main 侧引入：欢迎页系统任务上下文复用 AI 面板） */
 let panelOptions: Required<Pick<AiPanelOptions, 'workbenchIntegration'>> & Omit<AiPanelOptions, 'workbenchIntegration' | 'project'> = {
   workbenchIntegration: true,
 };
@@ -693,12 +669,19 @@ async function loadImageData(path: string): Promise<{ mime: string; data: string
   return out;
 }
 
-/** 模型是否支持图片输入（启发式与 Rust ai.rs models_json_for 一致：模型 id 小写含 "vision"）。 */
-function supportsVisionModel(modelId: string): boolean {
-  return modelId.toLowerCase().includes('vision');
+/** 模型是否支持图片输入（启发式与 Rust ai.rs models_json_for 保持一致）：
+ *  模型 id 小写含 "vision"；云分支补充：托管代理的 deepseek-v4-flash 对外 id 未变、
+ *  上游已切换为多模态模型，同样视为支持图片（个人模式直连官方 API 时不算）。 */
+function supportsVisionModel(modelId: string, hosted: boolean): boolean {
+  const id = modelId.toLowerCase();
+  return id.includes('vision') || (hosted && id === 'deepseek-v4-flash');
 }
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
+/** 知识库自动注入（Settings.knowledge.autoInject）：发消息前自动把相关度最高的前 N 条命中注入用户输入；只受开关影响，不影响 kb_search 工具挂载 */
+let kbAutoInject = false;
+/** 知识库自动注入条数（Settings.knowledge.injectCount，1–20） */
+let kbInjectCount = 5;
 /** 当前 AI 工作区域（默认本地；随激活终端/浏览器标签自动切换） */
 let workareaRef: ServerRef | null = null;
 /** 当前浏览器工作区域不使用服务器引用，单独记录以便发送时注入明确上下文。 */
@@ -871,6 +854,24 @@ function saveViewContext(): void {
   if (viewContext) viewContext.activeSessionId = activeSessionId;
 }
 
+/** 面板挂载选项（main 侧引入） */
+export interface AiPanelOptions {
+  /** 显式 AI 上下文；工作台不传时沿用 zustand 当前项目。 */
+  project?: Project;
+  /** 是否接入工作台标签、暂存区和 wbHandles；欢迎页任务上下文关闭。 */
+  workbenchIntegration?: boolean;
+  /** 固定本地工作区域说明；设置后不跟随工作台标签切换。 */
+  fixedWorkareaPath?: string;
+  /** 锁定模式选择；系统任务上下文固定为工作模式。 */
+  lockedMode?: AiMode;
+}
+
+export interface AiPanelController {
+  cleanup(): void;
+  /** 新建独立会话并发送首条纯文本消息。 */
+  startConversation(prompt: string): Promise<void>;
+}
+
 export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {}): AiPanelController {
   const nextProject = options.project ?? useWorkbench.getState().project;
   if (!nextProject) {
@@ -907,12 +908,9 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   workareaChipEl = null;
   activeSessionId = ctx.activeSessionId;
 
-  if (!document.getElementById('aishell-ai-panel-style')) {
-    const style = document.createElement('style');
-    style.id = 'aishell-ai-panel-style';
-    style.textContent = STYLE;
-    document.head.appendChild(style);
-  }
+  const style = document.createElement('style');
+  style.textContent = STYLE;
+  document.head.appendChild(style);
 
   container.innerHTML = `
     <div id="ai-session-bar">
@@ -975,8 +973,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
     modeSelect.title = '系统任务上下文固定为工作模式';
   }
 
-  const mountedHandle = createAiHandle();
-  if (panelOptions.workbenchIntegration) wbHandles.ai = mountedHandle;
+  if (panelOptions.workbenchIntegration) wbHandles.ai = aiHandle;
 
   /* 自动切换 AI 工作区域：激活终端标签（含新开终端）时跟随切换。
      legacy 由 bus 'tab-activated' 广播（activeId 变化时发激活 Tab），
@@ -1007,7 +1004,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   if (panelOptions.workbenchIntegration) void refreshStagingNotice();
   else stagingNotice.hidden = true;
   return {
-    cleanup: () => cleanup(mountedHandle),
+    cleanup,
     startConversation: (prompt: string) => startConversation(ctx, prompt),
   };
 }
@@ -1056,7 +1053,7 @@ function replayPendingSessionTitleEvents(ctx: ProjectContext): void {
   }
 }
 
-function cleanup(handle: ReturnType<typeof createAiHandle>): void {
+function cleanup(): void {
   if (unmounted) return;
   unmounted = true;
   cancelPendingRender();
@@ -1073,15 +1070,14 @@ function cleanup(handle: ReturnType<typeof createAiHandle>): void {
   if (offSessionOutside) { offSessionOutside(); offSessionOutside = null; }
   if (offStagingChanged) { offStagingChanged(); offStagingChanged = null; }
   if (offTabActivated) { offTabActivated(); offTabActivated = null; }
-  if (wbHandles.ai === handle) wbHandles.ai = null;
+  if (wbHandles.ai === aiHandle) wbHandles.ai = null;
   /* 不退订项目/会话事件，也不 aiAbort/aiKillProject；上下文继续接收并保存后台流。 */
   viewContext = null;
   project = null;
 }
 
 /* ---------- wbHandles.ai 句柄（终端模块添加快照 / 服务器引用 / 路径引用） ---------- */
-function createAiHandle() {
-  return {
+const aiHandle = {
   addSnapshot(snap: TermSnapshot): void {
     if (!snap || !snap.id) return;
     snapshots.set(snap.id, snap);
@@ -1151,17 +1147,10 @@ function createAiHandle() {
   currentSessionId(): string | null {
     return activeSessionId || null;
   },
-  };
-}
+};
 
 /* ---------- 会话管理 ---------- */
-function newSession(): ChatSession {
-  const s: ChatSession = { id: uid('sess'), title: '新会话', messages: [], autoTitleTriggered: false };
-  sessions.set(s.id, s);
-  if (viewContext) void ensureSessionSubscription(viewContext, s.id);
-  return s;
-}
-
+/** 新建独立会话并发送首条纯文本消息（main 侧引入：startConversation 程序化入口）。 */
 async function startConversation(ctx: ProjectContext, prompt: string): Promise<void> {
   const text = prompt.trim();
   if (!text) throw new Error('对话内容不能为空');
@@ -1176,6 +1165,13 @@ async function startConversation(ctx: ProjectContext, prompt: string): Promise<v
   renderHistory();
   updateSendBtn();
   await send(text);
+}
+
+function newSession(): ChatSession {
+  const s: ChatSession = { id: uid('sess'), title: '新会话', messages: [], autoTitleTriggered: false };
+  sessions.set(s.id, s);
+  if (viewContext) void ensureSessionSubscription(viewContext, s.id);
+  return s;
 }
 
 function openCurrentStaging(): void {
@@ -1310,14 +1306,17 @@ async function loadEffort(): Promise<void> {
     autoSwitchAiWorkdir = panelOptions.fixedWorkareaPath
       ? true
       : panelOptions.workbenchIntegration && !!st.settings.autoSwitchAiWorkdir;
+    kbAutoInject = st.settings.knowledge?.autoInject ?? true;
+    kbInjectCount = st.settings.knowledge?.injectCount ?? 5;
   } catch {
     /* 读取失败保持默认 low / 开启（与 Settings 默认一致） */
   }
+  // 固定工作区域（系统任务上下文）：不跟随标签切换，输入区固定显示任务目录标签
   if (panelOptions.fixedWorkareaPath) {
     workareaRef = { serverId: null, name: panelOptions.fixedWorkareaPath };
+    browserWorkarea = false;
     renderWorkareaChip();
   } else if (autoSwitchAiWorkdir) {
-    // 开启自动切换时：初始工作区域默认本地；已有激活标签则跟随终端或浏览器
     const active = getActiveTab(useWorkbench.getState());
     if (active) updateWorkareaFromTab(active);
     renderWorkareaChip();
@@ -1488,7 +1487,6 @@ function handleEventBody(sid: string, ev: AiEvent): void {
        本地 write/edit 不改远程文件，不触发（后端对远程 write/edit 不发 fs:changed，
        本地文件刷新走 fs:changed 事件，见 editor.ts）。 */
     const isRemoteFileOp = ['write', 'edit', 'delete_path'].includes(ev.tool) && !!existing?.serverId;
-    if (ev.tool === 'py' && !ev.isError) window.dispatchEvent(new CustomEvent('aishell:data-changed'));
     if (ev.tool === 'run_command' || ev.tool === 'sftp_upload'
       || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff'
       || ev.tool === 'staging_add' || ev.tool === 'staging_clear'
@@ -1626,8 +1624,22 @@ function buildTranscript(session: ChatSession): string {
   return out;
 }
 
+/** 归档后自动接受暂存区剩余变更(归档入口已向用户警告);失败不阻塞收尾,条目保留由用户处理 */
+async function acceptStagingOnArchive(pid: string, sid: string): Promise<void> {
+  try {
+    const entries = await stagingList(pid, sid);
+    for (const e of entries) {
+      await stagingAccept(pid, sid, e.entryId);
+    }
+    if (entries.length > 0) wbEvents.emit('staging-changed');
+  } catch (err) {
+    toast(`暂存区变更自动接受失败：${String(err)}`, 'error');
+  }
+}
+
 /** 归档成功后的前端收尾:移除会话 + 退订 + 活跃会话补位 + 通知笔记面板/打开笔记 */
 function afterArchived(ctx: ProjectContext, sid: string, notePath: string): void {
+  void acceptStagingOnArchive(ctx.project.id, sid);
   ctx.sessions.delete(sid);
   ctx.pendingBy.delete(sid);
   ctx.subscriptions.get(sid)?.();
@@ -1652,13 +1664,13 @@ function afterArchived(ctx: ProjectContext, sid: string, notePath: string): void
   }
 }
 
-/** 归档入口(右键菜单「归档会话」):拼转录 → ArchiveModal → sessionArchive → 收尾 */
+/** 归档入口(右键菜单「归档会话」):暂存区未审查变更警告 → 拼转录 → ArchiveModal → sessionArchive → 收尾 */
 function archiveSession(pid: string, sid: string): void {
   const ctx = viewContext;
   if (!ctx || ctx.project.id !== pid) return;
   const session = ctx.sessions.get(sid);
   if (!session) return;
-  openArchiveModal({
+  const openModal = (): void => openArchiveModal({
     sessionTitle: session.title,
     onConfirm: ({ mode, title, dirRel, noteRel }) => sessionArchive({
       projectId: pid,
@@ -1670,6 +1682,42 @@ function archiveSession(pid: string, sid: string): void {
       transcript: buildTranscript(session),
     }),
     onDone: (notePath) => afterArchived(ctx, sid, notePath),
+  });
+  /* 暂存区还有未接受变更时先警告:归档后这些变更将被自动接受(查询失败不阻塞归档) */
+  void stagingList(pid, sid).then(async (entries) => {
+    if (entries.length > 0) {
+      const ok = await confirmDialog({
+        title: '归档会话',
+        message: `当前会话暂存区还有 ${entries.length} 个变更未审查，归档后自动接受所有变更。`,
+        okText: '继续归档',
+      });
+      if (!ok) return;
+    }
+    openModal();
+  }).catch(() => openModal());
+}
+
+/** 生成笔记入口(右键菜单「生成笔记」):与归档共用对话框/LLM 整理,但不归档、不动暂存区,会话保持活跃 */
+function generateSessionNote(pid: string, sid: string): void {
+  const ctx = viewContext;
+  if (!ctx || ctx.project.id !== pid) return;
+  const session = ctx.sessions.get(sid);
+  if (!session) return;
+  openArchiveModal({
+    variant: 'note',
+    sessionTitle: session.title,
+    onConfirm: ({ mode, title, dirRel, noteRel }) => sessionNote({
+      mode: mode === 'update' ? 'update' : 'new', // note 变体无仅归档模式,防御性收敛
+      title,
+      dirRel,
+      noteRel,
+      transcript: buildTranscript(session),
+    }),
+    onDone: (notePath) => {
+      wbEvents.emit('notes-changed');
+      openNote(notePath);
+      toast('已生成笔记', 'success');
+    },
   });
 }
 
@@ -3076,7 +3124,7 @@ async function attachImages(items: AttachImageItem[]): Promise<void> {
   }
   try {
     const st = await getState();
-    if (!supportsVisionModel(st.settings.llm.modelId)) {
+    if (!supportsVisionModel(st.settings.llm.modelId, st.settings.cloud?.mode === 'hosted')) {
       toast('当前模型不支持图片，请先在设置中切换为 vision 模型', 'error');
       return;
     }
@@ -3503,7 +3551,8 @@ async function send(textOverride?: string): Promise<void> {
     return;
   }
   closeMention(); // 发送按钮路径可能带着打开的 @ 补全弹层
-  // 读取输入区：文本段与内嵌 chip 按输入框内顺序；程序化首条消息直接使用纯文本段。
+  // 读取输入区：文本段与内嵌 chip 按输入框内顺序；content 落盘保留 token（历史按 token 还原位置）；
+  // 程序化首条消息（main 侧引入：textOverride 非空时直接使用纯文本段，不读输入框）
   const segments: InputSegment[] = textOverride === undefined
     ? readInputSegments()
     : [{ kind: 'text', text: textOverride }];
@@ -3651,8 +3700,13 @@ async function send(textOverride?: string): Promise<void> {
  */
 async function buildPrompt(segments: InputSegment[], imgs: ImageRef[], chipData: Map<string, ChipDatum>): Promise<string> {
   let servers: Server[] = [];
+  /* 自动注入只在托管模式且平台启用了 knowledge 能力时执行（后端命令在个人模式会报错，静默降级） */
+  let kbKnown = false;
   try {
-    servers = (await getState()).servers;
+    const st = await getState();
+    servers = st.servers;
+    // 知识库仅在公司云（托管模式）且平台启用了 knowledge 能力时可用，与后端挂载逻辑一致
+    kbKnown = !!st.settings.cloud?.capabilities?.knowledge;
   } catch {
     /* 后端未就绪时仅用名称 */
   }
@@ -3713,7 +3767,31 @@ async function buildPrompt(segments: InputSegment[], imgs: ImageRef[], chipData:
     }
   }
   if (imgs.length) parts.push(`\n\n[已附加 ${imgs.length} 张图片: ${imgs.map((r) => r.name).join(', ')}]`);
-  return parts.join('').trim();
+  const base = parts.join('').trim();
+  // 知识库自动注入：开启且用户输入了文本时，用用户原文检索并把相关度最高的前 N 条命中前置到 prompt；
+  // 检索失败（未登录/知识库不可用/网络）静默降级，不阻断对话
+  const userText = segments.filter((s) => s.kind === 'text').map((s) => s.text).join(' ').trim();
+  if (kbAutoInject && kbKnown && userText) {
+    try {
+      const hits = await kbSearch(userText, kbInjectCount);
+      if (hits.length) return `${buildKbBlock(hits)}\n\n${base}`;
+    } catch {
+      /* 自动注入失败静默降级 */
+    }
+  }
+  return base;
+}
+
+/** 把知识库命中拼成「[知识库参考]」上下文块：按相关度降序取前 N 条，每条附来源与截断摘要。 */
+function buildKbBlock(hits: KbHit[]): string {
+  const n = Math.max(1, Math.min(20, kbInjectCount));
+  const top = [...hits].sort((a, b) => b.score - a.score).slice(0, n);
+  const lines = top.map((h, i) => {
+    const source = h.heading_path ? `${h.document_title}（${h.heading_path}）` : (h.document_title || '知识库');
+    const sum = (h.content_preview || h.snippet || '').slice(0, 500);
+    return `${i + 1}. [${source}]（相关度 ${h.score.toFixed(0)}）\n   ${sum}`;
+  });
+  return `[知识库参考]\n${lines.join('\n')}`;
 }
 
 /* ---------- 事件绑定 ---------- */
@@ -3892,8 +3970,9 @@ function bindEvents(): void {
       traceStatus().catch(() => false),
     ])
       .then(([entries, traceOn]) => {
-        /* 归档:生成中的会话禁归档(转录不完整,且后端杀进程会打断在途回合) */
-        const archiving = isGenerating(sid);
+        /* 生成中的会话禁生成笔记/归档(转录不完整;归档后端还会杀进程打断在途回合) */
+        const generating = isGenerating(sid);
+        const busyTip = generating ? '会话正在生成中，请先停止或等待完成' : undefined;
         showContextMenu(e.clientX, e.clientY, [
           { label: '复制', iconName: 'copy', action: doCopy, disabled: !copyTarget, disabledTip: copyTarget ? undefined : '没有可复制的内容' },
           'sep',
@@ -3903,8 +3982,13 @@ function bindEvents(): void {
           ...(traceOn ? ['sep' as const, { label: '追溯', iconName: 'search' as const, action: openTrace }] : []),
           'sep',
           {
+            label: '生成笔记', iconName: 'note' as const,
+            disabled: generating, disabledTip: busyTip,
+            action: () => generateSessionNote(pid, sid),
+          },
+          {
             label: '归档会话', iconName: 'archive' as const,
-            disabled: archiving, disabledTip: archiving ? '会话正在生成中，请先停止或等待完成' : undefined,
+            disabled: generating, disabledTip: busyTip,
             action: () => archiveSession(pid, sid),
           },
         ]);
