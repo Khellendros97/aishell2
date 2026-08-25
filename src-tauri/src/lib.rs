@@ -243,6 +243,7 @@ pub fn run() {
             term::term_record_stop,
             term::debug_export,
             fsops::fs_list,
+            fsops::fs_is_text,
             fsops::fs_read,
             fsops::fs_write,
             fsops::fs_create,
