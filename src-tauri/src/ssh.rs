@@ -445,7 +445,7 @@ impl SshManager {
                     Some(p) => p.to_string(),
                     None => self
                         .store
-                        .read_secret(&format!("server:{}", server.id))
+                        .read_server_secret(server)
                         .map_err(|e| format!("读取服务器「{}」的密码失败：{e}", server.name))?,
                 };
                 let res = tokio::time::timeout(
@@ -595,6 +595,7 @@ mod tests {
             auth_type: store::AuthType::Key,
             username: "tester".to_string(),
             key_path: path.to_string(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -636,6 +637,7 @@ mod tests {
             auth_type: store::AuthType::Password,
             username: "root".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -727,6 +729,7 @@ mod tests {
             auth_type: store::AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: true,
             bastion_id: None,
@@ -739,6 +742,7 @@ mod tests {
             auth_type: store::AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: Some(bid.to_string()),

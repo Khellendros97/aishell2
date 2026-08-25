@@ -287,6 +287,21 @@ export type Theme = 'dark' | 'light';
 
 export type AuthType = 'password' | 'key';
 
+/** 系统凭据库条目；密码永不通过前端状态返回，password 认证只展示已保存状态。 */
+export interface Credential {
+  id: string;
+  name: string;
+  authType: AuthType;
+  username: string;
+  keyPath: string;
+}
+
+export type CredentialMode = 'ask' | 'update' | 'fork';
+
+export type ServerSaveResult =
+  | { status: 'saved'; server: Server }
+  | { status: 'needsChoice'; credentialName: string; referenceCount: number };
+
 export interface Server {
   id: string;
   name: string;
@@ -295,6 +310,8 @@ export interface Server {
   authType: AuthType;
   username: string;
   keyPath: string;
+  /** 关联凭据库条目；null = 未关联（新建凭据/手工填写） */
+  credentialId: string | null;
   /** AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP */
   locked: boolean;
   /** 堡垒机开关：true = 本服务器作为跳板机，目标主机的 SSH/SFTP 连接经它转发；卡片打「堡垒机」标签 */
@@ -547,6 +564,7 @@ export interface DwsSubmitResult {
 export interface AppState {
   settings: Settings;
   servers: Server[];
+  credentials: Credential[];
   projects: Project[];
   sessions: Record<string, ChatSession[]>;
   /** 项目分类目录清单（'/' 分隔相对路径，与 Project.folder 同语义；空目录也在此）；旧配置无此字段为空列表 */

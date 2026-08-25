@@ -4,7 +4,7 @@
 //! - 数据模型与 src/types.ts 逐字段对齐（serde camelCase），字段名以 .proto/shared/mock.js 为准；
 //! - 命令清单见 src/api.ts 的 store 段（命令名/参数名逐一对应，Tauri snake_case→camelCase 自动映射）；
 //! - 持久化 <config_dir>/aishell.json，先写 .tmp 再 rename 原子替换；
-//! - 密钥走 keyring（service "AIShell"，account: `server:<id>` / `llm:apikey`），永不进 JSON、永不返回前端。
+//! - 密钥走 keyring（service "AIShell"，account: `credential:<id>` / `llm:apikey`），永不进 JSON、永不返回前端。
 //!
 //! 命令注册由主 agent 在集成阶段统一做（lib.rs 的 generate_handler），本模块只暴露命令函数与类型。
 
@@ -282,7 +282,45 @@ impl AiMode {
     }
 }
 
-/// 服务器配置。**没有密码字段**——密码只存 keyring（account `server:<id>`）。
+/// 可复用的服务器认证凭据。**没有密码字段**——密码只存 keyring（account `credential:<id>`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Credential {
+    pub id: String,
+    pub name: String,
+    pub auth_type: AuthType,
+    pub username: String,
+    pub key_path: String,
+}
+
+/// 凭据保存模式：ask 在共享凭据可能被改写时返回 needsChoice，update 修改共享凭据，
+/// fork 为当前服务器创建独立凭据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialSaveMode {
+    #[default]
+    Ask,
+    Update,
+    Fork,
+}
+
+/// 保存服务器命令的结构化结果，与前端 `ServerSaveResult` 判别联合逐字段对齐。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum ServerSaveResult {
+    Saved {
+        server: Server,
+    },
+    NeedsChoice {
+        #[serde(rename = "credentialName")]
+        credential_name: String,
+        #[serde(rename = "referenceCount")]
+        reference_count: usize,
+    },
+}
+
+/// 服务器连接配置。认证镜像字段保留在服务器上以兼容现有前端；实际 SSH 凭据由 credential_id 指向。
+/// 服务器永不携带密码，密码只存 keyring（account `credential:<id>`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Server {
@@ -293,6 +331,9 @@ pub struct Server {
     pub auth_type: AuthType,
     pub username: String,
     pub key_path: String,
+    /// 服务器使用的可复用凭据；旧配置无此字段时由加载迁移补齐。
+    #[serde(default)]
+    pub credential_id: Option<String>,
     /// AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP；旧配置无此字段按未锁定。
     #[serde(default)]
     pub locked: bool,
@@ -795,6 +836,8 @@ pub struct ChatSession {
 #[serde(rename_all = "camelCase")]
 pub struct AppState {
     pub settings: Settings,
+    #[serde(default)]
+    pub credentials: Vec<Credential>,
     pub servers: Vec<Server>,
     pub projects: Vec<Project>,
     pub sessions: HashMap<String, Vec<ChatSession>>,
@@ -856,6 +899,24 @@ const KEYRING_ACCOUNT_BRAVE: &str = "brave:apikey";
 /// 云服务 OAuth 令牌（CR-1.5）：access_token 过期由 refresh_token 轮换，均只存 keyring。
 const KEYRING_ACCOUNT_CLOUD_ACCESS: &str = "cloud:access_token";
 const KEYRING_ACCOUNT_CLOUD_REFRESH: &str = "cloud:refresh_token";
+
+fn keyring_account_credential(id: &str) -> String {
+    format!("credential:{id}")
+}
+
+/// 旧服务器迁移所用的稳定凭据 ID；同一服务器重复加载始终得到同一凭据。
+fn legacy_credential_id(server_id: &str) -> String {
+    format!("credential-{server_id}")
+}
+
+fn default_credential_name(username: &str, host: &str) -> String {
+    let username = username.trim();
+    if username.is_empty() {
+        host.to_string()
+    } else {
+        format!("{username}@{host}")
+    }
+}
 /// MCP 接入令牌（自签本地配对令牌，非第三方凭据）。
 /// 规则例外说明：`mcp_ensure_token` 命令会把它返回前端供显示/复制——这是「密钥永不返回
 /// 前端」的唯一例外，因为令牌必须展示给用户粘贴到外部 agent 工具；仍存 keyring 不入 JSON。
@@ -919,11 +980,9 @@ impl SecretStore for KeyringSecrets {
     }
 }
 
-#[cfg(test)]
 #[derive(Default)]
 struct MemorySecrets(std::sync::Mutex<std::collections::HashMap<String, String>>);
 
-#[cfg(test)]
 impl SecretStore for MemorySecrets {
     fn get(&self, account: &str) -> Result<String, String> {
         self.0
@@ -950,7 +1009,7 @@ impl SecretStore for MemorySecrets {
 }
 
 /// 测试专用：内存密钥后端构造 Store，绝不触碰真实 keyring（生产路径禁止使用）。
-#[cfg(test)]
+#[doc(hidden)]
 pub fn test_store(dir: PathBuf) -> Store {
     Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap()
 }
@@ -958,9 +1017,22 @@ pub fn test_store(dir: PathBuf) -> Store {
 /// 测试专用：绕过 upsert_server 的业务校验直接写入/覆盖服务器，
 /// 用于构造合法 API 到不了的非法堡垒机绑定态（幽灵/非堡垒机引用、链式跳板）做错误路径测试。
 #[cfg(test)]
-pub fn force_upsert_server(store: &Store, server: Server) {
+pub fn force_upsert_server(store: &Store, mut server: Server) {
     store
         .with_state(|s| {
+            if server.credential_id.is_none() {
+                let credential_id = legacy_credential_id(&server.id);
+                server.credential_id = Some(credential_id.clone());
+                if !s.credentials.iter().any(|c| c.id == credential_id) {
+                    s.credentials.push(Credential {
+                        id: credential_id,
+                        name: default_credential_name(&server.username, &server.host),
+                        auth_type: server.auth_type,
+                        username: server.username.clone(),
+                        key_path: server.key_path.clone(),
+                    });
+                }
+            }
             match s.servers.iter_mut().find(|sv| sv.id == server.id) {
                 Some(slot) => *slot = server,
                 None => s.servers.push(server),
@@ -1014,7 +1086,8 @@ fn seed_marker(ws: &str) -> String {
 
 /// 规范化 workspace 路径用于播种记录去重：目录存在时 canonicalize，否则原样（写入前会创建）。
 /// Windows canonicalize 的 `\\?\` verbatim 前缀统一剥掉，避免落盘记录形态不一致。
-fn normalize_ws(ws: &str) -> String {    let p = PathBuf::from(ws.trim());
+fn normalize_ws(ws: &str) -> String {
+    let p = PathBuf::from(ws.trim());
     let p = std::fs::canonicalize(&p).unwrap_or(p);
     #[cfg(windows)]
     let p = {
@@ -1098,9 +1171,12 @@ impl Store {
             state: Mutex::new(state),
             secrets,
         };
+        // 服务器凭据迁移必须先于 known_secrets：会话脱敏应读取迁移后的
+        // credential:<id>，不能在旧 server:<id> 已删除后才发现新凭据。
+        store.migrate_legacy_credentials()?;
         // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
         // 加载时按现行规则清洗，有变更立即原子写回。
-// （云分支不做默认模型迁移：对外模型 id 仍是 deepseek-v4-flash，无需升级。）
+        // （云分支不做默认模型迁移：对外模型 id 仍是 deepseek-v4-flash，无需升级。）
         let known = store.known_secrets();
         let dirty = {
             let mut guard = store
@@ -1149,6 +1225,22 @@ impl Store {
         Ok(out)
     }
 
+    /// 用候选快照提交跨实体变更：持久化成功后才替换内存状态，失败时保持原状态。
+    fn with_candidate_state<T>(
+        &self,
+        f: impl FnOnce(&mut AppState) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())?;
+        let mut candidate = guard.clone();
+        let out = f(&mut candidate)?;
+        self.persist_locked(&candidate)?;
+        *guard = candidate;
+        Ok(out)
+    }
+
     /// 先写 aishell.json.tmp 再 rename，避免半截文件。
     fn persist_locked(&self, state: &AppState) -> Result<(), String> {
         let json =
@@ -1157,6 +1249,88 @@ impl Store {
         fs::write(&tmp, json).map_err(|e| format!("写入临时文件失败: {e}"))?;
         fs::rename(&tmp, self.config_dir.join(STATE_FILE))
             .map_err(|e| format!("原子替换配置文件失败: {e}"))
+    }
+
+    /// 将旧的 server:<serverId> 密钥迁移到确定性的 credential:<credentialId>。
+    /// 先写新密钥、再持久化状态、最后删除旧密钥；任一步失败都不会先删除旧密码。
+    fn migrate_legacy_credentials(&self) -> Result<(), String> {
+        let mut pending = Vec::new();
+        {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            for server in &guard.servers {
+                if server.credential_id.is_some() {
+                    continue;
+                }
+                let credential_id = legacy_credential_id(&server.id);
+                let has_credential = guard.credentials.iter().any(|c| c.id == credential_id);
+                let old_account = keyring_account_server(&server.id);
+                let old_password = self.secrets.get(&old_account).ok();
+                let new_password_exists = self
+                    .secrets
+                    .get(&keyring_account_credential(&credential_id))
+                    .is_ok();
+                pending.push((
+                    server.clone(),
+                    credential_id,
+                    has_credential,
+                    old_account,
+                    old_password,
+                    new_password_exists,
+                ));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // 先复制密钥。已有新账号不覆盖，重复启动时保持幂等且不破坏用户更新过的密码。
+        let mut created_accounts: Vec<String> = Vec::new();
+        for (_, credential_id, _, _, password, new_password_exists) in &pending {
+            if let (Some(password), false) = (password.as_deref(), *new_password_exists) {
+                let account = keyring_account_credential(credential_id);
+                if let Err(error) = self.secrets.set(&account, password) {
+                    for created in created_accounts {
+                        let _ = self.secrets.delete(&created);
+                    }
+                    return Err(error);
+                }
+                created_accounts.push(account);
+            }
+        }
+
+        if let Err(error) = self.with_candidate_state(|state| {
+            for (server, credential_id, has_credential, _, _, _) in &pending {
+                if let Some(slot) = state.servers.iter_mut().find(|s| s.id == server.id) {
+                    if slot.credential_id.is_none() {
+                        slot.credential_id = Some(credential_id.clone());
+                    }
+                }
+                if !*has_credential && !state.credentials.iter().any(|c| c.id == *credential_id) {
+                    state.credentials.push(Credential {
+                        id: credential_id.clone(),
+                        name: default_credential_name(&server.username, &server.host),
+                        auth_type: server.auth_type,
+                        username: server.username.clone(),
+                        key_path: server.key_path.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }) {
+            for account in created_accounts {
+                let _ = self.secrets.delete(&account);
+            }
+            return Err(error);
+        }
+
+        // 状态已经成功落盘后才清理旧账号；清理失败不影响新凭据和旧密码的可恢复性。
+        for (_, _, _, old_account, _, _) in pending {
+            self.secrets.delete(&old_account)?;
+        }
+        Ok(())
     }
 
     /// 配置完整性（CR-2.5）：托管模式 + 已登录（refresh_token 在 keyring）即视为完整，
@@ -1221,7 +1395,10 @@ impl Store {
         }
         let marker = seed_marker(&ws);
         {
-            let guard = self.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
             if guard.seeded_skill_workspaces.contains(&marker) {
                 return Ok(());
             }
@@ -1342,11 +1519,9 @@ impl Store {
         }
     }
 
-    /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
-    /// 堡垒机绑定约束（非法组合在写 keyring 前拒绝）：
-    /// - 一台服务器不能同时是堡垒机又是目标主机；
-    /// - 目标主机的 bastion_id 必须指向一台已开启堡垒机的服务器。
-    pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
+    /// 校验堡垒机绑定约束：一台服务器不能同时作为堡垒机与目标主机，
+    /// 目标主机的 bastion_id 必须指向一台已开启堡垒机的服务器。
+    fn validate_server(&self, server: &Server) -> Result<(), String> {
         if server.is_bastion && server.bastion_id.is_some() {
             return Err(format!(
                 "服务器「{}」不能同时作为堡垒机与目标主机",
@@ -1354,8 +1529,13 @@ impl Store {
             ));
         }
         if let Some(bid) = &server.bastion_id {
-            let bastion_ok =
-                self.with_state(|s| Ok(s.servers.iter().any(|sv| sv.id == *bid && sv.is_bastion)))?;
+            let bastion_ok = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?
+                .servers
+                .iter()
+                .any(|sv| sv.id == *bid && sv.is_bastion);
             if !bastion_ok {
                 return Err(format!(
                     "目标主机「{}」的堡垒机不存在或未开启堡垒机功能（{}）",
@@ -1363,19 +1543,299 @@ impl Store {
                 ));
             }
         }
-        if let Some(pw) = password {
-            self.secrets.set(&keyring_account_server(&server.id), pw)?;
-        }
-        self.with_state(|s| {
-            match s.servers.iter_mut().find(|sv| sv.id == server.id) {
-                Some(slot) => *slot = server,
-                None => s.servers.push(server),
-            }
-            Ok(())
-        })
+        Ok(())
     }
 
-    /// 移除服务器、级联从所有 projects[].server_ids 移除、删 keyring 条目（不存在不算错）。
+    fn new_credential_id(&self, server_id: &str, state: &AppState) -> String {
+        let base = format!("credential-{server_id}");
+        if !state.credentials.iter().any(|c| c.id == base) {
+            return base;
+        }
+        let mut n = 2;
+        loop {
+            let id = format!("{base}-{n}");
+            if !state.credentials.iter().any(|c| c.id == id) {
+                return id;
+            }
+            n += 1;
+        }
+    }
+
+    fn credential_from_server(id: String, server: &Server, name: String) -> Credential {
+        Credential {
+            id,
+            name,
+            auth_type: server.auth_type,
+            username: server.username.clone(),
+            key_path: server.key_path.clone(),
+        }
+    }
+
+    /// 服务器已存在则更新，否则插入；password 为 Some 时写入凭据 keyring，None 保持原值。
+    /// 这是内部兼容 API，采用确定性的 update 行为，不向调用方暴露交互选择。
+    pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
+        self.save_server_with_credential(server, password, CredentialSaveMode::Update)
+            .map(|_| ())
+    }
+
+    /// 保存服务器并按凭据引用关系处理共享凭据。
+    pub fn save_server_with_credential(
+        &self,
+        mut server: Server,
+        password: Option<&str>,
+        mode: CredentialSaveMode,
+    ) -> Result<ServerSaveResult, String> {
+        self.validate_server(&server)?;
+        let snapshot = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())?
+            .clone();
+        let existing = snapshot.servers.iter().find(|s| s.id == server.id).cloned();
+        let current_id = existing.as_ref().and_then(|s| s.credential_id.clone());
+        let current = current_id
+            .as_ref()
+            .and_then(|id| snapshot.credentials.iter().find(|c| c.id == *id).cloned());
+        let requested_id = server.credential_id.clone();
+        let requested = requested_id
+            .as_ref()
+            .and_then(|id| snapshot.credentials.iter().find(|c| c.id == *id).cloned());
+        if requested_id.is_some() && requested.is_none() {
+            return Err(format!(
+                "凭据不存在：{}",
+                requested_id.as_deref().unwrap_or_default()
+            ));
+        }
+
+        let target_references = requested_id.as_ref().map_or(0, |id| {
+            snapshot
+                .servers
+                .iter()
+                .filter(|item| item.credential_id.as_deref() == Some(id))
+                .count()
+        });
+        let same_credential = requested_id.is_some() && requested_id == current_id;
+        let credential_changed = requested.as_ref().is_some_and(|credential| {
+            credential.auth_type != server.auth_type
+                || credential.username != server.username
+                || credential.key_path != server.key_path
+        });
+        let modifies_existing = credential_changed || password.is_some();
+        if let Some(credential) = requested.as_ref() {
+            if target_references > 0 && mode == CredentialSaveMode::Ask && modifies_existing {
+                return Ok(ServerSaveResult::NeedsChoice {
+                    credential_name: credential.name.clone(),
+                    reference_count: target_references,
+                });
+            }
+        }
+
+        let mut update_shared = false;
+        let mut copy_from = None;
+        let credential = match (&existing, requested, same_credential, mode) {
+            (_, Some(selected), _, CredentialSaveMode::Fork) if modifies_existing => {
+                copy_from = Some(selected.id.clone());
+                Self::credential_from_server(
+                    self.new_credential_id(&server.id, &snapshot),
+                    &server,
+                    default_credential_name(&server.username, &server.host),
+                )
+            }
+            (_, Some(mut selected), _, CredentialSaveMode::Update) if modifies_existing => {
+                selected.auth_type = server.auth_type;
+                selected.username = server.username.clone();
+                selected.key_path = server.key_path.clone();
+                update_shared = true;
+                selected
+            }
+            (_, Some(selected), _, _) => {
+                server.auth_type = selected.auth_type;
+                server.username = selected.username.clone();
+                server.key_path = selected.key_path.clone();
+                selected
+            }
+            (Some(_), None, _, _) => {
+                copy_from = current.as_ref().map(|credential| credential.id.clone());
+                Self::credential_from_server(
+                    self.new_credential_id(&server.id, &snapshot),
+                    &server,
+                    default_credential_name(&server.username, &server.host),
+                )
+            }
+            (None, None, _, _) => Self::credential_from_server(
+                self.new_credential_id(&server.id, &snapshot),
+                &server,
+                default_credential_name(&server.username, &server.host),
+            ),
+        };
+        server.credential_id = Some(credential.id.clone());
+
+        let account = keyring_account_credential(&credential.id);
+        let old_secret = self.secrets.get(&account).ok();
+        let copied_secret = copy_from
+            .as_deref()
+            .and_then(|id| self.secrets.get(&keyring_account_credential(id)).ok());
+        let secret_update = if credential.auth_type == AuthType::Key {
+            Some(None)
+        } else if let Some(value) = password {
+            Some(Some(value.to_string()))
+        } else if copy_from.is_some() {
+            copied_secret.map(Some)
+        } else {
+            None
+        };
+        if let Some(value) = &secret_update {
+            match value {
+                Some(value) => self.secrets.set(&account, value)?,
+                None => self.secrets.delete(&account)?,
+            }
+        }
+
+        let persisted = self.with_candidate_state(|state| {
+            match state
+                .credentials
+                .iter_mut()
+                .find(|item| item.id == credential.id)
+            {
+                Some(slot) if update_shared => *slot = credential.clone(),
+                Some(_) => {}
+                None => state.credentials.push(credential.clone()),
+            }
+            if update_shared {
+                for item in &mut state.servers {
+                    if item.credential_id.as_deref() == Some(&credential.id) {
+                        item.auth_type = credential.auth_type;
+                        item.username = credential.username.clone();
+                        item.key_path = credential.key_path.clone();
+                    }
+                }
+            }
+            match state.servers.iter_mut().find(|item| item.id == server.id) {
+                Some(slot) => *slot = server.clone(),
+                None => state.servers.push(server.clone()),
+            }
+            Ok(())
+        });
+        if let Err(error) = persisted {
+            if secret_update.is_some() {
+                match old_secret {
+                    Some(value) => {
+                        let _ = self.secrets.set(&account, &value);
+                    }
+                    None => {
+                        let _ = self.secrets.delete(&account);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        Ok(ServerSaveResult::Saved { server })
+    }
+
+    /// 全部凭据配置（不含密码）。
+    pub fn credentials_all(&self) -> Vec<Credential> {
+        self.state
+            .lock()
+            .map(|g| g.credentials.clone())
+            .unwrap_or_default()
+    }
+
+    /// 保存凭据并同步所有引用服务器的认证镜像；password 为 None 保持原密码。
+    pub fn upsert_credential(
+        &self,
+        credential: Credential,
+        password: Option<&str>,
+    ) -> Result<Credential, String> {
+        if credential.id.trim().is_empty() || credential.name.trim().is_empty() {
+            return Err("凭据名称不能为空".to_string());
+        }
+        let account = keyring_account_credential(&credential.id);
+        let old_secret = self.secrets.get(&account).ok();
+        let secret_update = if credential.auth_type == AuthType::Key {
+            Some(None)
+        } else {
+            password.map(|value| Some(value.to_string()))
+        };
+        if let Some(value) = &secret_update {
+            match value {
+                Some(value) => self.secrets.set(&account, value)?,
+                None => self.secrets.delete(&account)?,
+            }
+        }
+        let persisted = self.with_candidate_state(|state| {
+            match state
+                .credentials
+                .iter_mut()
+                .find(|item| item.id == credential.id)
+            {
+                Some(slot) => *slot = credential.clone(),
+                None => state.credentials.push(credential.clone()),
+            }
+            for server in &mut state.servers {
+                if server.credential_id.as_deref() == Some(&credential.id) {
+                    server.auth_type = credential.auth_type;
+                    server.username = credential.username.clone();
+                    server.key_path = credential.key_path.clone();
+                }
+            }
+            Ok(credential.clone())
+        });
+        if let Err(error) = persisted {
+            if secret_update.is_some() {
+                match old_secret {
+                    Some(value) => {
+                        let _ = self.secrets.set(&account, &value);
+                    }
+                    None => {
+                        let _ = self.secrets.delete(&account);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        persisted
+    }
+
+    /// 删除未被服务器引用的凭据；密钥认证凭据也尽力清理对应 keyring 账号。
+    pub fn delete_credential(&self, id: &str) -> Result<(), String> {
+        let (credential, references, old_password) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            let credential = guard.credentials.iter().find(|c| c.id == id).cloned();
+            let references = guard
+                .servers
+                .iter()
+                .filter(|s| s.credential_id.as_deref() == Some(id))
+                .count();
+            let password = self.secrets.get(&keyring_account_credential(id)).ok();
+            (credential, references, password)
+        };
+        if credential.is_none() {
+            return Ok(());
+        }
+        if references > 0 {
+            return Err(format!(
+                "凭据「{}」仍被 {} 台服务器引用，不能删除",
+                credential.unwrap().name,
+                references
+            ));
+        }
+        self.secrets.delete(&keyring_account_credential(id))?;
+        if let Err(e) = self.with_state(|s| {
+            s.credentials.retain(|c| c.id != id);
+            Ok(())
+        }) {
+            if let Some(password) = old_password {
+                let _ = self.secrets.set(&keyring_account_credential(id), &password);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 移除服务器、级联从所有 projects[].server_ids 移除，不删除可复用凭据。
     /// 服务器是堡垒机且仍有目标主机时拒绝删除（避免留下指向幽灵堡垒机的目标），
     /// 提示先到「SSH跳转设置」解除目标主机绑定。
     fn delete_server(&self, id: &str) -> Result<(), String> {
@@ -1393,7 +1853,7 @@ impl Store {
                 "堡垒机「{name}」仍有目标主机绑定，请先在「SSH跳转设置」中解除目标主机绑定后再删除"
             ));
         }
-        self.secrets.delete(&keyring_account_server(id))?;
+        // 删除服务器不删除可复用凭据；凭据由用户在凭据管理中显式删除。
         self.with_state(|s| {
             s.servers.retain(|sv| sv.id != id);
             s.mcp_devices.remove(id);
@@ -1404,14 +1864,8 @@ impl Store {
         })
     }
 
-    /// 清除全部服务器配置：先删各服务器 keyring 密钥（失败即中止、state 未动），
-    /// 再一次性清空 servers 并让所有 projects 解绑，原子落盘。
+    /// 清除全部服务器配置但保留可复用凭据；所有 projects 解绑并原子落盘。
     pub fn clear_all_servers(&self) -> Result<(), String> {
-        let ids: Vec<String> =
-            self.with_state(|s| Ok(s.servers.iter().map(|sv| sv.id.clone()).collect()))?;
-        for id in &ids {
-            self.secrets.delete(&keyring_account_server(id))?;
-        }
         self.with_state(|s| {
             s.servers.clear();
             s.mcp_devices.clear();
@@ -1626,6 +2080,7 @@ impl Store {
                 match s.servers.iter_mut().find(|x| x.id == sv.id) {
                     Some(slot) => {
                         let mut merged = sv.clone();
+                        merged.credential_id = slot.credential_id.clone();
                         merged.locked = slot.locked;
                         merged.is_bastion = slot.is_bastion;
                         merged.bastion_id = slot.bastion_id.clone();
@@ -1637,7 +2092,22 @@ impl Store {
                         }
                     }
                     None => {
-                        s.servers.push(sv.clone());
+                        let mut imported = sv.clone();
+                        let credential_id = imported
+                            .credential_id
+                            .clone()
+                            .unwrap_or_else(|| legacy_credential_id(&imported.id));
+                        imported.credential_id = Some(credential_id.clone());
+                        if !s.credentials.iter().any(|c| c.id == credential_id) {
+                            s.credentials.push(Credential {
+                                id: credential_id,
+                                name: default_credential_name(&imported.username, &imported.host),
+                                auth_type: imported.auth_type,
+                                username: imported.username.clone(),
+                                key_path: imported.key_path.clone(),
+                            });
+                        }
+                        s.servers.push(imported);
                         result.imported += 1;
                     }
                 }
@@ -1745,7 +2215,11 @@ impl Store {
     /// path 为 Some → 在该目录下创建 .aishell/；为 None → 用 <workspace_dir>/<name> 并创建（含 .aishell/）。
     /// 目录已存在不报错。返回最终项目路径。
     /// pub(crate)：ai_actions 的 SDK 导入项目（路径留空时默认 workspace 下创建）复用。
-    pub(crate) fn ensure_project_dirs(&self, path: Option<&str>, name: &str) -> Result<String, String> {
+    pub(crate) fn ensure_project_dirs(
+        &self,
+        path: Option<&str>,
+        name: &str,
+    ) -> Result<String, String> {
         let project_dir = match path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
             _ => {
@@ -1775,7 +2249,11 @@ impl Store {
         Ok(guard.sessions.get(project_id).cloned().unwrap_or_default())
     }
 
-    pub(crate) fn session_upsert(&self, project_id: &str, mut session: ChatSession) -> Result<(), String> {
+    pub(crate) fn session_upsert(
+        &self,
+        project_id: &str,
+        mut session: ChatSession,
+    ) -> Result<(), String> {
         // 落盘前脱敏：快照/文件引用/消息正文可能含配置里读到的凭据（硬约束：密码永不进 JSON）。
         // 注意 known_secrets() 自身要锁 state，必须先于 with_state 调用（std Mutex 不可重入）。
         let known = self.known_secrets();
@@ -1813,7 +2291,9 @@ impl Store {
         first_message: &str,
     ) -> Result<Option<String>, String> {
         self.with_state(|s| {
-            let Some(session) = s.sessions.get_mut(project_id)
+            let Some(session) = s
+                .sessions
+                .get_mut(project_id)
                 .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
             else {
                 return Ok(None);
@@ -1821,7 +2301,10 @@ impl Store {
             let Some(message) = session.messages.first() else {
                 return Ok(None);
             };
-            if session.auto_title_triggered || message.role != "user" || message.content != first_message {
+            if session.auto_title_triggered
+                || message.role != "user"
+                || message.content != first_message
+            {
                 return Ok(None);
             }
             let expected_title = session.title.clone();
@@ -1839,12 +2322,17 @@ impl Store {
         title: &str,
     ) -> Result<bool, String> {
         self.with_state(|s| {
-            let Some(session) = s.sessions.get_mut(project_id)
+            let Some(session) = s
+                .sessions
+                .get_mut(project_id)
                 .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
             else {
                 return Ok(false);
             };
-            if !expected_titles.iter().any(|expected| expected == &session.title) {
+            if !expected_titles
+                .iter()
+                .any(|expected| expected == &session.title)
+            {
                 return Ok(false);
             }
             session.title = title.to_string();
@@ -1860,7 +2348,9 @@ impl Store {
         archived: bool,
     ) -> Result<bool, String> {
         self.with_state(|s| {
-            let Some(session) = s.sessions.get_mut(project_id)
+            let Some(session) = s
+                .sessions
+                .get_mut(project_id)
                 .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
             else {
                 return Ok(false);
@@ -1887,12 +2377,29 @@ impl Store {
         guard.servers.iter().find(|sv| sv.id == id).cloned()
     }
 
-    /// 读 keyring 密钥；account 形如 `server:<id>` / `llm:apikey`（service "AIShell"）。
+    /// 读通用 keyring 密钥（仅内部后端使用）。密码账号统一为 credential:<id>。
+    /// 对历史测试/异常调用保留 server:<id> 的只读兼容映射，正常 SSH 路径不使用它。
     pub fn read_secret(&self, account: &str) -> Result<String, String> {
+        if let Some(server_id) = account.strip_prefix("server:") {
+            if let Some(server) = self.server(server_id) {
+                if let Ok(value) = self.read_server_secret(&server) {
+                    return Ok(value);
+                }
+            }
+        }
         self.secrets.get(account)
     }
 
-    /// 已知密钥字面量（LLM/Brave API Key + 各服务器密码 + 数据库连接密码），供 redact 脱敏精确匹配。
+    /// 按服务器引用读取密码；正常路径只访问 credential:<id>。
+    pub fn read_server_secret(&self, server: &Server) -> Result<String, String> {
+        let credential_id = server
+            .credential_id
+            .as_deref()
+            .ok_or_else(|| format!("服务器「{}」未关联登录凭据", server.name))?;
+        self.secrets.get(&keyring_account_credential(credential_id))
+    }
+
+    /// 已知密钥字面量（LLM/Brave API Key + 各凭据密码 + 数据库连接密码），供 redact 脱敏精确匹配。
     /// 空值与 <4 字符的短值剔除（短值误伤面大），结果去重。读取失败的条目静默跳过。
     pub fn known_secrets(&self) -> Vec<String> {
         let mut out: Vec<String> = [KEYRING_ACCOUNT_LLM, KEYRING_ACCOUNT_BRAVE]
@@ -1901,10 +2408,15 @@ impl Store {
             .collect();
         let guard = self.state.lock();
         if let Ok(g) = guard {
-            for sv in &g.servers {
-                if let Ok(v) = self.secrets.get(&keyring_account_server(&sv.id)) {
+            for credential in &g.credentials {
+                if let Ok(v) = self
+                    .secrets
+                    .get(&keyring_account_credential(&credential.id))
+                {
                     out.push(v);
                 }
+            }
+            for sv in &g.servers {
                 if let Some(conns) = g.db_connections.get(&sv.id) {
                     for c in conns {
                         if let Ok(v) = self.secrets.get(&keyring_account_db(&sv.id, &c.id)) {
@@ -2013,7 +2525,10 @@ impl Store {
 
     /// 全部服务器配置（clone 返回；不含密码——密码在 keyring）。SDK 导入去重等用。
     pub fn servers_all(&self) -> Vec<Server> {
-        self.state.lock().map(|g| g.servers.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.servers.clone())
+            .unwrap_or_default()
     }
 
     /// 全部普通项目（clone 返回）。系统任务合成项目永不暴露给项目列表或 SDK 导入。
@@ -2293,8 +2808,27 @@ pub async fn upsert_server(
     store: State<'_, Arc<Store>>,
     server: Server,
     password: Option<String>,
-) -> Result<(), String> {
-    store.upsert_server(server, password.as_deref())
+    credential_mode: Option<CredentialSaveMode>,
+) -> Result<ServerSaveResult, String> {
+    store.save_server_with_credential(
+        server,
+        password.as_deref(),
+        credential_mode.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+pub async fn upsert_credential(
+    store: State<'_, Arc<Store>>,
+    credential: Credential,
+    password: Option<String>,
+) -> Result<Credential, String> {
+    store.upsert_credential(credential, password.as_deref())
+}
+
+#[tauri::command]
+pub async fn delete_credential(store: State<'_, Arc<Store>>, id: String) -> Result<(), String> {
+    store.delete_credential(&id)
 }
 
 #[tauri::command]
@@ -2476,6 +3010,22 @@ mod tests {
         dir
     }
 
+    fn credential_test_server(id: &str, host: &str) -> Server {
+        Server {
+            id: id.to_string(),
+            name: format!("服务器-{id}"),
+            host: host.to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "deploy".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+        }
+    }
+
     fn test_chat_msg(role: &str, content: &str) -> ChatMsg {
         ChatMsg {
             role: role.to_string(),
@@ -2511,6 +3061,22 @@ mod tests {
                 auto_backup_remote_files: true,
                 knowledge: KnowledgeConfig::default(),
             },
+            credentials: vec![
+                Credential {
+                    id: "credential-srv-1".to_string(),
+                    name: "deploy@47.102.118.66".to_string(),
+                    auth_type: AuthType::Password,
+                    username: "deploy".to_string(),
+                    key_path: String::new(),
+                },
+                Credential {
+                    id: "credential-srv-2".to_string(),
+                    name: "ubuntu@192.168.10.21".to_string(),
+                    auth_type: AuthType::Key,
+                    username: "ubuntu".to_string(),
+                    key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
+                },
+            ],
             servers: vec![
                 Server {
                     id: "srv-1".to_string(),
@@ -2520,6 +3086,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "deploy".to_string(),
                     key_path: String::new(),
+                    credential_id: Some("credential-srv-1".to_string()),
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2532,6 +3099,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "ubuntu".to_string(),
                     key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
+                    credential_id: Some("credential-srv-2".to_string()),
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2560,7 +3128,7 @@ mod tests {
                         id: "sess-1".to_string(),
                         title: "会话一".to_string(),
                         auto_title_triggered: false,
-                    archived: false,
+                        archived: false,
                         messages: vec![ChatMsg {
                             role: "user".to_string(),
                             content: "看看日志".to_string(),
@@ -2612,7 +3180,8 @@ mod tests {
                                 source: "clipboard".to_string(),
                                 name: "截图.png".to_string(),
                                 mime: "image/png".to_string(),
-                                path: "D:/demo/.aishell/ai-images/1752000000000_截图.png".to_string(),
+                                path: "D:/demo/.aishell/ai-images/1752000000000_截图.png"
+                                    .to_string(),
                                 origin_path: None,
                                 server_id: None,
                                 size: 4096,
@@ -2842,7 +3411,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_server_cascades_and_clears_keyring() {
+    fn delete_server_cascades_and_keeps_reusable_credential() {
         let dir = temp_config_dir("cascade");
         let store = test_store(dir);
         store
@@ -2855,6 +3424,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2872,6 +3442,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2891,8 +3462,9 @@ mod tests {
             })
             .unwrap();
 
-        // 删除前密钥库里确实有密码
-        assert_eq!(store.read_secret("server:srv-c-1").unwrap(), "pw-1");
+        // 删除前凭据库里确实有密码
+        let deleted_server = store.server("srv-c-1").unwrap();
+        assert_eq!(store.read_server_secret(&deleted_server).unwrap(), "pw-1");
 
         store.delete_server("srv-c-1").unwrap();
 
@@ -2901,10 +3473,169 @@ mod tests {
         assert_eq!(guard.servers[0].id, "srv-c-2");
         assert_eq!(guard.projects[0].server_ids, vec!["srv-c-2".to_string()]);
         drop(guard);
-        // 密钥条目已删（再读应报 NoEntry 类错误）
-        assert!(store.read_secret("server:srv-c-1").is_err());
+        // 删除服务器只解除引用，可复用凭据及其密码仍由凭据库管理。
+        assert_eq!(store.read_server_secret(&deleted_server).unwrap(), "pw-1");
         // 删除不存在的服务器不算错
         store.delete_server("srv-c-404").unwrap();
+    }
+
+    #[test]
+    fn server_save_result_uses_frontend_camel_case_contract() {
+        let value = serde_json::to_value(ServerSaveResult::NeedsChoice {
+            credential_name: "共享凭据".to_string(),
+            reference_count: 2,
+        })
+        .unwrap();
+
+        assert_eq!(value["status"], "needsChoice");
+        assert_eq!(value["credentialName"], "共享凭据");
+        assert_eq!(value["referenceCount"], 2);
+        assert!(value.get("credential_name").is_none());
+        assert!(value.get("reference_count").is_none());
+    }
+
+    #[test]
+    fn shared_credential_ask_update_and_fork_are_consistent() {
+        let dir = temp_config_dir("shared-credential");
+        let store = test_store(dir);
+        let first = credential_test_server("srv-a", "10.0.0.1");
+        store
+            .upsert_server(first.clone(), Some("old-password"))
+            .unwrap();
+        let first = store.server("srv-a").unwrap();
+        let credential_id = first.credential_id.clone().unwrap();
+
+        let mut second = credential_test_server("srv-b", "10.0.0.2");
+        second.credential_id = Some(credential_id.clone());
+        let saved = store
+            .save_server_with_credential(second, None, CredentialSaveMode::Ask)
+            .unwrap();
+        assert!(matches!(saved, ServerSaveResult::Saved { .. }));
+
+        let mut changed = store.server("srv-a").unwrap();
+        changed.username = "root".to_string();
+        let result = store
+            .save_server_with_credential(
+                changed.clone(),
+                Some("new-password"),
+                CredentialSaveMode::Ask,
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            ServerSaveResult::NeedsChoice {
+                reference_count: 2,
+                ..
+            }
+        ));
+        assert_eq!(store.server("srv-a").unwrap().username, "deploy");
+        assert_eq!(store.read_server_secret(&first).unwrap(), "old-password");
+
+        let updated = store
+            .save_server_with_credential(
+                changed.clone(),
+                Some("new-password"),
+                CredentialSaveMode::Update,
+            )
+            .unwrap();
+        assert!(matches!(updated, ServerSaveResult::Saved { .. }));
+        assert!(store
+            .servers_all()
+            .iter()
+            .filter(|server| server.credential_id.as_deref() == Some(&credential_id))
+            .all(|server| server.username == "root"));
+        assert_eq!(
+            store
+                .read_server_secret(&store.server("srv-b").unwrap())
+                .unwrap(),
+            "new-password"
+        );
+
+        let mut forked = store.server("srv-a").unwrap();
+        forked.username = "release".to_string();
+        let result = store
+            .save_server_with_credential(forked, None, CredentialSaveMode::Fork)
+            .unwrap();
+        let ServerSaveResult::Saved { server: forked } = result else {
+            panic!("fork 应保存服务器");
+        };
+        assert_ne!(
+            forked.credential_id.as_deref(),
+            Some(credential_id.as_str())
+        );
+        assert_eq!(store.read_server_secret(&forked).unwrap(), "new-password");
+        assert_eq!(store.server("srv-b").unwrap().username, "root");
+    }
+
+    #[test]
+    fn legacy_server_credentials_migrate_once_without_exposing_password() {
+        let dir = temp_config_dir("credential-migration");
+        let mut state = AppState::default();
+        state
+            .servers
+            .push(credential_test_server("srv-legacy", "10.0.0.9"));
+        fs::write(
+            dir.join(STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        let secrets = std::sync::Arc::new(MemorySecrets::default());
+        secrets.set("server:srv-legacy", "legacy-password").unwrap();
+
+        let store = Store::with_secrets(dir.clone(), secrets.clone()).unwrap();
+        let migrated = store.server("srv-legacy").unwrap();
+        assert_eq!(
+            migrated.credential_id.as_deref(),
+            Some("credential-srv-legacy")
+        );
+        assert_eq!(store.credentials_all().len(), 1);
+        assert_eq!(
+            store.read_server_secret(&migrated).unwrap(),
+            "legacy-password"
+        );
+        assert!(secrets.get("server:srv-legacy").is_err());
+        let json = fs::read_to_string(dir.join(STATE_FILE)).unwrap();
+        assert!(!json.contains("legacy-password"));
+        drop(store);
+
+        let reloaded = Store::with_secrets(dir, secrets).unwrap();
+        assert_eq!(reloaded.credentials_all().len(), 1);
+        assert_eq!(
+            reloaded
+                .server("srv-legacy")
+                .unwrap()
+                .credential_id
+                .as_deref(),
+            Some("credential-srv-legacy")
+        );
+    }
+
+    #[test]
+    fn credential_delete_requires_no_references_and_server_delete_keeps_it() {
+        let dir = temp_config_dir("credential-delete");
+        let store = test_store(dir);
+        store
+            .upsert_server(
+                credential_test_server("srv-delete", "10.0.0.3"),
+                Some("password"),
+            )
+            .unwrap();
+        let server = store.server("srv-delete").unwrap();
+        let credential_id = server.credential_id.clone().unwrap();
+        assert!(store.delete_credential(&credential_id).is_err());
+
+        store.delete_server("srv-delete").unwrap();
+        assert!(store
+            .credentials_all()
+            .iter()
+            .any(|item| item.id == credential_id));
+        assert_eq!(store.read_server_secret(&server).unwrap(), "password");
+        store.delete_credential(&credential_id).unwrap();
+        assert!(store
+            .credentials_all()
+            .iter()
+            .all(|item| item.id != credential_id));
+        assert!(store.read_server_secret(&server).is_err());
     }
 
     #[test]
@@ -2919,6 +3650,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -2945,6 +3677,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: true,
             bastion_id: None,
@@ -2971,6 +3704,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-b".to_string()),
@@ -2985,6 +3719,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -2998,6 +3733,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-p".to_string()),
@@ -3013,6 +3749,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-ghost".to_string()),
@@ -3039,6 +3776,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: true,
             bastion_id: None,
@@ -3054,6 +3792,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: Some("srv-b".to_string()),
@@ -3308,7 +4047,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_servers_wipes_servers_and_keyring() {
+    fn clear_all_servers_keeps_reusable_credentials() {
         let dir = temp_config_dir("clear-all");
         let store = test_store(dir.clone());
         // 两台服务器（一台带密码）+ 一个已绑定项目
@@ -3322,6 +4061,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -3339,6 +4079,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -3357,7 +4098,8 @@ mod tests {
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
-        assert_eq!(store.read_secret("server:srv-cl-1").unwrap(), "pw-1");
+        let password_server = store.server("srv-cl-1").unwrap();
+        assert_eq!(store.read_server_secret(&password_server).unwrap(), "pw-1");
 
         store.clear_all_servers().unwrap();
 
@@ -3367,9 +4109,9 @@ mod tests {
         assert_eq!(guard.projects.len(), 1);
         assert!(guard.projects[0].server_ids.is_empty());
         drop(guard);
-        // keyring：全部删除
-        assert!(store.read_secret("server:srv-cl-1").is_err());
-        assert!(store.read_secret("server:srv-cl-2").is_err());
+        // 凭据库保留，后续仍可绑定到新服务器。
+        assert_eq!(store.credentials_all().len(), 2);
+        assert_eq!(store.read_server_secret(&password_server).unwrap(), "pw-1");
         // 落盘可重载且一致
         let reloaded = test_store(dir);
         let guard = reloaded.state.lock().unwrap();
@@ -3425,6 +4167,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -4261,7 +5004,10 @@ mod tests {
                 "部署检查",
             )
             .unwrap());
-        assert_eq!(store.sessions_get("proj-title").unwrap()[0].title, "部署检查");
+        assert_eq!(
+            store.sessions_get("proj-title").unwrap()[0].title,
+            "部署检查"
+        );
     }
 
     #[test]
@@ -4276,11 +5022,17 @@ mod tests {
             archived: false,
         };
         store.session_upsert("proj-arch", sess()).unwrap();
-        assert!(store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        assert!(store
+            .set_session_archived("proj-arch", "sess-arch", true)
+            .unwrap());
         // 重复设置同值返回 false（无变更）
-        assert!(!store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        assert!(!store
+            .set_session_archived("proj-arch", "sess-arch", true)
+            .unwrap());
         // 不存在会话返回 false 而非报错
-        assert!(!store.set_session_archived("proj-arch", "sess-none", true).unwrap());
+        assert!(!store
+            .set_session_archived("proj-arch", "sess-none", true)
+            .unwrap());
         // 前端残留快照 upsert 不得冲掉 archived 标记
         store.session_upsert("proj-arch", sess()).unwrap();
         let saved = store.sessions_get("proj-arch").unwrap().pop().unwrap();
@@ -4291,7 +5043,13 @@ mod tests {
         s2.archived = true;
         store.session_upsert("proj-arch", s2).unwrap();
         let list = store.sessions_get("proj-arch").unwrap();
-        assert!(!list.iter().find(|s| s.id == "sess-arch-2").unwrap().archived);
+        assert!(
+            !list
+                .iter()
+                .find(|s| s.id == "sess-arch-2")
+                .unwrap()
+                .archived
+        );
     }
 
     #[test]
@@ -4485,6 +5243,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4532,8 +5291,14 @@ mod tests {
         assert!(msg.file_refs.is_empty(), "旧数据应兼容为空引用列表");
         assert!(msg.server_refs.is_empty(), "旧数据应兼容为空服务器引用列表");
         assert!(msg.path_refs.is_empty(), "旧数据应兼容为空路径引用列表");
-        assert!(msg.browser_refs.is_empty(), "旧数据应兼容为空浏览器元素引用列表");
-        assert!(msg.browser_page_refs.is_empty(), "旧数据应兼容为空浏览器页面引用列表");
+        assert!(
+            msg.browser_refs.is_empty(),
+            "旧数据应兼容为空浏览器元素引用列表"
+        );
+        assert!(
+            msg.browser_page_refs.is_empty(),
+            "旧数据应兼容为空浏览器页面引用列表"
+        );
     }
 
     #[test]
@@ -4548,7 +5313,10 @@ mod tests {
             ..test_chat_msg("user", "看看 @page:控制台")
         };
         let json = serde_json::to_string(&m).unwrap();
-        assert!(json.contains("\"browserPageRefs\""), "序列化应为 camelCase: {json}");
+        assert!(
+            json.contains("\"browserPageRefs\""),
+            "序列化应为 camelCase: {json}"
+        );
         let back: ChatMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(back.browser_page_refs.len(), 1);
         assert_eq!(back.browser_page_refs[0].title, "控制台");
@@ -4595,6 +5363,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4643,6 +5412,7 @@ mod tests {
                 auth_type: AuthType::Password,
                 username: "root".to_string(),
                 key_path: String::new(),
+                credential_id: None,
                 locked: false,
                 is_bastion: false,
                 bastion_id: None,
@@ -4715,6 +5485,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4866,10 +5637,8 @@ mod tests {
     #[test]
     fn task_project_is_synthetic_fixed_path_and_agent_only() {
         let dir = temp_config_dir("task-project");
-        let workspace = std::env::temp_dir().join(format!(
-            "aishell-store-task-ws-{}",
-            std::process::id()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("aishell-store-task-ws-{}", std::process::id()));
         let _ = fs::remove_dir_all(&workspace);
         let store = test_store(dir.clone());
         store
@@ -4890,19 +5659,33 @@ mod tests {
             task.path.as_deref(),
             Some(workspace.join(".aishell").join("tasks").to_str().unwrap())
         );
-        assert!(workspace.join(".aishell").join("tasks").join(".aishell").is_dir());
+        assert!(workspace
+            .join(".aishell")
+            .join("tasks")
+            .join(".aishell")
+            .is_dir());
         assert_eq!(store.project(TASK_PROJECT_ID), Some(task.clone()));
         assert_eq!(store.project_path(TASK_PROJECT_ID), task.path);
         assert_eq!(store.ai_mode(TASK_PROJECT_ID), Some(AiMode::Agent));
         assert!(store.projects_all().iter().all(|p| p.id != TASK_PROJECT_ID));
-        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .projects
+            .iter()
+            .all(|p| p.id != TASK_PROJECT_ID));
         assert!(store.set_ai_mode(TASK_PROJECT_ID, AiMode::Agent).is_ok());
         assert_eq!(
-            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Yolo).unwrap_err(),
+            store
+                .set_ai_mode(TASK_PROJECT_ID, AiMode::Yolo)
+                .unwrap_err(),
             "系统任务上下文固定为工作模式"
         );
         assert_eq!(
-            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Suggest).unwrap_err(),
+            store
+                .set_ai_mode(TASK_PROJECT_ID, AiMode::Suggest)
+                .unwrap_err(),
             "系统任务上下文固定为工作模式"
         );
         let _ = fs::remove_dir_all(&workspace);
@@ -4912,7 +5695,10 @@ mod tests {
     fn task_project_requires_workspace_and_reserved_id_rejected() {
         let dir = temp_config_dir("task-project-reject");
         let store = test_store(dir);
-        assert_eq!(store.task_project().unwrap_err(), "请先在设置中配置工作区目录");
+        assert_eq!(
+            store.task_project().unwrap_err(),
+            "请先在设置中配置工作区目录"
+        );
         let task = Project {
             id: TASK_PROJECT_ID.to_string(),
             name: "伪造任务项目".to_string(),
@@ -4922,8 +5708,14 @@ mod tests {
             folder: String::new(),
             ai_mode: AiMode::Yolo,
         };
-        assert_eq!(store.upsert_project(task), Err("系统任务项目不可修改".to_string()));
-        assert_eq!(store.delete_project(TASK_PROJECT_ID), Err("系统任务项目不可删除".to_string()));
+        assert_eq!(
+            store.upsert_project(task),
+            Err("系统任务项目不可修改".to_string())
+        );
+        assert_eq!(
+            store.delete_project(TASK_PROJECT_ID),
+            Err("系统任务项目不可删除".to_string())
+        );
         store
             .with_state(|s| {
                 s.projects.push(Project {
@@ -4952,9 +5744,17 @@ mod tests {
             auto_title_triggered: false,
             archived: false,
         };
-        store.session_upsert(TASK_PROJECT_ID, session.clone()).unwrap();
+        store
+            .session_upsert(TASK_PROJECT_ID, session.clone())
+            .unwrap();
         assert_eq!(store.sessions_get(TASK_PROJECT_ID).unwrap(), vec![session]);
-        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .projects
+            .iter()
+            .all(|p| p.id != TASK_PROJECT_ID));
         let reloaded = test_store(dir);
         assert_eq!(reloaded.sessions_get(TASK_PROJECT_ID).unwrap().len(), 1);
     }
@@ -5013,6 +5813,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -5052,6 +5853,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: true,
                     is_bastion: false,
                     bastion_id: None,
@@ -5070,6 +5872,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -5093,6 +5896,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -5304,14 +6108,30 @@ mod tests {
             .join("skill-management")
             .join("SKILL.md");
         assert!(file.is_file(), "首次保存未播种内置技能");
-        let py_file = ws.join(".aishell").join("skills").join("python-script").join("SKILL.md");
+        let py_file = ws
+            .join(".aishell")
+            .join("skills")
+            .join("python-script")
+            .join("SKILL.md");
         assert!(py_file.is_file(), "首次保存未播种 python-script 内置技能");
         let content = fs::read_to_string(&file).unwrap();
         // 内容含两个目录、目录结构、scope/enabled 语义
-assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {content}");
-        assert!(content.contains("<name>/SKILL.md"), "缺少目录结构: {content}");
-        assert!(content.contains("## scope 语义"), "缺少 scope 语义: {content}");
-        assert!(content.contains("enabled") && content.contains("scope"), "缺少字段 schema");
+        assert!(
+            content.contains("## 两个技能根目录"),
+            "缺少目录说明: {content}"
+        );
+        assert!(
+            content.contains("<name>/SKILL.md"),
+            "缺少目录结构: {content}"
+        );
+        assert!(
+            content.contains("## scope 语义"),
+            "缺少 scope 语义: {content}"
+        );
+        assert!(
+            content.contains("enabled") && content.contains("scope"),
+            "缺少字段 schema"
+        );
         // 播种记录已落盘（记录的是 normalize_ws 规范化路径 + 播种代际标记）
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
@@ -5339,16 +6159,27 @@ assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {cont
             seeded_skill_workspaces: vec![legacy.clone()],
             ..Default::default()
         };
-        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        fs::write(
+            dir.join("aishell.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
         let store = test_store(dir);
         assert!(
-            ws.join(".aishell").join("skills").join("python-script").join("SKILL.md").is_file(),
+            ws.join(".aishell")
+                .join("skills")
+                .join("python-script")
+                .join("SKILL.md")
+                .is_file(),
             "旧工作区未补种 python-script"
         );
         let records = store.state.lock().unwrap().seeded_skill_workspaces.clone();
         assert_eq!(records.len(), 2, "旧记录保留 + 追加新代际标记: {records:?}");
         assert!(records.contains(&legacy), "旧记录被改写: {records:?}");
-        assert!(records.contains(&seed_marker(&legacy)), "缺新代际标记: {records:?}");
+        assert!(
+            records.contains(&seed_marker(&legacy)),
+            "缺新代际标记: {records:?}"
+        );
     }
 
     /// 目标已存在不覆盖；用户删除后同 workspace 重启/再次保存不复活。
@@ -5613,6 +6444,7 @@ assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {cont
                     auth_type: AuthType::Password,
                     username: "root".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -5711,18 +6543,22 @@ assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {cont
         let labels = on.enabled_labels();
         assert_eq!(labels, vec!["执行命令", "数据库查询"]);
     }
+
     /// 旧会话消息无 imageRefs 字段按空解析；带 imageRefs 的消息往返不丢字段。
     #[test]
     fn chat_msg_image_refs_compat_roundtrip() {
         let old = r#"{"role":"user","content":"看图","snapshots":[],"fileRefs":[],"serverRefs":[],"pathRefs":[],"browserRefs":[],"skillRefs":[],"actions":[],"ts":1}"#;
         let msg: ChatMsg = serde_json::from_str(old).unwrap();
-assert!(msg.image_refs.is_empty(), "旧会话无 imageRefs 应按空解析");
+        assert!(msg.image_refs.is_empty(), "旧会话无 imageRefs 应按空解析");
 
         let with_img = r#"{"role":"user","content":"看图","snapshots":[],"fileRefs":[],"serverRefs":[],"pathRefs":[],"browserRefs":[],"skillRefs":[],"imageRefs":[{"id":"img-1","source":"remote","name":"a.png","mime":"image/png","path":"C:/x/.aishell/ai-images/1_a.png","originPath":"/srv/a.png","serverId":"srv-1","size":10,"ts":2}],"actions":[],"ts":1}"#;
         let msg: ChatMsg = serde_json::from_str(with_img).unwrap();
         assert_eq!(msg.image_refs.len(), 1);
         assert_eq!(msg.image_refs[0].server_id.as_deref(), Some("srv-1"));
         let back = serde_json::to_string(&msg).unwrap();
-        assert!(back.contains("\"imageRefs\":"), "序列化应保留 camelCase 字段名");
+        assert!(
+            back.contains("\"imageRefs\":"),
+            "序列化应保留 camelCase 字段名"
+        );
     }
 }

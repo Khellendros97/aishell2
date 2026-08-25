@@ -26,7 +26,7 @@
  */
 import { icon } from '../../../../icons';
 import {
-  fsCopy, fsCreate, fsDelete, fsImport, fsMove, fsReveal, fsStat,
+  fsCopy, fsCreate, fsDelete, fsImport, fsIsText, fsMove, fsReveal, fsStat,
   sftpDelete, sftpDownload, sftpUpload,
 } from '../../../../api';
 import type { FsStat } from '../../../../types';
@@ -206,7 +206,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
     (document.activeElement as HTMLElement | null)?.blur?.();
     render();
   });
-  row.addEventListener('dblclick', () => openNode(node));
+  row.addEventListener('dblclick', () => void openNode(node));
   return row;
 }
 
@@ -232,8 +232,8 @@ async function deleteNode(node: TreeNode): Promise<void> {
   }
 }
 
-/* ---------- 打开(单击 / 菜单「打开」共用) ---------- */
-function openNode(node: TreeNode): void {
+/* ---------- 打开(双击 / 菜单「打开」共用) ---------- */
+async function openNode(node: TreeNode): Promise<void> {
   if (node.isDir) {
     if (isExpanded(node.path)) {
       collapse(node.path);
@@ -243,8 +243,13 @@ function openNode(node: TreeNode): void {
       if (node.children) render();
       else void loadDir(node);
     }
-  } else {
-    openLocalFile(node.path, node.name);
+    return;
+  }
+  try {
+    if (await fsIsText(node.path)) openLocalFile(node.path, node.name);
+    else await fsReveal(node.path);
+  } catch (err) {
+    toast(String(err), 'error');
   }
 }
 
@@ -512,7 +517,7 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
   ] : [];
   const uploadItems = sftpUploadItems(node.path, node.name);
   showContextMenu(x, y, [
-    { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => openNode(node) },
+    { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => void openNode(node) },
     ...(newItems.length ? ['sep' as const, ...newItems] : []),
     'sep',
     { label: '复制', iconName: 'copy', action: () => { setClip({ source: 'local', items: [{ path: node.path, name: node.name, isDir: node.isDir }], mode: 'copy' }); render(); } },

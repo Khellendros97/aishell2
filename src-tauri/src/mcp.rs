@@ -1222,6 +1222,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "test".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
