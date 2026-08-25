@@ -37,13 +37,13 @@ const COMMANDS: PanelCommand[] = [
   },
   {
     usage: 'server config clear',
-    desc: '清除所有服务器配置（服务器、分类目录、已保存的密码/密钥，所有项目解绑）',
+    desc: '清除所有服务器配置（凭据库保留，所有项目解绑）',
     match: (t) =>
       t.length === 3 && t[0] === 'server' && t[1] === 'config' && t[2] === 'clear',
     run: async () => {
       const ok = await confirmDialog({
         title: '清除所有服务器配置',
-        message: '将删除全部服务器、分类目录及已保存的密码/密钥，所有项目与服务器的绑定关系一并解除。此操作不可恢复，确定继续吗？',
+        message: '将删除全部服务器并解除所有项目绑定；凭据库中的登录信息会保留，可用于后续重新绑定。此操作不可恢复，确定继续吗？',
         danger: true,
         okText: '清除',
       });

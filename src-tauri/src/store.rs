@@ -4,7 +4,7 @@
 //! - 数据模型与 src/types.ts 逐字段对齐（serde camelCase），字段名以 .proto/shared/mock.js 为准；
 //! - 命令清单见 src/api.ts 的 store 段（命令名/参数名逐一对应，Tauri snake_case→camelCase 自动映射）；
 //! - 持久化 <config_dir>/aishell.json，先写 .tmp 再 rename 原子替换；
-//! - 密钥走 keyring（service "AIShell"，account: `server:<id>` / `llm:apikey`），永不进 JSON、永不返回前端。
+//! - 密钥走 keyring（service "AIShell"，account: `credential:<id>` / `llm:apikey`），永不进 JSON、永不返回前端。
 //!
 //! 命令注册由主 agent 在集成阶段统一做（lib.rs 的 generate_handler），本模块只暴露命令函数与类型。
 
@@ -39,7 +39,10 @@ impl<'de> Deserialize<'de> for Effort {
             "high" => Ok(Effort::High),
             "max" => Ok(Effort::Max),
             "medium" => Ok(Effort::Low),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["low", "high", "max"])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &["low", "high", "max"],
+            )),
         }
     }
 }
@@ -188,7 +191,43 @@ impl AiMode {
     }
 }
 
-/// 服务器配置。**没有密码字段**——密码只存 keyring（account `server:<id>`）。
+/// 可复用的服务器认证凭据。**没有密码字段**——密码只存 keyring（account `credential:<id>`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Credential {
+    pub id: String,
+    pub name: String,
+    pub auth_type: AuthType,
+    pub username: String,
+    pub key_path: String,
+}
+
+/// 凭据保存模式：ask 在共享凭据可能被改写时返回 needsChoice，update 修改共享凭据，
+/// fork 为当前服务器创建独立凭据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialSaveMode {
+    #[default]
+    Ask,
+    Update,
+    Fork,
+}
+
+/// 保存服务器命令的结构化结果，与前端 `ServerSaveResult` 判别联合逐字段对齐。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum ServerSaveResult {
+    Saved { server: Server },
+    NeedsChoice {
+        #[serde(rename = "credentialName")]
+        credential_name: String,
+        #[serde(rename = "referenceCount")]
+        reference_count: usize,
+    },
+}
+
+/// 服务器连接配置。认证镜像字段保留在服务器上以兼容现有前端；实际 SSH 凭据由 credential_id 指向。
+/// 服务器永不携带密码，密码只存 keyring（account `credential:<id>`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Server {
@@ -199,6 +238,9 @@ pub struct Server {
     pub auth_type: AuthType,
     pub username: String,
     pub key_path: String,
+    /// 服务器使用的可复用凭据；旧配置无此字段时由加载迁移补齐。
+    #[serde(default)]
+    pub credential_id: Option<String>,
     /// AI 操作锁：仅约束 AI 发起的远程动作，不影响用户手动 SSH/SFTP；旧配置无此字段按未锁定。
     #[serde(default)]
     pub locked: bool,
@@ -240,10 +282,36 @@ impl DbKind {
                 &["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]
             }
             DbKind::Redis => &[
-                "GET", "MGET", "KEYS", "SCAN", "TYPE", "TTL", "PTTL", "EXISTS", "DBSIZE",
-                "INFO", "PING", "STRLEN", "LLEN", "SCARD", "ZCARD", "HLEN", "HGET",
-                "HGETALL", "HKEYS", "HVALS", "SMEMBERS", "LRANGE", "ZRANGE", "SISMEMBER",
-                "HEXISTS", "SRANDMEMBER", "RANDOMKEY", "ZSCORE", "HSTRLEN", "GETRANGE",
+                "GET",
+                "MGET",
+                "KEYS",
+                "SCAN",
+                "TYPE",
+                "TTL",
+                "PTTL",
+                "EXISTS",
+                "DBSIZE",
+                "INFO",
+                "PING",
+                "STRLEN",
+                "LLEN",
+                "SCARD",
+                "ZCARD",
+                "HLEN",
+                "HGET",
+                "HGETALL",
+                "HKEYS",
+                "HVALS",
+                "SMEMBERS",
+                "LRANGE",
+                "ZRANGE",
+                "SISMEMBER",
+                "HEXISTS",
+                "SRANDMEMBER",
+                "RANDOMKEY",
+                "ZSCORE",
+                "HSTRLEN",
+                "GETRANGE",
             ],
         }
     }
@@ -675,6 +743,8 @@ pub struct ChatSession {
 #[serde(rename_all = "camelCase")]
 pub struct AppState {
     pub settings: Settings,
+    #[serde(default)]
+    pub credentials: Vec<Credential>,
     pub servers: Vec<Server>,
     pub projects: Vec<Project>,
     pub sessions: HashMap<String, Vec<ChatSession>>,
@@ -733,6 +803,24 @@ pub struct ScannedSession {
 const KEYRING_SERVICE: &str = "AIShell";
 const KEYRING_ACCOUNT_LLM: &str = "llm:apikey";
 const KEYRING_ACCOUNT_BRAVE: &str = "brave:apikey";
+
+fn keyring_account_credential(id: &str) -> String {
+    format!("credential:{id}")
+}
+
+/// 旧服务器迁移所用的稳定凭据 ID；同一服务器重复加载始终得到同一凭据。
+fn legacy_credential_id(server_id: &str) -> String {
+    format!("credential-{server_id}")
+}
+
+fn default_credential_name(username: &str, host: &str) -> String {
+    let username = username.trim();
+    if username.is_empty() {
+        host.to_string()
+    } else {
+        format!("{username}@{host}")
+    }
+}
 /// MCP 接入令牌（自签本地配对令牌，非第三方凭据）。
 /// 规则例外说明：`mcp_ensure_token` 命令会把它返回前端供显示/复制——这是「密钥永不返回
 /// 前端」的唯一例外，因为令牌必须展示给用户粘贴到外部 agent 工具；仍存 keyring 不入 JSON。
@@ -835,9 +923,22 @@ pub fn test_store(dir: PathBuf) -> Store {
 /// 测试专用：绕过 upsert_server 的业务校验直接写入/覆盖服务器，
 /// 用于构造合法 API 到不了的非法堡垒机绑定态（幽灵/非堡垒机引用、链式跳板）做错误路径测试。
 #[cfg(test)]
-pub fn force_upsert_server(store: &Store, server: Server) {
+pub fn force_upsert_server(store: &Store, mut server: Server) {
     store
         .with_state(|s| {
+            if server.credential_id.is_none() {
+                let credential_id = legacy_credential_id(&server.id);
+                server.credential_id = Some(credential_id.clone());
+                if !s.credentials.iter().any(|c| c.id == credential_id) {
+                    s.credentials.push(Credential {
+                        id: credential_id,
+                        name: default_credential_name(&server.username, &server.host),
+                        auth_type: server.auth_type,
+                        username: server.username.clone(),
+                        key_path: server.key_path.clone(),
+                    });
+                }
+            }
             match s.servers.iter_mut().find(|sv| sv.id == server.id) {
                 Some(slot) => *slot = server,
                 None => s.servers.push(server),
@@ -891,7 +992,8 @@ fn seed_marker(ws: &str) -> String {
 
 /// 规范化 workspace 路径用于播种记录去重：目录存在时 canonicalize，否则原样（写入前会创建）。
 /// Windows canonicalize 的 `\\?\` verbatim 前缀统一剥掉，避免落盘记录形态不一致。
-fn normalize_ws(ws: &str) -> String {    let p = PathBuf::from(ws.trim());
+fn normalize_ws(ws: &str) -> String {
+    let p = PathBuf::from(ws.trim());
     let p = std::fs::canonicalize(&p).unwrap_or(p);
     #[cfg(windows)]
     let p = {
@@ -975,13 +1077,19 @@ impl Store {
             state: Mutex::new(state),
             secrets,
         };
+        // 服务器凭据迁移必须先于 known_secrets：会话脱敏应读取迁移后的
+        // credential:<id>，不能在旧 server:<id> 已删除后才发现新凭据。
+        store.migrate_legacy_credentials()?;
         // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
         // 加载时按现行规则清洗，有变更立即原子写回。
         // 同时做默认模型迁移：配置里还是上一代默认值时升级为当前默认（vision 模型），
         // 用户显式改过的其他模型名不受影响。
         let known = store.known_secrets();
         let dirty = {
-            let mut guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
             let mut dirty = false;
             if guard.settings.llm.model_id == LEGACY_DEFAULT_MODEL_ID {
                 guard.settings.llm.model_id = LlmConfig::default().model_id;
@@ -995,7 +1103,10 @@ impl Store {
             dirty
         };
         if dirty {
-            let guard = store.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
             store.persist_locked(&guard)?;
         }
         // 内置技能一次性播种：workspace 已配置且从未播种时创建全局 skill-management；
@@ -1012,7 +1123,10 @@ impl Store {
     }
 
     /// 锁内变更状态并原子持久化；f 返回 Err 时不变更也不落盘。
-    fn with_state<T>(&self, f: impl FnOnce(&mut AppState) -> Result<T, String>) -> Result<T, String> {
+    fn with_state<T>(
+        &self,
+        f: impl FnOnce(&mut AppState) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut guard = self
             .state
             .lock()
@@ -1022,14 +1136,112 @@ impl Store {
         Ok(out)
     }
 
+    /// 用候选快照提交跨实体变更：持久化成功后才替换内存状态，失败时保持原状态。
+    fn with_candidate_state<T>(
+        &self,
+        f: impl FnOnce(&mut AppState) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())?;
+        let mut candidate = guard.clone();
+        let out = f(&mut candidate)?;
+        self.persist_locked(&candidate)?;
+        *guard = candidate;
+        Ok(out)
+    }
+
     /// 先写 aishell.json.tmp 再 rename，避免半截文件。
     fn persist_locked(&self, state: &AppState) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(state)
-            .map_err(|e| format!("序列化状态失败: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(state).map_err(|e| format!("序列化状态失败: {e}"))?;
         let tmp = self.config_dir.join(format!("{STATE_FILE}.tmp"));
         fs::write(&tmp, json).map_err(|e| format!("写入临时文件失败: {e}"))?;
         fs::rename(&tmp, self.config_dir.join(STATE_FILE))
             .map_err(|e| format!("原子替换配置文件失败: {e}"))
+    }
+
+    /// 将旧的 server:<serverId> 密钥迁移到确定性的 credential:<credentialId>。
+    /// 先写新密钥、再持久化状态、最后删除旧密钥；任一步失败都不会先删除旧密码。
+    fn migrate_legacy_credentials(&self) -> Result<(), String> {
+        let mut pending = Vec::new();
+        {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            for server in &guard.servers {
+                if server.credential_id.is_some() {
+                    continue;
+                }
+                let credential_id = legacy_credential_id(&server.id);
+                let has_credential = guard.credentials.iter().any(|c| c.id == credential_id);
+                let old_account = keyring_account_server(&server.id);
+                let old_password = self.secrets.get(&old_account).ok();
+                let new_password_exists = self
+                    .secrets
+                    .get(&keyring_account_credential(&credential_id))
+                    .is_ok();
+                pending.push((
+                    server.clone(),
+                    credential_id,
+                    has_credential,
+                    old_account,
+                    old_password,
+                    new_password_exists,
+                ));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // 先复制密钥。已有新账号不覆盖，重复启动时保持幂等且不破坏用户更新过的密码。
+        let mut created_accounts: Vec<String> = Vec::new();
+        for (_, credential_id, _, _, password, new_password_exists) in &pending {
+            if let (Some(password), false) = (password.as_deref(), *new_password_exists) {
+                let account = keyring_account_credential(credential_id);
+                if let Err(error) = self.secrets.set(&account, password) {
+                    for created in created_accounts {
+                        let _ = self.secrets.delete(&created);
+                    }
+                    return Err(error);
+                }
+                created_accounts.push(account);
+            }
+        }
+
+        if let Err(error) = self.with_candidate_state(|state| {
+            for (server, credential_id, has_credential, _, _, _) in &pending {
+                if let Some(slot) = state.servers.iter_mut().find(|s| s.id == server.id) {
+                    if slot.credential_id.is_none() {
+                        slot.credential_id = Some(credential_id.clone());
+                    }
+                }
+                if !*has_credential && !state.credentials.iter().any(|c| c.id == *credential_id) {
+                    state.credentials.push(Credential {
+                        id: credential_id.clone(),
+                        name: default_credential_name(&server.username, &server.host),
+                        auth_type: server.auth_type,
+                        username: server.username.clone(),
+                        key_path: server.key_path.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }) {
+            for account in created_accounts {
+                let _ = self.secrets.delete(&account);
+            }
+            return Err(error);
+        }
+
+        // 状态已经成功落盘后才清理旧账号；清理失败不影响新凭据和旧密码的可恢复性。
+        for (_, _, _, old_account, _, _) in pending {
+            self.secrets.delete(&old_account)?;
+        }
+        Ok(())
     }
 
     fn is_config_complete(&self) -> bool {
@@ -1086,7 +1298,10 @@ impl Store {
         }
         let marker = seed_marker(&ws);
         {
-            let guard = self.state.lock().map_err(|_| "store 状态锁损坏".to_string())?;
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
             if guard.seeded_skill_workspaces.contains(&marker) {
                 return Ok(());
             }
@@ -1108,11 +1323,7 @@ impl Store {
         })
     }
 
-    /// 服务器已存在则更新，否则插入；password 为 Some 时写入 keyring，None 保持原值。
-    /// 堡垒机绑定约束（非法组合在写 keyring 前拒绝）：
-    /// - 一台服务器不能同时是堡垒机又是目标主机；
-    /// - 目标主机的 bastion_id 必须指向一台已开启堡垒机的服务器。
-    pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
+    fn validate_server(&self, server: &Server) -> Result<(), String> {
         if server.is_bastion && server.bastion_id.is_some() {
             return Err(format!(
                 "服务器「{}」不能同时作为堡垒机与目标主机",
@@ -1120,11 +1331,13 @@ impl Store {
             ));
         }
         if let Some(bid) = &server.bastion_id {
-            let bastion_ok = self.with_state(|s| {
-                Ok(s.servers
+            let bastion_ok = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?
+                .servers
                     .iter()
-                    .any(|sv| sv.id == *bid && sv.is_bastion))
-            })?;
+                .any(|sv| sv.id == *bid && sv.is_bastion);
             if !bastion_ok {
                 return Err(format!(
                     "目标主机「{}」的堡垒机不存在或未开启堡垒机功能（{}）",
@@ -1132,19 +1345,294 @@ impl Store {
                 ));
             }
         }
-        if let Some(pw) = password {
-            self.secrets.set(&keyring_account_server(&server.id), pw)?;
+        Ok(())
         }
-        self.with_state(|s| {
-            match s.servers.iter_mut().find(|sv| sv.id == server.id) {
-                Some(slot) => *slot = server,
-                None => s.servers.push(server),
+
+    fn new_credential_id(&self, server_id: &str, state: &AppState) -> String {
+        let base = format!("credential-{server_id}");
+        if !state.credentials.iter().any(|c| c.id == base) {
+            return base;
+        }
+        let mut n = 2;
+        loop {
+            let id = format!("{base}-{n}");
+            if !state.credentials.iter().any(|c| c.id == id) {
+                return id;
             }
-            Ok(())
-        })
+            n += 1;
+        }
     }
 
-    /// 移除服务器、级联从所有 projects[].server_ids 移除、删 keyring 条目（不存在不算错）。
+    fn credential_from_server(id: String, server: &Server, name: String) -> Credential {
+        Credential {
+            id,
+            name,
+            auth_type: server.auth_type,
+            username: server.username.clone(),
+            key_path: server.key_path.clone(),
+        }
+    }
+
+    /// 服务器已存在则更新，否则插入；password 为 Some 时写入凭据 keyring，None 保持原值。
+    /// 这是内部兼容 API，采用确定性的 update 行为，不向调用方暴露交互选择。
+    pub fn upsert_server(&self, server: Server, password: Option<&str>) -> Result<(), String> {
+        self.save_server_with_credential(server, password, CredentialSaveMode::Update)
+            .map(|_| ())
+    }
+
+    /// 保存服务器并按凭据引用关系处理共享凭据。
+    pub fn save_server_with_credential(
+        &self,
+        mut server: Server,
+        password: Option<&str>,
+        mode: CredentialSaveMode,
+    ) -> Result<ServerSaveResult, String> {
+        self.validate_server(&server)?;
+        let snapshot = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())?
+            .clone();
+        let existing = snapshot.servers.iter().find(|s| s.id == server.id).cloned();
+        let current_id = existing.as_ref().and_then(|s| s.credential_id.clone());
+        let current = current_id
+            .as_ref()
+            .and_then(|id| snapshot.credentials.iter().find(|c| c.id == *id).cloned());
+        let requested_id = server.credential_id.clone();
+        let requested = requested_id
+            .as_ref()
+            .and_then(|id| snapshot.credentials.iter().find(|c| c.id == *id).cloned());
+        if requested_id.is_some() && requested.is_none() {
+            return Err(format!(
+                "凭据不存在：{}",
+                requested_id.as_deref().unwrap_or_default()
+            ));
+        }
+
+        let target_references = requested_id.as_ref().map_or(0, |id| {
+            snapshot
+                .servers
+                .iter()
+                .filter(|item| item.credential_id.as_deref() == Some(id))
+                .count()
+        });
+        let same_credential = requested_id.is_some() && requested_id == current_id;
+        let credential_changed = requested.as_ref().is_some_and(|credential| {
+            credential.auth_type != server.auth_type
+                || credential.username != server.username
+                || credential.key_path != server.key_path
+        });
+        let modifies_existing = credential_changed || password.is_some();
+        if let Some(credential) = requested.as_ref() {
+            if target_references > 0
+                && mode == CredentialSaveMode::Ask
+                && modifies_existing
+            {
+                return Ok(ServerSaveResult::NeedsChoice {
+                    credential_name: credential.name.clone(),
+                    reference_count: target_references,
+                });
+            }
+        }
+
+        let mut update_shared = false;
+        let mut copy_from = None;
+        let credential = match (&existing, requested, same_credential, mode) {
+            (_, Some(selected), _, CredentialSaveMode::Fork) if modifies_existing => {
+                copy_from = Some(selected.id.clone());
+                Self::credential_from_server(
+                    self.new_credential_id(&server.id, &snapshot),
+                    &server,
+                    default_credential_name(&server.username, &server.host),
+                )
+            }
+            (_, Some(mut selected), _, CredentialSaveMode::Update) if modifies_existing => {
+                selected.auth_type = server.auth_type;
+                selected.username = server.username.clone();
+                selected.key_path = server.key_path.clone();
+                update_shared = true;
+                selected
+            }
+            (_, Some(selected), _, _) => {
+                server.auth_type = selected.auth_type;
+                server.username = selected.username.clone();
+                server.key_path = selected.key_path.clone();
+                selected
+            }
+            (Some(_), None, _, _) => {
+                copy_from = current.as_ref().map(|credential| credential.id.clone());
+                Self::credential_from_server(
+                    self.new_credential_id(&server.id, &snapshot),
+                    &server,
+                    default_credential_name(&server.username, &server.host),
+                )
+            }
+            (None, None, _, _) => Self::credential_from_server(
+                self.new_credential_id(&server.id, &snapshot),
+                &server,
+                default_credential_name(&server.username, &server.host),
+            ),
+        };
+        server.credential_id = Some(credential.id.clone());
+
+        let account = keyring_account_credential(&credential.id);
+        let old_secret = self.secrets.get(&account).ok();
+        let copied_secret = copy_from
+            .as_deref()
+            .and_then(|id| self.secrets.get(&keyring_account_credential(id)).ok());
+        let secret_update = if credential.auth_type == AuthType::Key {
+            Some(None)
+        } else if let Some(value) = password {
+            Some(Some(value.to_string()))
+        } else if copy_from.is_some() {
+            copied_secret.map(Some)
+        } else {
+            None
+        };
+        if let Some(value) = &secret_update {
+            match value {
+                Some(value) => self.secrets.set(&account, value)?,
+                None => self.secrets.delete(&account)?,
+            }
+        }
+
+        let persisted = self.with_candidate_state(|state| {
+            match state.credentials.iter_mut().find(|item| item.id == credential.id) {
+                Some(slot) if update_shared => *slot = credential.clone(),
+                Some(_) => {}
+                None => state.credentials.push(credential.clone()),
+            }
+            if update_shared {
+                for item in &mut state.servers {
+                    if item.credential_id.as_deref() == Some(&credential.id) {
+                        item.auth_type = credential.auth_type;
+                        item.username = credential.username.clone();
+                        item.key_path = credential.key_path.clone();
+                    }
+                }
+            }
+            match state.servers.iter_mut().find(|item| item.id == server.id) {
+                Some(slot) => *slot = server.clone(),
+                None => state.servers.push(server.clone()),
+            }
+            Ok(())
+        });
+        if let Err(error) = persisted {
+            if secret_update.is_some() {
+                match old_secret {
+                    Some(value) => {
+                        let _ = self.secrets.set(&account, &value);
+                    }
+                    None => {
+                        let _ = self.secrets.delete(&account);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        Ok(ServerSaveResult::Saved { server })
+    }
+
+    /// 全部凭据配置（不含密码）。
+    pub fn credentials_all(&self) -> Vec<Credential> {
+        self.state
+            .lock()
+            .map(|g| g.credentials.clone())
+            .unwrap_or_default()
+    }
+
+    /// 保存凭据并同步所有引用服务器的认证镜像；password 为 None 保持原密码。
+    pub fn upsert_credential(
+        &self,
+        credential: Credential,
+        password: Option<&str>,
+    ) -> Result<Credential, String> {
+        if credential.id.trim().is_empty() || credential.name.trim().is_empty() {
+            return Err("凭据名称不能为空".to_string());
+        }
+        let account = keyring_account_credential(&credential.id);
+        let old_secret = self.secrets.get(&account).ok();
+        let secret_update = if credential.auth_type == AuthType::Key {
+            Some(None)
+        } else {
+            password.map(|value| Some(value.to_string()))
+        };
+        if let Some(value) = &secret_update {
+            match value {
+                Some(value) => self.secrets.set(&account, value)?,
+                None => self.secrets.delete(&account)?,
+            }
+        }
+        let persisted = self.with_candidate_state(|state| {
+            match state.credentials.iter_mut().find(|item| item.id == credential.id) {
+                Some(slot) => *slot = credential.clone(),
+                None => state.credentials.push(credential.clone()),
+            }
+            for server in &mut state.servers {
+                if server.credential_id.as_deref() == Some(&credential.id) {
+                    server.auth_type = credential.auth_type;
+                    server.username = credential.username.clone();
+                    server.key_path = credential.key_path.clone();
+                }
+            }
+            Ok(credential.clone())
+        });
+        if let Err(error) = persisted {
+            if secret_update.is_some() {
+                match old_secret {
+                    Some(value) => {
+                        let _ = self.secrets.set(&account, &value);
+                    }
+                    None => {
+                        let _ = self.secrets.delete(&account);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        persisted
+    }
+
+    /// 删除未被服务器引用的凭据；密钥认证凭据也尽力清理对应 keyring 账号。
+    pub fn delete_credential(&self, id: &str) -> Result<(), String> {
+        let (credential, references, old_password) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            let credential = guard.credentials.iter().find(|c| c.id == id).cloned();
+            let references = guard
+                .servers
+                .iter()
+                .filter(|s| s.credential_id.as_deref() == Some(id))
+                .count();
+            let password = self.secrets.get(&keyring_account_credential(id)).ok();
+            (credential, references, password)
+        };
+        if credential.is_none() {
+            return Ok(());
+        }
+        if references > 0 {
+            return Err(format!(
+                "凭据「{}」仍被 {} 台服务器引用，不能删除",
+                credential.unwrap().name,
+                references
+            ));
+        }
+        self.secrets.delete(&keyring_account_credential(id))?;
+        if let Err(e) = self.with_state(|s| {
+            s.credentials.retain(|c| c.id != id);
+            Ok(())
+        }) {
+            if let Some(password) = old_password {
+                let _ = self.secrets.set(&keyring_account_credential(id), &password);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 移除服务器、级联从所有 projects[].server_ids 移除，不删除可复用凭据。
     /// 服务器是堡垒机且仍有目标主机时拒绝删除（避免留下指向幽灵堡垒机的目标），
     /// 提示先到「SSH跳转设置」解除目标主机绑定。
     fn delete_server(&self, id: &str) -> Result<(), String> {
@@ -1154,12 +1642,15 @@ impl Store {
                 .any(|sv| sv.bastion_id.as_deref() == Some(id)))
         })?;
         if has_targets {
-            let name = self.server(id).map(|sv| sv.name).unwrap_or_else(|| id.to_string());
+            let name = self
+                .server(id)
+                .map(|sv| sv.name)
+                .unwrap_or_else(|| id.to_string());
             return Err(format!(
                 "堡垒机「{name}」仍有目标主机绑定，请先在「SSH跳转设置」中解除目标主机绑定后再删除"
             ));
         }
-        self.secrets.delete(&keyring_account_server(id))?;
+        // 删除服务器不删除可复用凭据；凭据由用户在凭据管理中显式删除。
         self.with_state(|s| {
             s.servers.retain(|sv| sv.id != id);
             s.mcp_devices.remove(id);
@@ -1170,13 +1661,8 @@ impl Store {
         })
     }
 
-    /// 清除全部服务器配置：先删各服务器 keyring 密钥（失败即中止、state 未动），
-    /// 再一次性清空 servers 并让所有 projects 解绑，原子落盘。
+    /// 清除全部服务器配置但保留可复用凭据；所有 projects 解绑并原子落盘。
     pub fn clear_all_servers(&self) -> Result<(), String> {
-        let ids: Vec<String> = self.with_state(|s| Ok(s.servers.iter().map(|sv| sv.id.clone()).collect()))?;
-        for id in &ids {
-            self.secrets.delete(&keyring_account_server(id))?;
-        }
         self.with_state(|s| {
             s.servers.clear();
             s.mcp_devices.clear();
@@ -1321,8 +1807,7 @@ impl Store {
             return Err("分类目录名称不能为空".to_string());
         }
         self.with_state(|s| {
-            if s
-                .projects
+            if s.projects
                 .iter()
                 .any(|p| p.quick_commands.iter().any(|qc| qc.folder == folder))
             {
@@ -1392,6 +1877,7 @@ impl Store {
                 match s.servers.iter_mut().find(|x| x.id == sv.id) {
                     Some(slot) => {
                         let mut merged = sv.clone();
+                        merged.credential_id = slot.credential_id.clone();
                         merged.locked = slot.locked;
                         merged.is_bastion = slot.is_bastion;
                         merged.bastion_id = slot.bastion_id.clone();
@@ -1403,7 +1889,22 @@ impl Store {
                         }
                     }
                     None => {
-                        s.servers.push(sv.clone());
+                        let mut imported = sv.clone();
+                        let credential_id = imported
+                            .credential_id
+                            .clone()
+                            .unwrap_or_else(|| legacy_credential_id(&imported.id));
+                        imported.credential_id = Some(credential_id.clone());
+                        if !s.credentials.iter().any(|c| c.id == credential_id) {
+                            s.credentials.push(Credential {
+                                id: credential_id,
+                                name: default_credential_name(&imported.username, &imported.host),
+                                auth_type: imported.auth_type,
+                                username: imported.username.clone(),
+                                key_path: imported.key_path.clone(),
+                            });
+                        }
+                        s.servers.push(imported);
                         result.imported += 1;
                     }
                 }
@@ -1488,7 +1989,8 @@ impl Store {
                     s.command_folders.push(f);
                 }
             }
-            if !project_folder.is_empty() && !s.project_folders.iter().any(|x| x == &project_folder) {
+            if !project_folder.is_empty() && !s.project_folders.iter().any(|x| x == &project_folder)
+            {
                 s.project_folders.push(project_folder);
             }
             Ok(())
@@ -1510,7 +2012,11 @@ impl Store {
     /// path 为 Some → 在该目录下创建 .aishell/；为 None → 用 <workspace_dir>/<name> 并创建（含 .aishell/）。
     /// 目录已存在不报错。返回最终项目路径。
     /// pub(crate)：ai_actions 的 SDK 导入项目（路径留空时默认 workspace 下创建）复用。
-    pub(crate) fn ensure_project_dirs(&self, path: Option<&str>, name: &str) -> Result<String, String> {
+    pub(crate) fn ensure_project_dirs(
+        &self,
+        path: Option<&str>,
+        name: &str,
+    ) -> Result<String, String> {
         let project_dir = match path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
             _ => {
@@ -1540,7 +2046,11 @@ impl Store {
         Ok(guard.sessions.get(project_id).cloned().unwrap_or_default())
     }
 
-    pub(crate) fn session_upsert(&self, project_id: &str, mut session: ChatSession) -> Result<(), String> {
+    pub(crate) fn session_upsert(
+        &self,
+        project_id: &str,
+        mut session: ChatSession,
+    ) -> Result<(), String> {
         // 落盘前脱敏：快照/文件引用/消息正文可能含配置里读到的凭据（硬约束：密码永不进 JSON）。
         // 注意 known_secrets() 自身要锁 state，必须先于 with_state 调用（std Mutex 不可重入）。
         let known = self.known_secrets();
@@ -1578,7 +2088,9 @@ impl Store {
         first_message: &str,
     ) -> Result<Option<String>, String> {
         self.with_state(|s| {
-            let Some(session) = s.sessions.get_mut(project_id)
+            let Some(session) = s
+                .sessions
+                .get_mut(project_id)
                 .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
             else {
                 return Ok(None);
@@ -1586,7 +2098,10 @@ impl Store {
             let Some(message) = session.messages.first() else {
                 return Ok(None);
             };
-            if session.auto_title_triggered || message.role != "user" || message.content != first_message {
+            if session.auto_title_triggered
+                || message.role != "user"
+                || message.content != first_message
+            {
                 return Ok(None);
             }
             let expected_title = session.title.clone();
@@ -1604,12 +2119,17 @@ impl Store {
         title: &str,
     ) -> Result<bool, String> {
         self.with_state(|s| {
-            let Some(session) = s.sessions.get_mut(project_id)
+            let Some(session) = s
+                .sessions
+                .get_mut(project_id)
                 .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
             else {
                 return Ok(false);
             };
-            if !expected_titles.iter().any(|expected| expected == &session.title) {
+            if !expected_titles
+                .iter()
+                .any(|expected| expected == &session.title)
+            {
                 return Ok(false);
             }
             session.title = title.to_string();
@@ -1625,7 +2145,9 @@ impl Store {
         archived: bool,
     ) -> Result<bool, String> {
         self.with_state(|s| {
-            let Some(session) = s.sessions.get_mut(project_id)
+            let Some(session) = s
+                .sessions
+                .get_mut(project_id)
                 .and_then(|list| list.iter_mut().find(|item| item.id == session_id))
             else {
                 return Ok(false);
@@ -1652,12 +2174,29 @@ impl Store {
         guard.servers.iter().find(|sv| sv.id == id).cloned()
     }
 
-    /// 读 keyring 密钥；account 形如 `server:<id>` / `llm:apikey`（service "AIShell"）。
+    /// 读通用 keyring 密钥（仅内部后端使用）。密码账号统一为 credential:<id>。
+    /// 对历史测试/异常调用保留 server:<id> 的只读兼容映射，正常 SSH 路径不使用它。
     pub fn read_secret(&self, account: &str) -> Result<String, String> {
+        if let Some(server_id) = account.strip_prefix("server:") {
+            if let Some(server) = self.server(server_id) {
+                if let Ok(value) = self.read_server_secret(&server) {
+                    return Ok(value);
+                }
+            }
+        }
         self.secrets.get(account)
     }
 
-    /// 已知密钥字面量（LLM/Brave API Key + 各服务器密码 + 数据库连接密码），供 redact 脱敏精确匹配。
+    /// 按服务器引用读取密码；正常路径只访问 credential:<id>。
+    pub fn read_server_secret(&self, server: &Server) -> Result<String, String> {
+        let credential_id = server
+            .credential_id
+            .as_deref()
+            .ok_or_else(|| format!("服务器「{}」未关联登录凭据", server.name))?;
+        self.secrets.get(&keyring_account_credential(credential_id))
+    }
+
+    /// 已知密钥字面量（LLM/Brave API Key + 各凭据密码 + 数据库连接密码），供 redact 脱敏精确匹配。
     /// 空值与 <4 字符的短值剔除（短值误伤面大），结果去重。读取失败的条目静默跳过。
     pub fn known_secrets(&self) -> Vec<String> {
         let mut out: Vec<String> = [KEYRING_ACCOUNT_LLM, KEYRING_ACCOUNT_BRAVE]
@@ -1666,10 +2205,15 @@ impl Store {
             .collect();
         let guard = self.state.lock();
         if let Ok(g) = guard {
-            for sv in &g.servers {
-                if let Ok(v) = self.secrets.get(&keyring_account_server(&sv.id)) {
+            for credential in &g.credentials {
+                if let Ok(v) = self
+                    .secrets
+                    .get(&keyring_account_credential(&credential.id))
+                {
                     out.push(v);
                 }
+            }
+            for sv in &g.servers {
                 if let Some(conns) = g.db_connections.get(&sv.id) {
                     for c in conns {
                         if let Ok(v) = self.secrets.get(&keyring_account_db(&sv.id, &c.id)) {
@@ -1778,7 +2322,10 @@ impl Store {
 
     /// 全部服务器配置（clone 返回；不含密码——密码在 keyring）。SDK 导入去重等用。
     pub fn servers_all(&self) -> Vec<Server> {
-        self.state.lock().map(|g| g.servers.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.servers.clone())
+            .unwrap_or_default()
     }
 
     /// 全部普通项目（clone 返回）。系统任务合成项目永不暴露给项目列表或 SDK 导入。
@@ -1914,10 +2461,7 @@ impl Store {
 
     /// 当前 MCP 服务配置（clone）。
     pub fn mcp_config(&self) -> McpServiceConfig {
-        self.state
-            .lock()
-            .map(|g| g.mcp)
-            .unwrap_or_default()
+        self.state.lock().map(|g| g.mcp).unwrap_or_default()
     }
 
     /// 修改 MCP 监听端口（1024–65535），只改目标字段。
@@ -2061,8 +2605,27 @@ pub async fn upsert_server(
     store: State<'_, Arc<Store>>,
     server: Server,
     password: Option<String>,
-) -> Result<(), String> {
-    store.upsert_server(server, password.as_deref())
+    credential_mode: Option<CredentialSaveMode>,
+) -> Result<ServerSaveResult, String> {
+    store.save_server_with_credential(
+        server,
+        password.as_deref(),
+        credential_mode.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+pub async fn upsert_credential(
+    store: State<'_, Arc<Store>>,
+    credential: Credential,
+    password: Option<String>,
+) -> Result<Credential, String> {
+    store.upsert_credential(credential, password.as_deref())
+}
+
+#[tauri::command]
+pub async fn delete_credential(store: State<'_, Arc<Store>>, id: String) -> Result<(), String> {
+    store.delete_credential(&id)
 }
 
 #[tauri::command]
@@ -2235,16 +2798,29 @@ pub async fn clear_all_servers(
 mod tests {
     use super::*;
 
-
     /// 造一个独立的临时配置目录（按 pid+tag 命名，测试间不冲突；不触碰真实用户配置）。
     fn temp_config_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aishell-store-test-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aishell-store-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn credential_test_server(id: &str, host: &str) -> Server {
+        Server {
+            id: id.to_string(),
+            name: format!("服务器-{id}"),
+            host: host.to_string(),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "deploy".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+        }
     }
 
     fn test_chat_msg(role: &str, content: &str) -> ChatMsg {
@@ -2268,13 +2844,30 @@ mod tests {
         AppState {
             settings: Settings {
                 workspace_dir: Some("D:\\AIShellWorkspace".to_string()),
-                llm: LlmConfig::default(),                search: SearchConfig::default(),
+                llm: LlmConfig::default(),
+                search: SearchConfig::default(),
                 theme: Theme::Dark,
                 auto_switch_ai_workdir: true,
                 project_view: ProjectView::Card,
                 approval_mode: ApprovalMode::Smart,
                 auto_backup_remote_files: true,
             },
+            credentials: vec![
+                Credential {
+                    id: "credential-srv-1".to_string(),
+                    name: "deploy@47.102.118.66".to_string(),
+                    auth_type: AuthType::Password,
+                    username: "deploy".to_string(),
+                    key_path: String::new(),
+                },
+                Credential {
+                    id: "credential-srv-2".to_string(),
+                    name: "ubuntu@192.168.10.21".to_string(),
+                    auth_type: AuthType::Key,
+                    username: "ubuntu".to_string(),
+                    key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
+                },
+            ],
             servers: vec![
                 Server {
                     id: "srv-1".to_string(),
@@ -2284,6 +2877,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "deploy".to_string(),
                     key_path: String::new(),
+                    credential_id: Some("credential-srv-1".to_string()),
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2296,6 +2890,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "ubuntu".to_string(),
                     key_path: "C:\\Users\\demo\\.ssh\\id_ed25519".to_string(),
+                    credential_id: Some("credential-srv-2".to_string()),
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2376,7 +2971,8 @@ mod tests {
                                 source: "clipboard".to_string(),
                                 name: "截图.png".to_string(),
                                 mime: "image/png".to_string(),
-                                path: "D:/demo/.aishell/ai-images/1752000000000_截图.png".to_string(),
+                                path: "D:/demo/.aishell/ai-images/1752000000000_截图.png"
+                                    .to_string(),
                                 origin_path: None,
                                 server_id: None,
                                 size: 4096,
@@ -2606,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_server_cascades_and_clears_keyring() {
+    fn delete_server_cascades_and_keeps_reusable_credential() {
         let dir = temp_config_dir("cascade");
         let store = test_store(dir);
         store
@@ -2619,6 +3215,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2636,6 +3233,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -2655,8 +3253,9 @@ mod tests {
             })
             .unwrap();
 
-        // 删除前密钥库里确实有密码
-        assert_eq!(store.read_secret("server:srv-c-1").unwrap(), "pw-1");
+        // 删除前凭据库里确实有密码
+        let deleted_server = store.server("srv-c-1").unwrap();
+        assert_eq!(store.read_server_secret(&deleted_server).unwrap(), "pw-1");
 
         store.delete_server("srv-c-1").unwrap();
 
@@ -2665,10 +3264,153 @@ mod tests {
         assert_eq!(guard.servers[0].id, "srv-c-2");
         assert_eq!(guard.projects[0].server_ids, vec!["srv-c-2".to_string()]);
         drop(guard);
-        // 密钥条目已删（再读应报 NoEntry 类错误）
-        assert!(store.read_secret("server:srv-c-1").is_err());
+        // 删除服务器只解除引用，可复用凭据及其密码仍由凭据库管理。
+        assert_eq!(store.read_server_secret(&deleted_server).unwrap(), "pw-1");
         // 删除不存在的服务器不算错
         store.delete_server("srv-c-404").unwrap();
+    }
+
+    #[test]
+    fn server_save_result_uses_frontend_camel_case_contract() {
+        let value = serde_json::to_value(ServerSaveResult::NeedsChoice {
+            credential_name: "共享凭据".to_string(),
+            reference_count: 2,
+        })
+        .unwrap();
+
+        assert_eq!(value["status"], "needsChoice");
+        assert_eq!(value["credentialName"], "共享凭据");
+        assert_eq!(value["referenceCount"], 2);
+        assert!(value.get("credential_name").is_none());
+        assert!(value.get("reference_count").is_none());
+    }
+
+    #[test]
+    fn shared_credential_ask_update_and_fork_are_consistent() {
+        let dir = temp_config_dir("shared-credential");
+        let store = test_store(dir);
+        let first = credential_test_server("srv-a", "10.0.0.1");
+        store.upsert_server(first.clone(), Some("old-password")).unwrap();
+        let first = store.server("srv-a").unwrap();
+        let credential_id = first.credential_id.clone().unwrap();
+
+        let mut second = credential_test_server("srv-b", "10.0.0.2");
+        second.credential_id = Some(credential_id.clone());
+        let saved = store
+            .save_server_with_credential(second, None, CredentialSaveMode::Ask)
+            .unwrap();
+        assert!(matches!(saved, ServerSaveResult::Saved { .. }));
+
+        let mut changed = store.server("srv-a").unwrap();
+        changed.username = "root".to_string();
+        let result = store
+            .save_server_with_credential(
+                changed.clone(),
+                Some("new-password"),
+                CredentialSaveMode::Ask,
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            ServerSaveResult::NeedsChoice {
+                reference_count: 2,
+                ..
+            }
+        ));
+        assert_eq!(store.server("srv-a").unwrap().username, "deploy");
+        assert_eq!(store.read_server_secret(&first).unwrap(), "old-password");
+
+        let updated = store
+            .save_server_with_credential(
+                changed.clone(),
+                Some("new-password"),
+                CredentialSaveMode::Update,
+            )
+            .unwrap();
+        assert!(matches!(updated, ServerSaveResult::Saved { .. }));
+        assert!(store
+            .servers_all()
+            .iter()
+            .filter(|server| server.credential_id.as_deref() == Some(&credential_id))
+            .all(|server| server.username == "root"));
+        assert_eq!(
+            store.read_server_secret(&store.server("srv-b").unwrap()).unwrap(),
+            "new-password"
+        );
+
+        let mut forked = store.server("srv-a").unwrap();
+        forked.username = "release".to_string();
+        let result = store
+            .save_server_with_credential(forked, None, CredentialSaveMode::Fork)
+            .unwrap();
+        let ServerSaveResult::Saved { server: forked } = result else {
+            panic!("fork 应保存服务器");
+        };
+        assert_ne!(forked.credential_id.as_deref(), Some(credential_id.as_str()));
+        assert_eq!(store.read_server_secret(&forked).unwrap(), "new-password");
+        assert_eq!(store.server("srv-b").unwrap().username, "root");
+    }
+
+    #[test]
+    fn legacy_server_credentials_migrate_once_without_exposing_password() {
+        let dir = temp_config_dir("credential-migration");
+        let mut state = AppState::default();
+        state
+            .servers
+            .push(credential_test_server("srv-legacy", "10.0.0.9"));
+        fs::write(
+            dir.join(STATE_FILE),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        let secrets = std::sync::Arc::new(MemorySecrets::default());
+        secrets.set("server:srv-legacy", "legacy-password").unwrap();
+
+        let store = Store::with_secrets(dir.clone(), secrets.clone()).unwrap();
+        let migrated = store.server("srv-legacy").unwrap();
+        assert_eq!(
+            migrated.credential_id.as_deref(),
+            Some("credential-srv-legacy")
+        );
+        assert_eq!(store.credentials_all().len(), 1);
+        assert_eq!(store.read_server_secret(&migrated).unwrap(), "legacy-password");
+        assert!(secrets.get("server:srv-legacy").is_err());
+        let json = fs::read_to_string(dir.join(STATE_FILE)).unwrap();
+        assert!(!json.contains("legacy-password"));
+        drop(store);
+
+        let reloaded = Store::with_secrets(dir, secrets).unwrap();
+        assert_eq!(reloaded.credentials_all().len(), 1);
+        assert_eq!(
+            reloaded
+                .server("srv-legacy")
+                .unwrap()
+                .credential_id
+                .as_deref(),
+            Some("credential-srv-legacy")
+        );
+    }
+
+    #[test]
+    fn credential_delete_requires_no_references_and_server_delete_keeps_it() {
+        let dir = temp_config_dir("credential-delete");
+        let store = test_store(dir);
+        store
+            .upsert_server(
+                credential_test_server("srv-delete", "10.0.0.3"),
+                Some("password"),
+            )
+            .unwrap();
+        let server = store.server("srv-delete").unwrap();
+        let credential_id = server.credential_id.clone().unwrap();
+        assert!(store.delete_credential(&credential_id).is_err());
+
+        store.delete_server("srv-delete").unwrap();
+        assert!(store.credentials_all().iter().any(|item| item.id == credential_id));
+        assert_eq!(store.read_server_secret(&server).unwrap(), "password");
+        store.delete_credential(&credential_id).unwrap();
+        assert!(store.credentials_all().iter().all(|item| item.id != credential_id));
+        assert!(store.read_server_secret(&server).is_err());
     }
 
     #[test]
@@ -2683,6 +3425,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -2709,6 +3452,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: true,
             bastion_id: None,
@@ -2716,9 +3460,15 @@ mod tests {
         store.upsert_server(base.clone(), None).unwrap();
 
         // 一台服务器不能同时是堡垒机又是目标主机
-        let both = Server { bastion_id: Some("srv-b".to_string()), ..base.clone() };
+        let both = Server {
+            bastion_id: Some("srv-b".to_string()),
+            ..base.clone()
+        };
         let err = store.upsert_server(both, None).unwrap_err();
-        assert!(err.contains("不能同时作为堡垒机与目标主机"), "错误串不符: {err}");
+        assert!(
+            err.contains("不能同时作为堡垒机与目标主机"),
+            "错误串不符: {err}"
+        );
 
         // 目标主机的堡垒机必须已开启堡垒机功能
         let target_ok = Server {
@@ -2729,6 +3479,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-b".to_string()),
@@ -2743,6 +3494,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -2756,6 +3508,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-p".to_string()),
@@ -2771,6 +3524,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-ghost".to_string()),
@@ -2779,7 +3533,10 @@ mod tests {
         assert!(err.contains("不存在或未开启"), "错误串不符: {err}");
 
         // 合法绑定在 state 里完整保存
-        assert_eq!(store.server("srv-t").unwrap().bastion_id.as_deref(), Some("srv-b"));
+        assert_eq!(
+            store.server("srv-t").unwrap().bastion_id.as_deref(),
+            Some("srv-b")
+        );
     }
 
     #[test]
@@ -2794,6 +3551,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: true,
             bastion_id: None,
@@ -2809,6 +3567,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: Some("srv-b".to_string()),
@@ -2836,8 +3595,14 @@ mod tests {
         let dir = temp_config_dir("proj-folder-create");
         let store = test_store(dir.clone());
         // 空串 / 纯分隔符 → 中文错误
-        assert_eq!(store.create_project_folder("  ").unwrap_err(), "分类目录名称不能为空");
-        assert_eq!(store.create_project_folder("///").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.create_project_folder("  ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
+        assert_eq!(
+            store.create_project_folder("///").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 规范化：trim + 去空段；支持层级
         store.create_project_folder(" 生产环境/Web ").unwrap();
         store.create_project_folder("a//b/").unwrap();
@@ -2849,7 +3614,10 @@ mod tests {
             );
         }
         // 重名（规范化后相同）报错，且列表不变
-        assert_eq!(store.create_project_folder("生产环境/Web").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.create_project_folder("生产环境/Web").unwrap_err(),
+            "分类目录已存在"
+        );
         assert_eq!(
             store.state.lock().unwrap().project_folders,
             vec!["生产环境/Web".to_string(), "a/b".to_string()]
@@ -2891,22 +3659,42 @@ mod tests {
             .unwrap();
 
         // 新旧名均按规范化处理：带空白与重复分隔符也应级联生效
-        store.rename_project_folder("生产环境", " 生产环境//Web ").unwrap();
+        store
+            .rename_project_folder("生产环境", " 生产环境//Web ")
+            .unwrap();
 
         let guard = store.state.lock().unwrap();
         assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
         assert_eq!(
-            guard.projects.iter().find(|p| p.id == "proj-r-1").unwrap().folder,
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-r-1")
+                .unwrap()
+                .folder,
             "生产环境/Web"
         );
-        assert_eq!(guard.projects.iter().find(|p| p.id == "proj-r-2").unwrap().folder, "");
+        assert_eq!(
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-r-2")
+                .unwrap()
+                .folder,
+            ""
+        );
         drop(guard);
         // 落盘后重载一致
         let reloaded = test_store(dir);
         let guard = reloaded.state.lock().unwrap();
         assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
         assert_eq!(
-            guard.projects.iter().find(|p| p.id == "proj-r-1").unwrap().folder,
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-r-1")
+                .unwrap()
+                .folder,
             "生产环境/Web"
         );
     }
@@ -2919,15 +3707,27 @@ mod tests {
         store.create_project_folder("乙").unwrap();
 
         // 未分类（空串）不可重命名
-        assert_eq!(store.rename_project_folder("", "x").unwrap_err(), "未分类目录不可重命名");
+        assert_eq!(
+            store.rename_project_folder("", "x").unwrap_err(),
+            "未分类目录不可重命名"
+        );
         // 目标已存在且 ≠ old → 报错
-        assert_eq!(store.rename_project_folder("甲", "乙").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.rename_project_folder("甲", "乙").unwrap_err(),
+            "分类目录已存在"
+        );
         // new 规范化后为空 → 报错
-        assert_eq!(store.rename_project_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.rename_project_folder("甲", " / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // new 规范化后与 old 相同 → no-op，列表不变
         store.rename_project_folder("甲", " 甲 ").unwrap();
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.project_folders, vec!["甲".to_string(), "乙".to_string()]);
+        assert_eq!(
+            guard.project_folders,
+            vec!["甲".to_string(), "乙".to_string()]
+        );
     }
 
     #[test]
@@ -2966,8 +3766,14 @@ mod tests {
         store.create_project_folder("生产环境").unwrap();
         store.create_project_folder("开发环境/Web").unwrap();
         // 未分类空串不可删除；规范化后为空同样报中文错误
-        assert_eq!(store.delete_project_folder("").unwrap_err(), "未分类目录不可删除");
-        assert_eq!(store.delete_project_folder(" / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.delete_project_folder("").unwrap_err(),
+            "未分类目录不可删除"
+        );
+        assert_eq!(
+            store.delete_project_folder(" / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 不存在的目录视为幂等成功
         store.delete_project_folder("不存在的目录").unwrap();
         // 删除成功：入参规范化，仅移除匹配项
@@ -3016,7 +3822,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_servers_wipes_servers_and_keyring() {
+    fn clear_all_servers_keeps_reusable_credentials() {
         let dir = temp_config_dir("clear-all");
         let store = test_store(dir.clone());
         // 两台服务器（一台带密码）+ 一个已绑定项目
@@ -3030,6 +3836,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -3047,6 +3854,7 @@ mod tests {
                     auth_type: AuthType::Key,
                     username: "u".to_string(),
                     key_path: "C:\\key".to_string(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -3065,7 +3873,8 @@ mod tests {
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
-        assert_eq!(store.read_secret("server:srv-cl-1").unwrap(), "pw-1");
+        let password_server = store.server("srv-cl-1").unwrap();
+        assert_eq!(store.read_server_secret(&password_server).unwrap(), "pw-1");
 
         store.clear_all_servers().unwrap();
 
@@ -3075,9 +3884,9 @@ mod tests {
         assert_eq!(guard.projects.len(), 1);
         assert!(guard.projects[0].server_ids.is_empty());
         drop(guard);
-        // keyring：全部删除
-        assert!(store.read_secret("server:srv-cl-1").is_err());
-        assert!(store.read_secret("server:srv-cl-2").is_err());
+        // 凭据库保留，后续仍可绑定到新服务器。
+        assert_eq!(store.credentials_all().len(), 2);
+        assert_eq!(store.read_server_secret(&password_server).unwrap(), "pw-1");
         // 落盘可重载且一致
         let reloaded = test_store(dir);
         let guard = reloaded.state.lock().unwrap();
@@ -3133,6 +3942,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -3158,7 +3968,11 @@ mod tests {
             let guard = store.state.lock().unwrap();
             assert_eq!(guard.servers.len(), 3);
             assert_eq!(guard.projects.len(), 2, "两个目录各建一个项目");
-            let web = guard.projects.iter().find(|p| p.name == "生产环境/Web").unwrap();
+            let web = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "生产环境/Web")
+                .unwrap();
             // 新项目：id proj- 前缀、path=None、quick_commands 空、ai_mode 默认、folder 空
             assert!(web.id.starts_with("proj-"), "id 应 proj- 前缀: {}", web.id);
             assert_eq!(web.path, None);
@@ -3170,7 +3984,11 @@ mod tests {
                 vec!["x-1".to_string(), "x-3".to_string()],
                 "同目录服务器应幂等去重绑定"
             );
-            let unnamed = guard.projects.iter().find(|p| p.name == "未命名项目").unwrap();
+            let unnamed = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "未命名项目")
+                .unwrap();
             assert_eq!(unnamed.server_ids, vec!["x-2".to_string()]);
             // 空目录不注册进 project_folders
             assert!(guard.project_folders.is_empty());
@@ -3193,7 +4011,11 @@ mod tests {
         {
             let guard = store.state.lock().unwrap();
             assert_eq!(guard.projects.len(), 2);
-            let web = guard.projects.iter().find(|p| p.name == "生产环境/Web").unwrap();
+            let web = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "生产环境/Web")
+                .unwrap();
             assert_eq!(
                 web.server_ids,
                 vec!["x-1".to_string(), "x-3".to_string()],
@@ -3220,9 +4042,17 @@ mod tests {
             .unwrap();
         assert_eq!(r.projects_created, 0, "同名项目复用不计新建");
         let guard = store.state.lock().unwrap();
-        let pre = guard.projects.iter().find(|p| p.name == "预置目录").unwrap();
+        let pre = guard
+            .projects
+            .iter()
+            .find(|p| p.name == "预置目录")
+            .unwrap();
         assert_eq!(pre.id, "proj-pre", "复用已有项目而非新建");
-        assert_eq!(pre.path, Some("D:\\existing".to_string()), "复用不覆盖原字段");
+        assert_eq!(
+            pre.path,
+            Some("D:\\existing".to_string()),
+            "复用不覆盖原字段"
+        );
         assert_eq!(pre.ai_mode, AiMode::Agent);
         assert_eq!(
             pre.server_ids,
@@ -3259,7 +4089,10 @@ mod tests {
         }"#;
         let state: AppState = serde_json::from_str(old).unwrap();
         assert_eq!(state.servers.len(), 1, "遗留 folder 字段不影响解析");
-        assert!(state.project_folders.is_empty(), "旧 serverFolders 不映射到 project_folders");
+        assert!(
+            state.project_folders.is_empty(),
+            "旧 serverFolders 不映射到 project_folders"
+        );
         assert_eq!(state.projects[0].folder, "", "旧项目无 folder 字段按未分类");
     }
 
@@ -3320,7 +4153,10 @@ mod tests {
             .is_err());
         // 覆盖写第二个 key
         store
-            .set_ui_expanded("welcome:projectGroups".to_string(), vec!["生产环境".to_string()])
+            .set_ui_expanded(
+                "welcome:projectGroups".to_string(),
+                vec!["生产环境".to_string()],
+            )
             .unwrap();
         let reloaded = test_store(dir.clone());
         let guard = reloaded.state.lock().unwrap();
@@ -3361,8 +4197,14 @@ mod tests {
         v.as_object_mut().unwrap().remove("sftpHistory");
         v.as_object_mut().unwrap().remove("sftpFavorites");
         let back: AppState = serde_json::from_value(v).unwrap();
-        assert!(back.sftp_history.is_empty(), "旧 JSON 无 sftpHistory 按空 map");
-        assert!(back.sftp_favorites.is_empty(), "旧 JSON 无 sftpFavorites 按空 map");
+        assert!(
+            back.sftp_history.is_empty(),
+            "旧 JSON 无 sftpHistory 按空 map"
+        );
+        assert!(
+            back.sftp_favorites.is_empty(),
+            "旧 JSON 无 sftpFavorites 按空 map"
+        );
         assert_eq!(back.servers.len(), 2, "其余字段不受影响");
     }
 
@@ -3399,9 +4241,7 @@ mod tests {
         );
         // 空数组覆盖后 key 仍在（清空语义）
         drop(guard);
-        store
-            .set_sftp_history("srv-1".to_string(), vec![])
-            .unwrap();
+        store.set_sftp_history("srv-1".to_string(), vec![]).unwrap();
         let reloaded2 = test_store(dir);
         assert!(
             reloaded2
@@ -3425,8 +4265,14 @@ mod tests {
             .set_sftp_favorites(
                 "srv-1".to_string(),
                 vec![
-                    SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() },
-                    SftpFavorite { path: "/backup".to_string(), title: "备份".to_string() },
+                    SftpFavorite {
+                        path: "/data".to_string(),
+                        title: "数据目录".to_string(),
+                    },
+                    SftpFavorite {
+                        path: "/backup".to_string(),
+                        title: "备份".to_string(),
+                    },
                 ],
             )
             .unwrap();
@@ -3434,7 +4280,10 @@ mod tests {
         assert!(store
             .set_sftp_favorites(
                 String::new(),
-                vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+                vec![SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "数据目录".to_string()
+                }],
             )
             .is_err());
         let reloaded = test_store(dir.clone());
@@ -3442,8 +4291,14 @@ mod tests {
         assert_eq!(
             guard.sftp_favorites.get("srv-1").unwrap(),
             &vec![
-                SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() },
-                SftpFavorite { path: "/backup".to_string(), title: "备份".to_string() },
+                SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "数据目录".to_string()
+                },
+                SftpFavorite {
+                    path: "/backup".to_string(),
+                    title: "备份".to_string()
+                },
             ],
             "收藏条目（含标题）按添加顺序保留"
         );
@@ -3452,7 +4307,10 @@ mod tests {
         store
             .set_sftp_favorites(
                 "srv-1".to_string(),
-                vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+                vec![SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "数据目录".to_string(),
+                }],
             )
             .unwrap();
         let reloaded2 = test_store(dir);
@@ -3464,7 +4322,10 @@ mod tests {
                 .sftp_favorites
                 .get("srv-1")
                 .unwrap(),
-            &vec![SftpFavorite { path: "/data".to_string(), title: "数据目录".to_string() }],
+            &vec![SftpFavorite {
+                path: "/data".to_string(),
+                title: "数据目录".to_string()
+            }],
             "覆盖写后落盘为新列表"
         );
     }
@@ -3487,14 +4348,23 @@ mod tests {
         assert_eq!(
             guard.sftp_favorites.get("srv-1").unwrap(),
             &vec![
-                SftpFavorite { path: "/data".to_string(), title: "data".to_string() },
-                SftpFavorite { path: "/etc/log".to_string(), title: "log".to_string() },
+                SftpFavorite {
+                    path: "/data".to_string(),
+                    title: "data".to_string()
+                },
+                SftpFavorite {
+                    path: "/etc/log".to_string(),
+                    title: "log".to_string()
+                },
             ],
             "旧纯路径条目按目录名补标题"
         );
         assert_eq!(
             guard.sftp_favorites.get("srv-2").unwrap(),
-            &vec![SftpFavorite { path: "/opt/app".to_string(), title: "核心应用".to_string() }],
+            &vec![SftpFavorite {
+                path: "/opt/app".to_string(),
+                title: "核心应用".to_string()
+            }],
             "新格式条目原样保留"
         );
     }
@@ -3504,8 +4374,14 @@ mod tests {
         let dir = temp_config_dir("qc-folder-create");
         let store = test_store(dir.clone());
         // 空串 / 纯分隔符 → 中文错误
-        assert_eq!(store.create_command_folder("  ").unwrap_err(), "分类目录名称不能为空");
-        assert_eq!(store.create_command_folder("///").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.create_command_folder("  ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
+        assert_eq!(
+            store.create_command_folder("///").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 规范化：trim + 去空段；支持层级
         store.create_command_folder(" 常用/部署 ").unwrap();
         store.create_command_folder("a//b/").unwrap();
@@ -3517,7 +4393,10 @@ mod tests {
             );
         }
         // 重名（规范化后相同）报错，且列表不变
-        assert_eq!(store.create_command_folder("常用/部署").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.create_command_folder("常用/部署").unwrap_err(),
+            "分类目录已存在"
+        );
         assert_eq!(
             store.state.lock().unwrap().command_folders,
             vec!["常用/部署".to_string(), "a/b".to_string()]
@@ -3579,15 +4458,27 @@ mod tests {
         store.create_command_folder("甲").unwrap();
         store.create_command_folder("乙").unwrap();
         // 未分类（空串）不可重命名
-        assert_eq!(store.rename_command_folder("", "x").unwrap_err(), "未分类目录不可重命名");
+        assert_eq!(
+            store.rename_command_folder("", "x").unwrap_err(),
+            "未分类目录不可重命名"
+        );
         // 目标已存在且 ≠ old → 报错
-        assert_eq!(store.rename_command_folder("甲", "乙").unwrap_err(), "分类目录已存在");
+        assert_eq!(
+            store.rename_command_folder("甲", "乙").unwrap_err(),
+            "分类目录已存在"
+        );
         // new 规范化后为空 → 报错
-        assert_eq!(store.rename_command_folder("甲", " / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.rename_command_folder("甲", " / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // new 规范化后与 old 相同 → no-op，列表不变
         store.rename_command_folder("甲", " 甲 ").unwrap();
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.command_folders, vec!["甲".to_string(), "乙".to_string()]);
+        assert_eq!(
+            guard.command_folders,
+            vec!["甲".to_string(), "乙".to_string()]
+        );
     }
 
     #[test]
@@ -3629,8 +4520,14 @@ mod tests {
         store.create_command_folder("常用").unwrap();
         store.create_command_folder("开发环境/Web").unwrap();
         // 未分类空串不可删除；规范化后为空同样报中文错误
-        assert_eq!(store.delete_command_folder("").unwrap_err(), "未分类目录不可删除");
-        assert_eq!(store.delete_command_folder(" / ").unwrap_err(), "分类目录名称不能为空");
+        assert_eq!(
+            store.delete_command_folder("").unwrap_err(),
+            "未分类目录不可删除"
+        );
+        assert_eq!(
+            store.delete_command_folder(" / ").unwrap_err(),
+            "分类目录名称不能为空"
+        );
         // 不存在的目录视为幂等成功
         store.delete_command_folder("不存在的目录").unwrap();
         // 删除成功：入参规范化，仅移除匹配项
@@ -3882,7 +4779,10 @@ mod tests {
                 "部署检查",
             )
             .unwrap());
-        assert_eq!(store.sessions_get("proj-title").unwrap()[0].title, "部署检查");
+        assert_eq!(
+            store.sessions_get("proj-title").unwrap()[0].title,
+            "部署检查"
+        );
     }
 
     #[test]
@@ -3897,11 +4797,17 @@ mod tests {
             archived: false,
         };
         store.session_upsert("proj-arch", sess()).unwrap();
-        assert!(store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        assert!(store
+            .set_session_archived("proj-arch", "sess-arch", true)
+            .unwrap());
         // 重复设置同值返回 false（无变更）
-        assert!(!store.set_session_archived("proj-arch", "sess-arch", true).unwrap());
+        assert!(!store
+            .set_session_archived("proj-arch", "sess-arch", true)
+            .unwrap());
         // 不存在会话返回 false 而非报错
-        assert!(!store.set_session_archived("proj-arch", "sess-none", true).unwrap());
+        assert!(!store
+            .set_session_archived("proj-arch", "sess-none", true)
+            .unwrap());
         // 前端残留快照 upsert 不得冲掉 archived 标记
         store.session_upsert("proj-arch", sess()).unwrap();
         let saved = store.sessions_get("proj-arch").unwrap().pop().unwrap();
@@ -3912,7 +4818,13 @@ mod tests {
         s2.archived = true;
         store.session_upsert("proj-arch", s2).unwrap();
         let list = store.sessions_get("proj-arch").unwrap();
-        assert!(!list.iter().find(|s| s.id == "sess-arch-2").unwrap().archived);
+        assert!(
+            !list
+                .iter()
+                .find(|s| s.id == "sess-arch-2")
+                .unwrap()
+                .archived
+        );
     }
 
     #[test]
@@ -4006,7 +4918,8 @@ mod tests {
                         tool_call_id: "call-1".to_string(),
                         tool: "run_command".to_string(),
                         intent: "查询在线记录".to_string(),
-                        summary: "执行命令（远程）：mysql -uicc -p'hunter2' -e 'select 1'".to_string(),
+                        summary: "执行命令（远程）：mysql -uicc -p'hunter2' -e 'select 1'"
+                            .to_string(),
                         status: "succeeded".to_string(),
                         timeout_seconds: None,
                         text_len: None,
@@ -4030,7 +4943,9 @@ mod tests {
         let raw2 = std::fs::read_to_string(dir.join(STATE_FILE)).unwrap();
         assert!(!raw2.contains("hunter2"), "加载迁移应清洗历史明文并写回");
         let back2 = store2.sessions_get("proj-mask").unwrap();
-        assert!(back2[0].messages[0].snapshots[0].content.contains("***已脱敏***"));
+        assert!(back2[0].messages[0].snapshots[0]
+            .content
+            .contains("***已脱敏***"));
 
         // 幂等：已脱敏文件重载不再触发写回（内容不再变化）
         drop(store2);
@@ -4056,9 +4971,14 @@ mod tests {
             enabled: true,
         };
         // 默认只读集回退
-        assert_eq!(conn.effective_commands(), vec!["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]);
+        assert_eq!(
+            conn.effective_commands(),
+            vec!["SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"]
+        );
         // 保存 + keyring
-        store.save_db_connection("srv-a", conn.clone(), Some("pw-db-1")).unwrap();
+        store
+            .save_db_connection("srv-a", conn.clone(), Some("pw-db-1"))
+            .unwrap();
         assert_eq!(store.db_connections("srv-a"), vec![conn.clone()]);
         assert_eq!(store.db_secret("srv-a", "db-1").unwrap(), "pw-db-1");
         // 更新（None 保持密码）
@@ -4075,7 +4995,11 @@ mod tests {
         assert!(store.db_connections("srv-a").is_empty());
         assert!(store.db_secret("srv-a", "db-1").is_err());
         // 校验失败不落盘
-        let bad = DbConnection { id: "db-x".to_string(), name: "".to_string(), ..conn };
+        let bad = DbConnection {
+            id: "db-x".to_string(),
+            name: "".to_string(),
+            ..conn
+        };
         assert!(store.save_db_connection("srv-a", bad, Some("pw")).is_err());
         assert!(store.db_connections("srv-a").is_empty());
     }
@@ -4094,6 +5018,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4112,9 +5037,14 @@ mod tests {
             allowed_commands: vec![],
             enabled: true,
         };
-        store.save_db_connection("srv-a", conn, Some("srun_3000@redis")).unwrap();
+        store
+            .save_db_connection("srv-a", conn, Some("srun_3000@redis"))
+            .unwrap();
         let known = store.known_secrets();
-        assert!(known.contains(&"srun_3000@redis".to_string()), "数据库密码应参与输出脱敏");
+        assert!(
+            known.contains(&"srun_3000@redis".to_string()),
+            "数据库密码应参与输出脱敏"
+        );
     }
 
     #[test]
@@ -4136,8 +5066,14 @@ mod tests {
         assert!(msg.file_refs.is_empty(), "旧数据应兼容为空引用列表");
         assert!(msg.server_refs.is_empty(), "旧数据应兼容为空服务器引用列表");
         assert!(msg.path_refs.is_empty(), "旧数据应兼容为空路径引用列表");
-        assert!(msg.browser_refs.is_empty(), "旧数据应兼容为空浏览器元素引用列表");
-        assert!(msg.browser_page_refs.is_empty(), "旧数据应兼容为空浏览器页面引用列表");
+        assert!(
+            msg.browser_refs.is_empty(),
+            "旧数据应兼容为空浏览器元素引用列表"
+        );
+        assert!(
+            msg.browser_page_refs.is_empty(),
+            "旧数据应兼容为空浏览器页面引用列表"
+        );
     }
 
     #[test]
@@ -4152,7 +5088,10 @@ mod tests {
             ..test_chat_msg("user", "看看 @page:控制台")
         };
         let json = serde_json::to_string(&m).unwrap();
-        assert!(json.contains("\"browserPageRefs\""), "序列化应为 camelCase: {json}");
+        assert!(
+            json.contains("\"browserPageRefs\""),
+            "序列化应为 camelCase: {json}"
+        );
         let back: ChatMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(back.browser_page_refs.len(), 1);
         assert_eq!(back.browser_page_refs[0].title, "控制台");
@@ -4193,6 +5132,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4241,6 +5181,7 @@ mod tests {
                 auth_type: AuthType::Password,
                 username: "root".to_string(),
                 key_path: String::new(),
+                credential_id: None,
                 locked: false,
                 is_bastion: false,
                 bastion_id: None,
@@ -4261,7 +5202,9 @@ mod tests {
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 2));
         assert_eq!(r.projects_created, 0);
         // 配置有变化：覆盖并计 updated（不新增重复项）
-        let r = store.merge_xshell_servers(&[srv("xshell-bbb", 22)]).unwrap();
+        let r = store
+            .merge_xshell_servers(&[srv("xshell-bbb", 22)])
+            .unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 1, 0));
         // 新会话：imported；旧会话原样仍 unchanged
         let r = store
@@ -4271,7 +5214,11 @@ mod tests {
         // 全部归入同一个「未命名项目」，绑定去重
         {
             let guard = store.state.lock().unwrap();
-            let unnamed = guard.projects.iter().find(|p| p.name == "未命名项目").unwrap();
+            let unnamed = guard
+                .projects
+                .iter()
+                .find(|p| p.name == "未命名项目")
+                .unwrap();
             assert_eq!(unnamed.server_ids.len(), 3, "三个会话都绑定且不重复");
         }
         // 内存状态与落盘一致
@@ -4280,7 +5227,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.join(STATE_FILE)).unwrap()).unwrap();
         assert_eq!(saved.servers.len(), 3);
         assert_eq!(
-            saved.servers.iter().find(|s| s.id == "xshell-bbb").unwrap().port,
+            saved
+                .servers
+                .iter()
+                .find(|s| s.id == "xshell-bbb")
+                .unwrap()
+                .port,
             22,
             "更新的配置应已持久化"
         );
@@ -4302,6 +5254,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4378,7 +5331,9 @@ mod tests {
         );
         assert!(!store.settings().search.enabled);
         // 空串视为覆盖（与 api_key 语义一致）
-        store.save_settings(store.settings(), None, Some("")).unwrap();
+        store
+            .save_settings(store.settings(), None, Some(""))
+            .unwrap();
         assert_eq!(store.read_secret("brave:apikey").unwrap(), "");
     }
 
@@ -4407,8 +5362,15 @@ mod tests {
         let state: AppState = serde_json::from_str(old).unwrap();
         assert!(!state.servers[0].locked, "旧服务器默认未锁定");
         assert!(!state.servers[0].is_bastion, "旧服务器默认不是堡垒机");
-        assert_eq!(state.servers[0].bastion_id, None, "旧服务器默认无堡垒机绑定");
-        assert_eq!(state.projects[0].ai_mode, AiMode::Suggest, "旧项目默认 suggest");
+        assert_eq!(
+            state.servers[0].bastion_id, None,
+            "旧服务器默认无堡垒机绑定"
+        );
+        assert_eq!(
+            state.projects[0].ai_mode,
+            AiMode::Suggest,
+            "旧项目默认 suggest"
+        );
         // 旧 ChatMsg 无 actions → 空
         let old_msg = r#"{"role":"assistant","content":"hi","snapshots":[],"fileRefs":[],"ts":1}"#;
         let msg: ChatMsg = serde_json::from_str(old_msg).unwrap();
@@ -4435,10 +5397,8 @@ mod tests {
     #[test]
     fn task_project_is_synthetic_fixed_path_and_agent_only() {
         let dir = temp_config_dir("task-project");
-        let workspace = std::env::temp_dir().join(format!(
-            "aishell-store-task-ws-{}",
-            std::process::id()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("aishell-store-task-ws-{}", std::process::id()));
         let _ = fs::remove_dir_all(&workspace);
         let store = test_store(dir.clone());
         store
@@ -4459,19 +5419,33 @@ mod tests {
             task.path.as_deref(),
             Some(workspace.join(".aishell").join("tasks").to_str().unwrap())
         );
-        assert!(workspace.join(".aishell").join("tasks").join(".aishell").is_dir());
+        assert!(workspace
+            .join(".aishell")
+            .join("tasks")
+            .join(".aishell")
+            .is_dir());
         assert_eq!(store.project(TASK_PROJECT_ID), Some(task.clone()));
         assert_eq!(store.project_path(TASK_PROJECT_ID), task.path);
         assert_eq!(store.ai_mode(TASK_PROJECT_ID), Some(AiMode::Agent));
         assert!(store.projects_all().iter().all(|p| p.id != TASK_PROJECT_ID));
-        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .projects
+            .iter()
+            .all(|p| p.id != TASK_PROJECT_ID));
         assert!(store.set_ai_mode(TASK_PROJECT_ID, AiMode::Agent).is_ok());
         assert_eq!(
-            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Yolo).unwrap_err(),
+            store
+                .set_ai_mode(TASK_PROJECT_ID, AiMode::Yolo)
+                .unwrap_err(),
             "系统任务上下文固定为工作模式"
         );
         assert_eq!(
-            store.set_ai_mode(TASK_PROJECT_ID, AiMode::Suggest).unwrap_err(),
+            store
+                .set_ai_mode(TASK_PROJECT_ID, AiMode::Suggest)
+                .unwrap_err(),
             "系统任务上下文固定为工作模式"
         );
         let _ = fs::remove_dir_all(&workspace);
@@ -4481,7 +5455,10 @@ mod tests {
     fn task_project_requires_workspace_and_reserved_id_rejected() {
         let dir = temp_config_dir("task-project-reject");
         let store = test_store(dir);
-        assert_eq!(store.task_project().unwrap_err(), "请先在设置中配置工作区目录");
+        assert_eq!(
+            store.task_project().unwrap_err(),
+            "请先在设置中配置工作区目录"
+        );
         let task = Project {
             id: TASK_PROJECT_ID.to_string(),
             name: "伪造任务项目".to_string(),
@@ -4491,8 +5468,14 @@ mod tests {
             folder: String::new(),
             ai_mode: AiMode::Yolo,
         };
-        assert_eq!(store.upsert_project(task), Err("系统任务项目不可修改".to_string()));
-        assert_eq!(store.delete_project(TASK_PROJECT_ID), Err("系统任务项目不可删除".to_string()));
+        assert_eq!(
+            store.upsert_project(task),
+            Err("系统任务项目不可修改".to_string())
+        );
+        assert_eq!(
+            store.delete_project(TASK_PROJECT_ID),
+            Err("系统任务项目不可删除".to_string())
+        );
         store
             .with_state(|s| {
                 s.projects.push(Project {
@@ -4521,9 +5504,17 @@ mod tests {
             auto_title_triggered: false,
             archived: false,
         };
-        store.session_upsert(TASK_PROJECT_ID, session.clone()).unwrap();
+        store
+            .session_upsert(TASK_PROJECT_ID, session.clone())
+            .unwrap();
         assert_eq!(store.sessions_get(TASK_PROJECT_ID).unwrap(), vec![session]);
-        assert!(store.state.lock().unwrap().projects.iter().all(|p| p.id != TASK_PROJECT_ID));
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .projects
+            .iter()
+            .all(|p| p.id != TASK_PROJECT_ID));
         let reloaded = test_store(dir);
         assert_eq!(reloaded.sessions_get(TASK_PROJECT_ID).unwrap().len(), 1);
     }
@@ -4582,6 +5573,7 @@ mod tests {
             auth_type: AuthType::Password,
             username: "u".to_string(),
             key_path: String::new(),
+            credential_id: None,
             locked: false,
             is_bastion: false,
             bastion_id: None,
@@ -4591,10 +5583,7 @@ mod tests {
 
         store.set_server_locked("sv-a", true).unwrap();
         assert!(store.server("sv-a").unwrap().locked);
-        assert!(
-            !store.server("sv-b").unwrap().locked,
-            "只改目标服务器"
-        );
+        assert!(!store.server("sv-b").unwrap().locked, "只改目标服务器");
         // 落盘持久化
         let store2 = test_store(dir);
         assert!(store2.server("sv-a").unwrap().locked);
@@ -4603,7 +5592,10 @@ mod tests {
         assert!(!store2.server("sv-a").unwrap().locked);
         // 不存在 → 中文错误
         let err = store2.set_server_locked("sv-missing", true).unwrap_err();
-        assert!(err.contains("服务器不存在：sv-missing"), "错误串不符: {err}");
+        assert!(
+            err.contains("服务器不存在：sv-missing"),
+            "错误串不符: {err}"
+        );
     }
 
     #[test]
@@ -4621,6 +5613,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: true,
                     is_bastion: false,
                     bastion_id: None,
@@ -4639,6 +5632,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4662,6 +5656,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "u".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -4693,16 +5688,36 @@ mod tests {
                 None,
             )
             .unwrap();
-        let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
+        let file = ws
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md");
         assert!(file.is_file(), "首次保存未播种内置技能");
-        let py_file = ws.join(".aishell").join("skills").join("python-script").join("SKILL.md");
+        let py_file = ws
+            .join(".aishell")
+            .join("skills")
+            .join("python-script")
+            .join("SKILL.md");
         assert!(py_file.is_file(), "首次保存未播种 python-script 内置技能");
         let content = fs::read_to_string(&file).unwrap();
         // 内容含两个目录、目录结构、scope/enabled 语义
-        assert!(content.contains("## 两个技能根目录"), "缺少目录说明: {content}");
-        assert!(content.contains("<name>/SKILL.md"), "缺少目录结构: {content}");
-        assert!(content.contains("## scope 语义"), "缺少 scope 语义: {content}");
-        assert!(content.contains("enabled") && content.contains("scope"), "缺少字段 schema");
+        assert!(
+            content.contains("## 两个技能根目录"),
+            "缺少目录说明: {content}"
+        );
+        assert!(
+            content.contains("<name>/SKILL.md"),
+            "缺少目录结构: {content}"
+        );
+        assert!(
+            content.contains("## scope 语义"),
+            "缺少 scope 语义: {content}"
+        );
+        assert!(
+            content.contains("enabled") && content.contains("scope"),
+            "缺少字段 schema"
+        );
         // 播种记录已落盘（记录的是 normalize_ws 规范化路径 + 播种代际标记）
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
@@ -4730,16 +5745,27 @@ mod tests {
             seeded_skill_workspaces: vec![legacy.clone()],
             ..Default::default()
         };
-        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        fs::write(
+            dir.join("aishell.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
         let store = test_store(dir);
         assert!(
-            ws.join(".aishell").join("skills").join("python-script").join("SKILL.md").is_file(),
+            ws.join(".aishell")
+                .join("skills")
+                .join("python-script")
+                .join("SKILL.md")
+                .is_file(),
             "旧工作区未补种 python-script"
         );
         let records = store.state.lock().unwrap().seeded_skill_workspaces.clone();
         assert_eq!(records.len(), 2, "旧记录保留 + 追加新代际标记: {records:?}");
         assert!(records.contains(&legacy), "旧记录被改写: {records:?}");
-        assert!(records.contains(&seed_marker(&legacy)), "缺新代际标记: {records:?}");
+        assert!(
+            records.contains(&seed_marker(&legacy)),
+            "缺新代际标记: {records:?}"
+        );
     }
 
     /// 目标已存在不覆盖；用户删除后同 workspace 重启/再次保存不复活。
@@ -4747,7 +5773,11 @@ mod tests {
     fn seed_never_overwrites_or_resurrects() {
         let dir = temp_config_dir("seed-keep");
         let ws = temp_config_dir("seed-keep-ws");
-        let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
+        let file = ws
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md");
         // 预置用户文件 → 保存设置不覆盖
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, "用户自建的内容").unwrap();
@@ -4762,7 +5792,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(fs::read_to_string(&file).unwrap(), "用户自建的内容", "已存在文件被覆盖");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "用户自建的内容",
+            "已存在文件被覆盖"
+        );
         // 用户删除后：重启（重新加载）不复活
         fs::remove_dir_all(ws.join(".aishell")).unwrap();
         let _store2 = test_store(dir.clone());
@@ -4808,8 +5842,18 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(ws1.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
-        assert!(ws2.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
+        assert!(ws1
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md")
+            .is_file());
+        assert!(ws2
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md")
+            .is_file());
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
         assert_eq!(state.seeded_skill_workspaces.len(), 2);
@@ -4856,7 +5900,10 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert!(err.contains("创建内置技能目录失败") || err.contains("创建技能根失败"), "错误串不符: {err}");
+        assert!(
+            err.contains("创建内置技能目录失败") || err.contains("创建技能根失败"),
+            "错误串不符: {err}"
+        );
         // 设置与播种记录保持旧值（ws1）
         let settings = store.settings();
         assert_eq!(
@@ -4866,7 +5913,11 @@ mod tests {
         );
         let state: AppState =
             serde_json::from_str(&fs::read_to_string(dir.join("aishell.json")).unwrap()).unwrap();
-        assert_eq!(state.seeded_skill_workspaces.len(), 1, "失败后播种记录被污染");
+        assert_eq!(
+            state.seeded_skill_workspaces.len(),
+            1,
+            "失败后播种记录被污染"
+        );
         assert!(state.seeded_skill_workspaces[0].contains("seed-fail-ws1"));
     }
 
@@ -4884,7 +5935,11 @@ mod tests {
             seeded_skill_workspaces: Vec::new(),
             ..Default::default()
         };
-        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        fs::write(
+            dir.join("aishell.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
         // 让播种失败：.aishell 被文件占位
         fs::write(ws.join(".aishell"), "占位文件").unwrap();
         let res = Store::with_secrets(dir.clone(), std::sync::Arc::new(MemorySecrets::default()));
@@ -4895,7 +5950,8 @@ mod tests {
         assert!(err.contains("内置技能"), "错误串不符: {err}");
         // 修复后加载成功
         fs::remove_file(ws.join(".aishell")).unwrap();
-        let store = Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
+        let store =
+            Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
         assert!(store.settings().workspace_dir.is_some());
     }
 
@@ -4908,7 +5964,12 @@ mod tests {
         let old = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark"},"servers":[],"projects":[],"sessions":{},"projectFolders":[],"commandFolders":[],"uiExpanded":{},"sftpHistory":{},"sftpFavorites":{},"dbConnections":{}}"#;
         fs::write(dir.join("aishell.json"), old).unwrap();
         let store = test_store(dir.clone());
-        assert!(store.state.lock().unwrap().seeded_skill_workspaces.is_empty());
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .seeded_skill_workspaces
+            .is_empty());
         // workspace 已配置但旧配置无播种字段 → 加载时播种一次并记录
         let state = AppState {
             settings: Settings {
@@ -4917,9 +5978,18 @@ mod tests {
             },
             ..Default::default()
         };
-        fs::write(dir.join("aishell.json"), serde_json::to_string(&state).unwrap()).unwrap();
+        fs::write(
+            dir.join("aishell.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
         let store = test_store(dir);
-        assert!(ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md").is_file());
+        assert!(ws
+            .join(".aishell")
+            .join("skills")
+            .join("skill-management")
+            .join("SKILL.md")
+            .is_file());
         assert_eq!(store.state.lock().unwrap().seeded_skill_workspaces.len(), 1);
     }
 
@@ -4960,6 +6030,7 @@ mod tests {
                     auth_type: AuthType::Password,
                     username: "root".to_string(),
                     key_path: String::new(),
+                    credential_id: None,
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
@@ -5007,11 +6078,19 @@ mod tests {
         let store = test_store(dir.clone());
         let t1 = store.mcp_token_ensure().unwrap();
         assert_eq!(t1.len(), 32, "令牌应为 32 字符十六进制");
-        assert_eq!(store.mcp_token_ensure().unwrap(), t1, "重复 ensure 返回同一令牌");
+        assert_eq!(
+            store.mcp_token_ensure().unwrap(),
+            t1,
+            "重复 ensure 返回同一令牌"
+        );
         let t2 = store.mcp_token_reset().unwrap();
         assert_eq!(t2.len(), 32);
         assert_ne!(t1, t2, "重置后令牌必须变化");
-        assert_eq!(store.mcp_token_ensure().unwrap(), t2, "重置后 ensure 返回新令牌");
+        assert_eq!(
+            store.mcp_token_ensure().unwrap(),
+            t2,
+            "重置后 ensure 返回新令牌"
+        );
         // 令牌不进 aishell.json（且令牌测试不应产生配置文件——从未触发 with_state 持久化）
         assert!(
             !dir.join("aishell.json").exists(),
@@ -5024,8 +6103,16 @@ mod tests {
     fn mcp_features_default_off_and_mapping() {
         let f = McpFeatures::default();
         for tool in [
-            "sftp_list", "sftp_upload", "sftp_download", "sftp_rename", "sftp_delete",
-            "read_file", "write_file", "edit_file", "exec_command", "db_query",
+            "sftp_list",
+            "sftp_upload",
+            "sftp_download",
+            "sftp_rename",
+            "sftp_delete",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "exec_command",
+            "db_query",
         ] {
             assert!(!f.tool_enabled(tool), "{tool} 默认应关闭");
         }
@@ -5048,7 +6135,9 @@ mod tests {
     fn legacy_default_model_migrates_to_vision() {
         let dir = temp_config_dir("model-migrate");
         let llm = |id: &str| {
-            format!(r#"{{"modelId":"{id}","baseUrl":"https://api.deepseek.com/v1","effort":"low"}}"#)
+            format!(
+                r#"{{"modelId":"{id}","baseUrl":"https://api.deepseek.com/v1","effort":"low"}}"#
+            )
         };
         // 旧默认 → 升级并写回
         fs::write(
@@ -5064,7 +6153,10 @@ mod tests {
         );
         drop(store);
         let raw = fs::read_to_string(dir.join("aishell.json")).unwrap();
-        assert!(raw.contains("deepseek-v4-flash-vision-exp"), "迁移应写回配置文件");
+        assert!(
+            raw.contains("deepseek-v4-flash-vision-exp"),
+            "迁移应写回配置文件"
+        );
 
         // 自定义模型名 → 不动
         fs::write(
@@ -5073,7 +6165,11 @@ mod tests {
         )
         .unwrap();
         let store = test_store(dir.clone());
-        assert_eq!(store.settings().llm.model_id, "deepseek-reasoner", "自定义模型名不应被迁移");
+        assert_eq!(
+            store.settings().llm.model_id,
+            "deepseek-reasoner",
+            "自定义模型名不应被迁移"
+        );
     }
 
     /// 旧会话消息无 imageRefs 字段按空解析；带 imageRefs 的消息往返不丢字段。
@@ -5088,7 +6184,9 @@ mod tests {
         assert_eq!(msg.image_refs.len(), 1);
         assert_eq!(msg.image_refs[0].server_id.as_deref(), Some("srv-1"));
         let back = serde_json::to_string(&msg).unwrap();
-        assert!(back.contains("\"imageRefs\":"), "序列化应保留 camelCase 字段名");
+        assert!(
+            back.contains("\"imageRefs\":"),
+            "序列化应保留 camelCase 字段名"
+        );
     }
-
 }
