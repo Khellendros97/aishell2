@@ -119,6 +119,8 @@ export const onTermExit = (id: string, cb: (code: number | null) => void): Promi
 
 /* ---------------- fs ---------------- */
 export const fsList = (path: string) => call<FsEntry[]>('fs_list', { path });
+/** 是否满足编辑器 UTF-8 文本约束；目录、>5MB、二进制返回 false。 */
+export const fsIsText = (path: string) => call<boolean>('fs_is_text', { path });
 /** >5MB 或二进制文件会 reject 错误串 */
 export const fsRead = (path: string) => call<string>('fs_read', { path });
 export const fsWrite = (path: string, content: string) => call<void>('fs_write', { path, content });

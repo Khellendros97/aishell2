@@ -319,6 +319,13 @@ class TermSession {
         { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
       ]);
     });
+    /* 中键快捷复制/粘贴；终端应用启用鼠标追踪时交还给应用（vim/tmux 等）。 */
+    this.host.addEventListener('mousedown', (e) => {
+      if (e.button !== 1 || this.term.modes.mouseTrackingMode !== 'none') return;
+      e.preventDefault();
+      if (this.term.hasSelection()) this.copySelection();
+      else void this.pasteClipboard();
+    });
     /* Ctrl+Shift+C 复制选区 / Ctrl+Shift+V 粘贴；
        preventDefault 必须调：否则浏览器默认行为（Chromium 的粘贴为纯文本）会再粘贴一遍 */
     this.term.attachCustomKeyEventHandler((e) => {
