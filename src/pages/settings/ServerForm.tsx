@@ -5,17 +5,19 @@
  *   <ServerForm ref={formRef} compact />；formRef: useRef<ServerFormHandle>(null)。
  * 对照 .proto/welcome.js（mini 新建表单）与 .proto/workbench-sidebar.js（服务器列表新建模态框）；
  * 后端接口 upsert_server（见 src/api.ts），字段与 src/types.ts Server 逐字段对齐
- * （serde camelCase：authType / keyPath / locked）。
+ * （serde camelCase：authType / keyPath / credentialId / locked）。
  * 安全约定：密码 / 密钥永不回传前端 —— 编辑时密码留空 = 提交 null（keyring 保持原值），也绝不写入 aishell.json。
  */
 import { forwardRef, useImperativeHandle, useRef, useState } from 'react';
-import type { Server } from '../../types';
+import type { Credential, Server } from '../../types';
 import { openDialog } from '../../api';
 import { uid } from '../../ui';
 
 export interface ServerFormOptions {
   /** 双列紧凑布局（欢迎页内联区）；缺省单列（侧栏模态框） */
   compact?: boolean;
+  /** 可选凭据库；未传时仍可手工填写，兼容所有旧入口 */
+  credentials?: Credential[];
 }
 
 export interface ServerFormHandle {
@@ -40,6 +42,7 @@ interface FormFields {
   username: string;
   password: string;
   keyPath: string;
+  credentialId: string | null;
 }
 
 /** 校验标红字段：只有名称 / IP / 端口会被标红（旧版对账号、密钥路径也只清除不标红） */
@@ -51,13 +54,13 @@ interface InvalidFields {
 
 /** 新建态初始值（同旧版 fill(null)：密码 / 密钥路径恒为空，不留上次输入） */
 const EMPTY_FIELDS: FormFields = {
-  name: '', host: '', port: '22', auth: 'password', username: '', password: '', keyPath: '',
+  name: '', host: '', port: '22', auth: 'password', username: '', password: '', keyPath: '', credentialId: null,
 };
 
 const EMPTY_INVALID: InvalidFields = { name: false, host: false, port: false };
 
 export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
-  function ServerForm({ compact }, ref): JSX.Element {
+  function ServerForm({ compact, credentials = [] }, ref): JSX.Element {
     const [fields, setFields] = useState<FormFields>(EMPTY_FIELDS);
     const [invalid, setInvalid] = useState<InvalidFields>(EMPTY_INVALID);
     const nameRef = useRef<HTMLInputElement>(null);
@@ -65,6 +68,21 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
     /** 校验标红：输入即清除（同欢迎页 mini 表单行为；与旧版 markInvalid 对应） */
     const clearInvalid = (key: keyof InvalidFields): void => {
       setInvalid((cur) => (cur[key] ? { ...cur, [key]: false } : cur));
+    };
+
+    /** 选择已有凭据后只回填非敏感字段；密码字段始终清空，留空提交 null。 */
+    const onCredentialChange = (id: string): void => {
+      // 「新建凭据」只是解除已有引用，凭据由后端保存分支决定，服务器自身保持 credentialId=null。
+      const credentialId = id && id !== '__new__' ? id : null;
+      const credential = credentialId ? credentials.find((item) => item.id === credentialId) : null;
+      setFields((f) => credential ? {
+        ...f,
+        credentialId,
+        auth: credential.authType,
+        username: credential.username,
+        keyPath: credential.keyPath,
+        password: '',
+      } : { ...f, credentialId: null, password: '' });
     };
 
     /* 浏览…：文件选择器选密钥（私钥无固定扩展名，不加过滤器） */
@@ -87,6 +105,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           username: server?.username ?? '',
           password: '', // 密码 / 密钥永不回显：编辑时留空 = 保持 keyring 原值
           keyPath: server?.keyPath ?? '',
+          credentialId: server?.credentialId ?? null,
         });
         setInvalid(EMPTY_INVALID);
       },
@@ -111,6 +130,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           authType,
           username: fields.username.trim(),
           keyPath: authType === 'key' ? fields.keyPath.trim() : '',
+          credentialId: fields.credentialId,
           locked: editing?.locked ?? false,
           // 堡垒机字段不在表单里：编辑时原样保留（目标主机经 SSH跳转设置绑定）
           isBastion: editing?.isBastion ?? false,
@@ -157,6 +177,23 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
             onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, port: v })); clearInvalid('port'); }}
           />
         </div>
+        {credentials.length > 0 ? (
+          <div className="field credential-field">
+            <label>使用凭据</label>
+            <select
+              className="select"
+              value={fields.credentialId ?? ''}
+              onChange={(e) => onCredentialChange(e.currentTarget.value)}
+            >
+              <option value="">手工填写（不关联凭据）</option>
+              {credentials.map((credential) => (
+                <option key={credential.id} value={credential.id}>{credential.name}</option>
+              ))}
+              <option value="__new__">新建凭据（保存服务器时创建）</option>
+            </select>
+            <div className="hint">选择已有凭据会填充认证信息；密码不会回显。</div>
+          </div>
+        ) : null}
         <div className="field">
           <label>认证方式</label>
           <select

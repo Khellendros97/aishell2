@@ -11,15 +11,16 @@
  * Workbench.ai.addServerRef → wbHandles.ai?.addServerRef;旧版 DOM 重建/节点复用改 React key。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { DbConnection, DbKind, McpDeviceConfig, Server } from '../../../types';
+import type { Credential, DbConnection, DbKind, McpDeviceConfig, Server } from '../../../types';
 import {
-  deleteDbConnection, deleteServer, getState, saveDbConnection, setServerLocked, upsertProject, upsertServer,
+  deleteDbConnection, deleteServer, getState, saveDbConnection, setServerLocked, upsertProject,
 } from '../../../api';
 import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, showContextMenu, toast, uid } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
 import { ServerForm, type ServerFormHandle } from '../../settings/ServerForm';
+import { saveServerWithCredentialChoice } from '../../settings/server-save';
 import { openMcpModal } from './McpModal';
 import { DB_COMMAND_GROUPS, DB_DEFAULT_COMMANDS, DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
 import './servers.css';
@@ -344,7 +345,7 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
 
 function ServersPanelBody(): JSX.Element {
   /* 后端状态快照(服务器 + MCP 设备配置);挂载 / project-changed / aishell:data-changed 触发重拉 */
-  const [data, setData] = useState<{ servers: Server[]; mcpDevices: Record<string, McpDeviceConfig> }>({ servers: [], mcpDevices: {} });
+  const [data, setData] = useState<{ servers: Server[]; credentials: Credential[]; mcpDevices: Record<string, McpDeviceConfig> }>({ servers: [], credentials: [], mcpDevices: {} });
   const [reloadKey, setReloadKey] = useState(0);
   const [searchText, setSearchText] = useState('');
 
@@ -375,7 +376,7 @@ function ServersPanelBody(): JSX.Element {
     void getState()
       .then((state) => {
         if (!alive) return;
-        setData({ servers: state.servers, mcpDevices: state.mcpDevices ?? {} });
+        setData({ servers: state.servers, credentials: state.credentials ?? [], mcpDevices: state.mcpDevices ?? {} });
         // 同步 store 项目快照:欢迎页等外部页面可能改过绑定,而 store 里的 project 是保活内存单例
         // (bound 列表按 project.serverIds 过滤,不刷新则返回后仍按旧绑定渲染)
         const s = useWorkbench.getState();
@@ -436,8 +437,10 @@ function ServersPanelBody(): JSX.Element {
     }
     const isNew = srvEditing === null;
     const server = form.buildServer(srvEditing);
+    let saved: Server | null;
     try {
-      await upsertServer(server, form.passwordValue());
+      saved = await saveServerWithCredentialChoice(server, form.passwordValue());
+      if (!saved) return;
       if (isNew) {
         // 创建成功后立即绑定到当前项目;先拉最新 project 合并,避免过期内存快照覆盖已删绑定
         const project = useWorkbench.getState().project;
@@ -447,8 +450,8 @@ function ServersPanelBody(): JSX.Element {
             const state = await getState();
             latest = state.projects.find((p) => p.id === project.id) ?? project;
           } catch { /* 后端未就绪时用内存快照 */ }
-          if (!latest.serverIds.includes(server.id)) {
-            latest.serverIds.push(server.id);
+          if (!latest.serverIds.includes(saved.id)) {
+            latest.serverIds.push(saved.id);
             await upsertProject(latest);
             // 同步 store 内存单例(新引用触发订阅者),避免下次绑定再次覆盖
             useWorkbench.getState().setProject({ ...project, serverIds: latest.serverIds });
@@ -583,12 +586,14 @@ function ServersPanelBody(): JSX.Element {
         }
         const bastion = form.buildServer(null);
         bastion.isBastion = draft.toggle;
-        // 先建堡垒机,再建目标主机(目标引用堡垒机 id,必须先存在)
-        await upsertServer(bastion, form.passwordValue());
+        // 先建堡垒机,再建目标主机(目标引用堡垒机 id,必须先存在)，每一步都处理共享凭据选择。
+        const savedBastion = await saveServerWithCredentialChoice(bastion, form.passwordValue());
+        if (!savedBastion) return;
         if (draft.toggle) {
           for (const t of draft.targets) {
-            t.server.bastionId = bastion.id;
-            await upsertServer(t.server, t.password);
+            t.server.bastionId = savedBastion.id;
+            const savedTarget = await saveServerWithCredentialChoice(t.server, t.password);
+            if (!savedTarget) return;
           }
         }
         await bindToProject([bastion.id, ...draft.targets.map((t) => t.server.id)]);
@@ -607,9 +612,9 @@ function ServersPanelBody(): JSX.Element {
             setJumpDraft({ ...draft, toggle: true });
             return;
           }
-          await upsertServer({ ...server, isBastion: false }, null);
+          if (!await saveServerWithCredentialChoice({ ...server, isBastion: false }, null)) return;
           for (const t of draft.targets) {
-            await upsertServer({ ...t.server, bastionId: null }, null);
+            if (!await saveServerWithCredentialChoice({ ...t.server, bastionId: null }, null)) return;
           }
           // 关闭开关时同样删除被移除的目标主机(否则残留引用已关闭堡垒机的非法绑定)
           for (const id of jumpOriginalIds) {
@@ -619,13 +624,13 @@ function ServersPanelBody(): JSX.Element {
           }
         } else {
           if (draft.toggle !== server.isBastion) {
-            await upsertServer({ ...server, isBastion: draft.toggle }, null);
+            if (!await saveServerWithCredentialChoice({ ...server, isBastion: draft.toggle }, null)) return;
           }
           for (const t of draft.targets) {
             if (!jumpOriginalIds.has(t.server.id)) {
               t.server.bastionId = server.id; // 自动绑定到堡垒机
             }
-            await upsertServer(t.server, t.password);
+            if (!await saveServerWithCredentialChoice(t.server, t.password)) return;
           }
           for (const id of jumpOriginalIds) {
             if (!draft.targets.some((t) => t.server.id === id)) {
@@ -692,7 +697,8 @@ function ServersPanelBody(): JSX.Element {
 
   /* ---------- 渲染 ---------- */
   const project = useWorkbench((s) => s.project);
-  const { servers, mcpDevices } = data;
+    const { servers, credentials, mcpDevices } = data;
+
   const ids = project?.serverIds ?? [];
   const bound = servers.filter((s) => ids.includes(s.id));
   // 搜索过滤:名称 / host / username 大小写不敏感;空串显示全部
@@ -851,7 +857,7 @@ function ServersPanelBody(): JSX.Element {
             <button className="icon-btn" title="关闭" onClick={closeSrv}><Icon name="x" /></button>
           </div>
           <div className="modal-body">
-            <ServerForm ref={srvFormRef} />
+            <ServerForm ref={srvFormRef} credentials={credentials} />
           </div>
           <div className="modal-foot">
             <button className="btn" onClick={closeSrv}>取消</button>
@@ -878,7 +884,7 @@ function ServersPanelBody(): JSX.Element {
               <div className="jump-section" id="jump-bastion-wrap">
                 <div className="jump-section-title">堡垒机服务器</div>
                 <div className="jump-hint">开启「作为堡垒机」后，本服务器的 SSH/SFTP 连接将作为目标主机的跳板</div>
-                <div id="jump-bastion-form"><ServerForm ref={jumpBastionFormRef} /></div>
+                <div id="jump-bastion-form"><ServerForm ref={jumpBastionFormRef} credentials={credentials} /></div>
               </div>
             ) : null}
             {jumpBannerName !== null ? (
@@ -951,7 +957,7 @@ function ServersPanelBody(): JSX.Element {
             <button className="icon-btn" title="关闭" onClick={closeTarget}><Icon name="x" /></button>
           </div>
           <div className="modal-body">
-            <div id="jump-target-form"><ServerForm ref={jumpTargetFormRef} /></div>
+            <div id="jump-target-form"><ServerForm ref={jumpTargetFormRef} credentials={credentials} /></div>
           </div>
           <div className="modal-foot">
             <button className="btn" onClick={closeTarget}>取消</button>

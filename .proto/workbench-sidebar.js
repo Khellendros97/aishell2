@@ -2,7 +2,7 @@
    工作台左侧功能栏模块（sidebar）
    - 活动栏切换：explorer / servers / commands（commands 需终端标签准入）
    - 文件资源管理器：模拟文件树、内联新建、删除、拖拽（local 拖出 / remote 拖入）
-   - 服务器列表：绑定服务器卡片，SSH / SFTP 标签页
+   - 服务器列表：绑定服务器卡片，SSH / SFTP 标签页；新建/编辑表单复用凭据库，修改共享凭据时必须选择更新或另存
    - 快捷指令：复制到终端 / 立即执行 / 编辑 / 删除，持久化到 AIShell db
    依赖：shared/mock.js（window.AIShell）、workbench-core.js（window.Workbench）
    仅创建本文件；不污染全局。
