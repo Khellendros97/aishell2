@@ -29,10 +29,11 @@ import '@xterm/xterm/css/xterm.css';
 
 import {
   SSH_AUTH_FAILED_PREFIX, getState, onTermData, onTermExit, openDialog, termClose, termCreate,
-  termInput, termRecordStart, termRecordStop, termResize, upsertProject, upsertServer,
+  termInput, termRecordStart, termRecordStop, termResize, upsertProject,
 } from '../../../api';
 import type { TermKind } from '../../../api';
 import type { QuickCommand, Server, ServerRef, TermSnapshot } from '../../../types';
+import { saveServerWithCredentialChoice } from '../../settings/server-save';
 import { icon } from '../../../icons';
 import { attachCombo, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { dbg } from '../../../debug';
@@ -1061,13 +1062,19 @@ async function showAuthFixDialog(serverId: string, errorMsg: string, onSaved: ()
     const passwordOrNull = authType === 'password' ? (password || null) : null;
     saveBtn.disabled = true;
     saveBtn.textContent = '保存中…';
+    let saved: Server | null;
     try {
-      await upsertServer(next, passwordOrNull);
+      saved = await saveServerWithCredentialChoice(next, passwordOrNull);
     } catch (err) {
       saveBtn.disabled = false;
       saveBtn.textContent = '保存并重连';
       errEl.textContent = String(err);
       toast(String(err), 'error');
+      return;
+    }
+    if (!saved) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = '保存并重连';
       return;
     }
     close();

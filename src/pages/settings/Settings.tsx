@@ -12,6 +12,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
 import type { AppState, LlmConfig, Settings as AppSettings, Theme } from '../../types';
+import { CredentialsPanel } from './CredentialsPanel';
 import { getMcpStatus, getState, openDialog, saveSettings, setMcpPort, setTheme } from '../../api';
 import { toast } from '../../ui';
 import { Icon } from '../../shared/Icon';
@@ -50,10 +51,11 @@ interface McpStatusLine {
 }
 
 /** 左侧导航分类：MCP 是 AIShell 作为服务端供外部工具接入，归功能特性；快捷键页只读。 */
-type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api';
+type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api' | 'credentials';
 
 const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'features', label: '功能特性', icon: 'zap' },
+  { id: 'credentials', label: '凭据库', icon: 'key' },
   { id: 'appearance', label: '外观', icon: 'monitor' },
   { id: 'shortcuts', label: '快捷键', icon: 'key' },
   { id: 'api', label: 'API 接口', icon: 'plug' },
@@ -142,6 +144,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const mcpPortRef = useRef<HTMLInputElement>(null);
 
   const [fields, setFields] = useState<SysFields>(EMPTY_FIELDS);
+  const [appState, setAppState] = useState<AppState | null>(null);
   const [page, setPage] = useState<SettingsPage>('features');
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [braveKeyVisible, setBraveKeyVisible] = useState(false);
@@ -169,6 +172,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   /** 装载后端状态到表单（同旧版 loadSystemSettings；主题取内存当前值:顶栏即时切换后 db 缓存已过期） */
   const applyState = (s: AppState): void => {
     dbRef.current = s;
+    setAppState(s);
     setFields({
       theme: currentTheme(),
       workspace: s.settings.workspaceDir || '',
@@ -200,7 +204,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   useEffect(() => {
     const onDataChanged = (): void => {
       void getState()
-        .then((s) => { dbRef.current = s; })
+        .then((s) => { dbRef.current = s; setAppState(s); })
         .catch((err) => toast(String(err), 'error'));
     };
     window.addEventListener('aishell:data-changed', onDataChanged);
@@ -296,6 +300,9 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
           ))}
         </nav>
         <main id="settings-content">
+          {page === 'credentials' && (
+            <CredentialsPanel initialState={appState} onChanged={(next) => { dbRef.current = next; setAppState(next); }} />
+          )}
           {page === 'appearance' && (
           <section id="panel-appearance" className="settings-panel">
             <div className="panel-head"><div className="panel-title">外观</div></div>

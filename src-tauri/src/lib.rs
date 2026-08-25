@@ -209,6 +209,8 @@ pub fn run() {
             store::save_settings,
             store::set_theme,
             store::upsert_server,
+            store::upsert_credential,
+            store::delete_credential,
             store::delete_server,
             store::upsert_project,
             delete_project_with_ai,

@@ -10,10 +10,15 @@
       workspaceDir: 'D:\\AIShellWorkspace',
       llm: { modelId: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1', apiKey: 'sk-proto-demo-key-********', effort: 'medium' },
     },
+    credentials: [
+      { id: 'cred-1', name: 'deploy@47.102.118.66', authType: 'password', username: 'deploy', keyPath: '' },
+      { id: 'cred-2', name: 'ubuntu@192.168.10.21', authType: 'key', username: 'ubuntu', keyPath: 'C:\\Users\\demo\\.ssh\\id_ed25519' },
+      { id: 'cred-3', name: 'root@10.8.0.5', authType: 'key', username: 'root', keyPath: 'C:\\Users\\demo\\.ssh\\gpu_key.pem' },
+    ],
     servers: [
-      { id: 'srv-1', name: '生产-Web-01', host: '47.102.118.66', port: 22, authType: 'password', username: 'deploy', password: '••••••••', keyPath: '', locked: false },
-      { id: 'srv-2', name: '测试-K8s-Node', host: '192.168.10.21', port: 2222, authType: 'key', username: 'ubuntu', password: '', keyPath: 'C:\\Users\\demo\\.ssh\\id_ed25519', locked: false },
-      { id: 'srv-3', name: 'GPU训练机', host: '10.8.0.5', port: 22, authType: 'key', username: 'root', password: '', keyPath: 'C:\\Users\\demo\\.ssh\\gpu_key.pem', locked: false },
+      { id: 'srv-1', name: '生产-Web-01', host: '47.102.118.66', port: 22, authType: 'password', username: 'deploy', keyPath: '', credentialId: 'cred-1', locked: false },
+      { id: 'srv-2', name: '测试-K8s-Node', host: '192.168.10.21', port: 2222, authType: 'key', username: 'ubuntu', keyPath: 'C:\\Users\\demo\\.ssh\\id_ed25519', credentialId: 'cred-2', locked: false },
+      { id: 'srv-3', name: 'GPU训练机', host: '10.8.0.5', port: 22, authType: 'key', username: 'root', keyPath: 'C:\\Users\\demo\\.ssh\\gpu_key.pem', credentialId: 'cred-3', locked: false },
     ],
     projects: [
       {

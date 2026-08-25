@@ -28,12 +28,13 @@ import type { AppState, Project, Server } from '../../types';
 import {
   createProjectFolder, deleteProject, deleteProjectFolder, deleteServer, ensureProjectDirs,
   getState, getTaskProject, openDialog, renameProjectFolder,
-  saveSettings, setUiExpanded, upsertProject, upsertServer,
+  saveSettings, setUiExpanded, upsertProject,
 } from '../../api';
 import { attachCombo, confirmDialog, promptDialog, toast, uid } from '../../ui';
 import { Icon } from '../../shared/Icon';
 import { navigate } from '../../router';
 import { ServerForm, type ServerFormHandle } from '../settings/ServerForm';
+import { saveServerWithCredentialChoice } from '../settings/server-save';
 import { AiPanel } from '../workbench/ai/AiPanel';
 import type { AiPanelController } from '../workbench/ai/ai-engine';
 import '../welcome.css';
@@ -52,7 +53,7 @@ const EMPTY_STATE: AppState = {
     approvalMode: 'smart',
     autoBackupRemoteFiles: true,
   },
-  servers: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
+  servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
   seededSkillWorkspaces: [],
   traceEnabled: false,
@@ -486,14 +487,16 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
     }
     const srv = miniFormRef.current!.buildServer(null);
     const password = miniFormRef.current!.passwordValue();
+    let saved: Server | null;
     try {
-      await upsertServer(srv, password);
+      saved = await saveServerWithCredentialChoice(srv, password);
     } catch (err) {
       toast(String(err), 'error');
       return;
     }
-    setDb((prev) => ({ ...prev, servers: [...prev.servers, srv] }));
-    setSelectedServerIds((prev) => [...prev, srv.id]);
+    if (!saved) return;
+    setDb((prev) => ({ ...prev, servers: [...prev.servers, saved!] }));
+    setSelectedServerIds((prev) => [...prev, saved!.id]);
     collapseMini();
     resetMini();
     toast('服务器已创建并自动选中', 'success');
@@ -544,21 +547,23 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
     const editing = srvEditingId ? db.servers.find((s) => s.id === srvEditingId) ?? null : null;
     const srv = srvFormRef.current!.buildServer(editing);
     const password = srvFormRef.current!.passwordValue();
+    let saved: Server | null;
     try {
-      await upsertServer(srv, password);
+      saved = await saveServerWithCredentialChoice(srv, password);
     } catch (e) {
       toast(String(e), 'error');
       return;
     }
+    if (!saved) return;
 
     if (editing) {
       setDb((prev) => ({
         ...prev,
-        servers: prev.servers.map((s) => (s.id === editing.id ? { ...s, ...srv } : s)),
+        servers: prev.servers.map((s) => (s.id === editing.id ? saved! : s)),
       }));
       toast('服务器已更新', 'success');
     } else {
-      setDb((prev) => ({ ...prev, servers: [...prev.servers, srv] }));
+      setDb((prev) => ({ ...prev, servers: [...prev.servers, saved!] }));
       // 新建服务器：把 id 并入当前项目绑定后再落盘（幂等去重）
       if (srvContextProjectId) {
         const proj = db.projects.find((p) => p.id === srvContextProjectId);
@@ -1012,7 +1017,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
               </div>
               <div className={`server-mini${miniExpanded ? '' : ' hidden'}`} id="server-mini">
                 {/* 服务器表单字段（双列紧凑布局）由 ServerForm 渲染，与侧栏编辑表单同源 */}
-                <div id="mini-form"><ServerForm ref={miniFormRef} compact /></div>
+                <div id="mini-form"><ServerForm ref={miniFormRef} compact credentials={db.credentials} /></div>
                 <div className={`error${miniErr === null ? ' hidden' : ''}`} id="mini-err">{miniErr}</div>
                 <div className="mini-actions">
                   <button className="btn" id="mini-cancel"
@@ -1038,7 +1043,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
             <button className="icon-btn" id="srv-modal-close" title="关闭" onClick={closeSrvModal}><Icon name="x" /></button>
           </div>
           <div className="modal-body">
-            <div id="srv-form"><ServerForm ref={srvFormRef} /></div>
+            <div id="srv-form"><ServerForm ref={srvFormRef} credentials={db.credentials} /></div>
             <div className={`error${srvErr === null ? ' hidden' : ''}`} id="srv-err">{srvErr}</div>
           </div>
           <div className="modal-foot">
