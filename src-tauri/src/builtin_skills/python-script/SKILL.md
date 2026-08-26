@@ -8,7 +8,7 @@ enabled: true
 
 # Python 脚本与 aishell SDK
 
-py 工具在本机执行 Python 脚本（仅工作/全自动模式可用，执行前需用户审批）。脚本内 `import aishell` 即可调用 AIShell 代管的服务器能力：连接复用、锁定服务器拦截、数据库命令白名单、凭据代管都在 AIShell 端完成——**脚本拿不到任何密码**。
+py 工具在本机执行 Python 脚本（仅工作/全自动模式可用，执行前需用户审批；系统任务上下文中不含 aishell.config 配置写入的探查类脚本自动放行，无需等待批准）。脚本内 `import aishell` 即可调用 AIShell 代管的服务器能力：连接复用、锁定服务器拦截、数据库命令白名单、凭据代管都在 AIShell 端完成——**脚本拿不到任何密码**。
 
 ## 何时使用
 
@@ -55,6 +55,7 @@ from aishell import servers, ssh, sftp, db
 
 - `config.import_project(name, path=None, folder="", servers=None)`：导入项目，可携带服务器列表。
   - path 留空时在工作区下创建 `<workspace>/<name>`；同名项目已存在则复用（并入服务器）。
+  - folder 为项目所属目录（'/' 分隔的相对路径，如 "生产环境/Web"；空串 = 未分类），欢迎页按目录对项目分组。从其他 SSH 工具迁移配置时必须用它保留来源层级（如源工具的「生产/Web」目录 → folder="Xshell/生产"、name="Web"），不要把所有服务器塞进单个项目。
   - servers 每项 `{name, host, username, port=22, authType="password"|"key", keyPath, password, locked=False, isBastion=False, bastion="<堡垒机名称>"}`；按 host+port+username 去重复用已有服务器（created=False），password 只进系统钥匙串；bastion 按名称引用（只对新建服务器生效）。
   - 返回 `{projectId, name, path, existed, servers: [{id, name, host, created}]}`。
 - `config.import_commands(commands, project_id=None, project_name=None)`：导入命令收藏到项目（project_id/project_name 二选一）。每项 `{title, command, folder="", global=False}`；title+command 完全相同则跳过。返回 `{projectId, projectName, added, skipped}`。
@@ -76,6 +77,28 @@ config.import_commands(
     project_id=r["projectId"],
 )
 config.import_note("电商生产环境/概览", "# 电商生产环境\n\n- Web-01：应用入口（堡垒机）\n- DB-01：数据库\n")
+```
+
+从其他 SSH 工具迁移配置：按来源目录逐个建项目，统一挂到以工具名命名的目录下，保留原分组结构（源目录树由前置探查得到）：
+
+```python
+from aishell import config
+
+# 键 = 源工具里的目录名，值 = 该目录下的会话；根目录未分组会话归入「未分组」
+tree = {
+    "浙江大学": [
+        {"name": "服务器1", "host": "10.10.1.1", "username": "root"},
+        {"name": "服务器2", "host": "10.10.1.2", "username": "root"},
+    ],
+    "山东大学": [
+        {"name": "服务器3", "host": "10.20.1.1", "username": "admin"},
+        {"name": "服务器4", "host": "10.20.1.2", "username": "admin"},
+    ],
+}
+for group, servers in tree.items():
+    r = config.import_project(group, folder="Xshell", servers=servers)
+    print(f'{r["name"]}：服务器 {len(r["servers"])} 台（existed={r["existed"]}）')
+# 多级目录把上级路径接进 folder：源结构「生产/Web」→ folder="Xshell/生产"
 ```
 
 ## 示例

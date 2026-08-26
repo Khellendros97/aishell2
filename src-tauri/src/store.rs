@@ -8,7 +8,7 @@
 //!
 //! 命令注册由主 agent 在集成阶段统一做（lib.rs 的 generate_handler），本模块只暴露命令函数与类型。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -602,7 +602,7 @@ impl McpFeatures {
 }
 
 /// MCP 设备配置（每服务器独立）：enabled = 加入 MCP 可发现设备列表。
-/// 服务器被删除时该条目级联清理（delete_server / clear_all_servers）。
+/// 服务器被删除时该条目级联清理（delete_server / clear_unreferenced_servers）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct McpDeviceConfig {
@@ -1853,45 +1853,162 @@ impl Store {
         Ok(())
     }
 
-    /// 移除服务器、级联从所有 projects[].server_ids 移除，不删除可复用凭据。
+    /// 清除未被任何服务器引用的凭据元数据与 keyring 密钥，返回清除数量。
+    pub fn clear_unreferenced_credentials(&self) -> Result<usize, String> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())?;
+        let referenced: HashSet<String> = guard
+            .servers
+            .iter()
+            .filter_map(|server| server.credential_id.clone())
+            .collect();
+        let orphan_ids: HashSet<String> = guard
+            .credentials
+            .iter()
+            .filter(|credential| !referenced.contains(&credential.id))
+            .map(|credential| credential.id.clone())
+            .collect();
+        if orphan_ids.is_empty() {
+            return Ok(0);
+        }
+        let orphans: Vec<(String, Option<String>)> = orphan_ids
+            .iter()
+            .map(|id| {
+                let account = keyring_account_credential(id);
+                let old_secret = self.secrets.get(&account).ok();
+                (account, old_secret)
+            })
+            .collect();
+
+        let mut deleted: Vec<(String, Option<String>)> = Vec::with_capacity(orphans.len());
+        for (account, old_secret) in &orphans {
+            if let Err(error) = self.secrets.delete(account) {
+                for (deleted_account, deleted_secret) in &deleted {
+                    if let Some(secret) = deleted_secret {
+                        let _ = self.secrets.set(deleted_account, secret);
+                    }
+                }
+                return Err(error);
+            }
+            deleted.push((account.clone(), old_secret.clone()));
+        }
+
+        let mut candidate = guard.clone();
+        candidate
+            .credentials
+            .retain(|credential| !orphan_ids.contains(&credential.id));
+        if let Err(error) = self.persist_locked(&candidate) {
+            for (account, old_secret) in &deleted {
+                if let Some(secret) = old_secret {
+                    let _ = self.secrets.set(account, secret);
+                }
+            }
+            return Err(error);
+        }
+        *guard = candidate;
+        Ok(orphan_ids.len())
+    }
+
+    /// 从状态中移除服务器及其附属配置，返回待清理的数据库 keyring 账号。
+    fn remove_servers_from_state(
+        state: &mut AppState,
+        ids: &HashSet<String>,
+        unbind_projects: bool,
+    ) -> Vec<String> {
+        let db_accounts = ids
+            .iter()
+            .flat_map(|server_id| {
+                state
+                    .db_connections
+                    .get(server_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|connection| keyring_account_db(server_id, &connection.id))
+            })
+            .collect();
+        state.servers.retain(|server| !ids.contains(&server.id));
+        state.mcp_devices.retain(|server_id, _| !ids.contains(server_id));
+        state.sftp_history.retain(|server_id, _| !ids.contains(server_id));
+        state.sftp_favorites.retain(|server_id, _| !ids.contains(server_id));
+        state.db_connections.retain(|server_id, _| !ids.contains(server_id));
+        if unbind_projects {
+            for project in &mut state.projects {
+                project.server_ids.retain(|server_id| !ids.contains(server_id));
+            }
+        }
+        db_accounts
+    }
+
+    fn delete_db_accounts(&self, accounts: Vec<String>) {
+        for account in accounts {
+            let _ = self.secrets.delete(&account);
+        }
+    }
+
+    /// 移除服务器、级联清理项目绑定及服务器附属配置，不删除可复用凭据。
     /// 服务器是堡垒机且仍有目标主机时拒绝删除（避免留下指向幽灵堡垒机的目标），
     /// 提示先到「SSH跳转设置」解除目标主机绑定。
     fn delete_server(&self, id: &str) -> Result<(), String> {
-        let has_targets = self.with_state(|s| {
-            Ok(s.servers
-                .iter()
-                .any(|sv| sv.bastion_id.as_deref() == Some(id)))
-        })?;
+        let has_targets = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())?
+            .servers
+            .iter()
+            .any(|server| server.bastion_id.as_deref() == Some(id));
         if has_targets {
             let name = self
                 .server(id)
-                .map(|sv| sv.name)
+                .map(|server| server.name)
                 .unwrap_or_else(|| id.to_string());
             return Err(format!(
                 "堡垒机「{name}」仍有目标主机绑定，请先在「SSH跳转设置」中解除目标主机绑定后再删除"
             ));
         }
-        // 删除服务器不删除可复用凭据；凭据由用户在凭据管理中显式删除。
-        self.with_state(|s| {
-            s.servers.retain(|sv| sv.id != id);
-            s.mcp_devices.remove(id);
-            for p in &mut s.projects {
-                p.server_ids.retain(|sid| sid != id);
-            }
-            Ok(())
-        })
+        let ids = HashSet::from([id.to_string()]);
+        let db_accounts = self.with_candidate_state(|state| {
+            Ok(Self::remove_servers_from_state(state, &ids, true))
+        })?;
+        self.delete_db_accounts(db_accounts);
+        Ok(())
     }
 
-    /// 清除全部服务器配置但保留可复用凭据；所有 projects 解绑并原子落盘。
-    pub fn clear_all_servers(&self) -> Result<(), String> {
-        self.with_state(|s| {
-            s.servers.clear();
-            s.mcp_devices.clear();
-            for p in &mut s.projects {
-                p.server_ids.clear();
+    /// 清除未被项目直接引用、也不是其依赖堡垒机的服务器及附属配置，返回清除数量。
+    pub fn clear_unreferenced_servers(&self) -> Result<usize, String> {
+        let (removed, db_accounts) = self.with_candidate_state(|state| {
+            let mut keep: HashSet<String> = state
+                .projects
+                .iter()
+                .flat_map(|project| project.server_ids.iter().cloned())
+                .collect();
+            let mut pending: Vec<String> = keep.iter().cloned().collect();
+            while let Some(server_id) = pending.pop() {
+                let Some(bastion_id) = state
+                    .servers
+                    .iter()
+                    .find(|server| server.id == server_id)
+                    .and_then(|server| server.bastion_id.clone())
+                else {
+                    continue;
+                };
+                if keep.insert(bastion_id.clone()) {
+                    pending.push(bastion_id);
+                }
             }
-            Ok(())
-        })
+            let removed_ids: HashSet<String> = state
+                .servers
+                .iter()
+                .filter(|server| !keep.contains(&server.id))
+                .map(|server| server.id.clone())
+                .collect();
+            let removed = removed_ids.len();
+            let db_accounts = Self::remove_servers_from_state(state, &removed_ids, false);
+            Ok((removed, db_accounts))
+        })?;
+        self.delete_db_accounts(db_accounts);
+        Ok(removed)
     }
 
     /// 分类目录名规范化：整体 trim、按 '/' 拆分、过滤空段后 join('/')（与前端表单同语义）。
@@ -2891,6 +3008,13 @@ pub async fn delete_credential(store: State<'_, Arc<Store>>, id: String) -> Resu
 }
 
 #[tauri::command]
+pub async fn clear_unreferenced_credentials(
+    store: State<'_, Arc<Store>>,
+) -> Result<usize, String> {
+    store.clear_unreferenced_credentials()
+}
+
+#[tauri::command]
 pub async fn delete_server(
     store: State<'_, Arc<Store>>,
     mcp: State<'_, Arc<crate::mcp::McpService>>,
@@ -3044,14 +3168,14 @@ pub async fn set_sftp_favorites(
 }
 
 #[tauri::command]
-pub async fn clear_all_servers(
+pub async fn clear_unreferenced_servers(
     store: State<'_, Arc<Store>>,
     mcp: State<'_, Arc<crate::mcp::McpService>>,
-) -> Result<(), String> {
-    store.clear_all_servers()?;
-    // 设备配置已全部清空 → 停止 MCP 监听
+) -> Result<usize, String> {
+    let removed = store.clear_unreferenced_servers()?;
+    // 被清理服务器的设备配置已移除，按剩余设备同步 MCP 监听。
     mcp.sync().await;
-    Ok(())
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------- tests
@@ -3521,9 +3645,37 @@ mod tests {
             })
             .unwrap();
 
-        // 删除前凭据库里确实有密码
+        // 删除前凭据库与服务器附属配置确实存在。
         let deleted_server = store.server("srv-c-1").unwrap();
         assert_eq!(store.read_server_secret(&deleted_server).unwrap(), "pw-1");
+        store
+            .save_db_connection(
+                "srv-c-1",
+                DbConnection {
+                    id: "db-c-1".to_string(),
+                    name: "DB".to_string(),
+                    kind: DbKind::Mysql,
+                    host: "127.0.0.1".to_string(),
+                    port: 3306,
+                    user: "root".to_string(),
+                    database: String::new(),
+                    allowed_commands: Vec::new(),
+                    enabled: true,
+                },
+                Some("db-password"),
+            )
+            .unwrap();
+        store
+            .with_state(|state| {
+                state.sftp_history.insert("srv-c-1".to_string(), vec!["/tmp".to_string()]);
+                state.sftp_favorites.insert(
+                    "srv-c-1".to_string(),
+                    vec![SftpFavorite { path: "/var".to_string(), title: "var".to_string() }],
+                );
+                state.mcp_devices.insert("srv-c-1".to_string(), McpDeviceConfig::default());
+                Ok(())
+            })
+            .unwrap();
 
         store.delete_server("srv-c-1").unwrap();
 
@@ -3531,7 +3683,12 @@ mod tests {
         assert_eq!(guard.servers.len(), 1);
         assert_eq!(guard.servers[0].id, "srv-c-2");
         assert_eq!(guard.projects[0].server_ids, vec!["srv-c-2".to_string()]);
+        assert!(!guard.sftp_history.contains_key("srv-c-1"));
+        assert!(!guard.sftp_favorites.contains_key("srv-c-1"));
+        assert!(!guard.mcp_devices.contains_key("srv-c-1"));
+        assert!(!guard.db_connections.contains_key("srv-c-1"));
         drop(guard);
+        assert!(store.db_secret("srv-c-1", "db-c-1").is_err());
         // 删除服务器只解除引用，可复用凭据及其密码仍由凭据库管理。
         assert_eq!(store.read_server_secret(&deleted_server).unwrap(), "pw-1");
         // 删除不存在的服务器不算错
@@ -3695,6 +3852,63 @@ mod tests {
             .iter()
             .all(|item| item.id != credential_id));
         assert!(store.read_server_secret(&server).is_err());
+    }
+
+    #[test]
+    fn clear_unreferenced_credentials_removes_metadata_and_secrets() {
+        let dir = temp_config_dir("credential-clear");
+        let store = test_store(dir);
+        store
+            .upsert_server(
+                credential_test_server("srv-keep-credential", "10.0.0.10"),
+                Some("keep-password"),
+            )
+            .unwrap();
+        let kept_server = store.server("srv-keep-credential").unwrap();
+        let kept_id = kept_server.credential_id.clone().unwrap();
+        store
+            .upsert_credential(
+                Credential {
+                    id: "credential-orphan-password".to_string(),
+                    name: "孤儿密码".to_string(),
+                    auth_type: AuthType::Password,
+                    username: "orphan".to_string(),
+                    key_path: String::new(),
+                },
+                Some("orphan-password"),
+            )
+            .unwrap();
+        store
+            .upsert_credential(
+                Credential {
+                    id: "credential-orphan-key".to_string(),
+                    name: "孤儿密钥".to_string(),
+                    auth_type: AuthType::Key,
+                    username: "orphan".to_string(),
+                    key_path: "C:\\orphan-key".to_string(),
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(store.clear_unreferenced_credentials().unwrap(), 2);
+        assert_eq!(store.credentials_all().len(), 1);
+        assert_eq!(store.credentials_all()[0].id, kept_id);
+        assert_eq!(store.read_server_secret(&kept_server).unwrap(), "keep-password");
+        assert!(store
+            .secrets
+            .get(&keyring_account_credential("credential-orphan-password"))
+            .is_err());
+        assert!(store
+            .secrets
+            .get(&keyring_account_credential("credential-orphan-key"))
+            .is_err());
+        assert_eq!(store.clear_unreferenced_credentials().unwrap(), 0);
+
+        store.delete_server("srv-keep-credential").unwrap();
+        assert_eq!(store.clear_unreferenced_credentials().unwrap(), 1);
+        assert!(store.credentials_all().is_empty());
+        assert!(store.read_server_secret(&kept_server).is_err());
     }
 
     #[test]
@@ -4106,79 +4320,134 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_servers_keeps_reusable_credentials() {
-        let dir = temp_config_dir("clear-all");
+    fn clear_unreferenced_servers_keeps_project_bastion_and_cleans_dependents() {
+        let dir = temp_config_dir("clear-unreferenced");
         let store = test_store(dir.clone());
-        // 两台服务器（一台带密码）+ 一个已绑定项目
+        let server = |id: &str, is_bastion: bool, bastion_id: Option<&str>| Server {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: format!("{id}.example"),
+            port: 22,
+            auth_type: AuthType::Password,
+            username: "u".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion,
+            bastion_id: bastion_id.map(str::to_string),
+        };
+        store.upsert_server(server("keep-bastion", true, None), None).unwrap();
         store
-            .upsert_server(
-                Server {
-                    id: "srv-cl-1".to_string(),
-                    name: "A".to_string(),
-                    host: "h1".to_string(),
-                    port: 22,
-                    auth_type: AuthType::Password,
-                    username: "u".to_string(),
-                    key_path: String::new(),
-                    credential_id: None,
-                    locked: false,
-                    is_bastion: false,
-                    bastion_id: None,
-                },
-                Some("pw-1"),
-            )
+            .upsert_server(server("keep-target", false, Some("keep-bastion")), None)
+            .unwrap();
+        store.upsert_server(server("drop-bastion", true, None), None).unwrap();
+        store
+            .upsert_server(server("drop-target", false, Some("drop-bastion")), None)
             .unwrap();
         store
-            .upsert_server(
-                Server {
-                    id: "srv-cl-2".to_string(),
-                    name: "B".to_string(),
-                    host: "h2".to_string(),
-                    port: 22,
-                    auth_type: AuthType::Key,
-                    username: "u".to_string(),
-                    key_path: "C:\\key".to_string(),
-                    credential_id: None,
-                    locked: false,
-                    is_bastion: false,
-                    bastion_id: None,
-                },
-                None,
-            )
+            .upsert_server(server("drop-password", false, None), Some("orphan-password"))
             .unwrap();
+        let dropped_password_server = store.server("drop-password").unwrap();
         store
             .upsert_project(Project {
-                id: "proj-cl-1".to_string(),
+                id: "proj-keep".to_string(),
                 name: "P".to_string(),
                 path: None,
-                server_ids: vec!["srv-cl-1".to_string(), "srv-cl-2".to_string()],
+                server_ids: vec!["keep-target".to_string()],
                 quick_commands: vec![],
                 folder: String::new(),
                 ai_mode: AiMode::Suggest,
             })
             .unwrap();
-        let password_server = store.server("srv-cl-1").unwrap();
-        assert_eq!(store.read_server_secret(&password_server).unwrap(), "pw-1");
 
-        store.clear_all_servers().unwrap();
+        let db = |id: &str| DbConnection {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: DbKind::Mysql,
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            database: String::new(),
+            allowed_commands: Vec::new(),
+            enabled: true,
+        };
+        store
+            .save_db_connection("keep-target", db("keep-db"), Some("keep-db-password"))
+            .unwrap();
+        store
+            .save_db_connection("drop-password", db("drop-db"), Some("drop-db-password"))
+            .unwrap();
+        store
+            .with_state(|state| {
+                for id in ["keep-target", "drop-password"] {
+                    state.sftp_history.insert(id.to_string(), vec!["/tmp".to_string()]);
+                    state.sftp_favorites.insert(
+                        id.to_string(),
+                        vec![SftpFavorite { path: "/var".to_string(), title: "var".to_string() }],
+                    );
+                    state.mcp_devices.insert(id.to_string(), McpDeviceConfig::default());
+                }
+                Ok(())
+            })
+            .unwrap();
 
-        // state：servers 清空，项目保留但解绑
+        assert_eq!(store.clear_unreferenced_servers().unwrap(), 3);
         let guard = store.state.lock().unwrap();
-        assert!(guard.servers.is_empty());
-        assert_eq!(guard.projects.len(), 1);
-        assert!(guard.projects[0].server_ids.is_empty());
+        let ids: HashSet<&str> = guard.servers.iter().map(|server| server.id.as_str()).collect();
+        assert_eq!(ids, HashSet::from(["keep-bastion", "keep-target"]));
+        assert_eq!(guard.projects[0].server_ids, vec!["keep-target".to_string()]);
+        assert!(guard.sftp_history.contains_key("keep-target"));
+        assert!(!guard.sftp_history.contains_key("drop-password"));
+        assert!(guard.sftp_favorites.contains_key("keep-target"));
+        assert!(!guard.sftp_favorites.contains_key("drop-password"));
+        assert!(guard.mcp_devices.contains_key("keep-target"));
+        assert!(!guard.mcp_devices.contains_key("drop-password"));
+        assert!(guard.db_connections.contains_key("keep-target"));
+        assert!(!guard.db_connections.contains_key("drop-password"));
         drop(guard);
-        // 凭据库保留，后续仍可绑定到新服务器。
-        assert_eq!(store.credentials_all().len(), 2);
-        assert_eq!(store.read_server_secret(&password_server).unwrap(), "pw-1");
-        // 落盘可重载且一致
+        assert_eq!(store.db_secret("keep-target", "keep-db").unwrap(), "keep-db-password");
+        assert!(store.db_secret("drop-password", "drop-db").is_err());
+        assert_eq!(store.read_server_secret(&dropped_password_server).unwrap(), "orphan-password");
+        assert_eq!(store.credentials_all().len(), 5);
+
         let reloaded = test_store(dir);
-        let guard = reloaded.state.lock().unwrap();
-        assert!(guard.servers.is_empty());
-        assert!(guard.projects[0].server_ids.is_empty());
-        // 幂等：空库再清不算错
-        drop(guard);
-        reloaded.clear_all_servers().unwrap();
+        assert_eq!(reloaded.clear_unreferenced_servers().unwrap(), 0);
+        assert_eq!(reloaded.state.lock().unwrap().servers.len(), 2);
+    }
+
+    #[test]
+    fn clear_unreferenced_servers_terminates_on_legacy_bastion_cycle() {
+        let dir = temp_config_dir("clear-cycle");
+        let store = test_store(dir);
+        let cyclic = |id: &str, bastion_id: &str| Server {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: id.to_string(),
+            port: 22,
+            auth_type: AuthType::Key,
+            username: "u".to_string(),
+            key_path: "key".to_string(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: Some(bastion_id.to_string()),
+        };
+        force_upsert_server(&store, cyclic("cycle-a", "cycle-b"));
+        force_upsert_server(&store, cyclic("cycle-b", "cycle-a"));
+        store
+            .upsert_project(Project {
+                id: "proj-cycle".to_string(),
+                name: "P".to_string(),
+                path: None,
+                server_ids: vec!["cycle-a".to_string()],
+                quick_commands: vec![],
+                folder: String::new(),
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+
+        assert_eq!(store.clear_unreferenced_servers().unwrap(), 0);
+        assert_eq!(store.state.lock().unwrap().servers.len(), 2);
     }
 
     #[test]

@@ -63,7 +63,7 @@ import MarkdownIt from 'markdown-it';
 import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon, type IconName } from '../../../icons';
 import {
-  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondDbRequest, aiSetThinking, getState, kbSearch, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
+  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, getState, kbSearch, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
   sessionArchive, sessionNote, sessionUpsert, sessionsGet, setAiMode, stagingAccept, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
@@ -187,6 +187,22 @@ const STYLE = `
 }
 .ai-action-group-toggle svg { width: 12px; height: 12px; }
 .ai-action-card .ai-action-detail { display: flex; flex-direction: column; gap: 5px; }
+/* ask 问答卡：问题正文 + 候选选项（radio）+ 自由输入框 */
+.ai-ask-question { display: flex; flex-direction: column; gap: 5px; padding: 4px 0; }
+.ai-ask-question + .ai-ask-question { border-top: 1px dashed var(--border); }
+.ai-ask-qtext { font-size: 12px; color: var(--text-0); word-break: break-all; white-space: pre-wrap; }
+.ai-ask-options { display: flex; flex-direction: column; gap: 3px; }
+.ai-ask-option {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-1);
+  cursor: pointer; padding: 2px 0;
+}
+.ai-ask-option:hover { color: var(--text-0); }
+.ai-ask-option input[type="radio"] { margin: 0; accent-color: var(--accent); }
+.ai-ask-input {
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 8px; font-size: 12px; color: var(--text-0); outline: none;
+}
+.ai-ask-input:focus { border-color: var(--accent); }
 .ai-action-impact-warn { color: var(--yellow); display: inline-flex; align-items: flex-start; gap: 4px; }
 .ai-action-impact-warn svg { flex: none; width: 12px; height: 12px; margin-top: 2px; }
 .ai-action-impact-ok { color: var(--green); }
@@ -460,6 +476,12 @@ interface ActionCard {
   requestId?: string;
   /** 数据库连接申请（request_db_connection）：AI 填写的连接信息，卡片只读展示、审批对话框复用 */
   dbRequest?: DbRequestDetail;
+  /** ask 工具问答卡：问题列表（每问可有候选选项；界面自动为每问附自由输入框） */
+  askRequest?: { questions: Array<{ question: string; options?: string[] }> };
+  /** ask 提交后的逐问回答（picked = 点选的选项，free = 自由输入）：卡片终态渲染时还原选中态/自定义回答 */
+  askAnswers?: Array<{ picked: string; free: string }>;
+  /** confirm 工具确认卡：单一是非问题 */
+  confirmRequest?: { question: string };
   /** 智能审批自动放行：status='smart' 时展示判定理由 */
   smartReason?: string;
   /** 影响计划（自动备份开启时审批事件携带）：unbounded 卡片展示「不保证完整备份」 */
@@ -507,6 +529,9 @@ const ACTION_NAMES: Record<string, string> = {
   staging_add: '主动暂存文件',
   staging_clear: '清理无变更暂存',
   request_db_connection: '申请数据库连接',
+  py: '执行 Python 脚本',
+  ask: '向用户提问',
+  confirm: '请求确认',
 };
 
 const ACTION_STATUS: Record<ActionCard['status'], string> = {
@@ -1478,6 +1503,41 @@ function handleEventBody(sid: string, ev: AiEvent): void {
       });
       pendingBy.set(sid, p);
     }
+  } else if (ev.type === 'ask') {
+    /* ask 工具（通用问答）：插入问答卡片（每问候选选项 + 自由输入框），
+       提交/取消经 aiRespondAsk 回执（submitAsk/cancelAsk）；卡片终态由前端本地标记 */
+    const cur = pendingBy.get(sid) ?? null;
+    const p = cur ?? emptyPending();
+    const existing = p.actions.get(ev.toolCallId);
+    p.actions.set(ev.toolCallId, {
+      toolCallId: ev.toolCallId,
+      tool: 'ask',
+      intent: `AI 助手提出了 ${ev.questions.length} 个问题`,
+      summary: existing?.summary ?? '',
+      askRequest: { questions: ev.questions },
+      requestId: ev.requestId,
+      status: 'approving',
+      textLen: existing?.textLen ?? p.text.length,
+      seq: existing?.seq ?? ++toolSeq,
+    });
+    pendingBy.set(sid, p);
+  } else if (ev.type === 'confirm') {
+    /* confirm 工具（通用是非确认）：插入确认卡片（确认/取消），经 aiRespondConfirm 回执 */
+    const cur = pendingBy.get(sid) ?? null;
+    const p = cur ?? emptyPending();
+    const existing = p.actions.get(ev.toolCallId);
+    p.actions.set(ev.toolCallId, {
+      toolCallId: ev.toolCallId,
+      tool: 'confirm',
+      intent: ev.question || existing?.intent || '',
+      summary: existing?.summary ?? '',
+      confirmRequest: { question: ev.question },
+      requestId: ev.requestId,
+      status: 'approving',
+      textLen: existing?.textLen ?? p.text.length,
+      seq: existing?.seq ?? ++toolSeq,
+    });
+    pendingBy.set(sid, p);
   } else if (ev.type === 'actionEnd') {
     /* 受控工具结束：更新终态（拒绝场景由前端本地标记，不走此事件） */
     const cur = pendingBy.get(sid) ?? null;
@@ -2028,6 +2088,8 @@ function htmlToNodes(html: string): HTMLElement[] {
  *  历史一串动作卡的折叠由 renderActionGroup 整组负责，单卡不再单独折叠。 */
 function renderActionCard(a: ActionCard): string {
   if (a.dbRequest) return renderDbRequestCard(a);
+  if (a.askRequest) return renderAskCard(a);
+  if (a.confirmRequest) return renderConfirmCard(a);
   const isCmd = a.tool === 'run_command';
   // actionStart 后：YOLO/人工批准为 running；智能审批自动放行暂存 smart，二者都仍在执行中。
   const isCmdRunning = isCmd && (a.status === 'running' || a.status === 'smart');
@@ -2106,6 +2168,80 @@ function renderDbRequestCard(a: ActionCard): string {
       <div class="ai-action-intent ai-action-summary">${kindLabel} · ${escapeHtml(d.host || '')}:${port}${d.user ? ' · 用户 ' + escapeHtml(d.user) : ''} · 服务器 ${escapeHtml(d.serverId || '')}</div>
       ${a.summary ? `<div class="ai-action-intent">申请理由：${escapeHtml(a.summary)}</div>` : ''}
       ${approveBtn}
+      ${resultHtml}
+    </div>
+  </div>`;
+}
+
+/** ask 工具问答卡：每个问题 = 问题正文 + 候选选项（radio）+ 自由输入框（始终附带，
+ *  输入内容优先于点选）；approving 时显示【提交回答】【取消】。提交后问答文本写入
+ *  result/summary（历史卡片回退默认渲染时仍能展示问答内容）。 */
+function renderAskCard(a: ActionCard): string {
+  const questions = a.askRequest?.questions ?? [];
+  const statusText = a.status === 'approving' ? '等待回答' : ACTION_STATUS[a.status] ?? a.status;
+  const cls = a.status === 'succeeded' || a.status === 'failed' || a.status === 'rejected' ? a.status : '';
+  const interactive = a.status === 'approving' && a.requestId;
+  const body = questions.map((q, i) => {
+    const ans = a.askAnswers?.[i];
+    const opts = (q.options ?? []).map((opt) => `
+      <label class="ai-ask-option">
+        <input type="radio" name="ask-${escapeHtml(a.toolCallId)}-${i}" value="${escapeHtml(opt)}"${interactive ? '' : ' disabled'}${ans && ans.picked === opt ? ' checked' : ''} />
+        <span>${escapeHtml(opt)}</span>
+      </label>`).join('');
+    /* 终态还原：自由输入有内容时以只读输入框回显；自定义回答（不匹配任何选项）额外标注 */
+    const answeredInput = !interactive && ans?.free
+      ? `<input class="ai-ask-input" type="text" value="${escapeHtml(ans.free)}" disabled />`
+      : '';
+    return `<div class="ai-ask-question" data-ask-idx="${i}">
+      <div class="ai-ask-qtext">${questions.length > 1 ? `${i + 1}. ` : ''}${escapeHtml(q.question)}</div>
+      ${opts ? `<div class="ai-ask-options">${opts}</div>` : ''}
+      ${interactive ? `<input class="ai-ask-input" type="text" placeholder="${q.options?.length ? '点选上方选项，或在此输入自定义回答' : '输入你的回答'}" />` : answeredInput}
+    </div>`;
+  }).join('');
+  const buttons = interactive
+    ? `<div class="ai-action-actions">
+        <button class="btn small primary" type="button" data-act-ask-submit="${escapeHtml(a.toolCallId)}">提交回答</button>
+        <button class="btn small" type="button" data-act-ask-cancel="${escapeHtml(a.toolCallId)}">取消</button>
+      </div>`
+    : '';
+  const resultHtml = a.result && (a.status === 'succeeded' || a.status === 'failed')
+    ? `<div class="ai-action-result">${escapeHtml(a.result)}</div>`
+    : '';
+  return `<div class="ai-action-card ${cls}" data-ask-card="${escapeHtml(a.toolCallId)}">
+    <div class="ai-action-head">
+      <span class="ai-action-name">${icon('message')} ${ACTION_NAMES[a.tool] ?? a.tool}</span>
+      <span class="ai-action-status">${statusText}</span>
+    </div>
+    <div class="ai-action-detail">
+      ${body}
+      ${buttons}
+      ${resultHtml}
+    </div>
+  </div>`;
+}
+
+/** confirm 工具确认卡：单一问题 + 【确认】【取消】；用户选择写入 result 供历史展示。 */
+function renderConfirmCard(a: ActionCard): string {
+  const question = a.confirmRequest?.question ?? a.intent;
+  const statusText = a.status === 'approving' ? '等待确认' : ACTION_STATUS[a.status] ?? a.status;
+  const cls = a.status === 'succeeded' || a.status === 'failed' || a.status === 'rejected' ? a.status : '';
+  const buttons = a.status === 'approving' && a.requestId
+    ? `<div class="ai-action-actions">
+        <button class="btn small primary" type="button" data-act-confirm-yes="${escapeHtml(a.toolCallId)}">确认</button>
+        <button class="btn small" type="button" data-act-confirm-no="${escapeHtml(a.toolCallId)}">取消</button>
+      </div>`
+    : '';
+  const resultHtml = a.result && (a.status === 'succeeded' || a.status === 'rejected')
+    ? `<div class="ai-action-result">${escapeHtml(a.result)}</div>`
+    : '';
+  return `<div class="ai-action-card ${cls}">
+    <div class="ai-action-head">
+      <span class="ai-action-name">${icon('message')} ${ACTION_NAMES[a.tool] ?? a.tool}</span>
+      <span class="ai-action-status">${statusText}</span>
+    </div>
+    <div class="ai-action-detail">
+      <div class="ai-action-intent">${escapeHtml(question)}</div>
+      ${buttons}
       ${resultHtml}
     </div>
   </div>`;
@@ -2562,9 +2698,120 @@ async function respondApproval(sid: string, toolCallId: string, confirmed: boole
   }
 }
 
+/** 提交 ask 问答卡：逐问收集答案（自由输入优先于点选，均未作答记「（未作答）」），
+ *  拼装「问/答」文本回执；问答内容同步进 summary（历史卡片回退默认渲染仍可展示）。 */
+async function submitAsk(sid: string, toolCallId: string): Promise<void> {
+  if (!project) return;
+  const p = pendingBy.get(sid) ?? null;
+  const card = p?.actions.get(toolCallId);
+  if (!p || !card || !card.requestId || !card.askRequest) {
+    toast('提问已过期', 'error');
+    return;
+  }
+  const cardEl = chat.querySelector(`[data-ask-card="${CSS.escape(toolCallId)}"]`);
+  /* 自由输入优先于点选：free 非空时清空 picked，避免终态卡片同时回显两个答案 */
+  const answers = card.askRequest.questions.map((q, i) => {
+    const scope = cardEl?.querySelector(`[data-ask-idx="${i}"]`);
+    const free = (scope?.querySelector('.ai-ask-input') as HTMLInputElement | null)?.value.trim() ?? '';
+    const picked = free ? '' : ((scope?.querySelector('input[type="radio"]:checked') as HTMLInputElement | null)?.value ?? '');
+    return { q, picked, free };
+  });
+  const response = answers
+    .map(({ q, picked, free }) => `问：${q.question}\n答：${free || picked || '（未作答）'}`)
+    .join('\n');
+  const requestId = card.requestId;
+  try {
+    await aiRespondAsk(`${project.id}:${sid}`, requestId, response);
+  } catch (err) {
+    toast(String(err), 'error');
+    return;
+  }
+  card.status = 'succeeded';
+  card.requestId = undefined;
+  card.askAnswers = answers.map(({ picked, free }) => ({ picked, free }));
+  card.result = response;
+  card.summary = response;
+  if (sid === activeSessionId) {
+    renderHistory();
+    updateSendBtn();
+  }
+}
+
+/** 取消 ask 问答卡：回执空串（guard 转为「用户取消了回答」文案），卡片标记已拒绝。 */
+async function cancelAsk(sid: string, toolCallId: string): Promise<void> {
+  if (!project) return;
+  const p = pendingBy.get(sid) ?? null;
+  const card = p?.actions.get(toolCallId);
+  if (!p || !card || !card.requestId || !card.askRequest) {
+    toast('提问已过期', 'error');
+    return;
+  }
+  const requestId = card.requestId;
+  try {
+    await aiRespondAsk(`${project.id}:${sid}`, requestId, '');
+  } catch (err) {
+    toast(String(err), 'error');
+    return;
+  }
+  card.status = 'rejected';
+  card.requestId = undefined;
+  card.result = '已取消回答';
+  if (sid === activeSessionId) {
+    renderHistory();
+    updateSendBtn();
+  }
+}
+
+/** 回复 confirm 确认卡：确认 → 成功（result「用户已确认」）；取消 → 已拒绝。 */
+async function respondConfirm(sid: string, toolCallId: string, confirmed: boolean): Promise<void> {
+  if (!project) return;
+  const p = pendingBy.get(sid) ?? null;
+  const card = p?.actions.get(toolCallId);
+  if (!p || !card || !card.requestId || !card.confirmRequest) {
+    toast('确认请求已过期', 'error');
+    return;
+  }
+  const requestId = card.requestId;
+  try {
+    await aiRespondConfirm(`${project.id}:${sid}`, requestId, confirmed);
+  } catch (err) {
+    toast(String(err), 'error');
+    return;
+  }
+  card.status = confirmed ? 'succeeded' : 'rejected';
+  card.requestId = undefined;
+  card.result = confirmed ? '用户已确认' : '用户已取消';
+  if (sid === activeSessionId) {
+    renderHistory();
+    updateSendBtn();
+  }
+}
+
 /* ---------- 建议卡片 / 动作审批 / 快照 chip 点击（事件委托） ---------- */
 function onChatClick(e: MouseEvent): void {
   const target = e.target as HTMLElement;
+  /* ask 问答卡【提交回答】/【取消】按钮 */
+  const askSubmitBtn = target.closest('[data-act-ask-submit]') as HTMLElement | null;
+  if (askSubmitBtn) {
+    void submitAsk(activeSessionId, askSubmitBtn.dataset.actAskSubmit ?? '');
+    return;
+  }
+  const askCancelBtn = target.closest('[data-act-ask-cancel]') as HTMLElement | null;
+  if (askCancelBtn) {
+    void cancelAsk(activeSessionId, askCancelBtn.dataset.actAskCancel ?? '');
+    return;
+  }
+  /* confirm 确认卡【确认】/【取消】按钮 */
+  const confirmYesBtn = target.closest('[data-act-confirm-yes]') as HTMLElement | null;
+  if (confirmYesBtn) {
+    void respondConfirm(activeSessionId, confirmYesBtn.dataset.actConfirmYes ?? '', true);
+    return;
+  }
+  const confirmNoBtn = target.closest('[data-act-confirm-no]') as HTMLElement | null;
+  if (confirmNoBtn) {
+    void respondConfirm(activeSessionId, confirmNoBtn.dataset.actConfirmNo ?? '', false);
+    return;
+  }
   /* 数据库连接申请卡【审批】按钮：打开审批对话框（关闭不回执，卡片保持待批） */
   const dbApproveBtn = target.closest('[data-act-db-approve]') as HTMLElement | null;
   if (dbApproveBtn) {

@@ -121,7 +121,7 @@ pub fn set_debug_app(app: AppHandle) {
 
 /// 追加一行带毫秒时间戳的诊断日志；失败静默（绝不影响终端主路径）。
 /// 同时落盘（diag_tx）与广播 `debug:log`（前端 Debug 面板实时流）。
-/// pub(crate)：gitinstall（Git Bash 首启安装引导）复用同一事件流。
+/// pub(crate)：pythoninstall（Python 运行时探测）等模块复用同一事件流。
 pub(crate) fn diag(msg: &str) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -664,8 +664,26 @@ impl TermManager {
 
 /* ---------------- 本地 shell 探测 ---------------- */
 
+/// 捆绑资源目录探测（与 pi 运行时一致的三候选）：exe 同级安装布局（$INSTDIR\resources\<rel>）
+/// → 扁平布局（$INSTDIR\<rel>，兼容）→ dev 源目录（CARGO_MANIFEST_DIR\resources\<rel>，仅开发态存在，
+/// release 二进制里该路径不存在、探测自然落空）。目录存在才返回。
+/// find_shell（git-portable）与 pythoninstall（python-embed）共用。
+#[cfg(windows)]
+pub(crate) fn bundled_resource_dir(rel: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("resources").join(rel));
+            candidates.push(dir.join(rel));
+        }
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join(rel));
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
 /// Windows：探测 Git Bash。顺序：env AISHELL_GIT_BASH → %PROGRAMFILES%\Git\bin\bash.exe →
-/// %PROGRAMFILES(X86)%\Git\bin\bash.exe → `where.exe bash` 输出中首个含 "Git" 的行
+/// %PROGRAMFILES(X86)%\Git\bin\bash.exe → 捆绑 PortableGit（resources/git-portable，免安装兜底，
+/// 优先于 PATH：避免命中过旧/未验证的 PATH 安装）→ `where.exe bash` 输出中首个含 "Git" 的行
 /// （排除 System32 的 WSL bash）。pub(crate)：ai_actions 本地命令复用。
 #[cfg(windows)]
 pub(crate) fn find_shell() -> Option<String> {
@@ -686,6 +704,12 @@ pub(crate) fn find_shell() -> Option<String> {
             if PathBuf::from(&p).is_file() {
                 return Some(p);
             }
+        }
+    }
+    if let Some(dir) = bundled_resource_dir("git-portable") {
+        let p = dir.join("bin").join("bash.exe");
+        if p.is_file() {
+            return Some(p.to_string_lossy().into_owned());
         }
     }
     let out = Command::new("where.exe").arg("bash").output().ok()?;
@@ -720,7 +744,7 @@ pub(crate) fn find_shell() -> Option<String> {
 /// find_shell 未命中时的用户可读错误（create_local / ai_actions 两调用点统一文案）。
 #[cfg(windows)]
 pub(crate) fn shell_missing_msg() -> String {
-    "未找到 Git Bash，请安装 Git for Windows 或设置 AISHELL_GIT_BASH".to_string()
+    "未找到 Git Bash：内置便携运行时缺失（可能安装包损坏，请重装 AIShell）且系统未安装 Git for Windows；也可手动安装 Git for Windows 或设置环境变量 AISHELL_GIT_BASH 指向 bash.exe 后重启".to_string()
 }
 
 /// find_shell 未命中时的用户可读错误（create_local / ai_actions 两调用点统一文案）。

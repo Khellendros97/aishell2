@@ -109,7 +109,7 @@ impl McpService {
 
     /// 按当前配置同步监听状态（幂等）：至少一台设备启用 → 确保监听在配置端口上；
     /// 无启用设备或端口变更 → 停止/重启。由 mcp_set_device / mcp_set_port /
-    /// delete_server / clear_all_servers 与启动时调用。
+    /// delete_server / clear_unreferenced_servers 与启动时调用。
     pub async fn sync(&self) {
         let desired = if self.core.store.mcp_enabled_count() > 0 {
             Some(self.core.store.mcp_config().port)
