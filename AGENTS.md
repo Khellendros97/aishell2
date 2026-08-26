@@ -25,8 +25,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 1. **单测绝不碰真实 keyring**:store.rs 密钥走 `SecretStore` trait,生产 `KeyringSecrets` / 测试 `MemorySecrets`。测试一律用 `test_store()` 构造,禁止 `Store::new()`(会写用户真实的 Windows 凭据管理器)。
 2. **密码 / API Key 永不进 JSON、永不返回前端**：只走 keyring(account:`server:<id>`、`llm:apikey`、`brave:apikey`)。表单留空提交 = 后端保持原值(前端传 `null`,不是空串)。
 3. **窗口 `dragDropEnabled: false`**(tauri.conf.json):wry 的 OLE DropTarget 会截杀页面内 HTML5 拖拽。OS 文件导入走 `webkitGetAsEntry` + `fs_import` 命令,不再用 `tauri://drag-drop` 事件。
-4. **Git Bash 路径**写死逻辑里要排除 `C:\Windows\System32\bash.exe`(那是 WSL);正确路径 `C:\Program Files\Git\bin\bash.exe`。
-5. **pi sidecar**:`src-tauri/resources/pi/` 不入库,由 `scripts/fetch-pi.sh` 拉取。ai.rs 按 `(projectId, sessionId)` 懒启动 `pi --mode rpc`,stdout 是 LF 分隔 JSONL(**不要用按行 readline 之外的假设,U+2028/29 不是行分隔**)。
+4. **Git Bash 路径**写死逻辑里要排除 `C:\Windows\System32\bash.exe`(那是 WSL);正确路径 `C:\Program Files\Git\bin\bash.exe`。系统未装时回退捆绑 PortableGit(term.rs `find_shell` 探测 `resources/git-portable`,免安装免管理员)。
+5. **pi sidecar 与捆绑运行时**:`src-tauri/resources/` 下 pi/pi 侧车、git-portable(PortableGit 预解压)、python-embed(embeddable 预解压)均不入库,分别由 `scripts/fetch-pi*.mjs|sh`、`fetch-git.mjs`、`fetch-python.mjs` 拉取(后两个非 Windows 平台自动跳过,镜像回退 + SHA-256 锁定);只有 tauri.windows.conf.json 把 git-portable/python-embed 打进 Windows 包。python-embed 构建期删 `python313._pth`——留着会忽略 PYTHONPATH,py 工具的 pysdk 注入(ai_actions)就失效。ai.rs 按 `(projectId, sessionId)` 懒启动 `pi --mode rpc`,stdout 是 LF 分隔 JSONL(**不要用按行 readline 之外的假设,U+2028/29 不是行分隔**)。
 6. 前端状态事实源在 Rust 端 `aishell.json`;前端不写 localStorage(那是原型的做法,已废弃)。
 7. **图标一律走 `src/icons.ts`,禁止 emoji**:React JSX 里用 `src/shared/Icon.tsx` 的 `<Icon name="..." />`,命令式/模板串场景用 `icon()` 字符串版;新图标往 `PATHS` 里加,不要内联 SVG 到业务文件。
 8. **DOM 行闭包引用的树节点对象不可无差别替换**(explorer 教训:轮询刷新曾整体重建 children 数组,行点击把状态写进孤儿节点导致展开失效);命令式引擎里变更时按 key reconcile 复用未变节点,React 树里列表必须 keyed 正确(节点路径作 key)。
