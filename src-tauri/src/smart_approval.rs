@@ -21,6 +21,11 @@ use crate::store::Store;
 /// 判定超时：超时视为判定失败（回退人工审批）。
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 思考型模型（deepseek reasoning 等）的思维链计入 max_tokens 预算，且多数兼容端点忽略
+/// reasoning_effort——预算太小会全部耗在思考上、正文为空（finish_reason=length），判定必失败
+/// 转人工（session_title.rs 同坑，曾以 32→1024 修复）。判定 JSON 本身很小，预算主要留给思维链。
+const JUDGE_MAX_TOKENS: u32 = 4096;
+
 /// 智能审批判定结果：危险判定 + LLM 补充的文件系统影响（格式未经校验，调用方按 unbounded 兜底）。
 #[derive(Debug, Clone)]
 pub struct JudgeOutput {
@@ -160,7 +165,7 @@ pub async fn judge(
             )},
         ],
         "temperature": 0,
-        "max_tokens": 400,
+        "max_tokens": JUDGE_MAX_TOKENS,
         "reasoning_effort": "low",
     });
     let client = reqwest::Client::builder()
@@ -181,10 +186,24 @@ pub async fn judge(
         .json()
         .await
         .map_err(|e| format!("审批判定响应解析失败: {e}"))?;
-    let content = data["choices"][0]["message"]["content"]
+    let message = &data["choices"][0]["message"];
+    // 正文兼容字符串与 content parts 数组两种形态（照 session_title::extract_content）。
+    let content = crate::session_title::extract_content(message).unwrap_or_default();
+    parse_judgement(&content).map_err(|e| format!("{e}{}", judge_diagnostic(&data, &content)))
+}
+
+/// 判定失败诊断后缀：思考型模型耗尽 max_tokens 的特征是正文无 JSON、finish_reason=length
+/// 且带 reasoning_content——附上这些与正文片段，trace 里可直接定位（照 session_title 模式）。
+fn judge_diagnostic(data: &serde_json::Value, content: &str) -> String {
+    let finish = data["choices"][0]["finish_reason"].as_str().unwrap_or("?");
+    let has_reasoning = data["choices"][0]["message"]["reasoning_content"]
         .as_str()
-        .unwrap_or("");
-    parse_judgement(content)
+        .is_some_and(|s| !s.is_empty());
+    format!(
+        "（finish_reason={finish}{}，正文: {}）",
+        if has_reasoning { "，含思维链" } else { "" },
+        crate::session_title::body_snippet(content)
+    )
 }
 
 /// 从模型输出中提取判定 JSON：宽松提取首个 `{` 到最后一个 `}`（容忍围栏/前后说明文字）。
@@ -242,7 +261,7 @@ pub fn parse_judgement(text: &str) -> Result<JudgeOutput, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_judgement, precheck_credential_access};
+    use super::{judge_diagnostic, parse_judgement, precheck_credential_access};
     use crate::ai_impact::{Effect, Operation};
 
     #[test]
@@ -299,6 +318,29 @@ mod tests {
         ] {
             assert!(precheck_credential_access(cmd).is_none(), "应放行: {cmd}");
         }
+    }
+
+    #[test]
+    fn diagnostic_marks_thinking_exhaustion() {
+        // 思考型模型耗尽 max_tokens：正文空、finish_reason=length、思维链非空
+        let data = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning_content": "思考中…"}
+            }]
+        });
+        let d = judge_diagnostic(&data, "");
+        assert!(d.contains("finish_reason=length"));
+        assert!(d.contains("含思维链"));
+        assert!(d.contains("空响应体"));
+
+        // 正常截断（无思维链字段）：诊断仍带 finish_reason 与正文片段
+        let data = serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "{\"dangerous\": tr"}}]
+        });
+        let d = judge_diagnostic(&data, "{\"dangerous\": tr");
+        assert!(d.contains("finish_reason=stop"));
+        assert!(d.contains("{\"dangerous\": tr"));
     }
 
     #[test]
