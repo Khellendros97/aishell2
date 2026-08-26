@@ -74,6 +74,7 @@ const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用�
 - 没有 bash 工具，不能执行任何命令。
 - request_agent_mode：当你需要执行命令或修改项目源码等 .aishell/ 之外的文件时，调用该工具向用户申请切换到工作(Agent)模式；需用户同意，不同意则继续给出建议。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
+- ask/confirm：需要用户决策或补充信息时，用 ask 一次性提出一个或多个问题（每问可附 2–4 个候选选项；界面已为每个问题自动附带自由输入框，不要生成「其他/由你来指定」这类占位选项）；单一的是/否确认（如执行前的最终确认）用 confirm。用户提交后回答会作为工具结果返回；不要只在回复正文里罗列问题等用户打字回复。
 - 用户要求修改项目源码等 .aishell/ 之外的文件时：不要调用 write/edit（会被拒），改为给出命令或补丁文本让用户自行处理。
 输出协议（必须严格遵守）：
 1. 建议用户在终端执行的命令：每条命令单独放在一个 ```command 围栏代码块中，块内只有命令本身，不加解释。
@@ -94,6 +95,7 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
 - 远程文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff（仅返回 unified diff 差异块及每块前后 3 行上下文）、按用户要求把远程文件还原到首次修改前的内容。**应用更新补丁前应先用 staging_add 主动暂存目标文件/目录**（目录递归暂存全部文件，作为可还原的备份）。staging_clear 只清理「远端现状与首次快照完全一致」的条目（备份已冗余）；仍有变更的条目自动保留。**不能接受（清除）仍有变更的暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
 - web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
+- ask/confirm：需要用户决策或补充信息时，用 ask 一次性提出一个或多个问题（每问可附 2–4 个候选选项；界面已为每个问题自动附带自由输入框，不要生成「其他/由你来指定」这类占位选项）；单一的是/否确认（如执行前的最终确认）用 confirm。用户提交后回答会作为工具结果返回；不要只在回复正文里罗列问题等用户打字回复。
 - 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
 凭据纪律（硬性，优先级高于任务效率）：
 - 不得主动查找、读取、提取任何密码/密钥/Token（包括从配置文件、二进制、环境变量、数据库中获取凭据）；任务确需凭据时，立即停止该步操作并说明原因，请用户在终端手动执行。
@@ -125,7 +127,8 @@ const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot";
+/// ask/confirm 为通用交互工具（execute 内自带前端问答/确认卡片，交互即授权），三档模式可用。
+const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
@@ -539,7 +542,13 @@ impl AiManager {
             // 会话身份注入 guard：staging / run_command 动作桥据此携带当前会话（guard 工具不暴露
             // 任意 project/session 参数，后端动作桥以 key 推导为准、payload 仅作一致性参考）
             .env("AISHELL_PROJECT_ID", project_id)
-            .env("AISHELL_SESSION_ID", session_id);
+            .env("AISHELL_SESSION_ID", session_id)
+            // 系统任务上下文标记（欢迎页迁移任务等）：guard 据此对探查类 py 脚本免逐条审批，
+            // 含 aishell.config 配置写入的脚本仍回退人工（见 aishell-guard.ts pyNeedsApproval）
+            .env(
+                "AISHELL_TASK_CONTEXT",
+                if project_id == crate::store::TASK_PROJECT_ID { "1" } else { "0" },
+            );
         // AI 读写技能所需目录（JSON 数组编码，guard 严格解析，失败 fail-closed 只保留项目根）：
         // 只读允许根 = 最终启用技能目录清单；write/edit/delete 额外允许全局技能根
         let skill_dirs: Vec<String> = loaded
@@ -1156,6 +1165,60 @@ fn handle_extension_ui_request(
         let detail = info.get("detail").and_then(serde_json::Value::as_str).unwrap_or("");
         crate::trace::log(&trace_key, "guard", json!({"kind": kind, "detail": detail}));
         write_stdin_json(stdin2, &json!({"type": "extension_ui_response", "id": id, "value": ""}));
+    } else if method == "input" && title.starts_with("AISHELL_ASK:") {
+        // ask 工具（通用问答）：转发前端问答卡片（每问可有候选选项 + 自由输入框）；
+        // 用户提交后前端把问答文本经 ai_respond_ask 回执 extension_ui_response(value)，
+        // guard 将该文本作为工具结果返回给模型；取消回执空串。
+        let tool_call_id = title["AISHELL_ASK:".len()..].to_string();
+        if let Ok(mut map) = approvals2.lock() {
+            map.insert(id.clone(), tool_call_id.clone());
+        }
+        let info: serde_json::Value = ev
+            .get("placeholder")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or_else(|| json!({}));
+        let questions = info.get("questions").cloned().unwrap_or_else(|| json!([]));
+        let count = questions.as_array().map(|a| a.len()).unwrap_or(0);
+        crate::trace::log(&trace_key, "guard", json!({
+            "kind": "ask_request",
+            "detail": format!("AI 向用户提问（{} 个问题）", count),
+        }));
+        let _ = app2.emit(
+            event,
+            json!({
+                "type": "ask",
+                "requestId": id,
+                "toolCallId": tool_call_id,
+                "questions": questions,
+            }),
+        );
+    } else if method == "confirm" && title.starts_with("AISHELL_CONFIRM:") {
+        // confirm 工具（通用是非确认）：转发前端确认卡片；用户点确认/取消后经
+        // ai_respond_confirm 回执 extension_ui_response(confirmed)，guard 转成文案返回模型。
+        let tool_call_id = title["AISHELL_CONFIRM:".len()..].to_string();
+        if let Ok(mut map) = approvals2.lock() {
+            map.insert(id.clone(), tool_call_id.clone());
+        }
+        let question = ev
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("question").and_then(serde_json::Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        crate::trace::log(&trace_key, "guard", json!({
+            "kind": "confirm_request",
+            "detail": format!("AI 请求用户确认: {question}"),
+        }));
+        let _ = app2.emit(
+            event,
+            json!({
+                "type": "confirm",
+                "requestId": id,
+                "toolCallId": tool_call_id,
+                "question": question,
+            }),
+        );
     } else if method == "confirm" && title.starts_with("AISHELL_MODE_REQUEST:") {
         // AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：
         // 与审批同通道转发前端（action=request_agent_mode），前端确认后经
@@ -2267,6 +2330,74 @@ pub async fn ai_respond_db_request(
         "type": "extension_ui_response",
         "id": request_id,
         "value": response,
+    }))
+    .map_err(|e| e.to_string())?;
+    buf.push(b'\n');
+    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    Ok(())
+}
+
+/// 回复 ask 工具提问：response 为前端拼装好的「问/答」文本（取消为空串，guard 据此
+/// 返回「用户取消了回答」文案）。校验语义同 ai_respond_approval。
+#[tauri::command]
+pub async fn ai_respond_ask(
+    mgr: State<'_, Arc<AiManager>>,
+    key: String,
+    request_id: String,
+    response: String,
+) -> Result<(), String> {
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+    let Some(proc) = procs.get_mut(&key) else {
+        return Err("pi 进程不存在".to_string());
+    };
+    let mut approvals = proc.approvals.lock().map_err(|e| e.to_string())?;
+    let Some(tool_call_id) = approvals.remove(&request_id) else {
+        return Err("提问已过期或不存在".to_string());
+    };
+    drop(approvals);
+    crate::trace::log(&key, "guard", json!({
+        "kind": "ask_decision",
+        "detail": format!("toolCallId={} 回答={}", tool_call_id, if response.is_empty() { "（取消）" } else { "已提交" }),
+    }));
+    let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+    let mut buf = serde_json::to_vec(&json!({
+        "type": "extension_ui_response",
+        "id": request_id,
+        "value": response,
+    }))
+    .map_err(|e| e.to_string())?;
+    buf.push(b'\n');
+    w.write_all(&buf).map_err(|e| format!("pi 进程已退出: {e}"))?;
+    Ok(())
+}
+
+/// 回复 confirm 工具确认：confirmed=true 确认 / false 取消（guard 转成对应文案作为工具结果）。
+/// 校验语义同 ai_respond_approval。
+#[tauri::command]
+pub async fn ai_respond_confirm(
+    mgr: State<'_, Arc<AiManager>>,
+    key: String,
+    request_id: String,
+    confirmed: bool,
+) -> Result<(), String> {
+    let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+    let Some(proc) = procs.get_mut(&key) else {
+        return Err("pi 进程不存在".to_string());
+    };
+    let mut approvals = proc.approvals.lock().map_err(|e| e.to_string())?;
+    let Some(tool_call_id) = approvals.remove(&request_id) else {
+        return Err("确认请求已过期或不存在".to_string());
+    };
+    drop(approvals);
+    crate::trace::log(&key, "guard", json!({
+        "kind": "confirm_decision",
+        "detail": format!("toolCallId={} 决定={}", tool_call_id, if confirmed { "确认" } else { "取消" }),
+    }));
+    let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+    let mut buf = serde_json::to_vec(&json!({
+        "type": "extension_ui_response",
+        "id": request_id,
+        "confirmed": confirmed,
     }))
     .map_err(|e| e.to_string())?;
     buf.push(b'\n');
