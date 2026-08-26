@@ -261,13 +261,19 @@ async fn handle_callback(
                     }
                     // 诊断：能力清单决定 web_search/知识库工具挂载，服务端配置变更需重登刷新
                     crate::term::diag(&format!(
-                        "[cloud] 登录成功，capabilities: models={} search={} knowledge={}",
+                        "[cloud] 登录成功，capabilities: models={} search={} knowledge={} dataSync={} fileBackup={}",
                         store.cloud_profile().1.map(|c| c.models.len()).unwrap_or(0),
                         store.cloud_profile().1.map(|c| c.search).unwrap_or(false),
                         store
                             .cloud_profile()
                             .1
                             .map(|c| c.knowledge)
+                            .unwrap_or(false),
+                        store.cloud_profile().1.map(|c| c.data_sync).unwrap_or(false),
+                        store
+                            .cloud_profile()
+                            .1
+                            .map(|c| c.file_backup)
                             .unwrap_or(false),
                     ));
                     write_callback_response(stream, true, "授权成功，公司账号已关联到 AIShell。")
@@ -506,9 +512,15 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
         .get("capabilities")
         .or_else(|| data.get("capabilities"))
         .or_else(|| body.get("capabilities"));
-    let mut caps = CloudCapabilities::default();
-    if let Some(c) = caps_raw {
-        caps.models = c
+    let caps = caps_raw.map(parse_capabilities).unwrap_or_default();
+    Ok((user, caps))
+}
+
+/// 能力清单逐字段防御解析：字段缺失/类型不符一律按关闭处理，新增能力必须在此显式登记
+/// （serde default 不会救手动解析路径）。
+fn parse_capabilities(c: &serde_json::Value) -> CloudCapabilities {
+    CloudCapabilities {
+        models: c
             .get("models")
             .and_then(|m| m.as_array())
             .map(|arr| {
@@ -516,15 +528,27 @@ async fn fetch_me(access: &str) -> Result<(CloudUser, CloudCapabilities), String
                     .filter_map(|x| x.as_str().map(String::from))
                     .collect()
             })
-            .unwrap_or_default();
-        caps.search = c.get("search").and_then(|v| v.as_bool()).unwrap_or(false);
-        caps.knowledge = c
+            .unwrap_or_default(),
+        search: c.get("search").and_then(|v| v.as_bool()).unwrap_or(false),
+        knowledge: c
             .get("knowledge")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        caps.latest_version = str_field(c, &["latest_version", "latestVersion"]);
+            .unwrap_or(false),
+        // 云同步/云备份能力：camelCase 为主，兼容旧服务端 snake_case
+        data_sync: ["dataSync", "data_sync"]
+            .iter()
+            .find_map(|k| c.get(k).and_then(|v| v.as_bool()))
+            .unwrap_or(false),
+        file_backup: ["fileBackup", "file_backup"]
+            .iter()
+            .find_map(|k| c.get(k).and_then(|v| v.as_bool()))
+            .unwrap_or(false),
+        latest_version: c
+            .get("latest_version")
+            .or_else(|| c.get("latestVersion"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
-    Ok((user, caps))
 }
 
 /// 授权回调监听任务：三路 select（连接 / 取消 / 超时），处理一次回调后退出。
@@ -1764,6 +1788,29 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_capabilities_reads_data_sync_and_file_backup() {
+        let caps = parse_capabilities(&json!({
+            "models": ["m1"],
+            "search": true,
+            "knowledge": false,
+            "dataSync": true,
+            "fileBackup": true,
+            "latestVersion": "1.2.3"
+        }));
+        assert!(caps.data_sync && caps.file_backup && caps.search && !caps.knowledge);
+        assert_eq!(caps.models, vec!["m1".to_string()]);
+        assert_eq!(caps.latest_version.as_deref(), Some("1.2.3"));
+
+        // 旧服务端 snake_case 兼容
+        let caps = parse_capabilities(&json!({"data_sync": true, "file_backup": true}));
+        assert!(caps.data_sync && caps.file_backup);
+
+        // 字段缺失一律按关闭
+        let caps = parse_capabilities(&json!({}));
+        assert!(!caps.data_sync && !caps.file_backup && !caps.search && !caps.knowledge);
+    }
 
     #[cfg(debug_assertions)]
     #[test]

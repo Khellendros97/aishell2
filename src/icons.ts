@@ -109,6 +109,15 @@ export const PATHS = {  folder:
     '<path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>',
   diff:
     '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/><path d="M6.5 9h3"/><path d="M8 7.5v3"/><path d="M14.5 15h3"/>',
+  /** 云同步与云备份（命令式菜单及 React 账号页共用） */
+  cloudSync:
+    '<path d="M7 18a5 5 0 1 1 1-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 7.9"/><path d="M12 12v8"/><path d="m9 17 3 3 3-3"/>',
+  cloudBackup:
+    '<path d="M7 18a5 5 0 1 1 1-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 7.9"/><path d="M12 20V9"/><path d="m8 13 4-4 4 4"/>',
+  device:
+    '<rect x="5" y="2" width="14" height="20" rx="2"/><path d="M9 5h6"/><path d="M11 18h2"/>',
+  sync:
+    '<path d="M20 7h-5V2"/><path d="M4 17h5v5"/><path d="M5.5 9A7 7 0 0 1 20 7"/><path d="M18.5 15A7 7 0 0 1 4 17"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

@@ -26,7 +26,8 @@
  */
 import { icon } from '../../../../icons';
 import {
-  fsCopy, fsCreate, fsDelete, fsImport, fsIsText, fsMove, fsReveal, fsStat,
+  cloudBackupStart, cloudStatus, cloudSyncStatus,
+  fsCopy, fsCreate, fsDelete, fsImport, fsIsText, fsList, fsMove, fsReveal, fsStat,
   sftpDelete, sftpDownload, sftpUpload,
 } from '../../../../api';
 import type { FsStat } from '../../../../types';
@@ -503,6 +504,52 @@ function sftpUploadItems(path: string, name: string): CtxItem[] {
   }];
 }
 
+/** 右键发起云备份：先展示可执行的本地枚举摘要，最终权限/状态/路径校验由 Rust 再次执行。 */
+async function backupToCloud(node: TreeNode): Promise<void> {
+  try {
+    const cloud = await cloudStatus();
+    if (!cloud.serverUrl) { toast('当前构建未接入云服务，请在管理员配置的版本中使用', 'error'); return; }
+    if (!cloud.loggedIn) { toast('请先登录云平台，再备份到云端', 'error'); return; }
+    if (!cloud.capabilities?.fileBackup) { toast('当前账号未开通文件云备份能力', 'error'); return; }
+    const sync = await cloudSyncStatus();
+    if (!sync.initialized) { toast('请先在账号页设置云同步密码', 'info'); return; }
+    if (!sync.unlocked) { toast('请先在账号页解锁云同步', 'info'); return; }
+
+    let files = 0;
+    let bytes = 0;
+    const walk = async (path: string, isDir: boolean): Promise<void> => {
+      if (!isDir) {
+        const stat = await fsStat(path);
+        files++;
+        bytes += stat.size;
+        return;
+      }
+      const entries = await fsList(path);
+      await Promise.all(entries.map((entry) => walk(joinPath(path, entry.name), entry.isDir)));
+    };
+    await walk(node.path, node.isDir);
+    const ok = await confirmDialog({
+      title: '备份到云端',
+      message: `将备份「${node.path}」及其内容，共 ${files} 个文件、${formatBytes(bytes)}。文件可能包含敏感信息，请确认后继续。`,
+      okText: '开始备份',
+    });
+    if (!ok) return;
+    const taskId = await cloudBackupStart(node.path);
+    toast(`云备份任务已启动（${taskId}）`, 'success', 3600, {
+      onClick: () => { window.location.hash = '#/account'; },
+    });
+  } catch (err) {
+    toast(`发起云备份失败：${String(err)}`, 'error');
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
 function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): void {
   const pasteTarget = node.isDir ? node : node.parent;
   /* 编辑中的文件禁止移动类操作——旧标签写盘会在旧路径重建文件,抵消操作;防线前置为禁用态
@@ -530,6 +577,7 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(node.path).catch((err) => toast(String(err), 'error')) },
     { label: '添加到对话', iconName: 'chatPlus', action: () => addPathToChat(node.path, node.isDir) },
+    { label: '备份到云端', iconName: 'cloudBackup', action: () => void backupToCloud(node) },
     { label: '复制文件路径', iconName: 'link', action: () => { void copyText(node.path.replace(/\//g, '\\')).then(() => toast('已复制文件路径', 'success')); } },
     { label: '复制相对路径', iconName: 'link', action: () => { void copyText(relativePath(node.path)).then(() => toast('已复制相对路径', 'success')); } },
     { label: '属性', iconName: 'info', action: () => void showProperties(node) },
@@ -548,6 +596,7 @@ function showRootMenu(x: number, y: number, root: TreeNode): void {
     'sep',
     { label: '在系统文件资源管理器中打开', iconName: 'externalLink', action: () => void fsReveal(root.path).catch((err) => toast(String(err), 'error')) },
     { label: '添加到对话', iconName: 'chatPlus', action: () => addPathToChat(root.path, true) },
+    { label: '备份到云端', iconName: 'cloudBackup', action: () => void backupToCloud(root) },
     { label: '属性', iconName: 'info', action: () => void showProperties(root) },
   ]);
 }
