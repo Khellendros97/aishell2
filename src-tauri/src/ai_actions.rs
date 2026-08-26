@@ -13,7 +13,7 @@
 //! run_command 默认 10 秒超时，模型可用 timeoutSeconds 覆盖（1–3600 秒）。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use regex::Regex;
@@ -43,6 +43,25 @@ const REMOTE_GLOB_MAX_DEPTH: usize = 12;
 const REMOTE_GLOB_MAX_DIRS: usize = 2000;
 /// 单次 AI SFTP 动作允许的根项数；目录内部递归不计入此项。
 pub(crate) const MAX_SFTP_BATCH_ITEMS: usize = 32;
+
+/// SDK 导入后配置变更类型（经 `config:changed` 通知前端定向刷新）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigChanged {
+    pub kind: ConfigChangedKind,
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigChangedKind {
+    Project,
+    Commands,
+    Skill,
+    Note,
+}
+
+pub(crate) type ConfigChangedEmitter = Arc<dyn Fn(&ConfigChanged) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SftpUploadItem {
@@ -81,6 +100,8 @@ pub struct AiActions {
     staging: Arc<RemoteStaging>,
     /// 内置浏览器（browser_open/read/console/screenshot 动作桥共用共享单实例）
     browser: Arc<crate::browser::BrowserManager>,
+    /// SDK 配置成功持久化后的事件回调；测试/无 UI 环境不注入则静默。
+    config_changed: StdMutex<Option<ConfigChangedEmitter>>,
 }
 
 impl AiActions {
@@ -90,7 +111,30 @@ impl AiActions {
         staging: Arc<RemoteStaging>,
         browser: Arc<crate::browser::BrowserManager>,
     ) -> Self {
-        AiActions { store, ssh, staging, browser }
+        AiActions {
+            store,
+            ssh,
+            staging,
+            browser,
+            config_changed: StdMutex::new(None),
+        }
+    }
+
+    /// 注入 SDK 配置变更事件回调（lib.rs：emit `config:changed`）。
+    pub(crate) fn set_config_changed_emitter(&self, f: ConfigChangedEmitter) {
+        *self.config_changed.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+    }
+
+    fn emit_config_changed(&self, kind: ConfigChangedKind, project_id: Option<String>) {
+        let event = ConfigChanged { kind, project_id };
+        if let Some(f) = self
+            .config_changed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            f(&event);
+        }
     }
 
     /// 内置浏览器管理器（run_internal_action 的 browser_* 动作分发用）
@@ -1176,6 +1220,7 @@ impl AiActions {
                 }
                 let pid = p.id.clone();
                 self.store.upsert_project(p)?;
+                self.emit_config_changed(ConfigChangedKind::Project, Some(pid.clone()));
                 Ok(json!({
                     "projectId": pid,
                     "name": name,
@@ -1200,6 +1245,7 @@ impl AiActions {
                 };
                 let pid = p.id.clone();
                 self.store.upsert_project(p)?;
+                self.emit_config_changed(ConfigChangedKind::Project, Some(pid.clone()));
                 Ok(json!({
                     "projectId": pid,
                     "name": name,
@@ -1283,6 +1329,7 @@ impl AiActions {
         let pid = project.id.clone();
         let pname = project.name.clone();
         self.store.upsert_project(project)?;
+        self.emit_config_changed(ConfigChangedKind::Commands, Some(pid.clone()));
         Ok(json!({"projectId": pid, "projectName": pname, "added": added, "skipped": skipped}))
     }
 
@@ -1330,6 +1377,10 @@ impl AiActions {
             &content,
             &scope,
         )?;
+        self.emit_config_changed(
+            ConfigChangedKind::Skill,
+            (origin == SkillOrigin::Project).then(|| project_id.to_string()),
+        );
         Ok(json!({
             "name": summary.name,
             "origin": summary.origin.as_str(),
@@ -1352,6 +1403,7 @@ impl AiActions {
             .unwrap_or("")
             .to_string();
         let path = crate::notes::import_note(&self.store, &rel, &content)?;
+        self.emit_config_changed(ConfigChangedKind::Note, None);
         Ok(json!({"path": path}))
     }
 
@@ -2773,6 +2825,84 @@ mod tests {
             .unwrap();
         let actions = test_actions(Arc::clone(&store));
         (actions, store, dir, ws)
+    }
+
+    #[test]
+    fn sdk_imports_emit_typed_config_changes_only_after_success() {
+        let (actions, _store, dir, ws) = sdk_fixture("import-events");
+        let events = Arc::new(StdMutex::new(Vec::<ConfigChanged>::new()));
+        let captured = Arc::clone(&events);
+        actions.set_config_changed_emitter(Arc::new(move |event| {
+            captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(event.clone());
+        }));
+
+        assert!(actions.sdk_import_project(&json!({"name": "  "})).is_err());
+        assert!(events.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+
+        let project = actions.sdk_import_project(&json!({"name": "事件项目"})).unwrap();
+        let project_id = project["projectId"].as_str().unwrap().to_string();
+        actions
+            .sdk_import_commands(&json!({
+                "projectId": project_id,
+                "commands": [{"title": "状态", "command": "git status"}]
+            }))
+            .unwrap();
+        actions
+            .sdk_import_skill(
+                &project_id,
+                &json!({
+                    "content": "---\nname: event-skill\ndescription: 事件测试\n---\n\n正文\n"
+                }),
+            )
+            .unwrap();
+        actions
+            .sdk_import_skill(
+                &project_id,
+                &json!({
+                    "content": "---\nname: event-project-skill\ndescription: 项目事件测试\n---\n\n正文\n",
+                    "origin": "project"
+                }),
+            )
+            .unwrap();
+        actions
+            .sdk_import_note(&json!({"path": "事件笔记", "content": "正文"}))
+            .unwrap();
+
+        let actual = events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            serde_json::to_value(&actual[0]).unwrap(),
+            json!({"kind": "project", "projectId": project_id})
+        );
+        assert_eq!(
+            actual,
+            vec![
+                ConfigChanged {
+                    kind: ConfigChangedKind::Project,
+                    project_id: Some(project_id.clone()),
+                },
+                ConfigChanged {
+                    kind: ConfigChangedKind::Commands,
+                    project_id: Some(project_id.clone()),
+                },
+                ConfigChanged {
+                    kind: ConfigChangedKind::Skill,
+                    project_id: None,
+                },
+                ConfigChanged {
+                    kind: ConfigChangedKind::Skill,
+                    project_id: Some(project_id),
+                },
+                ConfigChanged {
+                    kind: ConfigChangedKind::Note,
+                    project_id: None,
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
