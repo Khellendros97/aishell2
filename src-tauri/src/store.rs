@@ -154,6 +154,12 @@ pub struct CloudCapabilities {
     pub search: bool,
     #[serde(default)]
     pub knowledge: bool,
+    /// 用户结构化数据与笔记同步能力；旧服务端缺失时按关闭。
+    #[serde(default)]
+    pub data_sync: bool,
+    /// 本地文件/目录云备份能力；旧服务端缺失时按关闭。
+    #[serde(default)]
+    pub file_backup: bool,
     #[serde(default)]
     pub latest_version: Option<String>,
 }
@@ -1049,6 +1055,8 @@ pub struct Store {
     config_dir: PathBuf,
     state: Mutex<AppState>,
     secrets: std::sync::Arc<dyn SecretStore>,
+    /// 配置成功落盘后的轻量通知；回调只能唤醒后台任务，不能做网络或再次取 Store 锁。
+    change_notifier: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 const STATE_FILE: &str = "aishell.json";
@@ -1170,6 +1178,7 @@ impl Store {
             config_dir,
             state: Mutex::new(state),
             secrets,
+            change_notifier: Mutex::new(None),
         };
         // 服务器凭据迁移必须先于 known_secrets：会话脱敏应读取迁移后的
         // credential:<id>，不能在旧 server:<id> 已删除后才发现新凭据。
@@ -1226,7 +1235,7 @@ impl Store {
     }
 
     /// 用候选快照提交跨实体变更：持久化成功后才替换内存状态，失败时保持原状态。
-    fn with_candidate_state<T>(
+    pub(crate) fn with_candidate_state<T>(
         &self,
         f: impl FnOnce(&mut AppState) -> Result<T, String>,
     ) -> Result<T, String> {
@@ -1248,7 +1257,16 @@ impl Store {
         let tmp = self.config_dir.join(format!("{STATE_FILE}.tmp"));
         fs::write(&tmp, json).map_err(|e| format!("写入临时文件失败: {e}"))?;
         fs::rename(&tmp, self.config_dir.join(STATE_FILE))
-            .map_err(|e| format!("原子替换配置文件失败: {e}"))
+            .map_err(|e| format!("原子替换配置文件失败: {e}"))?;
+        let notifier = self
+            .change_notifier
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(notify) = notifier {
+            notify();
+        }
+        Ok(())
     }
 
     /// 将旧的 server:<serverId> 密钥迁移到确定性的 credential:<credentialId>。
@@ -2369,6 +2387,47 @@ impl Store {
     /// 配置目录（mcp.rs 传输目录回退用）。
     pub fn config_dir(&self) -> &std::path::Path {
         &self.config_dir
+    }
+
+    /// 注册配置落盘通知。回调发生在 Store 锁内，只能做无阻塞唤醒。
+    pub(crate) fn set_change_notifier(&self, notifier: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.change_notifier.lock() {
+            *slot = Some(notifier);
+        }
+    }
+
+    /// 笔记等文件级写入口的脏通知：与 persist_locked 同一唤醒通道，仅做无阻塞 notify。
+    pub(crate) fn notify_sync_dirty(&self) {
+        if let Ok(slot) = self.change_notifier.lock() {
+            if let Some(notifier) = &*slot {
+                notifier();
+            }
+        }
+    }
+
+    /// 云同步后端读取完整快照后立即释放锁；筛选和加密在锁外进行。
+    pub(crate) fn sync_snapshot(&self) -> Result<AppState, String> {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| "store 状态锁损坏".to_string())
+    }
+
+    /// 云同步专用秘密接口。account 由 cloud_sync 模块生成，绝不暴露为 Tauri 命令。
+    pub(crate) fn sync_read_secret(&self, account: &str) -> Result<String, String> {
+        self.secrets.get(account)
+    }
+
+    pub(crate) fn sync_write_secret(&self, account: &str, value: &str) -> Result<(), String> {
+        self.secrets.set(account, value)
+    }
+
+    pub(crate) fn sync_delete_secret(&self, account: &str) -> Result<(), String> {
+        self.secrets.delete(account)
+    }
+
+    pub(crate) fn credential_secret_account(credential_id: &str) -> String {
+        keyring_account_credential(credential_id)
     }
 
     /// 取服务器配置（clone 返回，不含密码）；不存在返回 None。
@@ -5948,6 +6007,8 @@ mod tests {
             models: vec!["gpt-4o".into()],
             search: true,
             knowledge: false,
+            data_sync: true,
+            file_backup: true,
             latest_version: Some("0.3.0".into()),
         };
         store.cloud_set_tokens("acc", "ref").unwrap();
@@ -6002,6 +6063,8 @@ mod tests {
                     models: vec!["gpt-4o".into()],
                     search: true,
                     knowledge: false,
+                    data_sync: false,
+                    file_backup: false,
                     latest_version: None,
                 },
             )

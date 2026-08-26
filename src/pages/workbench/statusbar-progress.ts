@@ -8,13 +8,17 @@
  *   files = 一个文件已完成（显示已处理文件数）；done = 命令结束（隐藏对应任务）。
  * - `staging:progress`（src/api.ts onStagingProgress）：递归暂存目录 / 清理暂存区 / 导出备份的进度。
  *   walk = 枚举阶段（不确定条）；stage/clear/export = 逐文件/逐条目占比；done = 操作完成（隐藏）。
+ * - `cloud-backup:progress`（src/api.ts onCloudBackupProgress）：云端备份长任务进度；只为云备份
+ *   任务显示取消按钮，Rust 后台任务的生命周期不随工作台导航终止。
  *
- * 多任务并存（上传 + 暂存）按 key 分槽：SFTP 任务用 taskId，暂存任务用 project:session。
+ * 多任务并存（上传 + 暂存 + 云备份）按 key 分槽：SFTP 任务用 taskId，暂存任务用 project:session，
+ * 云备份任务用 cloud-backup:taskId。
  * 显式控制（showProgress / hideProgress）用于暂存/清理操作开始前的占位与异常收尾；done 事件
  * 到达会自动移除任务槽，无需调用方重复隐藏。
  */
-import { onSftpProgress, onStagingProgress } from '../../api';
-import type { SftpProgress, StagingProgress } from '../../types';
+import { cloudBackupCancel, onCloudBackupProgress, onSftpProgress, onStagingProgress } from '../../api';
+import type { CloudBackupProgress, SftpProgress, StagingProgress } from '../../types';
+import { icon } from '../../icons';
 
 interface Task {
   key: string;
@@ -22,6 +26,8 @@ interface Task {
   /** 确定进度（0-100）或 null = 不确定（数据不足时显示滚动条） */
   pct: number | null;
   detail: string;
+  /** 仅云备份任务可取消；SFTP/staging 不设置此字段，保持原交互不变 */
+  cancel?: () => void;
 }
 
 const tasks = new Map<string, Task>();
@@ -51,6 +57,15 @@ function render(): void {
     detail.className = 'wb-progress-detail';
     detail.textContent = t.detail;
     bar.append(fill, label, detail);
+    if (t.cancel) {
+      const cancel = document.createElement('button');
+      cancel.className = 'icon-btn wb-progress-cancel';
+      cancel.title = '取消云备份';
+      cancel.setAttribute('aria-label', '取消云备份');
+      cancel.innerHTML = icon('x');
+      cancel.addEventListener('click', (event) => { event.stopPropagation(); t.cancel?.(); });
+      bar.appendChild(cancel);
+    }
     el.appendChild(bar);
   }
 }
@@ -63,9 +78,9 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-function upsert(key: string, title: string, pct: number | null, detail: string): void {
+function upsert(key: string, title: string, pct: number | null, detail: string, cancel?: () => void): void {
   const prev = tasks.get(key);
-  tasks.set(key, { key, title, pct, detail });
+  tasks.set(key, { key, title, pct, detail, cancel });
   if (prev || rootEl()) render();
 }
 
@@ -118,6 +133,20 @@ function ensureSubscribed(): void {
     const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
     const verb = p.phase === 'clear' ? '已检查' : p.phase === 'export' ? '已导出' : '已暂存';
     upsert(key, title, pct, `${verb} ${p.done} / ${p.total} · ${name}`);
+  });
+  void onCloudBackupProgress((p: CloudBackupProgress) => {
+    const key = `cloud-backup:${p.taskId}`;
+    if (p.phase === 'done' || p.phase === 'error' || p.phase === 'cancelled') {
+      finish(key);
+      return;
+    }
+    const pct = p.totalBytes > 0 ? Math.min(100, Math.round((p.doneBytes / p.totalBytes) * 100))
+      : p.filesTotal > 0 ? Math.min(100, Math.round((p.filesDone / p.filesTotal) * 100)) : null;
+    const phase = p.phase === 'scan' ? '扫描中' : p.phase === 'encrypt' ? '加密中' : p.phase === 'finalize' ? '收尾中' : '上传中';
+    const detail = p.currentPath ? `${p.currentPath} · ${formatBytes(p.doneBytes)} / ${formatBytes(p.totalBytes)}` : `已处理 ${p.filesDone} / ${p.filesTotal} 个文件`;
+    upsert(key, `云备份${phase}`, pct, detail, p.cancellable ? () => {
+      void cloudBackupCancel(p.taskId).catch(() => {});
+    } : undefined);
   });
 }
 

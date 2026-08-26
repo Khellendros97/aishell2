@@ -4,6 +4,7 @@ pub mod ai_images;
 pub mod ai_impact;
 pub mod browser;
 pub mod cloud;
+pub mod cloud_sync;
 pub mod dws;
 pub mod fsops;
 pub mod mcp;
@@ -164,6 +165,18 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             // 启动异步刷新：已登录则重拉 me（用户资料/能力清单），服务端配置变更无需重登
             let cloud_mgr = app.state::<Arc<cloud::CloudManager>>().inner().clone();
             let store2 = app.state::<Arc<store::Store>>().inner().clone();
+            // 用户数据云同步与文件备份：密码/vaultKey/凭据明文只存在于 Rust 端；
+            // 后台 worker 负责 dirty 防抖与 5 分钟周期兜底。
+            if let Ok(sync_manager) = cloud_sync::manager::CloudSyncManager::new(
+                app.handle().clone(),
+                store2.clone(),
+                cloud_mgr.clone(),
+            ) {
+                let backup_manager = cloud_sync::backup::BackupManager::new(sync_manager.clone());
+                cloud_sync::manager::CloudSyncManager::start_background(sync_manager.clone());
+                app.manage(sync_manager);
+                app.manage(backup_manager);
+            }
             let app2 = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 cloud::refresh_on_startup(&app2, &store2, &cloud_mgr).await;
@@ -334,6 +347,26 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             cloud::feedback_list,
             cloud::feedback_detail,
             cloud::feedback_download_attachment,
+            cloud_sync::cloud_sync_status,
+            cloud_sync::cloud_sync_initialize,
+            cloud_sync::cloud_sync_unlock,
+            cloud_sync::cloud_sync_lock,
+            cloud_sync::cloud_sync_now,
+            cloud_sync::cloud_sync_resolve_conflict,
+            cloud_sync::cloud_sync_change_password,
+            cloud_sync::cloud_sync_delete_all,
+            cloud_sync::cloud_sync_devices,
+            cloud_sync::cloud_sync_rename_device,
+            cloud_sync::cloud_sync_revoke_device,
+            cloud_sync::cloud_sync_reregister_device,
+            cloud_sync::cloud_backups_list,
+            cloud_sync::cloud_backup_start,
+            cloud_sync::cloud_backup_cancel,
+            cloud_sync::cloud_backup_resume,
+            cloud_sync::cloud_backup_interrupted,
+            cloud_sync::cloud_backup_abandon,
+            cloud_sync::cloud_backup_restore,
+            cloud_sync::cloud_backup_delete,
             ai::ai_respond_db_request,
             session_title::ai_generate_session_title,
             notes::notes_root_cmd,

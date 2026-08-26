@@ -75,7 +75,122 @@ export interface CloudCapabilities {
   models: string[];
   search: boolean;
   knowledge: boolean;
+  /** 是否开通用户数据同步；旧服务端缺失时按关闭处理 */
+  dataSync: boolean;
+  /** 是否开通文件云备份；旧服务端缺失时按关闭处理 */
+  fileBackup: boolean;
   latestVersion: string | null;
+}
+
+/** 云同步配额（云端不返回任何密钥或明文配置） */
+export interface SyncQuota {
+  usedBytes: number;
+  totalBytes: number;
+  backupUsedBytes: number;
+  backupTotalBytes: number;
+}
+
+/** 云同步服务端限制 */
+export interface SyncLimits {
+  maxBatchItems: number;
+  maxBatchBytes: number;
+  inlinePayloadBytes: number;
+  maxBackupBytes: number;
+  maxBackupFiles: number;
+  maxConcurrentBackups: number;
+}
+
+/** 同步冲突摘要；localValue/remoteValue 仅为非敏感展示摘要，绝不含凭据明文 */
+export interface SyncConflict {
+  id: string;
+  kind: string;
+  entityType: string;
+  entityId: string;
+  summary: string;
+  localDevice: string | null;
+  remoteDevice: string | null;
+  createdAt: string;
+  path?: string | null;
+}
+
+/** 云同步设备（installationId/deviceId 只作为标识展示，不是密钥） */
+export interface SyncDevice {
+  id: string;
+  deviceId?: string;
+  installationId?: string;
+  name: string;
+  isCurrent: boolean;
+  revoked: boolean;
+  lastSeenAt: string | null;
+  createdAt: string | null;
+}
+
+/** cloud_sync_status 返回值 / cloud-sync:changed 事件载荷 */
+export interface SyncStatus {
+  enabled: boolean;
+  backupEnabled: boolean;
+  initialized: boolean;
+  unlocked: boolean;
+  syncing: boolean;
+  status: 'idle' | 'syncing' | 'offline' | 'conflict' | 'quotaExceeded' | 'locked' | string;
+  lastSuccessAt: string | null;
+  /** 兼容后端以 lastSyncAt 命名的状态字段 */
+  lastSyncAt?: string | null;
+  pendingCount: number;
+  conflicts: SyncConflict[];
+  quota: SyncQuota;
+  limits: SyncLimits;
+  device: SyncDevice | null;
+}
+
+/** 云端文件备份条目；锁定时 name/rootMeta 可为空，避免泄露本地路径 */
+export interface CloudBackup {
+  id: string;
+  name: string | null;
+  deviceName: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  sizeBytes: number;
+  fileCount: number;
+  status: 'completed' | 'draft' | 'failed' | string;
+  locked: boolean;
+  rootMeta?: { name?: string | null; isDir?: boolean; fileCount?: number; sizeBytes?: number } | null;
+}
+
+/** cloud_backups_list 分页结果 */
+export interface CloudBackupPage {
+  items: CloudBackup[];
+  nextCursor: string | null;
+  total?: number;
+}
+
+/** cloud-backup:progress 事件载荷 */
+export interface CloudBackupProgress {
+  taskId: string;
+  phase: 'scan' | 'encrypt' | 'upload' | 'finalize' | 'done' | 'error' | 'cancelled' | string;
+  currentPath: string;
+  filesDone: number;
+  filesTotal: number;
+  doneBytes: number;
+  totalBytes: number;
+  speedBytesPerSecond: number;
+  cancellable: boolean;
+  error?: string | null;
+}
+
+/** 恢复遇到目标同名文件时的处理方式（与 Rust serde lowercase 对齐） */
+export type RestoreCollisionMode = 'skip' | 'keepBoth' | 'overwrite';
+
+/** 本地可续传/可放弃的中断备份任务（服务端列表只含 completed，草稿只存在本地记录里） */
+export interface InterruptedBackup {
+  taskId: string;
+  backupId: string;
+  displayName: string;
+  sourcePath: string;
+  filesDone: number;
+  filesTotal: number;
+  status: string;
+  createdAtUnixMs: number;
 }
 
 /** 云服务配置段（aishell.json）：只存非敏感资料，token 在 keyring */

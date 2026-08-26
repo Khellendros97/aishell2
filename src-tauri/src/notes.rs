@@ -140,6 +140,7 @@ pub(crate) fn import_note(store: &Store, rel: &str, content: &str) -> Result<Str
         fs::create_dir_all(parent).map_err(|e| format!("创建笔记目录失败: {e}"))?;
     }
     write_atomic(&target, content)?;
+    store.notify_sync_dirty();
     Ok(rel.replace('\\', "/"))
 }
 
@@ -304,6 +305,7 @@ async fn write_note(
     // LLM 失败则整体 Err:不写文件。
     let note = generate_note(store, mode == "update", existing.as_deref(), &transcript).await?;
     write_atomic(&target, &note)?;
+    store.notify_sync_dirty();
     Ok(target.to_string_lossy().into_owned())
 }
 

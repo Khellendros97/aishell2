@@ -6,7 +6,24 @@
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+use tauri::State;
+
+use crate::store::Store;
+
+/// 路径落在笔记根内时唤醒云同步 dirty 通道（防抖由同步 worker 负责）。
+/// 笔记面板经 fs_write/fs_create 等通用命令写笔记，不能绕过该通知。
+/// 这里按 workspace 拼路径而不调 notes_root()，避免为非笔记写入凭空创建目录。
+fn notify_notes_dirty(store: &Store, paths: &[&Path]) {
+    let Some(workspace) = store.settings().workspace_dir.filter(|s| !s.trim().is_empty()) else {
+        return;
+    };
+    let root = PathBuf::from(workspace).join(".aishell").join("notes");
+    if paths.iter().any(|path| path.starts_with(&root)) {
+        store.notify_sync_dirty();
+    }
+}
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -165,8 +182,14 @@ pub fn fs_read(path: String) -> Result<String, String> {
 
 /// 覆写文本文件（保存场景允许覆盖；目录目标报错）。
 #[tauri::command]
-pub fn fs_write(path: String, content: String) -> Result<(), String> {
-    let file = non_empty(&path)?;
+pub fn fs_write(store: State<'_, Arc<Store>>, path: String, content: String) -> Result<(), String> {
+    let file = fs_write_impl(&path, &content)?;
+    notify_notes_dirty(&store, &[&file]);
+    Ok(())
+}
+
+pub(crate) fn fs_write_impl(path: &str, content: &str) -> Result<PathBuf, String> {
+    let file = non_empty(path)?;
     if file.is_dir() {
         return Err("不能写入目录".to_string());
     }
@@ -175,13 +198,20 @@ pub fn fs_write(path: String, content: String) -> Result<(), String> {
             return Err(format!("父目录不存在：{}", parent.display()));
         }
     }
-    fs::write(&file, content).map_err(|e| format!("写入「{}」失败：{e}", file.display()))
+    fs::write(&file, content).map_err(|e| format!("写入「{}」失败：{e}", file.display()))?;
+    Ok(file)
 }
 
 /// 新建文件或目录；父目录必须已存在，目标已存在则报错。
 #[tauri::command]
-pub fn fs_create(path: String, is_dir: bool) -> Result<(), String> {
-    let target = non_empty(&path)?;
+pub fn fs_create(store: State<'_, Arc<Store>>, path: String, is_dir: bool) -> Result<(), String> {
+    let target = fs_create_impl(&path, is_dir)?;
+    notify_notes_dirty(&store, &[&target]);
+    Ok(())
+}
+
+pub(crate) fn fs_create_impl(path: &str, is_dir: bool) -> Result<PathBuf, String> {
+    let target = non_empty(path)?;
     if target.exists() {
         return Err(format!("「{}」已存在", target.display()));
     }
@@ -193,42 +223,55 @@ pub fn fs_create(path: String, is_dir: bool) -> Result<(), String> {
         return Err(format!("父目录不存在：{}", parent.display()));
     }
     if is_dir {
-        fs::create_dir(&target).map_err(|e| format!("创建目录「{}」失败：{e}", target.display()))
+        fs::create_dir(&target).map_err(|e| format!("创建目录「{}」失败：{e}", target.display()))?;
     } else {
         // create_new：目标不存在才创建，避免覆盖竞态
         fs::File::create_new(&target)
             .map(|_| ())
-            .map_err(|e| format!("创建文件「{}」失败：{e}", target.display()))
+            .map_err(|e| format!("创建文件「{}」失败：{e}", target.display()))?;
     }
+    Ok(target)
 }
 
 /// 导入 OS 拖入的文件/目录：重名自动 `name (1).ext`；文件内容走 base64。
 /// 返回最终落地的名称（前端据此递归子项）。
 #[tauri::command]
 pub fn fs_import(
+    store: State<'_, Arc<Store>>,
     dir: String,
     name: String,
     is_dir: bool,
     data: Option<String>,
 ) -> Result<String, String> {
-    let dir = non_empty(&dir)?;
+    let (target, final_name) = fs_import_impl(&dir, &name, is_dir, data.as_deref())?;
+    notify_notes_dirty(&store, &[&target]);
+    Ok(final_name)
+}
+
+pub(crate) fn fs_import_impl(
+    dir: &str,
+    name: &str,
+    is_dir: bool,
+    data: Option<&str>,
+) -> Result<(PathBuf, String), String> {
+    let dir = non_empty(dir)?;
     if !dir.is_dir() {
         return Err(format!("目标目录不存在：{}", dir.display()));
     }
     if name.trim().is_empty() || name.contains(['/', '\\']) {
         return Err("名称非法".to_string());
     }
-    let final_name = unique_local_name(&dir, &name)?;
+    let final_name = unique_local_name(&dir, name)?;
     let target = dir.join(&final_name);
     if is_dir {
         fs::create_dir(&target)
             .map_err(|e| format!("创建目录「{}」失败：{e}", target.display()))?;
     } else {
         let b64 = data.ok_or_else(|| "缺少文件数据".to_string())?;
-        let bytes = decode_base64(&b64)?;
+        let bytes = decode_base64(b64)?;
         fs::write(&target, bytes).map_err(|e| format!("写入「{}」失败：{e}", target.display()))?;
     }
-    Ok(final_name)
+    Ok((target, final_name))
 }
 
 /// 本地重名改名：`name (1).ext`；无扩展名（如目录）为 `name (1)`。sftp 下载复用。
@@ -272,14 +315,20 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 /// 移动/重命名：to 为完整目标路径；目标已存在报错；目录禁止移入自身或子孙。
 /// Windows rename 跨卷会失败——工作台内移动均在同盘，跨卷场景由用户走系统拷贝。
 #[tauri::command]
-pub fn fs_move(from: String, to: String) -> Result<(), String> {
-    let src = non_empty(&from)?;
-    let dst = non_empty(&to)?;
+pub fn fs_move(store: State<'_, Arc<Store>>, from: String, to: String) -> Result<(), String> {
+    let (src, dst) = fs_move_impl(&from, &to)?;
+    notify_notes_dirty(&store, &[&src, &dst]);
+    Ok(())
+}
+
+pub(crate) fn fs_move_impl(from: &str, to: &str) -> Result<(PathBuf, PathBuf), String> {
+    let src = non_empty(from)?;
+    let dst = non_empty(to)?;
     if !src.exists() {
         return Err(format!("源不存在:「{}」", src.display()));
     }
     if src == dst {
-        return Ok(()); // 原地移动视为无操作
+        return Ok((src, dst)); // 原地移动视为无操作
     }
     if dst.exists() {
         return Err(format!("目标已存在:「{}」", dst.display()));
@@ -292,14 +341,21 @@ pub fn fs_move(from: String, to: String) -> Result<(), String> {
     if !parent.is_dir() {
         return Err(format!("目标目录不存在:{}", parent.display()));
     }
-    fs::rename(&src, &dst).map_err(|e| format!("移动「{}」失败:{e}", src.display()))
+    fs::rename(&src, &dst).map_err(|e| format!("移动「{}」失败:{e}", src.display()))?;
+    Ok((src, dst))
 }
 
 /// 复制文件/目录(递归):to_dir 内重名自动 `name (1)`;返回最终落地路径。
 #[tauri::command]
-pub fn fs_copy(from: String, to_dir: String) -> Result<String, String> {
-    let src = non_empty(&from)?;
-    let dir = non_empty(&to_dir)?;
+pub fn fs_copy(store: State<'_, Arc<Store>>, from: String, to_dir: String) -> Result<String, String> {
+    let dst = fs_copy_impl(&from, &to_dir)?;
+    notify_notes_dirty(&store, &[&dst]);
+    Ok(dst.to_string_lossy().into_owned())
+}
+
+pub(crate) fn fs_copy_impl(from: &str, to_dir: &str) -> Result<PathBuf, String> {
+    let src = non_empty(from)?;
+    let dir = non_empty(to_dir)?;
     if !src.exists() {
         return Err(format!("源不存在:「{}」", src.display()));
     }
@@ -316,7 +372,7 @@ pub fn fs_copy(from: String, to_dir: String) -> Result<String, String> {
     let final_name = unique_local_name(&dir, name)?;
     let dst = dir.join(&final_name);
     copy_recursive(&src, &dst)?;
-    Ok(dst.to_string_lossy().into_owned())
+    Ok(dst)
 }
 
 /// 递归复制;调用方已保证 src 存在且 dst 不存在。
@@ -377,17 +433,24 @@ pub fn fs_reveal(path: String) -> Result<(), String> {
 
 /// 删除文件或目录（目录递归删除）。
 #[tauri::command]
-pub fn fs_delete(path: String) -> Result<(), String> {
-    let target = non_empty(&path)?;
+pub fn fs_delete(store: State<'_, Arc<Store>>, path: String) -> Result<(), String> {
+    let target = fs_delete_impl(&path)?;
+    notify_notes_dirty(&store, &[&target]);
+    Ok(())
+}
+
+pub(crate) fn fs_delete_impl(path: &str) -> Result<PathBuf, String> {
+    let target = non_empty(path)?;
     if !target.exists() {
         return Err(format!("「{}」不存在", target.display()));
     }
     if target.is_dir() {
         fs::remove_dir_all(&target)
-            .map_err(|e| format!("删除目录「{}」失败：{e}", target.display()))
+            .map_err(|e| format!("删除目录「{}」失败：{e}", target.display()))?;
     } else {
-        fs::remove_file(&target).map_err(|e| format!("删除文件「{}」失败：{e}", target.display()))
+        fs::remove_file(&target).map_err(|e| format!("删除文件「{}」失败：{e}", target.display()))?;
     }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -417,17 +480,17 @@ mod tests {
         let s = |p: &str| dir.join(p).to_string_lossy().into_owned();
 
         // 目标已存在报错
-        assert!(fs_move(s("a.txt"), s("b.txt")).is_err());
+        assert!(fs_move_impl(&s("a.txt"), &s("b.txt")).is_err());
         // 目录禁止移入自身子孙
-        assert!(fs_move(s("sub"), s("sub/inner/sub")).is_err());
+        assert!(fs_move_impl(&s("sub"), &s("sub/inner/sub")).is_err());
         // 同前缀但非子孙(E:\sub vs E:\subx)不应误判
         fs::create_dir(dir.join("subx")).unwrap();
         fs::write(dir.join("subx/c.txt"), "c").unwrap();
-        fs_move(s("subx/c.txt"), s("sub/c.txt")).unwrap();
+        fs_move_impl(&s("subx/c.txt"), &s("sub/c.txt")).unwrap();
         // 正常移动 + 重命名
-        fs_move(s("a.txt"), s("sub/a.txt")).unwrap();
+        fs_move_impl(&s("a.txt"), &s("sub/a.txt")).unwrap();
         assert!(!dir.join("a.txt").exists() && dir.join("sub/a.txt").exists());
-        fs_move(s("sub/a.txt"), s("sub/a2.txt")).unwrap();
+        fs_move_impl(&s("sub/a.txt"), &s("sub/a2.txt")).unwrap();
         assert!(dir.join("sub/a2.txt").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -442,20 +505,20 @@ mod tests {
         let s = |p: &str| dir.join(p).to_string_lossy().into_owned();
 
         // 文件复制 + 同目录重名自动改名
-        let p1 = fs_copy(s("f.txt"), s("out")).unwrap();
-        let p2 = fs_copy(s("f.txt"), s("out")).unwrap();
-        assert!(PathBuf::from(&p1).ends_with("f.txt"));
-        assert!(PathBuf::from(&p2).ends_with("f (1).txt"));
+        let p1 = fs_copy_impl(&s("f.txt"), &s("out")).unwrap();
+        let p2 = fs_copy_impl(&s("f.txt"), &s("out")).unwrap();
+        assert!(p1.ends_with("f.txt"));
+        assert!(p2.ends_with("f (1).txt"));
         assert_eq!(fs::read_to_string(&p2).unwrap(), "hello");
         // 目录递归复制,源不动
-        let p3 = fs_copy(s("d"), s("out")).unwrap();
+        let p3 = fs_copy_impl(&s("d"), &s("out")).unwrap();
         assert_eq!(
-            fs::read_to_string(PathBuf::from(&p3).join("nested/g.txt")).unwrap(),
+            fs::read_to_string(p3.join("nested/g.txt")).unwrap(),
             "world"
         );
         assert!(dir.join("d/nested/g.txt").exists());
         // 目录禁止复制进自身子孙
-        assert!(fs_copy(s("d"), s("d/nested")).is_err());
+        assert!(fs_copy_impl(&s("d"), &s("d/nested")).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -514,19 +577,19 @@ mod tests {
     fn create_write_delete_roundtrip() {
         let dir = tmp_dir("rw");
         let f = dir.join("new.txt");
-        fs_create(f.to_string_lossy().into_owned(), false).unwrap();
-        assert!(fs_create(f.to_string_lossy().into_owned(), false).is_err()); // 已存在
-        fs_write(f.to_string_lossy().into_owned(), "内容".into()).unwrap();
+        fs_create_impl(&f.to_string_lossy(), false).unwrap();
+        assert!(fs_create_impl(&f.to_string_lossy(), false).is_err()); // 已存在
+        fs_write_impl(&f.to_string_lossy(), "内容").unwrap();
         assert_eq!(fs_read(f.to_string_lossy().into_owned()).unwrap(), "内容");
-        fs_delete(f.to_string_lossy().into_owned()).unwrap();
+        fs_delete_impl(&f.to_string_lossy()).unwrap();
         assert!(!f.exists());
 
         let sub = dir.join("ghost").join("sub");
-        assert!(fs_create(sub.to_string_lossy().into_owned(), true).is_err()); // 父目录不存在
+        assert!(fs_create_impl(&sub.to_string_lossy(), true).is_err()); // 父目录不存在
         let d = dir.join("d");
-        fs_create(d.to_string_lossy().into_owned(), true).unwrap();
-        fs_write(d.join("a.txt").to_string_lossy().into_owned(), "x".into()).unwrap();
-        fs_delete(d.to_string_lossy().into_owned()).unwrap(); // 递归删除
+        fs_create_impl(&d.to_string_lossy(), true).unwrap();
+        fs_write_impl(&d.join("a.txt").to_string_lossy(), "x").unwrap();
+        fs_delete_impl(&d.to_string_lossy()).unwrap(); // 递归删除
         assert!(!d.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -535,9 +598,9 @@ mod tests {
     fn empty_path_rejected() {
         assert!(fs_list(String::new()).is_err());
         assert!(fs_read("  ".into()).is_err());
-        assert!(fs_write(String::new(), "x".into()).is_err());
-        assert!(fs_create(String::new(), false).is_err());
-        assert!(fs_delete(String::new()).is_err());
+        assert!(fs_write_impl("", "x").is_err());
+        assert!(fs_create_impl("", false).is_err());
+        assert!(fs_delete_impl("").is_err());
     }
 
     #[test]

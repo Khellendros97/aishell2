@@ -65,6 +65,15 @@ unicode-segmentation = "1"
 # 远程文件暂存 blob 内容寻址与大文件行级 diff（staging.rs）
 sha2 = "0.10"
 hex = "0.4"
+# 用户数据云同步：端到端加密、密码派生、用途密钥隔离与稳定实体标识
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+zeroize = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+hkdf = "0.12"
+hmac = "0.12"
+unicode-normalization = "0.1"
+tokio-util = "0.7"
 similar = "2.7"
 # Skill 系统 frontmatter 解析（serde_yaml 已归档，采用维护中的 serde_yaml_ng）
 serde_yaml_ng = "0.9.36"

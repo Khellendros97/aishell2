@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudMode, CloudStatus, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -269,6 +269,45 @@ export const cloudSetMode = (mode: CloudMode) => call<void>('cloud_set_mode', { 
 /** 登录/登出/登录失效/模式切换后广播（载荷 = CloudStatus） */
 export const onCloudChanged = (cb: (s: CloudStatus) => void): Promise<UnlistenFn> =>
   listen<CloudStatus>('cloud:changed', (e) => cb(e.payload));
+
+/* ---------------- 云同步与云备份（token / 密码 / vaultKey 全程留在 Rust 端） ---------------- */
+export const cloudSyncStatus = () => call<SyncStatus>('cloud_sync_status');
+export const cloudSyncInitialize = (password: string) => call<SyncStatus>('cloud_sync_initialize', { password });
+export const cloudSyncUnlock = (password: string) => call<SyncStatus>('cloud_sync_unlock', { password });
+export const cloudSyncLock = () => call<SyncStatus>('cloud_sync_lock');
+export const cloudSyncNow = () => call<SyncStatus>('cloud_sync_now');
+export const cloudSyncResolveConflict = (conflictId: string, resolution: string) =>
+  call<SyncStatus>('cloud_sync_resolve_conflict', { conflictId, resolution });
+export const cloudSyncChangePassword = (oldPassword: string, newPassword: string) =>
+  call<SyncStatus>('cloud_sync_change_password', { oldPassword, newPassword });
+/** 删除全部云端数据需要 Rust 发送固定确认头，前端只传入确认短语作为二次确认。 */
+export const cloudSyncDeleteAll = (confirmation: string) =>
+  call<void>('cloud_sync_delete_all', { confirmation });
+export const cloudSyncDevices = () => call<SyncDevice[]>('cloud_sync_devices');
+export const cloudSyncRenameDevice = (deviceId: string, name: string) =>
+  call<SyncDevice>('cloud_sync_rename_device', { deviceId, name });
+export const cloudSyncRevokeDevice = (deviceId: string) =>
+  call<void>('cloud_sync_revoke_device', { deviceId });
+export const cloudSyncReregisterDevice = (name?: string) =>
+  call<SyncDevice>('cloud_sync_reregister_device', { name: name ?? null });
+
+export const cloudBackupsList = (cursor?: string | null, limit?: number) =>
+  call<CloudBackupPage>('cloud_backups_list', { cursor: cursor ?? null, limit: limit ?? null });
+export const cloudBackupStart = (path: string) => call<string>('cloud_backup_start', { path });
+export const cloudBackupCancel = (taskId: string) => call<void>('cloud_backup_cancel', { taskId });
+export const cloudBackupResume = (backupId: string) => call<string>('cloud_backup_resume', { backupId });
+/** 本地记录里未完成的备份草稿（服务端列表不返回 draft，续传/放弃以这里为准） */
+export const cloudBackupInterrupted = () => call<InterruptedBackup[]>('cloud_backup_interrupted');
+export const cloudBackupAbandon = (taskId: string) => call<void>('cloud_backup_abandon', { taskId });
+export const cloudBackupRestore = (backupId: string, targetPath: string, collisionMode: RestoreCollisionMode) =>
+  call<void>('cloud_backup_restore', { backupId, targetPath, collisionMode });
+export const cloudBackupDelete = (backupId: string) => call<void>('cloud_backup_delete', { backupId });
+export const onCloudSyncChanged = (cb: (s: SyncStatus) => void): Promise<UnlistenFn> =>
+  listen<SyncStatus>('cloud-sync:changed', (e) => cb(e.payload));
+export const onCloudBackupProgress = (cb: (p: CloudBackupProgress) => void): Promise<UnlistenFn> =>
+  listen<CloudBackupProgress>('cloud-backup:progress', (e) => cb(e.payload));
+export const onCloudBackupChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen<unknown>('cloud-backup:changed', () => cb());
 
 /* ---------------- 用量报表 / 记忆卡片（token 全程留在 Rust 端，前端只收结构化数据） ---------------- */
 /** 个人用量报表（GET /api/usage）；days 1–90 默认 14；kind llm|search；model 仅 LLM 过滤 */
