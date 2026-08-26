@@ -216,6 +216,11 @@ export type AiEvent =
       impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string };
       /** 数据库连接申请（request_db_connection 工具）：AI 填写的连接信息，审批对话框只读展示 */
       connection?: { serverId: string; name: string; kind: DbKind; host: string; port?: number; user?: string; database?: string } }
+  /** ask 工具（通用问答）：AI 一次提出多个问题，前端渲染问答卡片（每问候选选项 + 自由输入框），
+   *  用户提交后经 aiRespondAsk 回执拼装好的问答文本 */
+  | { type: 'ask'; requestId: string; toolCallId: string; questions: Array<{ question: string; options?: string[] }> }
+  /** confirm 工具（通用是非确认）：单一问题 + 确认/取消，经 aiRespondConfirm 回执布尔 */
+  | { type: 'confirm'; requestId: string; toolCallId: string; question: string }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发。
@@ -255,6 +260,12 @@ export const aiRespondApproval = (key: string, requestId: string, confirmed: boo
  *  已保存连接的 id（工具结果直接携带，AI 据此 db_query）；false 为拒绝。校验语义同 aiRespondApproval。 */
 export const aiRespondDbRequest = (key: string, requestId: string, response: { approved: boolean; connectionId?: string }) =>
   call<void>('ai_respond_db_request', { key, requestId, response: JSON.stringify(response) });
+/** 回复 ask 工具提问：response 为拼装好的「问/答」文本（取消传空串）。校验语义同 aiRespondApproval。 */
+export const aiRespondAsk = (key: string, requestId: string, response: string) =>
+  call<void>('ai_respond_ask', { key, requestId, response });
+/** 回复 confirm 工具确认：confirmed=true 确认 / false 取消。校验语义同 aiRespondApproval。 */
+export const aiRespondConfirm = (key: string, requestId: string, confirmed: boolean) =>
+  call<void>('ai_respond_confirm', { key, requestId, confirmed });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 

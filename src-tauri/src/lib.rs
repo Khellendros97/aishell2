@@ -269,6 +269,8 @@ pub fn run() {
             ai::set_ai_mode,
             ai::ai_respond_approval,
             ai::ai_respond_db_request,
+            ai::ai_respond_ask,
+            ai::ai_respond_confirm,
             session_title::ai_generate_session_title,
             notes::notes_root_cmd,
             notes::notes_list_cmd,
