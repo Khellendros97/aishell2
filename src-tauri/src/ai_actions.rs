@@ -792,7 +792,7 @@ impl AiActions {
     ) -> Result<CommandResult, String> {
         let root = self.project_root(project_id)?;
         let python = crate::pythoninstall::find_python().ok_or_else(|| {
-            "未检测到 Python3：请重启 AIShell 触发自动安装引导，或手动安装 Python3（https://www.python.org/downloads/）；已安装也可设置环境变量 AISHELL_PYTHON 指向 python.exe".to_string()
+            "未检测到可用 Python3（内置运行时缺失且系统未安装，安装包可能损坏，请重装 AIShell）；也可手动安装 Python3（https://www.python.org/downloads/）或设置环境变量 AISHELL_PYTHON 指向 python.exe 后重启".to_string()
         })?;
         let seconds = timeout_seconds.unwrap_or(DEFAULT_PY_TIMEOUT_SECS);
         if !(1..=MAX_RUN_COMMAND_TIMEOUT_SECS).contains(&seconds) {

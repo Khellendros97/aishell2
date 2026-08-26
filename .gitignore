@@ -28,10 +28,10 @@ dist-ssr
 
 # pi runtime（scripts/fetch-pi.sh 拉取）
 src-tauri/resources/pi/
-# Git 安装程序（scripts/fetch-git.sh 拉取，首启静默安装用）
-src-tauri/resources/git/
-# Python 安装程序（scripts/fetch-python.mjs 拉取，首启静默安装用）
-src-tauri/resources/python/
+# PortableGit 预解压产物（scripts/fetch-git.mjs 下载解压，find_shell 免安装兜底）
+src-tauri/resources/git-portable/
+# Python embeddable 预解压产物（scripts/fetch-python.mjs 下载解压，find_python 免安装兜底）
+src-tauri/resources/python-embed/
 # Python SDK 包的解释器缓存（冒烟测试产生，不入库）
 __pycache__/
 src-tauri/target
