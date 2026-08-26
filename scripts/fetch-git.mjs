@@ -1,34 +1,46 @@
 #!/usr/bin/env node
 /**
- * 拉取 Git for Windows 官方 64 位安装程序（Git-<version>-64-bit.exe）到 src-tauri/resources/git/。
- * 用途：应用首启检测不到 Git Bash 时，弹窗征求用户同意后静默安装
- * （src-tauri/src/gitinstall.rs 从该目录取 Git-*-64-bit.exe；目录不入库，见根 .gitignore）。
+ * 拉取 Git for Windows 官方便携版（PortableGit-<version>-64-bit.7z.exe，自解压档案）
+ * 并预解压到 src-tauri/resources/git-portable/。
+ * 用途：作为 Windows 免安装内置 bash 随安装包分发（term.rs find_shell 探测兜底，
+ * 解压即用、免管理员权限、不写注册表）。目录不入库，见根 .gitignore；
+ * 非 Windows 平台直接跳过（macOS/Linux 走系统 shell）。
  * 构建前门（tauri.conf.json beforeBuildCommand 调用）：
- * - 已存在 Git-*-64-bit.exe 时跳过（幂等，本机构建零开销）；
- * - 缺失时抓 git-for-windows/git 最新 release 页（releases/latest 302 到最新 tag 页，
- *   不调 GitHub API，免鉴权免限流）。GitHub 现在不再服务端渲染资产下载链接，但 release
- *   正文带「Filename | SHA-256」表格：正则出完整安装器文件名（只匹配 Git-*-64-bit.exe，
- *   不匹配 MinGit/PortableGit/arm64/tar.bz2）与官方校验和，用 tag 拼直链下载并核验。
- *   若表格结构变化则退化为按命名约定（Git-<ver>-64-bit.exe）HEAD 探测。
+ * - 已存在同版本产物（bin/bash.exe + VERSION 匹配）时跳过（幂等，本机构建零开销）；
+ * - 缺失时按镜像顺序下载固定版本：npmmirror → 清华 tuna → GitHub 官方
+ *   （国内网络优先命中镜像），SHA-256 与脚本内硬编码值核验后静默解压
+ *   （SFX 参数 -o <目录> -y；硬编码值取自官方 release 页，升级时同步更新
+ *   GIT_TAG / GIT_FILE / GIT_SHA256 三个常量——不再运行时解析 latest，
+ *   可复现且国内网络无需访问 GitHub 页面）。
  * 强制更新：node scripts/fetch-git.mjs --force（等价于手动跑 scripts/fetch-git.sh）。
- * 不依赖 Git Bash：下载走 Node fetch。
+ * 不依赖 Git Bash：下载走 Node fetch，解压走 SFX 自身。
  */
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// 固定版本 + 官方 SHA-256（git-for-windows release 页资产 digest），升级时三个常量一起改
+const GIT_TAG = 'v2.55.0.windows.5';
+const GIT_FILE = 'PortableGit-2.55.0.5-64-bit.7z.exe';
+const GIT_SHA256 = '5aa8a20f6e9abb2c755f0e73c91c687701a46b309ad84a0ca6509380fa4ae290';
+
+// 下载源按序回退：npmmirror（国内快）→ 清华 tuna github-release 镜像 → GitHub 官方
+const DOWNLOAD_URLS = [
+  `https://registry.npmmirror.com/-/binary/git-for-windows/${GIT_TAG}/${GIT_FILE}`,
+  `https://mirrors.tuna.tsinghua.edu.cn/github-release/git-for-windows/git/${GIT_TAG}/${GIT_FILE}`,
+  `https://github.com/git-for-windows/git/releases/download/${GIT_TAG}/${GIT_FILE}`,
+];
+
 const FORCE = process.argv.includes('--force');
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DEST = path.join(ROOT, 'src-tauri', 'resources', 'git');
+const DEST = path.join(ROOT, 'src-tauri', 'resources', 'git-portable');
 
-// 幂等：DEST 下已有安装器则跳过（--force 时先清空重下）
-const existing = existsSync(DEST)
-  ? readdirSync(DEST).filter((f) => f.startsWith('Git-') && f.endsWith('-64-bit.exe'))
-  : [];
-if (existing.length > 0 && !FORCE) {
-  console.log(`==> ${path.join(DEST, existing[0])} 已存在，跳过下载（强制更新请用 --force）`);
+// 内置 bash 只在 Windows 打包/开发用到，其余平台直接跳过（避免 mac 构建白拉 59MB）
+if (process.platform !== 'win32') {
+  console.log(`==> 非 Windows 平台（${process.platform}），跳过 PortableGit 拉取`);
   process.exit(0);
 }
 
@@ -43,87 +55,74 @@ function fail(msg) {
 process.on('unhandledRejection', (e) => fail(`未捕获异常：${e?.stack || e}`));
 process.on('uncaughtException', (e) => fail(`未捕获异常：${e?.stack || e}`));
 
-/** HTTP 错误时输出状态码与响应体片段（GitHub 限流/鉴权错误的体里有明确原因）。 */
-async function dumpHttpError(prefix, r) {
-  const body = (await r.text().catch(() => '')).slice(0, 300);
-  fail(`${prefix}：HTTP ${r.status}${body ? ` — ${body}` : ''}`);
+function readText(p) {
+  try {
+    return readFileSync(p, 'utf8').trim();
+  } catch {
+    return null;
+  }
 }
 
-const LATEST_URL = 'https://github.com/git-for-windows/git/releases/latest';
-const UA = { 'User-Agent': 'aishell-build' };
-console.log('==> 解析最新 release 页...');
-const page = await fetch(LATEST_URL, { headers: UA, redirect: 'follow' }).catch((e) => {
-  fail(`release 页请求失败：${e.message}`);
-});
-if (!page.ok) {
-  await dumpHttpError('release 页解析失败', page);
+// 幂等：DEST 下已有同版本产物则跳过（--force 时清空重下）
+const versionFile = path.join(DEST, 'VERSION');
+if (
+  !FORCE &&
+  existsSync(path.join(DEST, 'bin', 'bash.exe')) &&
+  existsSync(versionFile) &&
+  readText(versionFile) === GIT_TAG
+) {
+  console.log(`==> ${DEST} 已是 ${GIT_TAG}，跳过（强制更新请用 --force）`);
+  process.exit(0);
 }
-// redirect follow 后落在最新 tag 页，tag 从最终 URL 取
-const tag = page.url.match(/\/releases\/tag\/([^/]+)/)?.[1] ?? 'unknown';
-const html = await page.text();
 
-// 主路径：release 正文「Filename | SHA-256」表格（GitHub 服务端渲染），取完整安装器与官方校验和
-const table = html.match(/>(Git-[\d.]+?-64-bit\.exe)<\/td>\s*<td>([0-9a-f]{64})/);
-let fileName, sha256;
-if (table) {
-  fileName = table[1];
-  sha256 = table[2];
-  console.log(`==> 最新版本：${tag}，资产：${fileName}（SHA-256 来自官方 release 表格）`);
-} else {
-  // 退化路径：表格结构变化时按命名约定探测（当前命名 Git-<ver>.<N>-64-bit.exe，
-  // 旧版为 Git-<ver>-64-bit.exe，ver=tag 去 v/.windows.N，N=windows 补丁号）
-  const ver = tag.replace(/^v/, '').replace(/\.windows\.\d+$/, '');
-  const n = tag.match(/\.windows\.(\d+)$/)?.[1];
-  const guesses = n ? [`Git-${ver}.${n}-64-bit.exe`, `Git-${ver}-64-bit.exe`] : [`Git-${ver}-64-bit.exe`];
-  fileName = null;
-  for (const g of guesses) {
-    const probe = await fetch(
-      `https://github.com/git-for-windows/git/releases/download/${tag}/${g}`,
-      { headers: UA, method: 'HEAD', redirect: 'follow' },
-    ).catch(() => null);
-    if (probe?.ok) {
-      fileName = g;
-      break;
+/** 逐源尝试下载，全部失败时 fail（带每个源的失败原因） */
+async function download() {
+  const errors = [];
+  for (const url of DOWNLOAD_URLS) {
+    console.log(`==> 尝试下载 ${url}`);
+    const dl = await fetch(url).catch((e) => {
+      errors.push(`${url}：${e.message}`);
+      return null;
+    });
+    if (!dl || !dl.ok) {
+      if (dl) errors.push(`${url}：HTTP ${dl.status}`);
+      continue;
     }
-  }
-  sha256 = null;
-  if (!fileName) {
-    fail('release 表格未解析到资产且约定名探测全部失败（页面结构可能变化），请手动更新本脚本');
-  }
-  console.log(`==> release 表格未解析到资产（页面结构可能变化），按约定探测命中：${fileName}`);
-}
-const downloadUrl = `https://github.com/git-for-windows/git/releases/download/${tag}/${fileName}`;
-console.log(`==> 下载 ${downloadUrl}`);
-
-const pkgPath = path.join(tmpdir(), `git-${Date.now()}-${fileName}`);
-try {
-  const dl = await fetch(downloadUrl, { headers: UA }).catch((e) => fail(`下载请求失败：${e.message}`));
-  if (!dl.ok) {
-    await dumpHttpError('下载失败', dl);
-  }
-  const buf = Buffer.from(await dl.arrayBuffer());
-  // 完整安装器约 60MB+；低于 10MB 视为错误页/限流页，拒绝落盘
-  if (buf.length < 10 * 1024 * 1024) {
-    fail(`下载内容异常偏小（${buf.length} 字节），疑似错误页/限流页`);
-  }
-  // 官方 release 表格自带 SHA-256，逐位核验后再落盘
-  if (sha256) {
+    const buf = Buffer.from(await dl.arrayBuffer());
+    // SFX 约 59MB；低于 10MB 视为错误页/限流页，拒绝落盘
+    if (buf.length < 10 * 1024 * 1024) {
+      errors.push(`${url}：内容异常偏小（${buf.length} 字节）`);
+      continue;
+    }
+    // 与官方 release 页 SHA-256 逐位核验（镜像只当加速，完整性仍以官方值为准）
     const actual = createHash('sha256').update(buf).digest('hex');
-    if (actual !== sha256) {
-      fail(`SHA-256 校验失败：期望 ${sha256}，实际 ${actual}`);
+    if (actual !== GIT_SHA256) {
+      errors.push(`${url}：SHA-256 校验失败（实际 ${actual}）`);
+      continue;
     }
     console.log('==> SHA-256 校验通过');
+    return buf;
   }
-  // 先落盘到系统临时目录，校验全部通过后再搬入 DEST（避免 DEST 出现半截文件）
-  writeFileSync(pkgPath, buf);
+  fail(`全部下载源失败：\n  ${errors.join('\n  ')}`);
+}
 
-  // 整体替换 DEST：先清旧目录再搬入，避免残留旧版本安装器被 gitinstall 误取。
-  // 用 copy 而非 rename：tmp 可能在别的盘符（跨卷 MoveFile 报 ENOENT）
+const buf = await download();
+
+// 先落盘到系统临时目录，校验全部通过后再解压（避免 DEST 出现半截解压）
+const sfxPath = path.join(tmpdir(), `portablegit-${Date.now()}-${GIT_FILE}`);
+writeFileSync(sfxPath, buf);
+try {
   rmSync(DEST, { recursive: true, force: true });
   mkdirSync(DEST, { recursive: true });
-  copyFileSync(pkgPath, path.join(DEST, fileName));
-  writeFileSync(path.join(DEST, 'VERSION'), tag);
-  console.log(`==> 完成：${fileName}（${tag}）-> ${path.join(DEST, fileName)}`);
+  // SFX 静默解压：-o 指定目标目录、-y 全部确认（git-for-windows 官方程序化解压用法），
+  // 输出直通终端便于 CI 观察进度；解压约 30–90 秒
+  console.log(`==> 解压到 ${DEST}（约 30–90 秒）`);
+  execFileSync(sfxPath, ['-o', DEST, '-y'], { stdio: 'inherit' });
+  if (!existsSync(path.join(DEST, 'bin', 'bash.exe'))) {
+    fail('解压后未找到 bin/bash.exe，产物结构异常');
+  }
+  writeFileSync(path.join(DEST, 'VERSION'), GIT_TAG);
+  console.log(`==> 完成：${GIT_FILE}（${GIT_TAG}）-> ${DEST}`);
 } finally {
-  rmSync(pkgPath, { force: true });
+  rmSync(sfxPath, { force: true });
 }

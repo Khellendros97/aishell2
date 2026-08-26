@@ -47,7 +47,6 @@
 .welcome-page .cloud-login-bar .spacer { flex: 1; }
 
 /* ---------- 工具行：搜索 / 全部展开折叠 / 视图切换 / SSH 配置迁移 / 分类目录 / 新建项目 ---------- */
->>>>>>> srun-aishell-cloud
 .welcome-page .welcome-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
 .welcome-page .welcome-toolbar #proj-search { flex: 1; min-width: 200px; max-width: 340px; }
 .welcome-page .view-switch {

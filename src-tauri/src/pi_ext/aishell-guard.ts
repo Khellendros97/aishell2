@@ -47,6 +47,12 @@
  * 用户反馈（feedback_submit）：对外提交到云平台（仅托管模式由 ai.rs 挂进 --tools），三档模式
  * 可用但 agent 模式逐调用审批（在 CONTROLLED_TOOLS）；仅文本，经 AISHELL_ACTION 桥交给
  * Rust cloud.rs（令牌从 keyring 取，不经扩展环境变量）。
+ * 系统任务上下文（AISHELL_TASK_CONTEXT=1，欢迎页迁移等本地任务）例外：探查类 py 脚本
+ * 免逐条审批自动放行；但脚本引用 aishell.config 导入族（写 AIShell 配置）时仍回退人工审批，
+ * path 源码读不到同样 fail-closed 回退人工。
+ * ask / confirm（通用交互工具，三档模式可用、免审批）：execute 内经 AISHELL_ASK: /
+ * AISHELL_CONFIRM: 通道把问题转发前端问答/确认卡片，用户提交后的回答文本/布尔作为
+ * 工具结果返回给模型；不进 CONTROLLED_TOOLS（交互即授权，避免双重审批）。
  * 路径处理：path.resolve 归一（相对路径、`..`、绝对路径）后统一小写做前缀比较
  * （Windows 大小写不敏感）；8.3 短文件名等无法归一的形式会因前缀失配被拒（安全方向）。
  */
@@ -220,6 +226,27 @@ export default function (pi: ExtensionAPI) {
 	let mode: AiMode = VALID_MODES.includes((process.env.AISHELL_AI_MODE || "") as AiMode)
 		? (process.env.AISHELL_AI_MODE as AiMode)
 		: "suggest";
+
+	/** 系统任务上下文（欢迎页「从其他 SSH 工具导入」等本地迁移任务）：探查类 py 脚本
+	 *  免逐条审批；含 aishell.config 配置写入的脚本仍需人工批准（见 pyNeedsApproval）。 */
+	const taskContext = process.env.AISHELL_TASK_CONTEXT === "1";
+	/** 命中即视为「写 AIShell 配置」的脚本特征（导入项目/命令/技能/笔记）。 */
+	const CONFIG_IMPORT_RE = /from\s+aishell\s+import[^\n]*\bconfig\b|\baishell\s*\.\s*config\b|\bconfig\s*\.\s*import_(project|commands|skill|note)\b/;
+	/** 任务上下文 py 免审批判定：仅探查类脚本自动放行；引用配置导入族或源码读不到
+	 *  （path 越界/读取失败）时 fail-closed 回退人工审批。 */
+	async function pyNeedsApproval(input: Record<string, unknown>): Promise<boolean> {
+		let code = typeof input.code === "string" ? input.code : "";
+		if (!code && typeof input.path === "string" && input.path.trim()) {
+			const abs = path.resolve(cwd, input.path).toLowerCase();
+			if (!inside(root, abs)) return true;
+			try {
+				code = await fs.readFile(abs, "utf8");
+			} catch {
+				return true;
+			}
+		}
+		return CONFIG_IMPORT_RE.test(code);
+	}
 
 	/** 增量切换工具集：只增删本扩展的工具，绝不碰 read/grep/web_search 等既有激活工具。
 	 *  注意：RPC 模式下 setActiveTools 不影响模型请求的 tools（pi 限制），初始工具集
@@ -641,6 +668,27 @@ export default function (pi: ExtensionAPI) {
 				}
 				return undefined;
 			}
+			case "ask": {
+				// 通用问答工具（三档模式可用、免审批）：只校验问题结构，交互本身即授权
+				const qs = input.questions;
+				if (!Array.isArray(qs) || qs.length === 0) {
+					return { block: true, reason: "ask: questions 至少包含一个问题。" };
+				}
+				for (const q of qs) {
+					const item = q as Record<string, unknown> | null;
+					if (!item || !(typeof item.question === "string" && item.question.trim())) {
+						return { block: true, reason: "ask: 每个问题都必须包含非空的 question 文本。" };
+					}
+				}
+				return undefined;
+			}
+			case "confirm": {
+				// 通用确认工具（三档模式可用、免审批）：单一是非问题
+				if (!(typeof input.question === "string" && input.question.trim())) {
+					return { block: true, reason: "confirm: 缺少非空的 question 文本。" };
+				}
+				return undefined;
+			}
 			case "request_agent_mode":
 				// 仅建议模式专属工具（suggest 的 --tools 白名单才含它）：agent/yolo 下防御性阻止
 				if (mode !== "suggest") {
@@ -702,7 +750,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (mode === "agent") {
 			if (CONTROLLED_TOOLS.includes(tool)) {
-				if (!(await approve(ctx, tool, input, event.toolCallId))) {
+				// 系统任务上下文：探查类 py 脚本免逐条审批（写配置的脚本仍回退人工）
+				if (tool === "py" && taskContext && !(await pyNeedsApproval(input))) {
+					traceReport(ctx, event.toolCallId, "task_py_auto", "任务上下文探查脚本自动放行（未涉及 AIShell 配置写入）");
+				} else if (!(await approve(ctx, tool, input, event.toolCallId))) {
 					return { block: true, reason: "用户拒绝了该操作" };
 				}
 			} else if (tool === "db_query" && !isDbReadCommand(String(input.command || ""))) {
@@ -1116,6 +1167,77 @@ export default function (pi: ExtensionAPI) {
 						: { localPath: params.localPath, remoteDir: params.remoteDir, overwrite: params.overwrite === true }),
 
 			});
+		},
+	});
+
+	/* ---------- 通用交互工具（ask / confirm）：三档模式可用、免审批（交互即授权） ----------
+	 *  execute 内经 AISHELL_ASK: / AISHELL_CONFIRM: 通道把问题转发前端卡片，用户提交后
+	 *  Rust 经 ai_respond_ask / ai_respond_confirm 回执；回答文本/布尔作为工具结果返回模型。 */
+	pi.registerTool({
+		name: "ask",
+		label: "向用户提问",
+		description:
+			"向用户提出一个或多个问题并等待回答（一次调用可含多个问题，避免多轮往返）。每个问题可附 2–4 个候选选项供点选；界面会为每个问题自动附带自由输入框，用户可点选选项或直接输入自定义回答。适合需要用户决策或补充信息的场景（方案选择、缺失参数、偏好确认）；用户的回答以「问/答」文本形式作为工具结果返回。",
+		promptSnippet: "向用户提问（可一次多问，可带选项）",
+		promptGuidelines: [
+			"需要用户做决定或补充信息时，用 ask 一次性问清，不要只在回复正文里罗列问题等用户打字回复。",
+			"options 只放真实候选答案（2–4 个）；不要放「其他」「由你来指定」之类占位项——界面已为每个问题自动提供自由输入框。",
+			"只需用户对单一事项做是/否确认时（如执行前最终确认），改用 confirm 工具。",
+		],
+		parameters: Type.Object({
+			questions: Type.Array(
+				Type.Object({
+					question: Type.String({ description: "问题正文（中文，一句话说清要用户决定什么）" }),
+					options: Type.Optional(Type.Array(Type.String(), { description: "供用户点选的候选答案（2–4 个，简洁）；不要包含「其他/由你指定」类占位项——界面已自动提供自由输入" })),
+				}),
+				{ minItems: 1, description: "问题列表（一次可提多个）" },
+			),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			let raw: string | undefined;
+			try {
+				raw = await ctx.ui.input(
+					"AISHELL_ASK:" + toolCallId,
+					JSON.stringify({ questions: params.questions }),
+				);
+			} catch {
+				// 中止/窗口卸载/客户端取消（cancelled:true）统一按取消
+				raw = undefined;
+			}
+			if (raw === undefined || !raw.trim()) {
+				return okResult("用户取消了回答（未作答）。请改用其它方式继续，或在回复正文中向用户说明需要哪些信息。");
+			}
+			return okResult(raw);
+		},
+	});
+
+	pi.registerTool({
+		name: "confirm",
+		label: "请求用户确认",
+		description:
+			"向用户提出单一的是非问题并等待「确认/取消」（如执行前的最终确认、方案是否可行的单一抉择）。工具结果返回用户是否确认。有多个问题或需要选项/补充信息时用 ask 工具。",
+		promptSnippet: "请求用户确认（确认/取消）",
+		promptGuidelines: [
+			"confirm 只用于单一是非确认；question 用一句中文说清要确认什么（可附关键影响）。",
+			"用户取消时不要反复重试同一确认，先在回复中说明影响并与用户沟通下一步。",
+		],
+		parameters: Type.Object({
+			question: Type.String({ description: "要用户确认的问题（中文，一句话；可附关键影响说明）" }),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			let ok = false;
+			try {
+				ok = await ctx.ui.confirm(
+					"AISHELL_CONFIRM:" + toolCallId,
+					JSON.stringify({ question: String(params.question || "") }),
+				);
+			} catch {
+				// 中止/窗口卸载/客户端取消（cancelled:true）统一按未确认
+				ok = false;
+			}
+			return okResult(ok
+				? "用户已确认。"
+				: "用户已取消（未确认）。请停止当前操作，在回复中说明影响并与用户确认下一步。");
 		},
 	});
 

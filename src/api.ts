@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -22,6 +22,9 @@ export const isConfigComplete = () => call<boolean>('is_config_complete');
 export const getState = () => call<AppState>('get_state');
 /** 当前工作区的系统任务项目（main 侧引入）：按 workspace 合成，用于「任务」会话默认绑定 */
 export const getTaskProject = () => call<Project>('get_task_project');
+/** Python SDK 成功导入配置后的全局通知。 */
+export const onConfigChanged = (cb: (event: ConfigChanged) => void): Promise<UnlistenFn> =>
+  listen<ConfigChanged>('config:changed', (e) => cb(e.payload));
 export const saveSettings = (settings: Settings, apiKey: string | null, braveKey: string | null) =>
   call<void>('save_settings', { settings, apiKey, braveKey });
 /** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */
@@ -31,6 +34,8 @@ export const upsertServer = (server: Server, password: string | null, credential
 export const upsertCredential = (credential: Credential, password: string | null) =>
   call<Credential>('upsert_credential', { credential, password });
 export const deleteCredential = (id: string) => call<void>('delete_credential', { id });
+/** 清除凭据库中未被任何服务器引用的凭据及其 keyring 密钥，返回清除数量。 */
+export const clearUnreferencedCredentials = () => call<number>('clear_unreferenced_credentials');
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
 /** 新建项目分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
 export const createProjectFolder = (name: string) => call<void>('create_project_folder', { name });
@@ -55,8 +60,8 @@ export const setSftpHistory = (serverId: string, paths: string[]) =>
 /** 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序，前端防抖后调用） */
 export const setSftpFavorites = (serverId: string, favorites: SftpFavorite[]) =>
   call<void>('set_sftp_favorites', { serverId, favorites });
-/** 清除全部服务器配置并让所有项目解绑；可复用凭据库保留。 */
-export const clearAllServers = () => call<void>('clear_all_servers');
+/** 清除未被项目直接或经堡垒机依赖引用的服务器及附属配置，返回清除数量。 */
+export const clearUnreferencedServers = () => call<number>('clear_unreferenced_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；
  *  密码永不迁移；无可用会话目录时 reject 中文错误串。 */
 export const importXshellSessions = () => call<XshellImportResult>('import_xshell_sessions');
@@ -211,6 +216,11 @@ export type AiEvent =
       impact?: { effect: 'none' | 'bounded' | 'unbounded'; changes: Array<{ operation: string; path: string; destination?: string | null }>; reason: string };
       /** 数据库连接申请（request_db_connection 工具）：AI 填写的连接信息，审批对话框只读展示 */
       connection?: { serverId: string; name: string; kind: DbKind; host: string; port?: number; user?: string; database?: string } }
+  /** ask 工具（通用问答）：AI 一次提出多个问题，前端渲染问答卡片（每问候选选项 + 自由输入框），
+   *  用户提交后经 aiRespondAsk 回执拼装好的问答文本 */
+  | { type: 'ask'; requestId: string; toolCallId: string; questions: Array<{ question: string; options?: string[] }> }
+  /** confirm 工具（通用是非确认）：单一问题 + 确认/取消，经 aiRespondConfirm 回执布尔 */
+  | { type: 'confirm'; requestId: string; toolCallId: string; question: string }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
   | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发。
@@ -250,6 +260,12 @@ export const aiRespondApproval = (key: string, requestId: string, confirmed: boo
  *  已保存连接的 id（工具结果直接携带，AI 据此 db_query）；false 为拒绝。校验语义同 aiRespondApproval。 */
 export const aiRespondDbRequest = (key: string, requestId: string, response: { approved: boolean; connectionId?: string }) =>
   call<void>('ai_respond_db_request', { key, requestId, response: JSON.stringify(response) });
+/** 回复 ask 工具提问：response 为拼装好的「问/答」文本（取消传空串）。校验语义同 aiRespondApproval。 */
+export const aiRespondAsk = (key: string, requestId: string, response: string) =>
+  call<void>('ai_respond_ask', { key, requestId, response });
+/** 回复 confirm 工具确认：confirmed=true 确认 / false 取消。校验语义同 aiRespondApproval。 */
+export const aiRespondConfirm = (key: string, requestId: string, confirmed: boolean) =>
+  call<void>('ai_respond_confirm', { key, requestId, confirmed });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 

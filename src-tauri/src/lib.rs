@@ -11,8 +11,6 @@ pub mod mcp;
 pub mod notes;
 pub mod redact;
 pub mod session_title;
-#[cfg(windows)]
-pub mod gitinstall;
 pub mod pythoninstall;
 pub mod pysdk;
 pub mod sftp;
@@ -147,6 +145,12 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
                 pi_debug,
                 Some(cloud_mgr.clone()),
             ));
+            {
+                let app2 = app.handle().clone();
+                ai.set_config_changed_emitter(Arc::new(move |event| {
+                    let _ = app2.emit("config:changed", event);
+                }));
+            }
             // MCP 服务端：按已启用设备自动监听 127.0.0.1:<port>/mcp（见 mcp.rs）
             let mcp = Arc::new(mcp::McpService::new(
                 store.clone(),
@@ -198,25 +202,6 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             update::start_background(app.handle().clone());
             // AI 会话 trace：启动 7 天过期清理任务（启动即清一次 + 每 24h）
             trace::spawn_cleanup_task();
-            // Git Bash 首启引导（第 1 项）：检测不到 Git Bash 时弹窗征求同意后静默安装
-            // 捆绑安装器。放后台线程并延迟触发：等主事件循环泵消息、主窗口显示后再弹框
-            // （dialog 插件内部 run_on_main_thread 依赖主循环在运行）。
-            #[cfg(windows)]
-            {
-                let app_git = app.handle().clone();
-                let app_py = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    gitinstall::ensure_on_startup(&app_git);
-                });
-                // Python3 首启引导（py 工具运行时依赖）：与 Git 同一套「检测 → 同意 → 静默装」
-                // 流程。错开 3 秒：两者都缺失时避免两个确认框同时弹出（dialog 会排队，但
-                // 间隔出让 Git 的弹框先展示更符合依赖直觉）。
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(4500));
-                    pythoninstall::ensure_on_startup(&app_py);
-                });
-            }
             if let Some(win) = app.get_webview_window("main") {
                 // 禁用 WebView2 浏览器快捷键（Ctrl+Shift+C 开 DevTools、Ctrl+滚轮缩放、F5 刷新等）：
                 // 它们在页面 keydown 之前的 accelerator 阶段被宿主拦截，JS 无法阻止，
@@ -253,6 +238,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             store::upsert_server,
             store::upsert_credential,
             store::delete_credential,
+            store::clear_unreferenced_credentials,
             store::delete_server,
             store::upsert_project,
             delete_project_with_ai,
@@ -276,7 +262,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             store::set_ui_expanded,
             store::set_sftp_history,
             store::set_sftp_favorites,
-            store::clear_all_servers,
+            store::clear_unreferenced_servers,
             xshell::import_xshell_sessions,
             xshell::import_xshell_from_dir,
             term::term_create,
@@ -368,6 +354,8 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             cloud_sync::cloud_backup_restore,
             cloud_sync::cloud_backup_delete,
             ai::ai_respond_db_request,
+            ai::ai_respond_ask,
+            ai::ai_respond_confirm,
             session_title::ai_generate_session_title,
             notes::notes_root_cmd,
             notes::notes_list_cmd,

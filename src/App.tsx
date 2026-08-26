@@ -6,9 +6,12 @@
  *   同项目回归原样复用(含裸 '#/workbench',目标项目即保活项目);
  * - 换项目才销毁重建(key 变更触发整树卸载 → Workbench 卸载清理关闭全部标签);
  * - 装载失败(无项目/后端异常,Workbench 已自行导航离开)或装载期间离开路由 → 销毁实例。
+ * 与后端接口点:监听 api.ts 的 config:changed，将 Python SDK 导入结果分发给欢迎页和工作台面板。
  */
 import { useEffect, useState } from 'react';
+import { onConfigChanged } from './api';
 import { useHashRoute } from './shared/useHashRoute';
+import { wbEvents } from './stores/workbench';
 import { Topbar } from './components/Topbar';
 import { Welcome } from './pages/welcome/Welcome';
 import { Settings } from './pages/settings/Settings';
@@ -29,6 +32,29 @@ export default function App(): JSX.Element {
   const isWb = route.name === '/workbench';
   const target = isWb ? route.params.get('project') : null;
   const [wb, setWb] = useState<WbInstance | null>(null);
+
+  /* 根组件常驻监听，避免欢迎页卸载或工作台隐藏时丢失 SDK 导入通知。 */
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void onConfigChanged((event) => {
+      if (event.kind === 'project') {
+        window.dispatchEvent(new CustomEvent('aishell:data-changed'));
+        wbEvents.emit('project-changed');
+      } else if (event.kind === 'commands' || event.kind === 'skill') {
+        wbEvents.emit('project-changed');
+      } else {
+        wbEvents.emit('notes-changed');
+      }
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   /* 工作台实例生命周期:进入工作台路由时创建/复用/重建,装载期离开路由销毁失败残留 */
   useEffect(() => {
