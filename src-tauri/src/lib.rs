@@ -132,6 +132,12 @@ pub fn run() {
                 browser.clone(),
                 pi_debug,
             ));
+            {
+                let app2 = app.handle().clone();
+                ai.set_config_changed_emitter(Arc::new(move |event| {
+                    let _ = app2.emit("config:changed", event);
+                }));
+            }
             // MCP 服务端：按已启用设备自动监听 127.0.0.1:<port>/mcp（见 mcp.rs）
             let mcp = Arc::new(mcp::McpService::new(
                 store.clone(),
@@ -190,6 +196,7 @@ pub fn run() {
             store::upsert_server,
             store::upsert_credential,
             store::delete_credential,
+            store::clear_unreferenced_credentials,
             store::delete_server,
             store::upsert_project,
             delete_project_with_ai,
@@ -213,7 +220,7 @@ pub fn run() {
             store::set_ui_expanded,
             store::set_sftp_history,
             store::set_sftp_favorites,
-            store::clear_all_servers,
+            store::clear_unreferenced_servers,
             xshell::import_xshell_sessions,
             xshell::import_xshell_from_dir,
             term::term_create,

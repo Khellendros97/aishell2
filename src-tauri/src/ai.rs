@@ -388,6 +388,14 @@ impl AiManager {
         }
     }
 
+    /// 注入 SDK 配置变更事件回调。
+    pub(crate) fn set_config_changed_emitter(
+        &self,
+        f: crate::ai_actions::ConfigChangedEmitter,
+    ) {
+        self.actions.set_config_changed_emitter(f);
+    }
+
     /// 读取并校验本项目技能集合：任何 SKILL.md 解析失败都返回含路径的中文错误，
     /// 阻止 spawn（不能退化为无技能启动）。
     fn load_skills(&self, project_id: &str) -> Result<LoadedSkills, String> {

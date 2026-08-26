@@ -4,7 +4,7 @@
  * 命令执行导致数据变化时广播 `aishell:data-changed`（CustomEvent），
  * 各页面监听后重新拉取状态渲染（settings / welcome / 侧栏 servers）。
  */
-import { clearAllServers, traceSetEnabled } from './api';
+import { clearUnreferencedCredentials, clearUnreferencedServers, traceSetEnabled } from './api';
 import { confirmDialog, toast } from './ui';
 import { icon } from './icons';
 import { toggleDebugPanel } from './debug';
@@ -37,20 +37,42 @@ const COMMANDS: PanelCommand[] = [
   },
   {
     usage: 'server config clear',
-    desc: '清除所有服务器配置（凭据库保留，所有项目解绑）',
+    desc: '清除未被任何项目引用的服务器及附属配置（项目所需堡垒机、凭据库保留）',
     match: (t) =>
       t.length === 3 && t[0] === 'server' && t[1] === 'config' && t[2] === 'clear',
     run: async () => {
       const ok = await confirmDialog({
-        title: '清除所有服务器配置',
-        message: '将删除全部服务器并解除所有项目绑定；凭据库中的登录信息会保留，可用于后续重新绑定。此操作不可恢复，确定继续吗？',
+        title: '清除未引用服务器',
+        message: '将删除未被任何项目使用的服务器及其 MCP、SFTP、数据库连接配置；项目正在使用的服务器及其堡垒机会保留，凭据库中的登录信息不会删除。此操作不可恢复，确定继续吗？',
         danger: true,
         okText: '清除',
       });
       if (!ok) return;
       try {
-        await clearAllServers();
-        toast('已清除所有服务器配置', 'success');
+        const removed = await clearUnreferencedServers();
+        toast(removed > 0 ? `已清除 ${removed} 台未引用服务器` : '没有未引用的服务器', 'success');
+        window.dispatchEvent(new CustomEvent('aishell:data-changed'));
+      } catch (err) {
+        toast(`清除失败: ${String(err)}`, 'error');
+      }
+    },
+  },
+  {
+    usage: 'keyring config clear',
+    desc: '清除凭据库中未被服务器引用的登录凭据（不影响 API Key、MCP 令牌、数据库连接密码）',
+    match: (t) =>
+      t.length === 3 && t[0] === 'keyring' && t[1] === 'config' && t[2] === 'clear',
+    run: async () => {
+      const ok = await confirmDialog({
+        title: '清除未引用凭据',
+        message: '将删除凭据库中未被任何服务器引用的登录凭据及其 keyring 密码；不会影响 API Key、MCP 令牌、数据库连接密码或现有服务器正在使用的凭据。此操作不可恢复，确定继续吗？',
+        danger: true,
+        okText: '清除',
+      });
+      if (!ok) return;
+      try {
+        const removed = await clearUnreferencedCredentials();
+        toast(removed > 0 ? `已清除 ${removed} 个未引用凭据` : '没有未引用的凭据', 'success');
         window.dispatchEvent(new CustomEvent('aishell:data-changed'));
       } catch (err) {
         toast(`清除失败: ${String(err)}`, 'error');

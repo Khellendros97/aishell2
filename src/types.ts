@@ -2,6 +2,12 @@
  * 共享数据模型 —— 与 Rust store.rs 的 serde camelCase 严格对齐，字段名以 .proto/shared/mock.js 为准。
  * 修改任何字段名都必须同步 Rust 侧。
  */
+/** Python SDK 导入成功后的配置变更事件，与 Rust ai_actions.rs ConfigChanged 对齐。 */
+export interface ConfigChanged {
+  kind: 'project' | 'commands' | 'skill' | 'note';
+  projectId: string | null;
+}
+
 export interface LlmConfig {
   modelId: string;
   baseUrl: string;

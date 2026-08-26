@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -22,6 +22,9 @@ export const isConfigComplete = () => call<boolean>('is_config_complete');
 export const getState = () => call<AppState>('get_state');
 /** 欢迎页 AI 的系统任务上下文；不进入普通项目列表。 */
 export const getTaskProject = () => call<Project>('get_task_project');
+/** Python SDK 成功导入配置后的全局通知。 */
+export const onConfigChanged = (cb: (event: ConfigChanged) => void): Promise<UnlistenFn> =>
+  listen<ConfigChanged>('config:changed', (e) => cb(e.payload));
 export const saveSettings = (settings: Settings, apiKey: string | null, braveKey: string | null) =>
   call<void>('save_settings', { settings, apiKey, braveKey });
 /** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */
@@ -31,6 +34,8 @@ export const upsertServer = (server: Server, password: string | null, credential
 export const upsertCredential = (credential: Credential, password: string | null) =>
   call<Credential>('upsert_credential', { credential, password });
 export const deleteCredential = (id: string) => call<void>('delete_credential', { id });
+/** 清除凭据库中未被任何服务器引用的凭据及其 keyring 密钥，返回清除数量。 */
+export const clearUnreferencedCredentials = () => call<number>('clear_unreferenced_credentials');
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
 /** 新建项目分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
 export const createProjectFolder = (name: string) => call<void>('create_project_folder', { name });
@@ -55,8 +60,8 @@ export const setSftpHistory = (serverId: string, paths: string[]) =>
 /** 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序，前端防抖后调用） */
 export const setSftpFavorites = (serverId: string, favorites: SftpFavorite[]) =>
   call<void>('set_sftp_favorites', { serverId, favorites });
-/** 清除全部服务器配置并让所有项目解绑；可复用凭据库保留。 */
-export const clearAllServers = () => call<void>('clear_all_servers');
+/** 清除未被项目直接或经堡垒机依赖引用的服务器及附属配置，返回清除数量。 */
+export const clearUnreferencedServers = () => call<number>('clear_unreferenced_servers');
 /** 一键从 Xshell 导入 SSH 会话：扫描 Documents/NetSarang Computer 最高版本的 Xshell/Sessions；
  *  密码永不迁移；无可用会话目录时 reject 中文错误串。 */
 export const importXshellSessions = () => call<XshellImportResult>('import_xshell_sessions');

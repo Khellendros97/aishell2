@@ -1493,7 +1493,6 @@ function handleEventBody(sid: string, ev: AiEvent): void {
        本地 write/edit 不改远程文件，不触发（后端对远程 write/edit 不发 fs:changed，
        本地文件刷新走 fs:changed 事件，见 editor.ts）。 */
     const isRemoteFileOp = ['write', 'edit', 'delete_path'].includes(ev.tool) && !!existing?.serverId;
-    if (ev.tool === 'py' && !ev.isError) window.dispatchEvent(new CustomEvent('aishell:data-changed'));
     if (ev.tool === 'run_command' || ev.tool === 'sftp_upload'
       || ev.tool === 'staging_restore' || ev.tool === 'staging_list' || ev.tool === 'staging_diff'
       || ev.tool === 'staging_add' || ev.tool === 'staging_clear'
