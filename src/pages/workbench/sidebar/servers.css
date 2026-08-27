@@ -22,6 +22,12 @@
   border: 1px solid var(--border); background: var(--bg-1);
 }
 .wbs-server-actions .icon-btn:hover { background: var(--bg-3); border-color: var(--border-strong); }
+/* 紧凑布局（设置-外观「服务器紧凑布局」）：折叠态只保留首行（图标/名称/IP），整卡点击展开 */
+.wbs-server-card.wbs-compact { gap: 0; padding: 8px 12px; }
+.wbs-server-card.wbs-compact.expanded { gap: 10px; }
+/* 折叠态首行右侧:「添加到对话」按钮 + 展开指示 */
+.wbs-server-card.wbs-compact .wbs-server-top .wbs-chat { margin-left: auto; width: 26px; height: 26px; font-size: 14px; flex: none; }
+.wbs-caret { flex: none; display: inline-flex; color: var(--text-3); font-size: 14px; }
 /* 远程服务器标题行（新建按钮） */
 .wbs-server-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;

@@ -40,6 +40,7 @@ interface SysFields {
   mcpPort: string;
   kbAutoInject: boolean;
   kbInjectCount: string;
+  compactServerList: boolean;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -47,7 +48,7 @@ const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '',
-  kbAutoInject: false, kbInjectCount: '5',
+  kbAutoInject: false, kbInjectCount: '5', compactServerList: false,
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -218,6 +219,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       mcpPort: String(s.mcp?.port ?? 8945),
       kbAutoInject: s.settings.knowledge?.autoInject ?? true,
       kbInjectCount: String(s.settings.knowledge?.injectCount ?? 5),
+      compactServerList: s.settings.compactServerList ?? false,
     });
     void refreshMcpStatus();
   };
@@ -333,11 +335,14 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       cloud: dbRef.current?.settings.cloud ?? { mode: 'personal', user: null, capabilities: null },
       autoBackupRemoteFiles: fields.autoBackup,
       knowledge: { autoInject: fields.kbAutoInject, injectCount: kbInjectCount },
+      compactServerList: fields.compactServerList,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
       await setMcpPort(mcpPort);
       if (dbRef.current) dbRef.current.settings = settings;
+      /* 广播全局数据变更:工作台侧栏服务器列表等 keep-alive 页面据此重拉状态,紧凑布局开关即时生效 */
+      window.dispatchEvent(new CustomEvent('aishell:data-changed'));
       toast('设置已保存', 'success');
       void refreshMcpStatus();
     } catch (err) {
@@ -429,6 +434,16 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 <option value="light">亮色</option>
               </select>
               <div className="hint">选择后立即生效；顶栏 ☀/☾ 按钮亦可快捷切换</div>
+            </div>
+            <div className="field">
+              <label>服务器紧凑布局</label>
+              <input
+                id="f-compact-server-list"
+                type="checkbox"
+                checked={fields.compactServerList}
+                onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, compactServerList: checked })); }}
+              />
+              <div className="hint">开启后工作台侧栏的服务器卡片默认折叠，仅显示图标、名称和 IP；点击卡片展开操作按钮</div>
             </div>
             <div className="form-actions">
               <button id="btn-save-system" className="btn primary" onClick={() => void save()}>保存</button>

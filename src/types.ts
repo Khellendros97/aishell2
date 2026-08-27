@@ -62,6 +62,8 @@ export interface Settings {
   cloud: CloudConfig;
   /** 自动备份远程文件：开启后 AI 会话第一次修改某远程文件前保存原始快照（会话级暂存区）；旧配置无此字段按开启 */
   autoBackupRemoteFiles: boolean;
+  /** 服务器紧凑布局：开启后工作台侧栏服务器卡片默认折叠（仅图标/名称/IP），点击展开；旧配置无此字段按关闭 */
+  compactServerList: boolean;
 }
 
 /** 云服务接入模式（与 store.rs CloudMode serde lowercase 对齐） */
