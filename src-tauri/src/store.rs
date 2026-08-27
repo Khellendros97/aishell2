@@ -208,6 +208,10 @@ pub struct Settings {
     /// 知识库配置（云端只读中转）；旧配置无此字段时按默认开启自动注入处理
     #[serde(default)]
     pub knowledge: KnowledgeConfig,
+    /// 服务器紧凑布局：开启后工作台侧栏服务器卡片默认折叠（仅图标/名称/IP），点击展开操作按钮；
+    /// 旧配置无此字段时按关闭处理（默认关闭，保持完整卡片）
+    #[serde(default)]
+    pub compact_server_list: bool,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -228,6 +232,7 @@ impl Default for Settings {
             },
             auto_backup_remote_files: true,
             knowledge: KnowledgeConfig::default(),
+            compact_server_list: false,
         }
     }
 }
@@ -3422,6 +3427,7 @@ mod tests {
                 },
                 auto_backup_remote_files: true,
                 knowledge: KnowledgeConfig::default(),
+                compact_server_list: false,
             },
             credentials: vec![
                 Credential {
@@ -6049,6 +6055,7 @@ mod tests {
                     },
                     auto_backup_remote_files: true,
                     knowledge: KnowledgeConfig::default(),
+                    compact_server_list: false,
                 },
                 Some("sk-test-key"),
                 None,
@@ -6247,6 +6254,7 @@ mod tests {
                     },
                     auto_backup_remote_files: true,
                     knowledge: KnowledgeConfig::default(),
+                    compact_server_list: false,
                 },
                 None,
                 Some("bsk-1"),
