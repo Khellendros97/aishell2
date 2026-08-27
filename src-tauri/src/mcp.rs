@@ -1226,6 +1226,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 Some("pw"),
             )

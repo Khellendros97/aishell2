@@ -36,6 +36,93 @@
   border-color: var(--accent);
 }
 
+/* ---------- 地址栏历史下拉(聚焦展开最近记录,输入按子串过滤;最多 8 条由引擎侧限制) ---------- */
+
+.browser-address-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+.browser-address-wrap .browser-address {
+  width: 100%;
+}
+
+/* 浮于工具栏下方;打开期间引擎会隐藏子 webview 让位(原生表面永远压过 DOM),z-index 仅
+   处理与工具栏兄弟元素的层级关系 */
+.browser-history-drop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.browser-history-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  user-select: none;
+}
+
+.browser-history-item:hover,
+.browser-history-item.active {
+  background: var(--bg-3);
+}
+
+/* 键盘选中态叠加描边,与悬停区分 */
+.browser-history-item.active {
+  outline: 1px solid var(--accent);
+}
+
+.browser-history-ic {
+  flex: none;
+  display: inline-flex;
+  color: var(--text-2);
+}
+
+.browser-history-item.active .browser-history-ic {
+  color: var(--accent);
+}
+
+.browser-history-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.browser-history-title {
+  font-size: 12.5px;
+  color: var(--text-0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-history-url {
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 页面区:左侧 webview 覆盖区 + 右侧标签页侧边栏 */
 .browser-body {
   display: flex;
@@ -196,6 +283,15 @@
   flex: none;
   display: inline-flex;
   color: var(--text-2);
+}
+
+/* 站点 favicon(加载失败由引擎捕获 error 换回默认地球 SVG) */
+.browser-favicon {
+  width: 15px;
+  height: 15px;
+  border-radius: 3px;
+  object-fit: cover;
+  display: block;
 }
 
 .browser-page-row.active .browser-page-ic {

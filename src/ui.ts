@@ -60,10 +60,12 @@ export interface ConfirmOptions {
   message?: string;
   danger?: boolean;
   okText?: string;
+  /** 可选的受影响条目清单（如批量删除前列出项目名），渲染为可滚动列表 */
+  list?: string[];
 }
 
 export function confirmDialog({
-  title = '确认操作', message = '', danger = false, okText = '确定',
+  title = '确认操作', message = '', danger = false, okText = '确定', list,
 }: ConfirmOptions = {}): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
   const mask = document.createElement('div');
@@ -79,6 +81,16 @@ export function confirmDialog({
       </div>`;
     mask.querySelector('h3')!.textContent = title;
     mask.querySelector('.modal-body')!.textContent = message;
+    if (list && list.length > 0) {
+      const ul = document.createElement('ul');
+      ul.className = 'confirm-list';
+      for (const item of list) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        ul.appendChild(li);
+      }
+      mask.querySelector('.modal-body')!.appendChild(ul);
+    }
     mask.querySelector('[data-act=ok]')!.textContent = okText;
     document.body.appendChild(mask);
     requestAnimationFrame(() => mask.classList.add('open'));

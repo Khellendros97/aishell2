@@ -34,6 +34,11 @@
 .wbs-search { display: flex; align-items: center; gap: 6px; margin: 0 2px 8px; }
 .wbs-search .input { flex: 1; min-width: 0; }
 
+/* 热门标签 chips 行（搜索框下方，点击切换 #tag 筛选） */
+.wbs-tags { display: flex; flex-wrap: wrap; gap: 4px; margin: -2px 2px 8px; }
+.wbs-tags .tag { font-size: 11px; }
+.wbs-tags .tag .ic { font-size: 11px; }
+
 /* 数据库连接配置弹窗（AI 受管查询通道） */
 .db-conn-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
 .db-conn-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border, #333); border-radius: 8px; }

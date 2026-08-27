@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserHistoryItem, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TraceEntry, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -44,6 +44,9 @@ export const renameProjectFolder = (oldName: string, newName: string) =>
   call<void>('rename_project_folder', { old: oldName, new: newName });
 /** 删除项目分类目录：目录下仍有项目时返回后端中文错误；未分类不可删除 */
 export const deleteProjectFolder = (name: string) => call<void>('delete_project_folder', { name });
+/** 按分类递归删除项目：含子分类下的项目一并删除（服务器仅解绑不删除），返回删除的项目数 */
+export const deleteFolderWithProjects = (name: string) =>
+  call<number>('delete_folder_with_projects', { name });
 /** 新建命令收藏分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
 export const createCommandFolder = (name: string) => call<void>('create_command_folder', { name });
 /** 重命名命令收藏分类目录：级联改写所有项目命令的 folder；new 与 old 相同为 no-op；未分类不可重命名 */
@@ -415,6 +418,12 @@ export const browserCloseView = (viewId: string) => call<void>('browser_close_vi
 /** 驱动受限本地 ZIP 走可见的 SkillHub 页面流程；只返回终态，不额外广播进度事件。 */
 export const browserPublishSkillhub = (projectId: string, origin: SkillOrigin, packagePath: string) =>
   call<SkillHubPublishOutcome>('browser_publish_skillhub', { projectId, origin, packagePath });
+/** 记录地址栏历史：导航/标题事件后防抖上报（后端按 URL 合并去重保持 MRU，落盘 aishell.json） */
+export const browserHistoryAdd = (url: string, title: string) =>
+  call<void>('browser_history_add', { url, title });
+/** 地址栏历史下拉数据源：query 对 URL/标题做大小写不敏感子串过滤，limit 默认 8，返回 MRU 序 */
+export const browserHistoryList = (query: string, limit = 8) =>
+  call<BrowserHistoryItem[]>('browser_history_list', { query, limit });
 export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
   listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
 

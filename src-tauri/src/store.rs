@@ -351,6 +351,9 @@ pub struct Server {
     /// None = 普通服务器或堡垒机自身。旧配置无此字段按未绑定。
     #[serde(default)]
     pub bastion_id: Option<String>,
+    /// 用户自定义标签（搜索框 #tag 筛选用）；旧配置无此字段按空标签处理。
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// 数据库类型（AI 受管查询通道）。
@@ -424,6 +427,40 @@ pub struct SftpFavorite {
     pub path: String,
     #[serde(default)]
     pub title: String,
+}
+
+/// 内置浏览器地址栏历史上限（MRU 截尾；下拉显示条数由前端按需查询，与存储上限解耦）。
+pub const BROWSER_HISTORY_CAP: usize = 200;
+
+/// 内置浏览器地址栏历史条目（MRU，最新在前）。URL 为对外展示形态（本地文件即 file:///，
+/// 与地址栏/事件一致）；重新导航时后端 normalize_input 会再归一化。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserHistoryEntry {
+    pub url: String,
+    /// 页面标题（导航事件时往往尚未加载完成，为空串；标题事件到达后补填）
+    #[serde(default)]
+    pub title: String,
+    /// 最近一次访问的毫秒时间戳
+    pub ts: u64,
+}
+
+/// 历史过滤（纯函数）：query 小写化后按子串匹配 URL 与标题（空 query = 不过滤），
+/// 保持原 MRU 序，取前 limit 条。
+fn filter_browser_history(
+    entries: &[BrowserHistoryEntry],
+    query: &str,
+    limit: usize,
+) -> Vec<BrowserHistoryEntry> {
+    let q = query.trim().to_lowercase();
+    entries
+        .iter()
+        .filter(|e| {
+            q.is_empty() || e.url.to_lowercase().contains(&q) || e.title.to_lowercase().contains(&q)
+        })
+        .take(limit)
+        .cloned()
+        .collect()
 }
 
 /// 收藏夹兼容反序列化：旧配置 `serverId -> string[]`（纯路径）→ 新结构 `{path, title}[]`，
@@ -868,6 +905,10 @@ pub struct AppState {
     /// 旧配置为纯路径数组（Vec<String>），读取时经 de_sftp_favorites 自动迁移（标题取目录名）。
     #[serde(default, deserialize_with = "de_sftp_favorites")]
     pub sftp_favorites: HashMap<String, Vec<SftpFavorite>>,
+    /// 内置浏览器地址栏历史（MRU：最新在前，上限 BROWSER_HISTORY_CAP 条，由 record_browser_history 维护）。
+    /// 旧配置无此字段按空列表解析。
+    #[serde(default)]
+    pub browser_history: Vec<BrowserHistoryEntry>,
     /// 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表。密码在 keyring。
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
@@ -1066,6 +1107,18 @@ const TASK_PROJECT_NAME: &str = "系统任务";
 
 fn is_task_project_id(project_id: &str) -> bool {
     project_id == TASK_PROJECT_ID
+}
+
+/// 服务器标签规范化：逐项 trim、去空、去重（保序）。保存与导入入口统一走这里。
+pub fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let t = t.trim();
+        if !t.is_empty() && !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// 系统任务项目的固定目录：`<workspace>/.aishell/tasks`。
@@ -1603,6 +1656,7 @@ impl Store {
         password: Option<&str>,
         mode: CredentialSaveMode,
     ) -> Result<ServerSaveResult, String> {
+        server.tags = normalize_tags(&server.tags);
         self.validate_server(&server)?;
         let snapshot = self
             .state
@@ -2020,7 +2074,8 @@ impl Store {
             .join("/")
     }
 
-    /// 新建项目分类目录：规范化名称；空串报错、重名报错；一次 with_state 原子落盘。
+    /// 新建项目分类目录：规范化名称；空串报错、重名报错；嵌套路径自动补建缺失的祖先目录，
+    /// 保证树形展示时中间层级存在。一次 with_state 原子落盘。
     pub fn create_project_folder(&self, name: &str) -> Result<(), String> {
         let folder = Self::normalize_folder(name);
         if folder.is_empty() {
@@ -2030,13 +2085,19 @@ impl Store {
             if s.project_folders.iter().any(|f| f == &folder) {
                 return Err("分类目录已存在".to_string());
             }
-            s.project_folders.push(folder);
+            let segs: Vec<&str> = folder.split('/').collect();
+            for i in 1..=segs.len() {
+                let prefix = segs[..i].join("/");
+                if !s.project_folders.iter().any(|f| f == &prefix) {
+                    s.project_folders.push(prefix);
+                }
+            }
             Ok(())
         })
     }
 
-    /// 重命名项目分类目录：级联改写所有 folder==old 的项目（含历史 JSON 里产生的、不在
-    /// project_folders 列表里的旧值），并同步列表（old 移除、new 不存在才追加）。
+    /// 重命名项目分类目录：前缀级联——folder==old 或以 old/ 为前缀（子分类）的项目与目录
+    /// 条目同步改写；级联结果与既有目录撞名时去重合并；new 的祖先目录缺失时补建。
     /// 未分类（空串）不可重命名；new 规范化后与 old 相同视为 no-op。一次 with_state 原子落盘。
     pub fn rename_project_folder(&self, old: &str, new: &str) -> Result<(), String> {
         if old.is_empty() {
@@ -2049,20 +2110,86 @@ impl Store {
         if folder == old {
             return Ok(());
         }
+        let old_prefix = format!("{old}/");
+        let cascade = |f: &str| -> Option<String> {
+            if f == old {
+                Some(folder.clone())
+            } else {
+                f.strip_prefix(&old_prefix)
+                    .map(|rest| format!("{folder}/{rest}"))
+            }
+        };
         self.with_state(|s| {
             if s.project_folders.iter().any(|f| f == &folder) {
                 return Err("分类目录已存在".to_string());
             }
             for p in &mut s.projects {
-                if p.folder == old {
-                    p.folder = folder.clone();
+                if let Some(nf) = cascade(&p.folder) {
+                    p.folder = nf;
                 }
             }
-            s.project_folders.retain(|f| f != old);
-            if !s.project_folders.iter().any(|f| f == &folder) {
-                s.project_folders.push(folder);
+            let mut folders = std::mem::take(&mut s.project_folders);
+            for f in folders.iter_mut() {
+                if let Some(nf) = cascade(f) {
+                    *f = nf;
+                }
             }
+            if !folders.iter().any(|f| f == &folder) {
+                folders.push(folder.clone());
+            }
+            // new 的祖先目录缺失时补建（与 create 同语义）
+            let segs: Vec<&str> = folder.split('/').collect();
+            for i in 1..segs.len() {
+                let prefix = segs[..i].join("/");
+                if !folders.iter().any(|f| f == &prefix) {
+                    folders.push(prefix);
+                }
+            }
+            // 级联后可能与既有目录撞名，去重保序
+            let mut seen: Vec<String> = Vec::new();
+            folders.retain(|f| {
+                if seen.iter().any(|x| x == f) {
+                    false
+                } else {
+                    seen.push(f.clone());
+                    true
+                }
+            });
+            s.project_folders = folders;
             Ok(())
+        })
+    }
+
+    /// 按分类递归删除项目：folder 精确匹配或以其为前缀（子分类）的项目全部按
+    /// delete_project 同语义删除（删项目记录与 sessions，不动服务器）；
+    /// 同时清理该前缀下的 project_folders 条目。返回删除的项目数。
+    pub fn delete_folder_with_projects(&self, name: &str) -> Result<usize, String> {
+        if name.is_empty() {
+            return Err("未分类目录不可删除".to_string());
+        }
+        let folder = Self::normalize_folder(name);
+        if folder.is_empty() {
+            return Err("分类目录名称不能为空".to_string());
+        }
+        let prefix = format!("{folder}/");
+        self.with_state(|s| {
+            let matches = |f: &str| f == folder || f.starts_with(&prefix);
+            let removed: Vec<String> = s
+                .projects
+                .iter()
+                .filter(|p| matches(&p.folder))
+                .map(|p| p.id.clone())
+                .collect();
+            if removed.iter().any(|id| is_task_project_id(id)) {
+                return Err("系统任务项目不可删除".to_string());
+            }
+            let n = removed.len();
+            s.projects.retain(|p| !matches(&p.folder));
+            for id in &removed {
+                s.sessions.remove(id);
+            }
+            s.project_folders.retain(|f| !matches(f));
+            Ok(n)
         })
     }
 
@@ -2179,6 +2306,49 @@ impl Store {
             s.sftp_history.insert(server_id, paths);
             Ok(())
         })
+    }
+
+    /// 记录内置浏览器地址栏历史：URL 完全一致则置顶并补填非空标题，否则插入头部；
+    /// 超出 [`BROWSER_HISTORY_CAP`] 截尾。空 URL 忽略。一次 with_state 原子落盘。
+    /// URL/标题均为对外展示形态（本地文件即 file:///），由前端导航事件传入。
+    pub fn record_browser_history(&self, url: String, title: String) -> Result<(), String> {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return Ok(());
+        }
+        let title = title.trim().to_string();
+        self.with_state(|s| {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let list = &mut s.browser_history;
+            match list.iter().position(|e| e.url == url) {
+                Some(pos) => {
+                    // 同地址重复访问：置顶刷新时间；标题只补不洗（后到的空串别抹掉已知标题）
+                    let mut entry = list.remove(pos);
+                    if !title.is_empty() {
+                        entry.title = title;
+                    }
+                    entry.ts = ts;
+                    list.insert(0, entry);
+                }
+                None => list.insert(0, BrowserHistoryEntry { url, title, ts }),
+            }
+            list.truncate(BROWSER_HISTORY_CAP);
+            Ok(())
+        })
+    }
+
+    /// 地址栏历史下拉数据源：query 非空时对 URL 与标题做大小写不敏感子串过滤，
+    /// 保持 MRU 序，最多 limit 条。只读不改状态、不落盘。
+    pub fn browser_history_filtered(&self, query: &str, limit: usize) -> Vec<BrowserHistoryEntry> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())
+            .expect("store 状态锁损坏");
+        filter_browser_history(&guard.browser_history, query, limit)
     }
 
     /// 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序）。
@@ -3116,6 +3286,14 @@ pub async fn delete_project_folder(
 }
 
 #[tauri::command]
+pub async fn delete_folder_with_projects(
+    store: State<'_, Arc<Store>>,
+    name: String,
+) -> Result<usize, String> {
+    store.delete_folder_with_projects(&name)
+}
+
+#[tauri::command]
 pub async fn create_command_folder(
     store: State<'_, Arc<Store>>,
     name: String,
@@ -3206,6 +3384,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         }
     }
 
@@ -3273,6 +3452,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 Server {
                     id: "srv-2".to_string(),
@@ -3286,6 +3466,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
             ],
             projects: vec![Project {
@@ -3390,6 +3571,7 @@ mod tests {
             ui_expanded: HashMap::new(),
             sftp_history: HashMap::new(),
             sftp_favorites: HashMap::new(),
+            browser_history: Vec::new(),
             db_connections: HashMap::new(),
             mcp: McpServiceConfig::default(),
             mcp_devices: {
@@ -3611,6 +3793,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 Some("pw-1"),
             )
@@ -3629,6 +3812,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -3927,6 +4111,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store.upsert_server(base.clone(), None).unwrap();
         let mut updated = base;
@@ -3954,12 +4139,14 @@ mod tests {
             locked: false,
             is_bastion: true,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store.upsert_server(base.clone(), None).unwrap();
 
         // 一台服务器不能同时是堡垒机又是目标主机
         let both = Server {
             bastion_id: Some("srv-b".to_string()),
+            tags: Vec::new(),
             ..base.clone()
         };
         let err = store.upsert_server(both, None).unwrap_err();
@@ -3981,6 +4168,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-b".to_string()),
+            tags: Vec::new(),
         };
         store.upsert_server(target_ok, None).unwrap();
         // 未开启堡垒机的服务器不能作堡垒机引用
@@ -3996,6 +4184,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store.upsert_server(plain.clone(), None).unwrap();
         let bad_ref = Server {
@@ -4010,6 +4199,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-p".to_string()),
+            tags: Vec::new(),
         };
         let err = store.upsert_server(bad_ref, None).unwrap_err();
         assert!(err.contains("未开启堡垒机功能"), "错误串不符: {err}");
@@ -4026,6 +4216,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: Some("srv-ghost".to_string()),
+            tags: Vec::new(),
         };
         let err = store.upsert_server(ghost, None).unwrap_err();
         assert!(err.contains("不存在或未开启"), "错误串不符: {err}");
@@ -4053,6 +4244,7 @@ mod tests {
             locked: false,
             is_bastion: true,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store.upsert_server(bastion, None).unwrap();
         store
@@ -4069,6 +4261,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: Some("srv-b".to_string()),
+                    tags: Vec::new(),
                 },
                 Some("pw-t"),
             )
@@ -4101,14 +4294,19 @@ mod tests {
             store.create_project_folder("///").unwrap_err(),
             "分类目录名称不能为空"
         );
-        // 规范化：trim + 去空段；支持层级
+        // 规范化：trim + 去空段；支持层级；嵌套路径自动补建祖先目录
         store.create_project_folder(" 生产环境/Web ").unwrap();
         store.create_project_folder("a//b/").unwrap();
         {
             let guard = store.state.lock().unwrap();
             assert_eq!(
                 guard.project_folders,
-                vec!["生产环境/Web".to_string(), "a/b".to_string()]
+                vec![
+                    "生产环境".to_string(),
+                    "生产环境/Web".to_string(),
+                    "a".to_string(),
+                    "a/b".to_string()
+                ]
             );
         }
         // 重名（规范化后相同）报错，且列表不变
@@ -4118,13 +4316,23 @@ mod tests {
         );
         assert_eq!(
             store.state.lock().unwrap().project_folders,
-            vec!["生产环境/Web".to_string(), "a/b".to_string()]
+            vec![
+                "生产环境".to_string(),
+                "生产环境/Web".to_string(),
+                "a".to_string(),
+                "a/b".to_string()
+            ]
         );
         // 落盘后重载一致
         let reloaded = test_store(dir);
         assert_eq!(
             reloaded.state.lock().unwrap().project_folders,
-            vec!["生产环境/Web".to_string(), "a/b".to_string()]
+            vec![
+                "生产环境".to_string(),
+                "生产环境/Web".to_string(),
+                "a".to_string(),
+                "a/b".to_string()
+            ]
         );
     }
 
@@ -4162,7 +4370,11 @@ mod tests {
             .unwrap();
 
         let guard = store.state.lock().unwrap();
-        assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
+        // 级联后补建 new 的祖先目录「生产环境」
+        assert_eq!(
+            guard.project_folders,
+            vec!["生产环境/Web".to_string(), "生产环境".to_string()]
+        );
         assert_eq!(
             guard
                 .projects
@@ -4185,7 +4397,10 @@ mod tests {
         // 落盘后重载一致
         let reloaded = test_store(dir);
         let guard = reloaded.state.lock().unwrap();
-        assert_eq!(guard.project_folders, vec!["生产环境/Web".to_string()]);
+        assert_eq!(
+            guard.project_folders,
+            vec!["生产环境/Web".to_string(), "生产环境".to_string()]
+        );
         assert_eq!(
             guard
                 .projects
@@ -4274,17 +4489,20 @@ mod tests {
         );
         // 不存在的目录视为幂等成功
         store.delete_project_folder("不存在的目录").unwrap();
-        // 删除成功：入参规范化，仅移除匹配项
+        // 删除成功：入参规范化，仅移除匹配项（祖先目录「开发环境」保留）
         store.delete_project_folder(" 开发环境/Web ").unwrap();
         {
             let guard = store.state.lock().unwrap();
-            assert_eq!(guard.project_folders, vec!["生产环境".to_string()]);
+            assert_eq!(
+                guard.project_folders,
+                vec!["生产环境".to_string(), "开发环境".to_string()]
+            );
         }
         // 落盘后重载一致
         let reloaded = test_store(dir);
         assert_eq!(
             reloaded.state.lock().unwrap().project_folders,
-            vec!["生产环境".to_string()]
+            vec!["生产环境".to_string(), "开发环境".to_string()]
         );
     }
 
@@ -4320,6 +4538,157 @@ mod tests {
     }
 
     #[test]
+    fn rename_project_folder_cascades_to_subfolders() {
+        let dir = temp_config_dir("proj-rename-prefix");
+        let store = test_store(dir);
+        store.create_project_folder("华东/浙江省/杭州市").unwrap();
+        store
+            .upsert_project(Project {
+                id: "proj-p-1".to_string(),
+                name: "直属".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                folder: "华东".to_string(),
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+        store
+            .upsert_project(Project {
+                id: "proj-p-2".to_string(),
+                name: "子级".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                folder: "华东/浙江省".to_string(),
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+
+        store.rename_project_folder("华东", "华南").unwrap();
+
+        let guard = store.state.lock().unwrap();
+        // 前缀级联：直属与子分类项目、目录清单全部改写
+        assert_eq!(
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-p-1")
+                .unwrap()
+                .folder,
+            "华南"
+        );
+        assert_eq!(
+            guard
+                .projects
+                .iter()
+                .find(|p| p.id == "proj-p-2")
+                .unwrap()
+                .folder,
+            "华南/浙江省"
+        );
+        assert_eq!(
+            guard.project_folders,
+            vec![
+                "华南".to_string(),
+                "华南/浙江省".to_string(),
+                "华南/浙江省/杭州市".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_folder_with_projects_recurses_and_keeps_servers() {
+        let dir = temp_config_dir("proj-folder-batch-delete");
+        let store = test_store(dir.clone());
+        store.create_project_folder("华东/浙江省").unwrap();
+        store
+            .upsert_server(
+                Server {
+                    id: "srv-b-1".into(),
+                    name: "留存".into(),
+                    host: "10.1.0.1".into(),
+                    port: 22,
+                    auth_type: AuthType::Password,
+                    username: "root".into(),
+                    key_path: String::new(),
+                    credential_id: None,
+                    locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
+                    tags: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let proj = |id: &str, folder: &str| Project {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: None,
+            server_ids: vec!["srv-b-1".to_string()],
+            quick_commands: vec![],
+            folder: folder.to_string(),
+            ai_mode: AiMode::Suggest,
+        };
+        store.upsert_project(proj("proj-b-1", "华东")).unwrap();
+        store.upsert_project(proj("proj-b-2", "华东/浙江省")).unwrap();
+        store.upsert_project(proj("proj-b-3", "华北")).unwrap();
+
+        // 递归删除：直属 + 子分类项目都没了，「华东」及子目录条目清理
+        let n = store.delete_folder_with_projects("华东").unwrap();
+        assert_eq!(n, 2);
+        {
+            let guard = store.state.lock().unwrap();
+            assert!(guard.projects.iter().all(|p| p.id == "proj-b-3"));
+            // 「华东」及子目录条目清理，「华北」保留（upsert_project 自动注册的目录）
+            assert_eq!(guard.project_folders, vec!["华北".to_string()]);
+            // 服务器不受影响（仅解绑语义，与单个 delete_project 一致）
+            assert!(guard.servers.iter().any(|s| s.id == "srv-b-1"));
+        }
+        // 未分类不可删
+        assert_eq!(
+            store.delete_folder_with_projects("").unwrap_err(),
+            "未分类目录不可删除"
+        );
+        // 落盘后重载一致
+        let reloaded = test_store(dir);
+        let guard = reloaded.state.lock().unwrap();
+        assert_eq!(guard.projects.len(), 1);
+        assert_eq!(guard.project_folders, vec!["华北".to_string()]);
+    }
+
+    #[test]
+    fn server_tags_default_and_normalize() {
+        // 旧配置无 tags 字段 → 反序列化为空数组
+        let legacy: Server = serde_json::from_str(
+            r#"{"id":"srv-1","name":"n","host":"h","port":22,"authType":"password","username":"u","keyPath":""}"#,
+        )
+        .unwrap();
+        assert!(legacy.tags.is_empty());
+        // 保存时归一化：trim、去空、去重保序
+        let dir = temp_config_dir("server-tags-normalize");
+        let store = test_store(dir);
+        store
+            .upsert_server(
+                Server {
+                    tags: vec![
+                        " AAA ".to_string(),
+                        "".to_string(),
+                        "AAA".to_string(),
+                        "BI".to_string(),
+                    ],
+                    ..legacy
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.server("srv-1").unwrap().tags,
+            vec!["AAA".to_string(), "BI".to_string()]
+        );
+    }
+
+    #[test]
     fn clear_unreferenced_servers_keeps_project_bastion_and_cleans_dependents() {
         let dir = temp_config_dir("clear-unreferenced");
         let store = test_store(dir.clone());
@@ -4335,6 +4704,7 @@ mod tests {
             locked: false,
             is_bastion,
             bastion_id: bastion_id.map(str::to_string),
+            tags: Vec::new(),
         };
         store.upsert_server(server("keep-bastion", true, None), None).unwrap();
         store
@@ -4431,6 +4801,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: Some(bastion_id.to_string()),
+            tags: Vec::new(),
         };
         force_upsert_server(&store, cyclic("cycle-a", "cycle-b"));
         force_upsert_server(&store, cyclic("cycle-b", "cycle-a"));
@@ -4499,6 +4870,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         // 有目录 → 项目名 = 目录路径；空目录 → 归「未命名项目」
         store
@@ -5575,6 +5947,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -5695,6 +6068,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 Some("pw-a"),
             )
@@ -5744,6 +6118,7 @@ mod tests {
                 locked: false,
                 is_bastion: false,
                 bastion_id: None,
+                tags: Vec::new(),
             },
             // 全部未分类 → 归「未命名项目」，不干扰计数断言
             folder: String::new(),
@@ -5817,6 +6192,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 folder: String::new(),
             }])
@@ -6145,6 +6521,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store.upsert_server(srv("sv-a"), None).unwrap();
         store.upsert_server(srv("sv-b"), None).unwrap();
@@ -6185,6 +6562,7 @@ mod tests {
                     locked: true,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -6204,6 +6582,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 folder: String::new(),
             }])
@@ -6228,6 +6607,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 folder: String::new(),
             }])
@@ -6780,6 +7160,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 Some("pw"),
             )
@@ -6892,5 +7273,106 @@ mod tests {
             back.contains("\"imageRefs\":"),
             "序列化应保留 camelCase 字段名"
         );
+    }
+
+    /// 浏览器历史记录合并语义：同 URL 置顶刷新时间且空标题不覆盖已知标题；
+    /// 新地址插头部；超出 BROWSER_HISTORY_CAP 截尾；空 URL 忽略；落盘可重开。
+    #[test]
+    fn browser_history_record_merges_mru_and_caps() {
+        let dir = temp_config_dir("browser-history");
+        let store = test_store(dir.clone());
+        store
+            .record_browser_history("https://a.com/".into(), "A 页面".into())
+            .unwrap();
+        store
+            .record_browser_history("https://b.com/".into(), String::new())
+            .unwrap();
+        // 重复访问 a：置顶；本次未带标题不应抹掉已知标题
+        store
+            .record_browser_history(" https://a.com/ ".into(), String::new())
+            .unwrap();
+        let list = store.browser_history_filtered("", 10);
+        let urls: Vec<&str> = list.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a.com/", "https://b.com/"], "MRU 应置顶");
+        assert_eq!(list[0].title, "A 页面", "后到的空串不应覆盖已知标题");
+        assert!(list[0].ts >= list[1].ts, "置顶条目时间戳不应更早");
+        // 标题补填：b 后续带标题到达时写入
+        store
+            .record_browser_history("https://b.com/".into(), "B 页面".into())
+            .unwrap();
+        let list = store.browser_history_filtered("", 10);
+        assert_eq!(list[0].title, "B 页面");
+        // 空地址忽略
+        store
+            .record_browser_history("   ".into(), "无效".into())
+            .unwrap();
+        assert_eq!(
+            store.browser_history_filtered("", usize::MAX).len(),
+            2,
+            "空 URL 不入历史"
+        );
+        // 超上限截尾：最新在前
+        for i in 0..(BROWSER_HISTORY_CAP + 20) {
+            store
+                .record_browser_history(format!("https://x.com/{i}"), String::new())
+                .unwrap();
+        }
+        let all = store.browser_history_filtered("", usize::MAX);
+        assert_eq!(all.len(), BROWSER_HISTORY_CAP, "应截尾至上限");
+        assert_eq!(all[0].url, format!("https://x.com/{}", BROWSER_HISTORY_CAP + 19));
+        drop(store);
+        // 原子落盘：用 MemorySecrets 重开（绝不走真实 keyring），记录仍在
+        let reopened =
+            Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
+        assert!(!reopened.browser_history_filtered("", usize::MAX).is_empty());
+    }
+
+    /// 浏览器历史过滤：URL 与标题均参与、大小写不敏感；空 query 不过滤保持 MRU 序。
+    #[test]
+    fn browser_history_filter_matches_url_or_title() {
+        let entry = |url: &str, title: &str| BrowserHistoryEntry {
+            url: url.to_string(),
+            title: title.to_string(),
+            ts: 0,
+        };
+        let entries = vec![
+            entry("https://github.com/aishell/repo", "GitHub · AIShell"),
+            entry("file:///C:/docs/intro.html", "新手入门"),
+            entry("http://localhost:3000/api", ""),
+            entry("https://example.com/Path?q=1", "Example 站点"),
+        ];
+        let hits = |q: &str| filter_browser_history(&entries, q, 8);
+        assert_eq!(hits("GITHUB").len(), 1, "URL 应大小写不敏感匹配");
+        assert_eq!(hits("github.com")[0].url, "https://github.com/aishell/repo");
+        assert_eq!(
+            hits("入门")[0].url,
+            "file:///C:/docs/intro.html",
+            "中文标题应可命中"
+        );
+        assert_eq!(
+            hits("example.com/path")[0].url,
+            "https://example.com/Path?q=1",
+            "路径片段应可命中"
+        );
+        // 空 query = 最近记录原序返回，limit 截取生效
+        let recent = filter_browser_history(&entries, "  ", 2);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].url, "https://github.com/aishell/repo");
+        assert!(hits("不存在关键词xyz").is_empty());
+    }
+
+    /// 旧 aishell.json 无 browserHistory 字段按空列表解析，不影响加载。
+    #[test]
+    fn legacy_state_without_browser_history_parses_empty() {
+        let dir = temp_config_dir("legacy-bhist");
+        let old = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark"},"servers":[],"projects":[],"sessions":{},"projectFolders":[],"commandFolders":[],"uiExpanded":{},"sftpHistory":{},"sftpFavorites":{},"dbConnections":{}}"#;
+        fs::write(dir.join("aishell.json"), old).unwrap();
+        let store = test_store(dir);
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .browser_history
+            .is_empty());
     }
 }
