@@ -327,6 +327,40 @@ pub struct SftpFavorite {
     pub title: String,
 }
 
+/// 内置浏览器地址栏历史上限（MRU 截尾；下拉显示条数由前端按需查询，与存储上限解耦）。
+pub const BROWSER_HISTORY_CAP: usize = 200;
+
+/// 内置浏览器地址栏历史条目（MRU，最新在前）。URL 为对外展示形态（本地文件即 file:///，
+/// 与地址栏/事件一致）；重新导航时后端 normalize_input 会再归一化。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserHistoryEntry {
+    pub url: String,
+    /// 页面标题（导航事件时往往尚未加载完成，为空串；标题事件到达后补填）
+    #[serde(default)]
+    pub title: String,
+    /// 最近一次访问的毫秒时间戳
+    pub ts: u64,
+}
+
+/// 历史过滤（纯函数）：query 小写化后按子串匹配 URL 与标题（空 query = 不过滤），
+/// 保持原 MRU 序，取前 limit 条。
+fn filter_browser_history(
+    entries: &[BrowserHistoryEntry],
+    query: &str,
+    limit: usize,
+) -> Vec<BrowserHistoryEntry> {
+    let q = query.trim().to_lowercase();
+    entries
+        .iter()
+        .filter(|e| {
+            q.is_empty() || e.url.to_lowercase().contains(&q) || e.title.to_lowercase().contains(&q)
+        })
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
 /// 收藏夹兼容反序列化：旧配置 `serverId -> string[]`（纯路径）→ 新结构 `{path, title}[]`，
 /// 旧条目的 title 取路径目录名（rsplit('/') 首个片段，根目录取空串由前端兜底显示）。
 fn de_sftp_favorites<'de, D>(d: D) -> Result<HashMap<String, Vec<SftpFavorite>>, D::Error>
@@ -769,6 +803,10 @@ pub struct AppState {
     /// 旧配置为纯路径数组（Vec<String>），读取时经 de_sftp_favorites 自动迁移（标题取目录名）。
     #[serde(default, deserialize_with = "de_sftp_favorites")]
     pub sftp_favorites: HashMap<String, Vec<SftpFavorite>>,
+    /// 内置浏览器地址栏历史（MRU：最新在前，上限 BROWSER_HISTORY_CAP 条，由 record_browser_history 维护）。
+    /// 旧配置无此字段按空列表解析。
+    #[serde(default)]
+    pub browser_history: Vec<BrowserHistoryEntry>,
     /// 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表。密码在 keyring。
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
@@ -1960,6 +1998,49 @@ impl Store {
         })
     }
 
+    /// 记录内置浏览器地址栏历史：URL 完全一致则置顶并补填非空标题，否则插入头部；
+    /// 超出 [`BROWSER_HISTORY_CAP`] 截尾。空 URL 忽略。一次 with_state 原子落盘。
+    /// URL/标题均为对外展示形态（本地文件即 file:///），由前端导航事件传入。
+    pub fn record_browser_history(&self, url: String, title: String) -> Result<(), String> {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return Ok(());
+        }
+        let title = title.trim().to_string();
+        self.with_state(|s| {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let list = &mut s.browser_history;
+            match list.iter().position(|e| e.url == url) {
+                Some(pos) => {
+                    // 同地址重复访问：置顶刷新时间；标题只补不洗（后到的空串别抹掉已知标题）
+                    let mut entry = list.remove(pos);
+                    if !title.is_empty() {
+                        entry.title = title;
+                    }
+                    entry.ts = ts;
+                    list.insert(0, entry);
+                }
+                None => list.insert(0, BrowserHistoryEntry { url, title, ts }),
+            }
+            list.truncate(BROWSER_HISTORY_CAP);
+            Ok(())
+        })
+    }
+
+    /// 地址栏历史下拉数据源：query 非空时对 URL 与标题做大小写不敏感子串过滤，
+    /// 保持 MRU 序，最多 limit 条。只读不改状态、不落盘。
+    pub fn browser_history_filtered(&self, query: &str, limit: usize) -> Vec<BrowserHistoryEntry> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())
+            .expect("store 状态锁损坏");
+        filter_browser_history(&guard.browser_history, query, limit)
+    }
+
     /// 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序）。
     /// 前端防抖后调用，仅覆盖该 serverId 不影响其他服务器。一次 with_state 原子落盘。
     pub fn set_sftp_favorites(
@@ -3122,6 +3203,7 @@ mod tests {
             ui_expanded: HashMap::new(),
             sftp_history: HashMap::new(),
             sftp_favorites: HashMap::new(),
+            browser_history: Vec::new(),
             db_connections: HashMap::new(),
             mcp: McpServiceConfig::default(),
             mcp_devices: {
@@ -6457,5 +6539,106 @@ mod tests {
             back.contains("\"imageRefs\":"),
             "序列化应保留 camelCase 字段名"
         );
+    }
+
+    /// 浏览器历史记录合并语义：同 URL 置顶刷新时间且空标题不覆盖已知标题；
+    /// 新地址插头部；超出 BROWSER_HISTORY_CAP 截尾；空 URL 忽略；落盘可重开。
+    #[test]
+    fn browser_history_record_merges_mru_and_caps() {
+        let dir = temp_config_dir("browser-history");
+        let store = test_store(dir.clone());
+        store
+            .record_browser_history("https://a.com/".into(), "A 页面".into())
+            .unwrap();
+        store
+            .record_browser_history("https://b.com/".into(), String::new())
+            .unwrap();
+        // 重复访问 a：置顶；本次未带标题不应抹掉已知标题
+        store
+            .record_browser_history(" https://a.com/ ".into(), String::new())
+            .unwrap();
+        let list = store.browser_history_filtered("", 10);
+        let urls: Vec<&str> = list.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a.com/", "https://b.com/"], "MRU 应置顶");
+        assert_eq!(list[0].title, "A 页面", "后到的空串不应覆盖已知标题");
+        assert!(list[0].ts >= list[1].ts, "置顶条目时间戳不应更早");
+        // 标题补填：b 后续带标题到达时写入
+        store
+            .record_browser_history("https://b.com/".into(), "B 页面".into())
+            .unwrap();
+        let list = store.browser_history_filtered("", 10);
+        assert_eq!(list[0].title, "B 页面");
+        // 空地址忽略
+        store
+            .record_browser_history("   ".into(), "无效".into())
+            .unwrap();
+        assert_eq!(
+            store.browser_history_filtered("", usize::MAX).len(),
+            2,
+            "空 URL 不入历史"
+        );
+        // 超上限截尾：最新在前
+        for i in 0..(BROWSER_HISTORY_CAP + 20) {
+            store
+                .record_browser_history(format!("https://x.com/{i}"), String::new())
+                .unwrap();
+        }
+        let all = store.browser_history_filtered("", usize::MAX);
+        assert_eq!(all.len(), BROWSER_HISTORY_CAP, "应截尾至上限");
+        assert_eq!(all[0].url, format!("https://x.com/{}", BROWSER_HISTORY_CAP + 19));
+        drop(store);
+        // 原子落盘：用 MemorySecrets 重开（绝不走真实 keyring），记录仍在
+        let reopened =
+            Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
+        assert!(!reopened.browser_history_filtered("", usize::MAX).is_empty());
+    }
+
+    /// 浏览器历史过滤：URL 与标题均参与、大小写不敏感；空 query 不过滤保持 MRU 序。
+    #[test]
+    fn browser_history_filter_matches_url_or_title() {
+        let entry = |url: &str, title: &str| BrowserHistoryEntry {
+            url: url.to_string(),
+            title: title.to_string(),
+            ts: 0,
+        };
+        let entries = vec![
+            entry("https://github.com/aishell/repo", "GitHub · AIShell"),
+            entry("file:///C:/docs/intro.html", "新手入门"),
+            entry("http://localhost:3000/api", ""),
+            entry("https://example.com/Path?q=1", "Example 站点"),
+        ];
+        let hits = |q: &str| filter_browser_history(&entries, q, 8);
+        assert_eq!(hits("GITHUB").len(), 1, "URL 应大小写不敏感匹配");
+        assert_eq!(hits("github.com")[0].url, "https://github.com/aishell/repo");
+        assert_eq!(
+            hits("入门")[0].url,
+            "file:///C:/docs/intro.html",
+            "中文标题应可命中"
+        );
+        assert_eq!(
+            hits("example.com/path")[0].url,
+            "https://example.com/Path?q=1",
+            "路径片段应可命中"
+        );
+        // 空 query = 最近记录原序返回，limit 截取生效
+        let recent = filter_browser_history(&entries, "  ", 2);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].url, "https://github.com/aishell/repo");
+        assert!(hits("不存在关键词xyz").is_empty());
+    }
+
+    /// 旧 aishell.json 无 browserHistory 字段按空列表解析，不影响加载。
+    #[test]
+    fn legacy_state_without_browser_history_parses_empty() {
+        let dir = temp_config_dir("legacy-bhist");
+        let old = r#"{"settings":{"workspaceDir":null,"llm":{"modelId":"m","baseUrl":"u","effort":"low"},"search":{"enabled":false},"theme":"dark"},"servers":[],"projects":[],"sessions":{},"projectFolders":[],"commandFolders":[],"uiExpanded":{},"sftpHistory":{},"sftpFavorites":{},"dbConnections":{}}"#;
+        fs::write(dir.join("aishell.json"), old).unwrap();
+        let store = test_store(dir);
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .browser_history
+            .is_empty());
     }
 }

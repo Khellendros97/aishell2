@@ -4,7 +4,10 @@
 //! - 命令 `browser_ensure` / `browser_set_rect` / `browser_set_visible` / `browser_navigate` /
 //!   `browser_back` / `browser_forward` / `browser_reload` / `browser_set_inspect` /
 //!   `browser_open_devtools` / `browser_close_view`（除 close_view 外均带 viewId 参数）；
-//! - 事件 `browser:event` payload `{ kind: 'url'|'title'|'element'|'ai-navigate'|'new-window', viewId, ... }`；
+//!   另有地址栏历史两命令 `browser_history_add` / `browser_history_list`（无 viewId，
+//!   持久化在 AppState.browserHistory，见 store.rs；前端在页面导航/标题事件后上报）。
+//! - 事件 `browser:event` payload `{ kind: 'url'|'title'|'element'|'favicon'|'ai-navigate'|'new-window', viewId, ... }`
+//!   （favicon = 注入脚本探测到的站点图标地址，http(s)/data:image 才转发）；
 //! - AI 动作桥（ai.rs run_internal_action）：browser_open / browser_read / browser_console / browser_screenshot，
 //!   目标视图 = 当前用户可视页面 → 用户最近浏览过的页面 → 专用 "ai" 页面（延续旧单实例的共享语义）。
 //!
@@ -73,6 +76,8 @@ pub struct BrowserState {
     pub url: String,
     pub title: String,
     pub inspect: bool,
+    /// 站点图标地址（可能为空串；重开标签时前端直接复用，无需等重新探测）
+    pub favicon: String,
 }
 
 /// 单个浏览器页面的状态与子 webview（页面 = 前端标签栏的一项）。
@@ -81,6 +86,9 @@ struct BrowserView {
     inspect: bool,
     url: String,
     title: String,
+    /// 站点图标地址（页面注入脚本探测 link[rel~=icon] / 兜底 /favicon.ico 后回传，
+    /// 经 WebMessage → browser:event kind=favicon 转发前端；仅存内存不持久化）
+    favicon: String,
     console: VecDeque<ConsoleEntry>,
     /// webview 当前是否对用户可见（活跃页面且无遮罩时前端置 true；截图后台渲染据此恢复）
     shown: bool,
@@ -305,6 +313,7 @@ impl BrowserManager {
                     inspect: false,
                     url: String::new(),
                     title: String::new(),
+                    favicon: String::new(),
                     console: VecDeque::new(),
                     shown: false,
                     rect: (0.0, 0.0, 1280.0, 800.0),
@@ -568,6 +577,30 @@ fn handle_page_message(mgr: &BrowserManager, view_id: &str, msg: &str) {
                 inner.console.push_back(entry);
             }
         }
+        "favicon" => {
+            // 站点图标探测结果（页面注入脚本回传）。只放行 http(s) 与 data:image —— blob:
+            // 等页面内短生命周期地址主 webview 无法加载，其他 scheme 无意义；
+            // 上限 64KB 防 data: 巨型载荷刷内存。
+            let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("");
+            let ok = (url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("data:image/"))
+                && url.len() <= 64 * 1024;
+            if !ok {
+                return;
+            }
+            {
+                let mut views = mgr.views.lock().unwrap();
+                if let Some(inner) = views.get_mut(view_id) {
+                    inner.favicon = url.to_string();
+                }
+            }
+            let mut v = v;
+            v["viewId"] = json!(view_id);
+            if let Some(a) = app_handle() {
+                let _ = a.emit("browser:event", v);
+            }
+        }
         "element" => {
             let mut v = v;
             if v.get("ts").and_then(|x| x.as_u64()).is_none() {
@@ -778,6 +811,7 @@ pub async fn browser_ensure(
         url: display_url(&v.url),
         title: v.title.clone(),
         inspect: v.inspect,
+        favicon: v.favicon.clone(),
     })
 }
 
@@ -905,6 +939,33 @@ pub async fn browser_close_view(
     mgr.close_view(&view_id)
 }
 
+/* ---------------- 地址栏历史（持久化在 AppState.browserHistory，store.rs） ---------------- */
+
+/// 记录地址栏历史：前端在页面导航 url 事件 / 标题 title 事件后防抖上报最新已知状态；
+/// 后端按 URL 合并去重保持 MRU（同地址置顶补标题），URL/标题为对外展示形态
+/// （本地文件即 file:///）。AI 在隐藏页面的后台导航不经过前端事件，不进历史。
+#[tauri::command]
+pub async fn browser_history_add(
+    store: State<'_, Arc<crate::store::Store>>,
+    url: String,
+    title: String,
+) -> Result<(), String> {
+    store.record_browser_history(url, title)
+}
+
+/// 地址栏历史下拉数据源：query 非空时对 URL 与标题做大小写不敏感子串过滤，
+/// 保持 MRU 序，最多 limit 条（默认 8，上限 50）；空 query = 最近记录。
+#[tauri::command]
+pub async fn browser_history_list(
+    store: State<'_, Arc<crate::store::Store>>,
+    query: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::store::BrowserHistoryEntry>, String> {
+    let q = query.unwrap_or_default();
+    let limit = limit.unwrap_or(8).clamp(1, 50);
+    Ok(store.browser_history_filtered(&q, limit))
+}
+
 /* ---------------- 注入脚本：console 钩子（常开）+ 检查元素（休眠态，Rust eval 激活） ---------------- */
 
 const INSPECTOR_JS: &str = r##"(function () {
@@ -950,6 +1011,48 @@ const INSPECTOR_JS: &str = r##"(function () {
   window.addEventListener('unhandledrejection', function (e) {
     if (allow()) post({ kind: 'console', level: 'error', text: 'Unhandled rejection: ' + fmt(e.reason), ts: Date.now() });
   });
+
+  /* ---------- 站点图标探测：优先 link[rel~=icon]，超时兜底 /favicon.ico ----------
+     页面脚本常在解析后期才注入 <link>，故 DOMContentLoaded / load / 1.5s 三次尝试；
+     非网页(本地文件等)不探测。结果经 post 走 WebMessage 通道回传宿主。 */
+  var faviconDone = false;
+  function tryFavicon() {
+    if (faviconDone) return;
+    try {
+      if (!/^https?:$/.test(location.protocol)) { faviconDone = true; return; }
+      var links = [];
+      var all = document.querySelectorAll('link[rel]');
+      for (var i = 0; i < all.length; i++) {
+        if ((all[i].rel || '').toLowerCase().indexOf('icon') >= 0) links.push(all[i]);
+      }
+      if (!links.length) return; // 尚未出现，等下次尝试
+      var best = null;
+      for (var j = 0; j < links.length; j++) {
+        if (links[j].rel.trim().toLowerCase() === 'icon') { best = links[j]; break; }
+      }
+      if (!best && links[0]) best = links[0]; // apple-touch-icon / shortcut icon 等也认
+      if (best && best.href) {
+        faviconDone = true;
+        post({ kind: 'favicon', url: best.href });
+      }
+    } catch (e) { /* 探测失败静默，保持默认图标 */ }
+  }
+  function faviconFallback() {
+    tryFavicon();
+    if (!faviconDone) {
+      faviconDone = true;
+      try {
+        if (/^https?:$/.test(location.protocol)) {
+          post({ kind: 'favicon', url: new URL('/favicon.ico', location.href).href });
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+  }
+  document.addEventListener('DOMContentLoaded', tryFavicon);
+  window.addEventListener('load', tryFavicon);
+  window.addEventListener('load', function () { setTimeout(faviconFallback, 1500); });
+  window.addEventListener('load', function () { setTimeout(faviconFallback, 4000); });
+  tryFavicon();
 
   /* ---------- 检查元素：默认休眠，__aishellInspector.enable()/disable() 激活 ---------- */
   var overlay = null, label = null, active = false;
@@ -1032,6 +1135,51 @@ mod tests {
         }
     }
 
+    /// favicon 消息：仅放行 http(s)/data:image 且更新页面状态并转发事件（无 AppHandle 时只改状态）；
+    /// blob:/javascript:/超大 data: 一律丢弃。
+    #[test]
+    fn favicon_message_filters_scheme_and_updates_view() {
+        let mgr = BrowserManager::new();
+        {
+            let mut views = mgr.views.lock().unwrap();
+            views.insert(
+                "p1".to_string(),
+                BrowserView {
+                    webview: None,
+                    inspect: false,
+                    url: String::new(),
+                    title: String::new(),
+                    favicon: String::new(),
+                    console: VecDeque::new(),
+                    shown: false,
+                    rect: (0.0, 0.0, 0.0, 0.0),
+                    load_tx: watch::channel(0u64).0,
+                },
+            );
+        }
+        let set = |url: &str| {
+            handle_page_message(
+                &mgr,
+                "p1",
+                &serde_json::json!({ "kind": "favicon", "url": url }).to_string(),
+            );
+        };
+        set("https://a.com/favicon.ico");
+        set("data:image/png;base64,iVBOR");
+        let got = mgr.views.lock().unwrap()["p1"].favicon.clone();
+        assert_eq!(got, "data:image/png;base64,iVBOR", "http(s) 与 data:image 应放行");
+        // 不合规格式不覆盖既有值
+        set("blob:https://a.com/uuid");
+        set("javascript:alert(1)");
+        set("file:///C:/x.png");
+        set(&format!("data:image/png;base64,{}", "A".repeat(64 * 1024 + 1)));
+        assert_eq!(
+            mgr.views.lock().unwrap()["p1"].favicon,
+            "data:image/png;base64,iVBOR",
+            "非法 scheme / 超大载荷应被丢弃"
+        );
+    }
+
     #[test]
     fn ai_target_prefers_visible_then_last_user() {
         let mgr = BrowserManager::new();
@@ -1050,6 +1198,7 @@ mod tests {
                     inspect: false,
                     url: String::new(),
                     title: String::new(),
+                    favicon: String::new(),
                     console: VecDeque::new(),
                     shown: false,
                     rect: (0.0, 0.0, 0.0, 0.0),
@@ -1068,6 +1217,7 @@ mod tests {
                     inspect: false,
                     url: String::new(),
                     title: String::new(),
+                    favicon: String::new(),
                     console: VecDeque::new(),
                     shown: true,
                     rect: (0.0, 0.0, 0.0, 0.0),

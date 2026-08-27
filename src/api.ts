@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserHistoryItem, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -305,6 +305,12 @@ export const browserSetInspect = (viewId: string, enabled: boolean) =>
 export const browserOpenDevtools = (viewId: string) => call<void>('browser_open_devtools', { viewId });
 /** 关闭页面：释放该页面的子 webview 与 Rust 侧状态 */
 export const browserCloseView = (viewId: string) => call<void>('browser_close_view', { viewId });
+/** 记录地址栏历史：导航/标题事件后防抖上报（后端按 URL 合并去重保持 MRU，落盘 aishell.json） */
+export const browserHistoryAdd = (url: string, title: string) =>
+  call<void>('browser_history_add', { url, title });
+/** 地址栏历史下拉数据源：query 对 URL/标题做大小写不敏感子串过滤，limit 默认 8，返回 MRU 序 */
+export const browserHistoryList = (query: string, limit = 8) =>
+  call<BrowserHistoryItem[]>('browser_history_list', { query, limit });
 export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
   listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
 
