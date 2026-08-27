@@ -599,6 +599,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         }
     }
 
@@ -641,6 +642,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         let msg = auth_failed_msg(&server, "Disconnected");
         assert!(msg.starts_with(AUTH_FAILED_PREFIX));
@@ -733,6 +735,7 @@ mod tests {
             locked: false,
             is_bastion: true,
             bastion_id: None,
+            tags: Vec::new(),
         };
         let target = |id: &str, bid: &str| store::Server {
             id: id.to_string(),
@@ -746,6 +749,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: Some(bid.to_string()),
+            tags: Vec::new(),
         };
         // 合法堡垒机 + 合法目标
         store::force_upsert_server(&store, bastion("b"));

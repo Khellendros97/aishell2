@@ -67,6 +67,9 @@ pub struct CoreServerV1 {
     pub locked: bool,
     pub is_bastion: bool,
     pub bastion_id: Option<String>,
+    /// 用户自定义标签；旧载荷无此字段时按空（default 保老 envelope 可解）。
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 pub type CoreProject = CoreProjectV1;
@@ -146,6 +149,7 @@ pub fn from_app_state(state: &AppState) -> CoreConfigPayloadV1 {
                 locked: s.locked,
                 is_bastion: s.is_bastion,
                 bastion_id: s.bastion_id.clone(),
+                tags: s.tags.clone(),
             })
             .collect(),
         command_folders: state.command_folders.clone(),
@@ -222,6 +226,7 @@ pub fn apply_remote(state: &mut AppState, payload: &CoreConfigPayloadV1) -> Resu
             locked: s.locked,
             is_bastion: s.is_bastion,
             bastion_id: s.bastion_id.clone(),
+            tags: s.tags.clone(),
         })
         .collect();
 
@@ -364,6 +369,7 @@ fn payload_parts(payload: &CoreConfigPayloadV1) -> (Vec<Project>, Vec<Credential
                 locked: s.locked,
                 is_bastion: s.is_bastion,
                 bastion_id: s.bastion_id.clone(),
+                tags: s.tags.clone(),
             })
             .collect(),
     )
@@ -765,6 +771,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         }
     }
     fn payload() -> CoreConfigPayloadV1 {
@@ -808,6 +815,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         });
         let value = serde_json::to_value(from_app_state(&state)).unwrap();
         assert!(!value.to_string().contains("private"));
@@ -847,6 +855,7 @@ mod tests {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         });
         let mut remote = payload();
         remote.projects.push(p("p2", "新项目", &[]));

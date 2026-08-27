@@ -18,6 +18,7 @@ import {
 import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, showContextMenu, toast, uid } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
+import { matchServer, parseSearchQuery, toggleTagInQuery, topTags } from '../../../shared/search';
 import type { SidebarPanelDef } from './panel-types';
 import { ServerForm, type ServerFormHandle } from '../../settings/ServerForm';
 import { saveServerWithCredentialChoice } from '../../settings/server-save';
@@ -701,11 +702,17 @@ function ServersPanelBody(): JSX.Element {
 
   const ids = project?.serverIds ?? [];
   const bound = servers.filter((s) => ids.includes(s.id));
-  // 搜索过滤:名称 / host / username 大小写不敏感;空串显示全部
+  // 搜索过滤：#tag 条件 AND + 名称 / host / username 大小写不敏感子串匹配；空串显示全部
+  const parsedQuery = parseSearchQuery(searchText);
   const q = searchText.trim().toLowerCase();
-  const filtered = bound.filter((s) =>
-    !q || [s.name, s.host, s.username].some((v) => v.toLowerCase().includes(q)));
+  const filtered = bound.filter((s) => matchServer(s, parsedQuery));
+  // 热门 tag chips：当前项目内被引用最多的标签，点击切换进/出搜索条件
+  const hotTags = topTags(bound);
+  const activeTags = parsedQuery.tags;
   const byId = new Map(servers.map((sv) => [sv.id, sv]));
+  // 现有全部标签（服务器表单 tag 输入的自动补全候选）
+  const allTagOptions = [...new Set(servers.flatMap((s) => s.tags))].sort((a, b) =>
+    a.localeCompare(b, 'zh'));
 
   return (
     <>
@@ -749,11 +756,28 @@ function ServersPanelBody(): JSX.Element {
         <div className="wbs-search">
           <input
             className="input"
-            placeholder="搜索服务器…"
+            placeholder="搜索服务器…（#标签 筛选）"
             value={searchText}
             onChange={(e) => setSearchText(e.currentTarget.value)}
           />
         </div>
+
+        {/* 热门标签 chips：被引用最多的几个 tag，点击追加/移除 #tag 筛选条件 */}
+        {hotTags.length > 0 && (
+          <div className="wbs-tags">
+            {hotTags.map((t) => (
+              <button
+                key={t}
+                className={`tag clickable${activeTags.includes(t.toLowerCase()) ? ' active' : ''}`}
+                title={`筛选 #${t}`}
+                onClick={() => setSearchText(toggleTagInQuery(searchText, t))}
+              >
+                <Icon name="hash" />
+                {t}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="wbs-server-list">
           {filtered.length === 0 ? (
@@ -801,7 +825,7 @@ function ServersPanelBody(): JSX.Element {
                       <Icon name={s.locked ? 'lock' : 'unlock'} />
                     </button>
                   </div>
-                  {/* 认证 / 堡垒机 / MCP 标签独立一行,避免与右上角按钮挤在一起 */}
+                  {/* 认证 / 堡垒机 / MCP 标签独立一行,避免与右上角按钮挤在一起；末尾跟用户自定义 tag */}
                   <div className="wbs-server-tags">
                     <span className="tag">{s.authType === 'key' ? <><Icon name="key" /> 密钥</> : '密码'}</span>
                     {s.isBastion ? (
@@ -812,6 +836,9 @@ function ServersPanelBody(): JSX.Element {
                     {mcpDevices[s.id]?.enabled ? (
                       <span className="tag green"><Icon name="plug" /> MCP</span>
                     ) : null}
+                    {s.tags.map((t) => (
+                      <span key={t} className="tag blue"><Icon name="hash" />{t}</span>
+                    ))}
                   </div>
                   <div className="wbs-server-actions">
                     <button className="icon-btn wbs-chat" title="添加到对话" aria-label="添加到对话"
@@ -857,7 +884,7 @@ function ServersPanelBody(): JSX.Element {
             <button className="icon-btn" title="关闭" onClick={closeSrv}><Icon name="x" /></button>
           </div>
           <div className="modal-body">
-            <ServerForm ref={srvFormRef} credentials={credentials} />
+            <ServerForm ref={srvFormRef} credentials={credentials} allTags={allTagOptions} />
           </div>
           <div className="modal-foot">
             <button className="btn" onClick={closeSrv}>取消</button>
@@ -884,7 +911,7 @@ function ServersPanelBody(): JSX.Element {
               <div className="jump-section" id="jump-bastion-wrap">
                 <div className="jump-section-title">堡垒机服务器</div>
                 <div className="jump-hint">开启「作为堡垒机」后，本服务器的 SSH/SFTP 连接将作为目标主机的跳板</div>
-                <div id="jump-bastion-form"><ServerForm ref={jumpBastionFormRef} credentials={credentials} /></div>
+                <div id="jump-bastion-form"><ServerForm ref={jumpBastionFormRef} credentials={credentials} allTags={allTagOptions} /></div>
               </div>
             ) : null}
             {jumpBannerName !== null ? (
@@ -957,7 +984,7 @@ function ServersPanelBody(): JSX.Element {
             <button className="icon-btn" title="关闭" onClick={closeTarget}><Icon name="x" /></button>
           </div>
           <div className="modal-body">
-            <div id="jump-target-form"><ServerForm ref={jumpTargetFormRef} credentials={credentials} /></div>
+            <div id="jump-target-form"><ServerForm ref={jumpTargetFormRef} credentials={credentials} allTags={allTagOptions} /></div>
           </div>
           <div className="modal-foot">
             <button className="btn" onClick={closeTarget}>取消</button>

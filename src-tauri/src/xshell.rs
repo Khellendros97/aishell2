@@ -261,6 +261,7 @@ fn parse_session_file(
         locked: false,
         is_bastion: false,
         bastion_id: None,
+        tags: Vec::new(),
     };
     let needs = session_needs_attention(&server, user_key, user_keys_dir);
     // 所属目录：会话文件相对 Sessions 根目录的父目录（'/' 连接）；根目录下为空串（未分类）

@@ -3,6 +3,8 @@
  * 与后端的接口点:
  * - 命令:browser_ensure / set_rect / set_visible / navigate / back / forward / reload /
  *   set_inspect / open_devtools / close_view(全部带 viewId,src/api.ts 封装,Rust browser.rs);
+ *   地址栏历史 browser_history_add / browser_history_list(无 viewId,持久化在
+ *   aishell.json browserHistory——store.rs record_browser_history 合并去重,MRU 上限 200);
  * - 事件:browser:event(url / title / element / ai-navigate / new-window,均带 viewId)。
  * 多页面模型:工作台浏览器标签页(固定 id 'browser' 单实例)内部维护多个「页面」,
  * 每页对应 Rust 侧一个子 webview(label = browser-<viewId>),首次导航才懒创建,
@@ -11,21 +13,28 @@
  * 右侧标签页侧边栏默认折叠(窄轨:仅页面图标 + 新建/展开按钮);展开后显示标题列表。
  * 本引擎职责:
  * - 工具栏 UI(后退/前进/刷新/地址栏/打开本地 HTML/检查元素/开发者工具,作用于活跃页面);
+ * - 标签页侧边栏图标:优先站点 favicon(子 webview 注入脚本探测 link[rel~=icon],
+ *   经 kind=favicon 事件回传;加载失败回落默认地球),仅内存镜像不持久化,重开标签时
+ *   browser_ensure 返回的 favicon 字段直接恢复;
  * - 活跃页面容器 rect 同步(ResizeObserver + window resize,逻辑坐标与窗口 1:1);
  * - 显隐合成:页面活跃 && 标签激活 && 工作台可见 && 无全屏遮罩(.modal-mask/.ctx-menu 挂
  *   body 直下)&& 已导航 才显示——子 webview 永远浮在主 webview 之上,遮罩出现时必须让位;
  *   非活跃页面一律隐藏。
  * - 检查模式开关;element 事件 → wbHandles.ai.addBrowserRef(chip 引用,发送时展开);
+ * - 地址栏历史:导航/标题事件防抖上报后端;地址栏聚焦展开最近记录(最多 8 条),
+ *   输入按子串过滤(URL/标题,大小写不敏感),↑↓ 选择 / Enter 打开 / Esc 关闭 / 点击打开;
+ *   下拉打开期间隐藏全部页面 webview(原生表面永远盖住 DOM,须让其让位,与遮罩避让同机制);
  * - 页面增删/切换(关闭最后一页自动补一页空白页)。
  * 挂载契约:每次挂载完整初始化 DOM/监听/观察,清理函数完整回收;引擎状态跨挂载保留。
  */
 import { icon } from '../../../icons';
 import { showContextMenu, toast } from '../../../ui';
 import {
-  browserBack, browserCloseView, browserEnsure, browserForward, browserNavigate, browserOpenDevtools,
-  browserReload, browserSetInspect, browserSetRect, browserSetVisible, onBrowserEvent, openDialog,
+  browserBack, browserCloseView, browserEnsure, browserForward, browserHistoryAdd, browserHistoryList,
+  browserNavigate, browserOpenDevtools, browserReload, browserSetInspect, browserSetRect,
+  browserSetVisible, onBrowserEvent, openDialog,
 } from '../../../api';
-import type { BrowserEvent, BrowserRef } from '../../../types';
+import type { BrowserEvent, BrowserHistoryItem, BrowserRef } from '../../../types';
 import { wbHandles } from '../../../stores/workbench';
 
 /* ---------- 模块级状态(跨标签切换保留;各页面 webview 在 Rust 侧) ---------- */
@@ -35,6 +44,8 @@ interface PageState {
   id: string;
   url: string;
   title: string;
+  /** 站点图标地址(空串 = 尚未探测到,显示默认地球) */
+  favicon: string;
   inspect: boolean;
   /** 是否发生过真实导航(about:blank 之外)——未导航页面无 webview,显示占位提示 */
   hasNavigated: boolean;
@@ -56,8 +67,25 @@ let overlayOpen = false;
 /** 用户正在编辑地址栏(期间不用 url 事件回填覆盖输入) */
 let editingAddress = false;
 
+/* ---------- 地址栏历史(上报防抖 + 下拉状态) ---------- */
+
+/** 下拉最多展示条数(需求:8 条;存储上限 200 在 store.rs BROWSER_HISTORY_CAP) */
+const HISTORY_LIMIT = 8;
+/** 导航 started/finished/title 多次事件的防抖合并窗口 */
+const HISTORY_DEBOUNCE_MS = 400;
+let histPending: { url: string; title: string } | null = null;
+let histTimer: ReturnType<typeof setTimeout> | null = null;
+let histOpen = false;
+/** 当前下拉数据(MRU 序,已按 query 过滤、截取前 8 条) */
+let histItems: BrowserHistoryItem[] = [];
+/** 键盘高亮行下标,-1 = 无高亮(回车走原文输入) */
+let histActiveIdx = -1;
+/** 只应用最后一次查询结果(输入竞态与失焦保护) */
+let histReqSeq = 0;
+
 let containerEl: HTMLElement | null = null;
 let addressInput: HTMLInputElement | null = null;
+let histDropEl: HTMLDivElement | null = null;
 let inspectBtn: HTMLButtonElement | null = null;
 let hintEl: HTMLDivElement | null = null;
 let viewEl: HTMLDivElement | null = null;
@@ -121,8 +149,9 @@ function hasBlockingOverlay(): boolean {
 }
 
 function applyVisibility(): void {
-  // 四重条件:页面活跃 && 标签激活 && 工作台可见(路由停留) && 无全屏遮罩 && 已发生导航
-  const base = tabActive && workbenchActive && !overlayOpen;
+  // 五重条件:页面活跃 && 标签激活 && 工作台可见(路由停留) && 无全屏遮罩 && 历史下拉未开 && 已发生导航
+  // (历史下拉是 DOM,压不过原生子 webview,打开期间必须让页面整体隐藏,与遮罩避让同机制)
+  const base = tabActive && workbenchActive && !overlayOpen && !histOpen;
   for (const p of pages) {
     if (!p.hasNavigated) {
       p.shownApplied = false;
@@ -212,13 +241,130 @@ export async function openInActivePage(input: string): Promise<string> {
   return normalized;
 }
 
+/* ---------- 地址栏历史:导航事件防抖上报 + 输入下拉过滤 ---------- */
+
+/** 防抖合并后上报历史:started/finished/title 一次导航连发多条,按同 URL 归并只补标题;
+ *  不同地址以最新为准(重定向链收敛到最终页)。失败静默——历史非关键路径。 */
+function queueHistoryRecord(url: string, title: string): void {
+  if (!url || url === 'about:blank') return;
+  histPending =
+    histPending && histPending.url === url
+      ? { url, title: title || histPending.title }
+      : { url, title };
+  if (!histTimer) {
+    histTimer = setTimeout(() => {
+      histTimer = null;
+      const item = histPending;
+      histPending = null;
+      if (item) void browserHistoryAdd(item.url, item.title).catch(() => {});
+    }, HISTORY_DEBOUNCE_MS);
+  }
+}
+
+/** 历史行标题兜底:无页面标题时显示 host */
+function historyDisplayTitle(it: BrowserHistoryItem): string {
+  if (it.title) return it.title;
+  try {
+    return new URL(it.url).hostname || it.url;
+  } catch {
+    return it.url;
+  }
+}
+
+/** 按地址栏当前输入刷新下拉(URL/标题子串过滤,MRU 序前 8 条);查询竞态由 histReqSeq 收敛,
+ *  过期结果与失焦后的迟到结果直接丢弃。无匹配时收起下拉(不留空面板)。 */
+async function refreshHistoryDrop(): Promise<void> {
+  const input = addressInput;
+  if (!input || !editingAddress) return;
+  const query = input.value.trim();
+  const seq = ++histReqSeq;
+  let items: BrowserHistoryItem[] = [];
+  try {
+    items = await browserHistoryList(query, HISTORY_LIMIT);
+  } catch {
+    /* 查询失败按空列表处理 */
+  }
+  if (!addressInput || seq !== histReqSeq || !editingAddress) return;
+  if (!items.length) {
+    closeHistoryDrop();
+    return;
+  }
+  histItems = items;
+  histActiveIdx = -1;
+  renderHistoryDrop();
+}
+
+function renderHistoryDrop(): void {
+  const el = histDropEl;
+  if (!el) return;
+  el.innerHTML = histItems
+    .map(
+      (it, i) =>
+        `<div class="browser-history-item${i === histActiveIdx ? ' active' : ''}" data-hist-idx="${i}">
+          <span class="browser-history-ic">${icon('history')}</span>
+          <span class="browser-history-text">
+            <span class="browser-history-title">${escapeText(historyDisplayTitle(it))}</span>
+            <span class="browser-history-url">${escapeText(it.url)}</span>
+          </span>
+        </div>`,
+    )
+    .join('');
+  const wasOpen = histOpen;
+  histOpen = histItems.length > 0;
+  el.style.display = histOpen ? 'block' : 'none';
+  // 下拉打开/收起都会改变子 webview 该不该让位
+  if (histOpen !== wasOpen) applyVisibility();
+}
+
+function updateHistHighlight(): void {
+  histDropEl?.querySelectorAll<HTMLElement>('.browser-history-item').forEach((el, i) => {
+    el.classList.toggle('active', i === histActiveIdx);
+    if (i === histActiveIdx) el.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+function closeHistoryDrop(): void {
+  histReqSeq++; // 在途查询作废
+  histItems = [];
+  histActiveIdx = -1;
+  const wasOpen = histOpen;
+  histOpen = false;
+  if (histDropEl) {
+    histDropEl.style.display = 'none';
+    histDropEl.innerHTML = '';
+  }
+  if (wasOpen) applyVisibility();
+}
+
+/** 键盘 ↑↓ 在「原文输入(-1) ↔ 各历史行」间循环移动(浏览器惯例:最后一条再 ↓ 回到原文) */
+function moveHistHighlight(dir: 1 | -1): void {
+  if (!histOpen || !histItems.length) return;
+  const last = histItems.length - 1;
+  histActiveIdx =
+    dir > 0 ? (histActiveIdx >= last ? -1 : histActiveIdx + 1) : histActiveIdx <= -1 ? last : histActiveIdx - 1;
+  updateHistHighlight();
+}
+
+async function commitHistoryItem(it: BrowserHistoryItem): Promise<void> {
+  if (addressInput) addressInput.value = it.url;
+  closeHistoryDrop();
+  await navigate(it.url);
+}
+
 /* ---------- 页面增删切换 ---------- */
 
 function newPage(): PageState {
-  const p: PageState = { id: `p${++pageSeq}`, url: '', title: '', inspect: false, hasNavigated: false, shownApplied: false };
+  const p: PageState = { id: `p${++pageSeq}`, url: '', title: '', favicon: '', inspect: false, hasNavigated: false, shownApplied: false };
   pages.push(p);
   setActivePage(p.id);
   return p;
+}
+
+/** 页面图标标记:有站点 favicon 用 <img>(加载失败由捕获 error 回落地球),否则默认地球 */
+function pageIconHtml(p: PageState): string {
+  if (!p.favicon) return icon('globe');
+  const src = escapeText(p.favicon).replace(/"/g, '&quot;');
+  return `<img class="browser-favicon" src="${src}" alt="" referrerpolicy="no-referrer" />`;
 }
 
 function setActivePage(id: string): void {
@@ -261,7 +407,7 @@ function renderPagesBar(): void {
     el.classList.remove('expanded');
     const dots = pages.map((p) =>
       `<button class="browser-page-dot${p.id === activePageId ? ' active' : ''}" data-pages-id="${p.id}"
-        title="${pageDisplayTitle(p).replace(/"/g, '&quot;')}${p.url ? ` · ${p.url.replace(/"/g, '&quot;')}` : ''}">${icon('globe')}</button>`,
+        title="${pageDisplayTitle(p).replace(/"/g, '&quot;')}${p.url ? ` · ${p.url.replace(/"/g, '&quot;')}` : ''}"><span class="browser-page-ic">${pageIconHtml(p)}</span></button>`,
     ).join('');
     el.innerHTML =
       `<button class="icon-btn browser-pages-toggle" data-pages-act="toggle" title="展开标签页列表">${icon('chevronLeft')}</button>` +
@@ -273,7 +419,7 @@ function renderPagesBar(): void {
   el.classList.remove('collapsed');
   const rows = pages.map((p) =>
     `<div class="browser-page-row${p.id === activePageId ? ' active' : ''}" data-pages-id="${p.id}" title="${p.url.replace(/"/g, '&quot;')}">
-      <span class="browser-page-ic">${icon('globe')}</span>
+      <span class="browser-page-ic">${pageIconHtml(p)}</span>
       <span class="browser-page-title">${escapeText(pageDisplayTitle(p))}</span>
       <button class="browser-page-close" data-pages-close="${p.id}" title="关闭页面">${icon('x')}</button>
     </div>`,
@@ -339,8 +485,11 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
       <button class="icon-btn" data-act="back" title="后退">${icon('arrowLeft')}</button>
       <button class="icon-btn" data-act="forward" title="前进">${icon('arrowRight')}</button>
       <button class="icon-btn" data-act="reload" title="刷新">${icon('refresh')}</button>
-      <input class="browser-address" type="text" spellcheck="false"
-        placeholder="输入网址或本地 HTML 路径,回车打开" />
+      <div class="browser-address-wrap">
+        <input class="browser-address" type="text" spellcheck="false"
+          placeholder="输入网址或本地 HTML 路径,回车打开" />
+        <div class="browser-history-drop" style="display:none"></div>
+      </div>
       <button class="icon-btn" data-act="local" title="打开本地 HTML 文件">${icon('folderOpen')}</button>
       <button class="icon-btn browser-inspect-btn" data-act="inspect"
         title="检查元素:点击页面元素加入 AI 对话">${icon('inspect')}</button>
@@ -357,6 +506,7 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     </div>`;
 
   addressInput = container.querySelector<HTMLInputElement>('.browser-address');
+  histDropEl = container.querySelector<HTMLDivElement>('.browser-history-drop');
   inspectBtn = container.querySelector<HTMLButtonElement>('[data-act="inspect"]');
   hintEl = container.querySelector<HTMLDivElement>('.browser-hint');
   viewEl = container.querySelector<HTMLDivElement>('.browser-view');
@@ -402,21 +552,60 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
 
   pagesEl?.addEventListener('click', onPagesClick);
   pagesEl?.addEventListener('contextmenu', onPagesContextMenu);
+  /** favicon <img> 加载失败回落默认地球(error 事件不冒泡,用捕获监听) */
+  const onPageImgError = (e: Event): void => {
+    const img = e.target;
+    if (!(img instanceof HTMLImageElement) || !img.classList.contains('browser-favicon')) return;
+    const holder = img.parentElement;
+    if (!holder || !holder.classList.contains('browser-page-ic')) return;
+    holder.innerHTML = icon('globe');
+  };
+  pagesEl?.addEventListener('error', onPageImgError, true);
 
   const onAddressKey = (e: KeyboardEvent): void => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (histOpen && histItems.length) {
+        e.preventDefault(); // 下拉打开时 ↑↓ 用于选择行,不移动光标
+        moveHistHighlight(e.key === 'ArrowDown' ? 1 : -1);
+      }
+      return;
+    }
     if (e.key === 'Enter' && addressInput) {
       e.preventDefault();
-      void navigate(addressInput.value);
+      const picked = histOpen && histActiveIdx >= 0 ? histItems[histActiveIdx] : null;
+      closeHistoryDrop();
+      // 有键盘选中项 → 打开该历史;否则按原文导航(浏览器惯例)
+      void (picked ? commitHistoryItem(picked) : navigate(addressInput.value));
+    } else if (e.key === 'Escape' && histOpen) {
+      closeHistoryDrop();
     }
   };
-  const onAddressFocus = (): void => { editingAddress = true; };
+  const onAddressInput = (): void => {
+    void refreshHistoryDrop();
+  };
+  const onAddressFocus = (): void => {
+    editingAddress = true;
+    // 聚焦即展开最近记录(无记录时 refresh 内部自动收起)
+    void refreshHistoryDrop();
+  };
   const onAddressBlur = (): void => {
     editingAddress = false;
+    closeHistoryDrop();
     // 未导航提交时还原为当前地址
     const p = activePage();
     if (addressInput && p && addressInput.value.trim() !== p.url) addressInput.value = p.url;
   };
+  /** mousedown 而非 click:preventDefault 保住地址栏焦点,避免 blur 抢先把下拉关掉 */
+  const onHistoryMouseDown = (e: MouseEvent): void => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('[data-hist-idx]');
+    if (!row) return;
+    e.preventDefault();
+    const it = histItems[Number(row.dataset.histIdx)];
+    if (it && addressInput) void commitHistoryItem(it);
+  };
+  histDropEl?.addEventListener('mousedown', onHistoryMouseDown);
   addressInput?.addEventListener('keydown', onAddressKey);
+  addressInput?.addEventListener('input', onAddressInput);
   addressInput?.addEventListener('focus', onAddressFocus);
   addressInput?.addEventListener('blur', onAddressBlur);
 
@@ -448,9 +637,17 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
       applyVisibility();
       updateAddress();
       renderPagesBar();
+      if (page) queueHistoryRecord(page.url, page.title);
     } else if (ev.kind === 'title' && ev.title && page) {
       page.title = ev.title;
       renderPagesBar();
+      queueHistoryRecord(page.url, page.title);
+    } else if (ev.kind === 'favicon' && ev.url && page) {
+      // 站点图标(注入脚本已限定 http(s)/data:image,此处再防御一次;失败不覆盖已知值)
+      if (/^(https?:|data:image\/)/i.test(ev.url)) {
+        page.favicon = ev.url;
+        renderPagesBar();
+      }
     } else if (ev.kind === 'ai-navigate' && ev.url) {
       toast(`AI 正在打开: ${ev.url}`);
     } else if (ev.kind === 'new-window' && ev.url) {
@@ -498,6 +695,7 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
         }
         p.title = st.title || p.title;
         p.inspect = st.inspect;
+        if (st.favicon) p.favicon = st.favicon;
       } catch {
         /* webview 已不存在(理论上不会):保持镜像状态 */
       }
@@ -520,11 +718,21 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     container.querySelector('.browser-toolbar')?.removeEventListener('click', onToolbarClick);
     pagesEl?.removeEventListener('click', onPagesClick);
     pagesEl?.removeEventListener('contextmenu', onPagesContextMenu);
+    pagesEl?.removeEventListener('error', onPageImgError, true);
     addressInput?.removeEventListener('keydown', onAddressKey);
+    addressInput?.removeEventListener('input', onAddressInput);
     addressInput?.removeEventListener('focus', onAddressFocus);
     addressInput?.removeEventListener('blur', onAddressBlur);
+    histDropEl?.removeEventListener('mousedown', onHistoryMouseDown);
+    closeHistoryDrop();
+    // 未落库的防抖条目随卸载立即上报(页面访问是既成事实,不因标签关闭而丢)
+    if (histTimer) { clearTimeout(histTimer); histTimer = null; }
+    const pending = histPending;
+    histPending = null;
+    if (pending) void browserHistoryAdd(pending.url, pending.title).catch(() => {});
     container.innerHTML = '';
     addressInput = null;
+    histDropEl = null;
     inspectBtn = null;
     hintEl = null;
     viewEl = null;
