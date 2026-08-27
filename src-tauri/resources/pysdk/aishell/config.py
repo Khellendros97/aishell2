@@ -14,9 +14,10 @@ def import_project(name, path=None, folder="", servers=None):
     - name 必填；已存在同名项目时复用（并入服务器、保留原路径，existed=True）；
     - path 留空时在工作区目录下创建 <workspace>/<name>（含 .aishell/），返回的 path 为最终路径；
     - servers 每项：{name, host, username, port=22, authType="password"|"key",
-      keyPath, password, locked=False, isBastion=False, bastion="<堡垒机名称>"}；
+      keyPath, password, locked=False, isBastion=False, bastion="<堡垒机名称>",
+      tags=["细分标签", ...]}（tags 可选，字符串列表，供搜索框 #tag 筛选）；
       按 host+port+username 去重——已存在则复用其 id（created=False，传了 password 会更新凭据，
-      其余配置不动）；堡垒机绑定只对新建服务器生效，bastion 按服务器名称引用（本批或已有）。
+      tags 取并集合并，其余配置不动）；堡垒机绑定只对新建服务器生效，bastion 按服务器名称引用（本批或已有）。
     """
     params = {"name": name, "folder": folder or ""}
     if path:
