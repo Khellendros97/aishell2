@@ -117,6 +117,10 @@ pub struct Settings {
     /// 旧配置无此字段时按开启处理（默认开启）
     #[serde(default = "default_true")]
     pub auto_backup_remote_files: bool,
+    /// 服务器紧凑布局：开启后工作台侧栏服务器卡片默认折叠（仅图标/名称/IP），点击展开操作按钮；
+    /// 旧配置无此字段时按关闭处理（默认关闭，保持完整卡片）
+    #[serde(default)]
+    pub compact_server_list: bool,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -131,6 +135,7 @@ impl Default for Settings {
             project_view: ProjectView::default(),
             approval_mode: ApprovalMode::default(),
             auto_backup_remote_files: true,
+            compact_server_list: false,
         }
     }
 }
@@ -3154,6 +3159,7 @@ mod tests {
                 project_view: ProjectView::Card,
                 approval_mode: ApprovalMode::Smart,
                 auto_backup_remote_files: true,
+                compact_server_list: false,
             },
             credentials: vec![
                 Credential {
@@ -5759,6 +5765,7 @@ mod tests {
                     project_view: ProjectView::Card,
                     approval_mode: ApprovalMode::Smart,
                     auto_backup_remote_files: true,
+                    compact_server_list: false,
                 },
                 Some("sk-test-key"),
                 None,
@@ -5951,6 +5958,7 @@ mod tests {
                     project_view: ProjectView::List,
                     approval_mode: ApprovalMode::Smart,
                     auto_backup_remote_files: true,
+                    compact_server_list: false,
                 },
                 None,
                 Some("bsk-1"),

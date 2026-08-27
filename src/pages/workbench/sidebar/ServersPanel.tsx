@@ -9,6 +9,8 @@
  *  - 数据库连接配置(AI 受管查询通道):列表 ↔ 表单两视图,共享常量来自 ../db。
  * 与旧版差异:Workbench.state.project → useWorkbench.getState().project;bus → wbEvents;
  * Workbench.ai.addServerRef → wbHandles.ai?.addServerRef;旧版 DOM 重建/节点复用改 React key。
+ * 2026-08 新增:设置-外观「服务器紧凑布局」开启时卡片默认折叠(仅图标/名称/IP),点击展开操作按钮,
+ * 开关存 settings.compactServerList(无 proto/legacy 对照)。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Credential, DbConnection, DbKind, McpDeviceConfig, Server } from '../../../types';
@@ -345,10 +347,12 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
 /* ---------- 面板主体 ---------- */
 
 function ServersPanelBody(): JSX.Element {
-  /* 后端状态快照(服务器 + MCP 设备配置);挂载 / project-changed / aishell:data-changed 触发重拉 */
-  const [data, setData] = useState<{ servers: Server[]; credentials: Credential[]; mcpDevices: Record<string, McpDeviceConfig> }>({ servers: [], credentials: [], mcpDevices: {} });
+  /* 后端状态快照(服务器 + MCP 设备配置 + 紧凑布局设置);挂载 / project-changed / aishell:data-changed 触发重拉 */
+  const [data, setData] = useState<{ servers: Server[]; credentials: Credential[]; mcpDevices: Record<string, McpDeviceConfig>; compact: boolean }>({ servers: [], credentials: [], mcpDevices: {}, compact: false });
   const [reloadKey, setReloadKey] = useState(0);
   const [searchText, setSearchText] = useState('');
+  /* 紧凑布局下已展开的服务器 id(默认全部折叠,点击卡片展开/收起) */
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   /* 新建/编辑服务器模态(常驻挂载,hidden/open 切换) */
   const [srvState, openSrv, closeSrv] = useFadeModal();
@@ -377,7 +381,7 @@ function ServersPanelBody(): JSX.Element {
     void getState()
       .then((state) => {
         if (!alive) return;
-        setData({ servers: state.servers, credentials: state.credentials ?? [], mcpDevices: state.mcpDevices ?? {} });
+        setData({ servers: state.servers, credentials: state.credentials ?? [], mcpDevices: state.mcpDevices ?? {}, compact: state.settings.compactServerList ?? false });
         // 同步 store 项目快照:欢迎页等外部页面可能改过绑定,而 store 里的 project 是保活内存单例
         // (bound 列表按 project.serverIds 过滤,不刷新则返回后仍按旧绑定渲染)
         const s = useWorkbench.getState();
@@ -696,9 +700,19 @@ function ServersPanelBody(): JSX.Element {
       .catch((err) => toast(`切换 AI 锁失败: ${String(err)}`, 'error'));
   };
 
+  /** 紧凑布局:点击卡片切换展开/收起(展开后才显示编辑/锁定/标签与操作按钮) */
+  const toggleExpand = (id: string): void => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   /* ---------- 渲染 ---------- */
   const project = useWorkbench((s) => s.project);
-    const { servers, credentials, mcpDevices } = data;
+    const { servers, credentials, mcpDevices, compact } = data;
 
   const ids = project?.serverIds ?? [];
   const bound = servers.filter((s) => ids.includes(s.id));
@@ -798,10 +812,13 @@ function ServersPanelBody(): JSX.Element {
               const lockTitle = s.locked
                 ? 'AI 远程操作已锁定，点击解锁（手动 SSH/SFTP 不受影响）'
                 : 'AI 远程操作未锁定，点击锁定（手动 SSH/SFTP 不受影响）';
+              /* 紧凑布局:默认折叠(仅图标/名称/IP),点击卡片展开其余信息与操作按钮 */
+              const expanded = !compact || expandedIds.has(s.id);
               return (
                 <div
                   key={s.id}
-                  className="card wbs-server-card"
+                  className={`card wbs-server-card${compact ? ` wbs-compact clickable${expanded ? ' expanded' : ''}` : ''}`}
+                  onClick={compact ? () => toggleExpand(s.id) : undefined}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -816,55 +833,72 @@ function ServersPanelBody(): JSX.Element {
                       <span className="wbs-server-name" title={s.name}>{s.name}</span>
                       <span className="wbs-server-addr mono">{s.host}:{s.port}</span>
                     </span>
-                    <button className="icon-btn wbs-edit" title="编辑服务器配置" aria-label="编辑服务器配置"
-                      onClick={(e) => { e.stopPropagation(); openEditModal(s); }}>
-                      <Icon name="pencil" />
-                    </button>
-                    <button className={`icon-btn wbs-lock${s.locked ? ' locked' : ''}`} title={lockTitle} aria-label={lockTitle} aria-pressed={s.locked}
-                      onClick={(e) => { e.stopPropagation(); toggleLock(s); }}>
-                      <Icon name={s.locked ? 'lock' : 'unlock'} />
-                    </button>
+                    {expanded ? (
+                      <>
+                        <button className="icon-btn wbs-edit" title="编辑服务器配置" aria-label="编辑服务器配置"
+                          onClick={(e) => { e.stopPropagation(); openEditModal(s); }}>
+                          <Icon name="pencil" />
+                        </button>
+                        <button className={`icon-btn wbs-lock${s.locked ? ' locked' : ''}`} title={lockTitle} aria-label={lockTitle} aria-pressed={s.locked}
+                          onClick={(e) => { e.stopPropagation(); toggleLock(s); }}>
+                          <Icon name={s.locked ? 'lock' : 'unlock'} />
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        {/* 折叠态保留最常用的「添加到对话」,其余操作展开后可用 */}
+                        <button className="icon-btn wbs-chat" title="添加到对话" aria-label="添加到对话"
+                          onClick={(e) => { e.stopPropagation(); addRefToChat({ serverId: s.id, name: s.name }); }}>
+                          <Icon name="chatPlus" />
+                        </button>
+                        <span className="wbs-caret"><Icon name="chevronDown" /></span>
+                      </>
+                    )}
                   </div>
                   {/* 认证 / 堡垒机 / MCP 标签独立一行,避免与右上角按钮挤在一起；末尾跟用户自定义 tag */}
-                  <div className="wbs-server-tags">
-                    <span className="tag">{s.authType === 'key' ? <><Icon name="key" /> 密钥</> : '密码'}</span>
-                    {s.isBastion ? (
-                      <span className="tag purple"><Icon name="server" /> 堡垒机</span>
-                    ) : s.bastionId ? (
-                      <span className="tag purple"><Icon name="link" /> 堡垒机:{byId.get(s.bastionId)?.name ?? '已删除'}</span>
-                    ) : null}
-                    {mcpDevices[s.id]?.enabled ? (
-                      <span className="tag green"><Icon name="plug" /> MCP</span>
-                    ) : null}
-                    {s.tags.map((t) => (
-                      <span key={t} className="tag blue"><Icon name="hash" />{t}</span>
-                    ))}
-                  </div>
-                  <div className="wbs-server-actions">
-                    <button className="icon-btn wbs-chat" title="添加到对话" aria-label="添加到对话"
-                      onClick={(e) => { e.stopPropagation(); addRefToChat({ serverId: s.id, name: s.name }); }}>
-                      <Icon name="chatPlus" />
-                    </button>
-                    <button className="icon-btn wbs-ssh" title="SSH 连接" aria-label="SSH 连接" onClick={() => openTerminal(s)}>
-                      <Icon name="terminal" />
-                    </button>
-                    <button className="icon-btn wbs-sftp" title="SFTP 文件管理" aria-label="SFTP 文件管理" onClick={() => openSftp(s)}>
-                      <Icon name="folder" />
-                    </button>
-                    {/* 「更多」下拉菜单:MCP 接入 / 数据库连接 / SSH跳转设置(非常用操作收纳进下拉)。
-                        服务器已锁定(不允许 AI 访问)时 MCP 入口禁用(后端亦强制拒绝)。 */}
-                    <button className="icon-btn wbs-more" title="更多操作" aria-label="更多操作"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        showContextMenu(e.clientX, e.clientY, [
-                          { label: 'MCP', iconName: 'plug', disabled: s.locked, disabledTip: '服务器已锁定（不允许 AI 访问），MCP 不可用', action: () => openMcpModal(s) },
-                          { label: '数据库连接', iconName: 'database', action: () => setDbServer(s) },
-                          { label: 'SSH跳转设置', iconName: 'link', action: () => void openJumpEdit(s) },
-                        ]);
-                      }}>
-                      <Icon name="more" />
-                    </button>
-                  </div>
+                  {expanded ? (
+                    <>
+                      <div className="wbs-server-tags">
+                        <span className="tag">{s.authType === 'key' ? <><Icon name="key" /> 密钥</> : '密码'}</span>
+                        {s.isBastion ? (
+                          <span className="tag purple"><Icon name="server" /> 堡垒机</span>
+                        ) : s.bastionId ? (
+                          <span className="tag purple"><Icon name="link" /> 堡垒机:{byId.get(s.bastionId)?.name ?? '已删除'}</span>
+                        ) : null}
+                        {mcpDevices[s.id]?.enabled ? (
+                          <span className="tag green"><Icon name="plug" /> MCP</span>
+                        ) : null}
+                        {s.tags.map((t) => (
+                          <span key={t} className="tag blue"><Icon name="hash" />{t}</span>
+                        ))}
+                      </div>
+                      <div className="wbs-server-actions">
+                        <button className="icon-btn wbs-chat" title="添加到对话" aria-label="添加到对话"
+                          onClick={(e) => { e.stopPropagation(); addRefToChat({ serverId: s.id, name: s.name }); }}>
+                          <Icon name="chatPlus" />
+                        </button>
+                        <button className="icon-btn wbs-ssh" title="SSH 连接" aria-label="SSH 连接" onClick={(e) => { e.stopPropagation(); openTerminal(s); }}>
+                          <Icon name="terminal" />
+                        </button>
+                        <button className="icon-btn wbs-sftp" title="SFTP 文件管理" aria-label="SFTP 文件管理" onClick={(e) => { e.stopPropagation(); openSftp(s); }}>
+                          <Icon name="folder" />
+                        </button>
+                        {/* 「更多」下拉菜单:MCP 接入 / 数据库连接 / SSH跳转设置(非常用操作收纳进下拉)。
+                            服务器已锁定(不允许 AI 访问)时 MCP 入口禁用(后端亦强制拒绝)。 */}
+                        <button className="icon-btn wbs-more" title="更多操作" aria-label="更多操作"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            showContextMenu(e.clientX, e.clientY, [
+                              { label: 'MCP', iconName: 'plug', disabled: s.locked, disabledTip: '服务器已锁定（不允许 AI 访问），MCP 不可用', action: () => openMcpModal(s) },
+                              { label: '数据库连接', iconName: 'database', action: () => setDbServer(s) },
+                              { label: 'SSH跳转设置', iconName: 'link', action: () => void openJumpEdit(s) },
+                            ]);
+                          }}>
+                          <Icon name="more" />
+                        </button>
+                      </div>
+                    </>
+                  ) : null}
                 </div>
               );
             })

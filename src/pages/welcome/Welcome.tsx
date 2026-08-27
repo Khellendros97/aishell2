@@ -57,6 +57,7 @@ const EMPTY_STATE: AppState = {
     projectView: 'card',
     approvalMode: 'smart',
     autoBackupRemoteFiles: true,
+    compactServerList: false,
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
