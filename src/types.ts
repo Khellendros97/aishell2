@@ -265,7 +265,8 @@ export interface ReadImageOut {
 
 /** browser:event 事件 payload（Rust browser.rs 发射）；viewId 标记来源页面（多页面模型） */
 export interface BrowserEvent {
-  kind: 'url' | 'title' | 'element' | 'ai-navigate' | 'new-window';
+  /** kind=favicon 时 url 为站点图标地址（页面注入脚本探测 link[rel~=icon] 的结果） */
+  kind: 'url' | 'title' | 'element' | 'favicon' | 'ai-navigate' | 'new-window';
   /** 来源页面 id（Rust 侧 viewId） */
   viewId?: string;
   url?: string;
@@ -283,6 +284,19 @@ export interface BrowserState {
   url: string;
   title: string;
   inspect: boolean;
+  /** 站点图标地址（可能为空串/缺失；重开标签时直接复用，无需等重新探测） */
+  favicon?: string;
+}
+
+/** 内置浏览器地址栏历史条目（MRU 最新在前；持久化在 aishell.json browserHistory，
+ *  Rust store.rs record_browser_history 维护合并/截尾，browser_history_list 查询） */
+export interface BrowserHistoryItem {
+  /** 对外展示形态 URL（本地文件即 file:///），可直接作为导航输入 */
+  url: string;
+  /** 页面标题（导航时往往尚未加载完成，可能为空串） */
+  title: string;
+  /** 最近一次访问的毫秒时间戳 */
+  ts: number;
 }
 
 export interface ChatMsg {
