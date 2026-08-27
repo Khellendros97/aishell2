@@ -155,6 +155,24 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 /* 服务器表单双列紧凑布局（欢迎页内联区，见 server-form.ts）；侧栏模态框默认单列 */
 .server-form-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; }
 .server-form-grid .field { margin-bottom: 12px; }
+
+/* 标签 chip 编辑器（服务器表单）：chips + 内联输入框同框，候选行点击添加 */
+.tag-editor {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  padding: 5px 8px; min-height: 32px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-s);
+}
+.tag-editor:focus-within { border-color: var(--accent); }
+.tag-editor .tag-input {
+  flex: 1; min-width: 90px; border: none; outline: none; background: none;
+  color: var(--text-0); font-size: 12px; font-family: var(--font-ui); padding: 2px 0;
+}
+.tag-remove {
+  border: none; background: none; color: inherit; cursor: pointer;
+  font-size: 12px; line-height: 1; padding: 0 0 0 2px; opacity: .7;
+}
+.tag-remove:hover { opacity: 1; }
+.tag-suggestions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 /* 输入框 + 按钮同行（密钥路径浏览、项目目录浏览等，server-form.ts / welcome 共用） */
 .path-row { display: flex; gap: 8px; }
 .path-row .input { flex: 1; min-width: 0; }
@@ -205,6 +223,17 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
 .tag.red { background: var(--red-dim); color: var(--red); }
 .tag.yellow { background: var(--yellow-dim); color: var(--yellow); }
 .tag.purple { background: rgba(182, 135, 232, 0.14); color: var(--purple); }
+/* 可点击筛选 chip（#tag 热门标签行）；active = 已在搜索条件中（button 元素需重置字体） */
+.tag.clickable { cursor: pointer; border: 1px solid transparent; font-family: var(--font-ui); }
+.tag.clickable:hover { background: var(--bg-hover); color: var(--text-0); }
+.tag.clickable.active { background: var(--accent-dim); color: var(--accent-hover); border-color: var(--accent); }
+
+/* 确认弹窗的受影响条目清单（批量删除警告等） */
+.confirm-list {
+  margin: 10px 0 0; padding: 8px 8px 8px 26px; max-height: 180px; overflow-y: auto;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-s);
+  font-size: 12px; line-height: 1.8;
+}
 
 /* ---------- 右键菜单（共享，explorer / 编辑器通用） ---------- */
 .ctx-menu {

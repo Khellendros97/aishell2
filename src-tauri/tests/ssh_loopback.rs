@@ -210,6 +210,7 @@ async fn shell_echo_roundtrip() {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -299,6 +300,7 @@ async fn remote_exec_roundtrip() {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         ssh.connect_direct(server, Some("test"))
             .await
@@ -367,6 +369,7 @@ async fn locked_server_blocks_ai_remote_but_manual_paths_ok() {
             locked: true,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store
             .upsert_server(server.clone(), None)
@@ -539,6 +542,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store.upsert_server(server.clone(), None).expect("登记服务器应成功");
         ssh.connect_direct(server, Some("test"))
@@ -638,6 +642,7 @@ async fn remote_run_command_blocks_when_snapshot_fails() {
             locked: false,
             is_bastion: false,
             bastion_id: None,
+            tags: Vec::new(),
         };
         store2.upsert_server(server2.clone(), None).expect("登记服务器应成功");
         ssh2.connect_direct(server2, Some("test"))
@@ -832,6 +837,7 @@ async fn jump_target_exec_roundtrip_via_bastion() {
                     locked: false,
                     is_bastion: true,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -850,6 +856,7 @@ async fn jump_target_exec_roundtrip_via_bastion() {
                     locked: false,
                     is_bastion: false,
                     bastion_id: Some("bastion".to_string()),
+                    tags: Vec::new(),
                 },
                 None,
             )

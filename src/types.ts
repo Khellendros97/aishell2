@@ -118,6 +118,8 @@ export interface Server {
   isBastion: boolean;
   /** 所属堡垒机 id：非空 = 目标主机，连接时先连堡垒机再经其转发；卡片打「堡垒机:名称」标签 */
   bastionId: string | null;
+  /** 用户自定义标签（搜索框 #tag 筛选用）；旧配置无此字段按空数组 */
+  tags: string[];
 }
 
 export interface QuickCommand {

@@ -214,6 +214,7 @@ pub fn run() {
             store::create_project_folder,
             store::rename_project_folder,
             store::delete_project_folder,
+            store::delete_folder_with_projects,
             store::create_command_folder,
             store::rename_command_folder,
             store::delete_command_folder,

@@ -18,6 +18,8 @@ export interface ServerFormOptions {
   compact?: boolean;
   /** 可选凭据库；未传时仍可手工填写，兼容所有旧入口 */
   credentials?: Credential[];
+  /** 现有全部 tag（标签输入的自动补全候选）；未传则无候选 */
+  allTags?: string[];
 }
 
 export interface ServerFormHandle {
@@ -33,7 +35,7 @@ export interface ServerFormHandle {
   focusFirst(): void;
 }
 
-/** 表单七个字段（与旧版 f-* 元素一一对应；port 以字符串保存，校验时才转数字） */
+/** 表单字段（与旧版 f-* 元素一一对应；port 以字符串保存，校验时才转数字；tags 为标签列表） */
 interface FormFields {
   name: string;
   host: string;
@@ -43,6 +45,7 @@ interface FormFields {
   password: string;
   keyPath: string;
   credentialId: string | null;
+  tags: string[];
 }
 
 /** 校验标红字段：只有名称 / IP / 端口会被标红（旧版对账号、密钥路径也只清除不标红） */
@@ -54,16 +57,34 @@ interface InvalidFields {
 
 /** 新建态初始值（同旧版 fill(null)：密码 / 密钥路径恒为空，不留上次输入） */
 const EMPTY_FIELDS: FormFields = {
-  name: '', host: '', port: '22', auth: 'password', username: '', password: '', keyPath: '', credentialId: null,
+  name: '', host: '', port: '22', auth: 'password', username: '', password: '', keyPath: '', credentialId: null, tags: [],
 };
 
 const EMPTY_INVALID: InvalidFields = { name: false, host: false, port: false };
 
 export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
-  function ServerForm({ compact, credentials = [] }, ref): JSX.Element {
+  function ServerForm({ compact, credentials = [], allTags = [] }, ref): JSX.Element {
     const [fields, setFields] = useState<FormFields>(EMPTY_FIELDS);
     const [invalid, setInvalid] = useState<InvalidFields>(EMPTY_INVALID);
+    const [tagInput, setTagInput] = useState('');
     const nameRef = useRef<HTMLInputElement>(null);
+
+    /** 提交一个标签：去 # 前缀、trim、去重；回车 / 逗号 / 点候选 / 失焦时调用 */
+    const commitTag = (raw: string): void => {
+      const t = raw.trim().replace(/^#+/, '');
+      if (t && !fields.tags.includes(t)) {
+        setFields((f) => (f.tags.includes(t) ? f : { ...f, tags: [...f.tags, t] }));
+      }
+      setTagInput('');
+    };
+    const removeTag = (t: string): void => {
+      setFields((f) => ({ ...f, tags: f.tags.filter((x) => x !== t) }));
+    };
+    // 自动补全候选：未选中且匹配当前输入
+    const tagQuery = tagInput.trim().replace(/^#+/, '').toLowerCase();
+    const tagSuggestions = allTags
+      .filter((t) => !fields.tags.includes(t) && (!tagQuery || t.toLowerCase().includes(tagQuery)))
+      .slice(0, 8);
 
     /** 校验标红：输入即清除（同欢迎页 mini 表单行为；与旧版 markInvalid 对应） */
     const clearInvalid = (key: keyof InvalidFields): void => {
@@ -106,7 +127,9 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           password: '', // 密码 / 密钥永不回显：编辑时留空 = 保持 keyring 原值
           keyPath: server?.keyPath ?? '',
           credentialId: server?.credentialId ?? null,
+          tags: server?.tags ?? [],
         });
+        setTagInput('');
         setInvalid(EMPTY_INVALID);
       },
       validate(): string | null {
@@ -135,6 +158,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           // 堡垒机字段不在表单里：编辑时原样保留（目标主机经 SSH跳转设置绑定）
           isBastion: editing?.isBastion ?? false,
           bastionId: editing?.bastionId ?? null,
+          tags: fields.tags,
         };
       },
       passwordValue(): string | null {
@@ -240,6 +264,61 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
             </div>
           </div>
         )}
+        {/* 标签：chip 编辑器，回车/逗号提交，候选来自现有全部 tag（搜索框 #tag 筛选用） */}
+        <div className="field" style={compact ? { gridColumn: '1 / -1' } : undefined}>
+          <label>标签</label>
+          <div className="tag-editor">
+            {fields.tags.map((t) => (
+              <span key={t} className="tag blue">
+                {t}
+                <button
+                  type="button"
+                  className="tag-remove"
+                  title={`移除标签 ${t}`}
+                  onClick={() => removeTag(t)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            <input
+              className="tag-input"
+              placeholder="回车添加标签"
+              value={tagInput}
+              onChange={(e) => {
+                const v = e.currentTarget.value;
+                if (v.includes(',') || v.includes('，')) {
+                  commitTag(v.replace(/[,，]/g, ''));
+                } else {
+                  setTagInput(v);
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); commitTag(tagInput); }
+                else if (e.key === 'Backspace' && !tagInput && fields.tags.length > 0) {
+                  removeTag(fields.tags[fields.tags.length - 1]);
+                }
+              }}
+              onBlur={() => commitTag(tagInput)}
+            />
+          </div>
+          {tagSuggestions.length > 0 && (
+            <div className="tag-suggestions">
+              {tagSuggestions.map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  className="tag clickable"
+                  // mousedown 先于 blur：preventDefault 保持输入框焦点，避免先触发 onBlur 提交
+                  onMouseDown={(e) => { e.preventDefault(); commitTag(t); }}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="hint">标签用于搜索框 #标签 筛选，如 #生产 #已下架。</div>
+        </div>
       </div>
     );
   },

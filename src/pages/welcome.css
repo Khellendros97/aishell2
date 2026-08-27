@@ -46,6 +46,11 @@
 .welcome-page .view-switch .icon-btn { width: 26px; height: 24px; font-size: 13px; border-radius: 4px; }
 .welcome-page .view-switch .icon-btn.active { background: var(--bg-3); color: var(--accent); }
 
+/* 热门标签 chips 行（项目区搜索框下方 / 项目弹窗服务器多选内），点击切换 #tag 筛选 */
+.welcome-page .proj-tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin: -6px 0 12px; }
+.welcome-page .proj-tag-row.in-modal { margin: -2px 0 8px; }
+.welcome-page .proj-tag-row .tag .ic { font-size: 11px; }
+
 /* ---------- 项目分类目录分组 ---------- */
 .welcome-page .proj-group { margin-bottom: 10px; }
 /* 组标题行：文件夹图标 + 名称 + 计数；点击展开/收起，重命名/删除按钮在行内（事件委托见 welcome.ts） */

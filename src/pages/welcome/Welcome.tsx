@@ -5,9 +5,11 @@
  *
  * 后端接口点（均见 src/api.ts）：get_state / upsert_project / delete_project / upsert_server /
  * delete_server / create_project_folder / rename_project_folder / delete_project_folder /
- * set_ui_expanded（welcome:projectGroups 分组展开状态）/ save_settings（projectView 视图持久化）/
- * ensure_project_dirs（新建项目先拿最终路径再落盘）/ get_task_project（欢迎页 AI 系统任务上下文）；
- * 浏览按钮走 @tauri-apps/plugin-dialog 的 openDialog，通用 SSH 配置迁移走 AI + python-script skill。
+ * delete_folder_with_projects（按分类递归删除项目）/ set_ui_expanded（welcome:projectGroups 分组展开状态）/
+ * save_settings（projectView 视图持久化）/ ensure_project_dirs（新建项目先拿最终路径再落盘）/
+ * get_task_project（欢迎页 AI 系统任务上下文）；浏览按钮走 @tauri-apps/plugin-dialog 的 openDialog，
+ * 通用 SSH 配置迁移走 AI + python-script skill。
+ * 服务器 #tag 筛选与热门标签 chips 复用 src/shared/search.ts 的共享解析器。
  *
  * 服务器表单（mini 快捷新建 + 弹层完整模式）由并行迁移的 src/pages/settings/ServerForm.tsx 提供，
  * ref 句柄语义以 legacy/pages/server-form.ts 的 ServerFormHandle 为准
@@ -26,12 +28,15 @@ import {
 } from 'react';
 import type { AppState, Project, Server } from '../../types';
 import {
-  createProjectFolder, deleteProject, deleteProjectFolder, deleteServer, ensureProjectDirs,
-  getState, getTaskProject, openDialog, renameProjectFolder,
+  createProjectFolder, deleteFolderWithProjects, deleteProject, deleteProjectFolder,
+  deleteServer, ensureProjectDirs, getState, getTaskProject, openDialog, renameProjectFolder,
   saveSettings, setUiExpanded, upsertProject,
 } from '../../api';
 import { attachCombo, confirmDialog, promptDialog, toast, uid } from '../../ui';
 import { Icon } from '../../shared/Icon';
+import {
+  matchProject, matchServer, parseSearchQuery, toggleTagInQuery, topTags,
+} from '../../shared/search';
 import { navigate } from '../../router';
 import { ServerForm, type ServerFormHandle } from '../settings/ServerForm';
 import { saveServerWithCredentialChoice } from '../settings/server-save';
@@ -66,47 +71,68 @@ const EMPTY_STATE: AppState = {
  */
 const PAGE_ROOT_STYLE: CSSProperties = { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 };
 
-/** 搜索匹配：项目名 / 路径 / 所属目录 大小写不敏感；空串显示全部 */
-function matchProject(p: Project, q: string): boolean {
-  if (!q) return true;
-  return [p.name, p.path ?? '', p.folder ?? ''].some((v) => v.toLowerCase().includes(q));
+/** 分类树节点：path 为完整 '/' 分隔路径（'' 仅用于未分类，不进树），projects 为直属该项目录的项目 */
+interface FolderNode {
+  name: string;
+  path: string;
+  children: FolderNode[];
+  projects: Project[];
 }
 
-/** 分组计算（与 legacy renderProjects 的分组/排序/空态判定逐条对应） */
-function computeGroups(db: AppState, q: string): {
-  projects: Project[]; filtered: Project[]; folderSet: Set<string>;
-  groups: Map<string, Project[]>; keys: string[];
-} {
-  const projects = db.projects || [];
-  const filtered = q ? projects.filter((p) => matchProject(p, q)) : projects;
+/**
+ * 构建分类树：目录来源 = projectFolders ∪ 各项目 folder（非搜索态，空目录也渲染）；
+ * 搜索态只由 filtered 项目的 folder 建树（含祖先链）。children 按中文字序排序。
+ */
+function buildFolderTree(db: AppState, filtered: Project[], searching: boolean): FolderNode[] {
+  const roots: FolderNode[] = [];
+  const nodes = new Map<string, FolderNode>();
+  const ensure = (path: string): void => {
+    if (!path || nodes.has(path)) return;
+    let acc = '';
+    let prev: FolderNode | null = null;
+    for (const seg of path.split('/')) {
+      acc = acc ? `${acc}/${seg}` : seg;
+      let node = nodes.get(acc);
+      if (!node) {
+        node = { name: seg, path: acc, children: [], projects: [] };
+        nodes.set(acc, node);
+        if (prev) prev.children.push(node);
+        else roots.push(node);
+      }
+      prev = node;
+    }
+  };
 
-  // 组来源：projectFolders ∪ 各项目 folder 派生值（并集，去重），空目录（0 个项目）也渲染；
-  // 搜索中只展示命中项目的分组（空目录无意义，保持搜索空态语义）。
-  const folderSet = new Set<string>(db.projectFolders ?? []);
-  projects.forEach((p) => folderSet.add(p.folder || ''));
-
-  const groups = new Map<string, Project[]>();
-  if (q) {
-    filtered.forEach((p) => {
-      const key = p.folder || '';
-      const arr = groups.get(key);
-      if (arr) arr.push(p);
-      else groups.set(key, [p]);
-    });
-  } else {
-    folderSet.forEach((key) => groups.set(key, []));
-    filtered.forEach((p) => groups.get(p.folder || '')!.push(p));
+  if (!searching) {
+    (db.projectFolders ?? []).forEach((f) => ensure(f));
   }
+  for (const p of filtered) {
+    const f = p.folder || '';
+    if (!f) continue;
+    ensure(f);
+    nodes.get(f)!.projects.push(p);
+  }
+  const sortRec = (n: FolderNode): void => {
+    n.children.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+    n.children.forEach(sortRec);
+  };
+  roots.forEach(sortRec);
+  return roots;
+}
 
-  // 未分类（空串）组排最后
-  const keys = groups.size
-    ? Array.from(groups.keys()).sort((a, b) => {
-        if (!a) return 1;
-        if (!b) return -1;
-        return a.localeCompare(b, 'zh');
-      })
-    : [];
-  return { projects, filtered, folderSet, groups, keys };
+/** 收集树内全部目录路径（全部展开 / 折叠按钮用） */
+function collectFolderPaths(roots: readonly FolderNode[], out: string[] = []): string[] {
+  for (const n of roots) {
+    out.push(n.path);
+    collectFolderPaths(n.children, out);
+  }
+  return out;
+}
+
+/** 节点的递归项目数（直属 + 全部子分类，组标题角标用） */
+function countProjects(node: FolderNode): number {
+  return node.projects.length
+    + node.children.reduce((sum, c) => sum + countProjects(c), 0);
 }
 
 export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
@@ -289,34 +315,77 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
       return;
     }
     setDb(await getState());
+    // 前缀级联重命名后，旧目录及其子分类的折叠状态整体清除（新路径保持展开可见）
+    const oldPrefix = `${folder}/`;
     const next = new Set(expandedGroups);
-    next.delete(folder); // 目录已改名，旧折叠状态不再保留
+    for (const k of [...next]) {
+      if (k === folder || k.startsWith(oldPrefix)) next.delete(k);
+    }
     setExpandedGroups(next);
     persistGroupsExpanded(next);
     toast(`分类目录已重命名为「${name}」`, 'success');
   }
 
-  /** 删除空分类目录：确认后调后端（失败显示后端中文错误），仅空组标题行有删除按钮 */
+  /**
+   * 删除分类目录：
+   * - 目录与子分类下都没有项目 → 仅删目录条目（delete_project_folder），简单确认；
+   * - 有项目（含子分类）→ 危险确认弹窗列出全部受影响项目，调 delete_folder_with_projects
+   *   递归删除（服务器保留不删除，便于误导入后整批清掉重新导入）。
+   */
   async function deleteFolderFlow(folder: string): Promise<void> {
-    const ok = await confirmDialog({
-      title: '删除分类目录',
-      message: `确定删除分类目录「${folder}」吗？`,
-      danger: true,
-      okText: '删除',
-    });
-    if (!ok) return;
-    try {
-      await deleteProjectFolder(folder);
-    } catch (err) {
-      toast(String(err), 'error');
-      return;
+    const prefix = `${folder}/`;
+    const affectedFolders = (db.projectFolders ?? []).filter(
+      (f) => f === folder || f.startsWith(prefix),
+    );
+    const affectedProjects = (db.projects ?? []).filter(
+      (p) => (p.folder || '') === folder || (p.folder || '').startsWith(prefix),
+    );
+    if (affectedProjects.length === 0 && affectedFolders.length <= 1) {
+      const ok = await confirmDialog({
+        title: '删除分类目录',
+        message: `确定删除分类目录「${folder}」吗？`,
+        danger: true,
+        okText: '删除',
+      });
+      if (!ok) return;
+      try {
+        await deleteProjectFolder(folder);
+      } catch (err) {
+        toast(String(err), 'error');
+        return;
+      }
+      setDb(await getState());
+      toast(`分类目录「${folder}」已删除`, 'success');
+    } else {
+      const subCount = Math.max(0, affectedFolders.length - 1);
+      const scope = subCount > 0 ? `及其 ${subCount} 个子分类` : '';
+      const ok = await confirmDialog({
+        title: '删除分类及项目',
+        message:
+          `将删除分类「${folder}」${scope}下的共 ${affectedProjects.length} 个项目` +
+          '（清单见下方）。仅删除项目记录与 AI 会话，不会删除磁盘文件和服务器配置。',
+        danger: true,
+        okText: `删除 ${affectedProjects.length} 个项目`,
+        list: affectedProjects.map((p) => p.name),
+      });
+      if (!ok) return;
+      let n: number;
+      try {
+        n = await deleteFolderWithProjects(folder);
+      } catch (err) {
+        toast(String(err), 'error');
+        return;
+      }
+      setDb(await getState());
+      toast(`已删除「${folder}」下 ${n} 个项目`, 'success');
     }
-    setDb(await getState());
+    // 已删除目录及其子分类的折叠状态一并清理
     const next = new Set(expandedGroups);
-    next.delete(folder); // 已删除目录不再保留折叠状态
+    for (const k of [...next]) {
+      if (k === folder || k.startsWith(prefix)) next.delete(k);
+    }
     setExpandedGroups(next);
     persistGroupsExpanded(next);
-    toast(`分类目录「${folder}」已删除`, 'success');
   }
 
   /* ---------- 删除项目 ---------- */
@@ -639,12 +708,14 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
 4. 探查完成后，用中文简要汇总发现结果。
 
 【阶段二：确认导入计划】
-5. 基于探查结果制定迁移计划：字段映射、按 host + port + username 去重的规则、预计新增/复用/跳过项、待用户补充的凭据。计划必须包含「源目录 → 目标项目」对照表，组织规则如下：
-   - 源工具的目录结构一比一保留：每个目录对应 AIShell 的一个项目，项目名取目录名，项目目录（folder）=「${name}」加上该目录的上级路径。例如源结构「生产环境/Web」→ import_project("Web", folder="${name}/生产环境")；「浙江大学」→ import_project("浙江大学", folder="${name}")。
-   - 直接挂在源工具根目录、不属于任何文件夹的会话，统一归入名为「未分组」的项目（folder 同为「${name}」）。
-   - 不同上级路径下的同名目录会引发项目名冲突（项目按名称去重），计划中必须标注并给出消歧后的项目名（如「Web（生产环境）」）。
-   - 禁止把所有服务器聚合到单个项目。
-6. 用 ask 工具把计划提交给我确认：把「源目录 → 目标项目」对照表和新增/复用/跳过统计放进问题正文，用选项让我选择（如是否按此计划继续、同名目录如何消歧、待补凭据如何处理）。不要只在回复正文里罗列计划等我打字回复。
+5. 基于探查结果制定迁移计划：字段映射、按 host + port + username 去重的规则、预计新增/复用/跳过项、待用户补充的凭据。计划必须包含「源目录 → 分类 / 项目 / 标签」对照表。AIShell 采用「分类-项目-主机」三层语义结构，你需要对源工具的目录树做语义分析后再落位，规则如下：
+   - 地理位置类目录（如 华东、华北、浙江省、北京 等行政区划或地域词）→ 转为分类目录（import_project 的 folder 参数），支持多级嵌套路径（用 / 分隔，如 folder="华东/浙江省"）。纯地理层级本身不建项目。
+   - 具体单位 / 业务系统类目录（如 xx大学、xx企业、xx系统、xx平台）→ 转为一个 AIShell 项目，项目名取目录名；其上级地理层级写入 folder（不含工具名）。例如源结构「北京/北京航空航天大学/新平台」：北京 → folder 层级、北京航空航天大学 → 项目名、新平台 → 该组服务器的标签。
+   - 其余细分分组（如 AAA、BI、访客、部门名、用途归类等）→ 不建项目也不建分类，转为该组内每台服务器的标签：随 import_project 的 servers[i].tags 字段传入（字符串数组，如 ["AAA","访客"]）；同名细分分组出现在多处时可合并为同一个标签。
+   - 直接挂在源根目录、不属于任何分组的会话归入名为「未分组」的项目（folder 留空 = 未分类）。只有当源工具完全没有目录结构时，才把所有项目统一放到以「${name}」命名的分类下（folder="${name}"）作为兜底。
+   - 分类只承载地理等大颗粒语义层级；禁止把细粒度分组建成分类目录（那会让分类树退化成源目录树的镜像），禁止把所有服务器聚合到单个项目。
+   - 同一地理层级下的多个单位各自建项目。项目按名称去重：不同上级路径下的同名目录会引发冲突，计划中必须标注并给出消歧后的项目名（如「Web（生产环境）」）。
+6. 用 ask 工具把计划提交给我确认：把「源目录 → 分类 / 项目 / 标签」对照表和新增/复用/跳过统计放进问题正文，用选项让我选择（如是否按此计划继续、同名目录如何消歧、待补凭据如何处理）。不要只在回复正文里罗列计划等我打字回复。
 7. 我回答后，如需最终把关再调用一次 confirm 工具（如「确认按上述计划执行导入？」）。我确认前不得写文件、不得调用 aishell.config.import_project、不得修改 AIShell 配置。
 
 【阶段三：执行导入】
@@ -738,16 +809,29 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
     };
   }, []);
 
-  /* ---------- 渲染计算（对应 legacy renderProjects / renderServerList / syncViewBtns / syncToggleFoldersBtn） ---------- */
-  const q = query.trim().toLowerCase();
-  const { projects, filtered, folderSet, groups, keys } = computeGroups(db, q);
+  /* ---------- 渲染计算（分类树 + 搜索；对应 legacy renderProjects 的分组/空态职责） ---------- */
+  const parsedQuery = parseSearchQuery(query);
+  const searching = !!query.trim();
+  const projects = db.projects || [];
+  const serversById = new Map((db.servers || []).map((s) => [s.id, s] as const));
+  // 项目过滤：#tag 条件 AND + name/path/folder 文本匹配（共享解析器）
+  const filtered = searching ? projects.filter((p) => matchProject(p, serversById, parsedQuery)) : projects;
+  const folderTree = buildFolderTree(db, filtered, searching);
   // 完全没有项目且没有任何目录 → 引导空态；有项目但搜索无命中 → 搜索空态
   // （loaded 前与 legacy 骨架一致：空态保持 hidden，等首次 getState 后再展示）
-  const showEmpty = loaded && projects.length === 0 && folderSet.size === 0;
+  const folderCount = new Set([
+    ...(db.projectFolders ?? []),
+    ...projects.map((p) => p.folder || ''),
+  ]).size;
+  const showEmpty = loaded && projects.length === 0 && folderCount === 0;
   const showSearchEmpty = loaded && projects.length > 0 && filtered.length === 0;
-  // 「全部展开 / 全部折叠」单按钮：按当前状态切换，图标 = 目标动作
-  const allExpanded = keys.length > 0 && keys.every((k) => expandedGroups.has(k));
+  // 「全部展开 / 全部折叠」单按钮：按当前状态切换，图标 = 目标动作（含未分类组）
+  const folderPaths = collectFolderPaths(folderTree);
+  const allFolderKeys = ['', ...folderPaths];
+  const allExpanded = folderPaths.length > 0 && allFolderKeys.every((k) => expandedGroups.has(k));
   const wsDir = db.settings.workspaceDir || '';
+  /** 搜索态强制展开命中子树；平时按折叠状态 */
+  const expandedOf = (path: string): boolean => searching || expandedGroups.has(path);
 
   /** 卡片视图：单张项目卡片（标签最多 5 个：超过 5 台显示前 4 个 + 「+剩余数量」） */
   const projectCardEl = (p: Project): JSX.Element => {
@@ -847,16 +931,23 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
     );
   };
 
-  /* 服务器多选列表内容（对应 legacy renderServerList；搜索过滤：名称 / host / username 大小写不敏感） */
+  /* 服务器多选列表内容（对应 legacy renderServerList；搜索过滤：#tag 条件 AND +
+     名称 / host / username 大小写不敏感子串，共享解析器） */
   const allServers = db.servers || [];
-  const serverQ = serverQuery.trim().toLowerCase();
-  const filteredServers = serverQ
-    ? allServers.filter((s) => [s.name, s.host, s.username].some((v) => v.toLowerCase().includes(serverQ)))
+  const parsedSrvQuery = parseSearchQuery(serverQuery);
+  const filteredServers = serverQuery.trim()
+    ? allServers.filter((s) => matchServer(s, parsedSrvQuery))
     : allServers;
+  // 现有全部标签（表单 tag 输入候选）与热门标签（多选列表 / 项目区筛选 chips）
+  const allTagOptions = [...new Set(allServers.flatMap((s) => s.tags))].sort((a, b) =>
+    a.localeCompare(b, 'zh'));
+  const hotServerTags = topTags(allServers);
+  const activeQueryTags = parsedQuery.tags;
+  const activeServerQueryTags = parsedSrvQuery.tags;
   const serverListContent = !allServers.length
     ? <div className="server-empty">暂无服务器，可在下方新建</div>
     : !filteredServers.length
-      ? <div className="server-empty">没有匹配的服务器，试试其他关键词</div>
+      ? <div className="server-empty">没有匹配的服务器，试试其他关键词或 #标签</div>
       : (
         <>
           {filteredServers.map((s) => (
@@ -874,6 +965,46 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
         </>
       );
 
+  /* ---------- 分类树渲染：递归层级分组（华东/浙江省/杭州市），组标题可折叠 / 重命名 / 删除 ----------
+     拖拽投放复用 .proj-group-title[data-folder] 委托（onGroupsDragOver/onGroupsDrop）；
+     未分类（folder=''）不进树，单独渲染在最下方。 */
+  const renderGroupBody = (groupProjects: Project[]): JSX.Element =>
+    viewMode === 'card'
+      ? <div className="proj-grid">{groupProjects.map(projectCardEl)}</div>
+      : <div className="proj-list">{groupProjects.map(projectRowEl)}</div>;
+
+  const renderFolderNode = (node: FolderNode, depth: number): JSX.Element => {
+    const expanded = expandedOf(node.path);
+    const total = countProjects(node);
+    return (
+      <div className="proj-group" key={node.path}>
+        <div
+          className={`proj-group-title${dropTarget === node.path ? ' drop-target' : ''}`}
+          data-folder={node.path}
+          style={depth > 0 ? { marginLeft: depth * 16 } : undefined}
+          onClick={() => { if (!searching) toggleGroup(node.path); }}
+          onDragLeave={onGroupTitleDragLeave}
+        >
+          <span className="pgt-folder"><Icon name={expanded ? 'folderOpen' : 'folder'} /></span>
+          <span className="pgt-name" title={node.path}>{node.name}</span>
+          <span className="tag" title={`含子分类共 ${total} 个项目`}>{total}</span>
+          <button className="icon-btn" data-act="rename-folder" data-folder={node.path}
+            title={`重命名「${node.path}」（子分类一并改名）`}
+            onClick={(e) => { e.stopPropagation(); void renameFolderFlow(node.path); }}><Icon name="pencil" /></button>
+          <button className="icon-btn danger" data-act="del-folder" data-folder={node.path}
+            title={`删除「${node.path}」${total > 0 ? `（递归删除其下 ${total} 个项目）` : ''}`}
+            onClick={(e) => { e.stopPropagation(); void deleteFolderFlow(node.path); }}><Icon name="trash" /></button>
+        </div>
+        {(node.projects.length > 0 || node.children.length > 0) && (
+          <div className={`proj-group-body${expanded ? '' : ' hidden'}`}>
+            {node.projects.length > 0 ? renderGroupBody(node.projects) : null}
+            {node.children.map((c) => renderFolderNode(c, depth + 1))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   /* ---------- 页面骨架（DOM 结构 / 类名 / 文案与 legacy welcome.ts 一致） ---------- */
   return (
     <div className="welcome-page" style={PAGE_ROOT_STYLE}>
@@ -887,7 +1018,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
         </div>
 
         <div className="welcome-toolbar">
-          <input className="input" id="proj-search" placeholder="搜索项目名 / 路径 / 所属目录…"
+          <input className="input" id="proj-search" placeholder="搜索项目名 / 路径 / 所属目录 / #标签…"
             value={query} onChange={(e) => setQuery(e.target.value)} />
           <button className="icon-btn" id="btn-toggle-folders" title={allExpanded ? '全部折叠' : '全部展开'}
             onClick={() => {
@@ -895,7 +1026,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
                 setExpandedGroups(new Set());
                 persistGroupsExpanded(new Set());
               } else {
-                const next = new Set(keys);
+                const next = new Set(allFolderKeys);
                 setExpandedGroups(next);
                 persistGroupsExpanded(next);
               }
@@ -919,39 +1050,48 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
           </button>
         </div>
 
+        {/* 热门标签 chips：被引用最多的几个服务器标签，点击切换进/出 #tag 搜索条件 */}
+        {hotServerTags.length > 0 && (
+          <div className="proj-tag-row">
+            {hotServerTags.map((t) => (
+              <button
+                key={t}
+                className={`tag clickable${activeQueryTags.includes(t.toLowerCase()) ? ' active' : ''}`}
+                title={`筛选 #${t}`}
+                onClick={() => setQuery(toggleTagInQuery(query, t))}
+              >
+                <Icon name="hash" />
+                {t}
+              </button>
+            ))}
+          </div>
+        )}
+
         <div id="proj-groups" onDragOver={onGroupsDragOver} onDrop={onGroupsDrop}>
-          {keys.map((folderKey) => {
-            const groupProjects = groups.get(folderKey)!;
-            const expanded = expandedGroups.has(folderKey);
-            const groupBody = viewMode === 'card'
-              ? <div className="proj-grid">{groupProjects.map(projectCardEl)}</div>
-              : <div className="proj-list">{groupProjects.map(projectRowEl)}</div>;
+          {folderTree.map((n) => renderFolderNode(n, 0))}
+          {/* 未分类组：不进树，固定渲染在最后（无项目时不渲染空壳） */}
+          {(() => {
+            const uncategorized = filtered.filter((p) => !(p.folder || ''));
+            if (!uncategorized.length) return null;
+            const expanded = expandedOf('');
             return (
-              <div className="proj-group" key={folderKey}>
+              <div className="proj-group">
                 <div
-                  className={`proj-group-title${dropTarget === folderKey ? ' drop-target' : ''}`}
-                  data-folder={folderKey}
-                  onClick={() => toggleGroup(folderKey)}
+                  className={`proj-group-title${dropTarget === '' ? ' drop-target' : ''}`}
+                  data-folder=""
+                  onClick={() => { if (!searching) toggleGroup(''); }}
                   onDragLeave={onGroupTitleDragLeave}
                 >
                   <span className="pgt-folder"><Icon name={expanded ? 'folderOpen' : 'folder'} /></span>
-                  <span className="pgt-name" title={folderKey || '未分类'}>{folderKey || '未分类'}</span>
-                  <span className="tag">{groupProjects.length}</span>
-                  {folderKey ? (
-                    <button className="icon-btn" data-act="rename-folder" data-folder={folderKey}
-                      title={`重命名「${folderKey}」`}
-                      onClick={(e) => { e.stopPropagation(); void renameFolderFlow(folderKey); }}><Icon name="pencil" /></button>
-                  ) : null}
-                  {folderKey && groupProjects.length === 0 ? (
-                    <button className="icon-btn danger" data-act="del-folder" data-folder={folderKey}
-                      title={`删除「${folderKey}」`}
-                      onClick={(e) => { e.stopPropagation(); void deleteFolderFlow(folderKey); }}><Icon name="trash" /></button>
-                  ) : null}
+                  <span className="pgt-name">未分类</span>
+                  <span className="tag">{uncategorized.length}</span>
                 </div>
-                <div className={`proj-group-body${expanded ? '' : ' hidden'}`}>{groupBody}</div>
+                <div className={`proj-group-body${expanded ? '' : ' hidden'}`}>
+                  {renderGroupBody(uncategorized)}
+                </div>
               </div>
             );
-          })}
+          })()}
         </div>
 
         <div className={`empty-state${showEmpty ? '' : ' hidden'}`} id="empty-state">
@@ -1021,16 +1161,32 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
             <div className="field">
               <label>绑定远程服务器（可多选）</label>
               <div className="server-search-row">
-                <input className="input" id="server-search" placeholder="搜索服务器…"
+                <input className="input" id="server-search" placeholder="搜索服务器…（#标签 筛选）"
                   value={serverQuery} onChange={(e) => setServerQuery(e.target.value)} />
               </div>
+              {/* 热门标签 chips：点击切换进/出 #tag 筛选条件 */}
+              {hotServerTags.length > 0 && (
+                <div className="proj-tag-row in-modal">
+                  {hotServerTags.map((t) => (
+                    <button
+                      key={t}
+                      className={`tag clickable${activeServerQueryTags.includes(t.toLowerCase()) ? ' active' : ''}`}
+                      title={`筛选 #${t}`}
+                      onClick={() => setServerQuery(toggleTagInQuery(serverQuery, t))}
+                    >
+                      <Icon name="hash" />
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              )}
               <div className="server-list" id="server-list">{serverListContent}</div>
               <div className={`server-add${miniExpanded ? ' hidden' : ''}`} id="server-add-toggle" onClick={expandMini}>
                 <Icon name="plus" /> 新建服务器连接
               </div>
               <div className={`server-mini${miniExpanded ? '' : ' hidden'}`} id="server-mini">
                 {/* 服务器表单字段（双列紧凑布局）由 ServerForm 渲染，与侧栏编辑表单同源 */}
-                <div id="mini-form"><ServerForm ref={miniFormRef} compact credentials={db.credentials} /></div>
+                <div id="mini-form"><ServerForm ref={miniFormRef} compact credentials={db.credentials} allTags={allTagOptions} /></div>
                 <div className={`error${miniErr === null ? ' hidden' : ''}`} id="mini-err">{miniErr}</div>
                 <div className="mini-actions">
                   <button className="btn" id="mini-cancel"
@@ -1056,7 +1212,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
             <button className="icon-btn" id="srv-modal-close" title="关闭" onClick={closeSrvModal}><Icon name="x" /></button>
           </div>
           <div className="modal-body">
-            <div id="srv-form"><ServerForm ref={srvFormRef} credentials={db.credentials} /></div>
+            <div id="srv-form"><ServerForm ref={srvFormRef} credentials={db.credentials} allTags={allTagOptions} /></div>
             <div className={`error${srvErr === null ? ' hidden' : ''}`} id="srv-err">{srvErr}</div>
           </div>
           <div className="modal-foot">

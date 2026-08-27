@@ -1133,6 +1133,17 @@ impl AiActions {
                 .get("locked")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let tags = crate::store::normalize_tags(
+                &item
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+            );
             // 去重：host+port+username 相同视为同一台
             let existing = self
                 .store
@@ -1140,9 +1151,17 @@ impl AiActions {
                 .into_iter()
                 .find(|sv| sv.host == host && sv.port == port && sv.username == username);
             match existing {
-                Some(sv) => {
-                    // 复用已有配置；仅显式传了 password 时更新 keyring 凭据
-                    if password.is_some() {
+                Some(mut sv) => {
+                    // 复用已有配置；tags 取并集合并（有新标签才落盘），
+                    // 仅显式传了 password 时更新 keyring 凭据
+                    let merged = crate::store::normalize_tags(
+                        &sv.tags.iter().cloned().chain(tags).collect::<Vec<_>>(),
+                    );
+                    let tags_changed = merged != sv.tags;
+                    if tags_changed {
+                        sv.tags = merged;
+                    }
+                    if password.is_some() || tags_changed {
                         self.store.upsert_server(sv.clone(), password.as_deref())?;
                     }
                     pendings.push(Pending {
@@ -1164,6 +1183,7 @@ impl AiActions {
                         locked,
                         is_bastion,
                         bastion_id: None,
+                        tags,
                     };
                     self.store.upsert_server(sv.clone(), password.as_deref())?;
                     pendings.push(Pending {
@@ -2529,6 +2549,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -2613,6 +2634,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -2631,6 +2653,7 @@ mod tests {
                     locked: true,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -2650,6 +2673,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -2958,6 +2982,7 @@ mod tests {
                     locked: false,
                     is_bastion: false,
                     bastion_id: None,
+                    tags: Vec::new(),
                 },
                 None,
             )
@@ -2990,6 +3015,47 @@ mod tests {
         let proj = store.project(r1["projectId"].as_str().unwrap()).unwrap();
         assert_eq!(proj.server_ids.len(), 2); // srv-pre + 新增（重复引用不重复并入）
         assert_eq!(store.servers_all().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sdk_import_project_writes_and_merges_tags() {
+        let (actions, store, dir, ws) = sdk_fixture("import-tags");
+        // 新建条目写入 tags（归一化：trim、去空、去重）
+        let r = actions
+            .sdk_import_project(&json!({
+                "name": "标签项目",
+                "servers": [{"name": "web-1", "host": "10.2.0.1", "username": "root",
+                             "tags": [" AAA ", "", "AAA", "BI"]}]
+            }))
+            .unwrap();
+        assert_eq!(r["servers"][0]["created"], true);
+        let sv = store
+            .servers_all()
+            .into_iter()
+            .find(|s| s.host == "10.2.0.1")
+            .unwrap();
+        assert_eq!(sv.tags, vec!["AAA".to_string(), "BI".to_string()]);
+
+        // 去重命中已有条目：tags 并集合并，已有标签不丢、不重复
+        actions
+            .sdk_import_project(&json!({
+                "name": "标签项目",
+                "servers": [{"name": "web-1", "host": "10.2.0.1", "username": "root",
+                             "tags": ["BI", "访客"]}]
+            }))
+            .unwrap();
+        let sv = store
+            .servers_all()
+            .into_iter()
+            .find(|s| s.host == "10.2.0.1")
+            .unwrap();
+        assert_eq!(
+            sv.tags,
+            vec!["AAA".to_string(), "BI".to_string(), "访客".to_string()]
+        );
+        assert_eq!(store.servers_all().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ws);
     }
