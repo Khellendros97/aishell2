@@ -10,15 +10,8 @@ import { Icon } from '../ui';
 import { TopBar } from './TopBar';
 import { AI_PANEL, WIN_H, WIN_W } from '../scene';
 
-/** 一条聊天消息(气泡态);ai 消息可带工具行与输入中指示 */
-export interface ChatMsg {
-  role: 'user' | 'ai';
-  text: string;
-  /** 工具行标签(如「kb_search 你服务于哪家企业」) */
-  tool?: string;
-  /** 正在输入(三点指示) */
-  typing?: boolean;
-}
+import { Bubble, type ChatMsg } from './AiBits';
+export type { ChatMsg } from './AiBits';
 
 export interface WorkbenchState {
   msgs: ChatMsg[];
@@ -115,58 +108,6 @@ const TERM_LINES: TermLine[] = [
   { prompt: true },
   { cmd: true, cursor: true },
 ];
-
-/** 正在输入三点指示(帧驱动确定性闪烁) */
-const TypingDots: React.FC<{ frame: number }> = ({ frame }) => (
-  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-    <span style={{ fontSize: 11, color: C.text2, marginRight: 2 }}>正在输入</span>
-    {[0, 1, 2].map((i) => {
-      const up = (frame * 2 + i * 8) % 48 < 24;
-      return (
-        <span
-          key={i}
-          style={{
-            width: 5,
-            height: 5,
-            borderRadius: '50%',
-            background: C.text2,
-            opacity: up ? 1 : 0.25,
-            transform: up ? 'translateY(-2px)' : 'none',
-          }}
-        />
-      );
-    })}
-  </span>
-);
-
-const Bubble: React.FC<{ msg: ChatMsg; frame: number }> = ({ msg, frame }) => {
-  const isUser = msg.role === 'user';
-  return (
-    <div style={{ display: 'flex', justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
-      <div
-        style={{
-          maxWidth: '88%',
-          padding: '8px 11px',
-          borderRadius: 10,
-          borderBottomRightRadius: isUser ? 3 : 10,
-          borderBottomLeftRadius: isUser ? 10 : 3,
-          background: isUser ? C.accentDim : C.bg2,
-          fontSize: 12.5,
-          lineHeight: 1.6,
-          wordBreak: 'break-word',
-        }}
-      >
-        {msg.tool && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: C.text2, marginBottom: 3, fontFamily: FONT_MONO }}>
-            <Icon name="wrench" size={11} />
-            {msg.tool}
-          </div>
-        )}
-        {msg.typing && !msg.text ? <TypingDots frame={frame} /> : msg.text}
-      </div>
-    </div>
-  );
-};
 
 export const Workbench: React.FC<{ state: WorkbenchState; frame: number }> = ({ state, frame }) => (
   <div
