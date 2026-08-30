@@ -6,7 +6,9 @@
   "scripts": {
     "studio": "remotion studio src/index.ts",
     "render": "remotion render src/index.ts InitAiDemo out/01-init-ai-demo.mp4",
-    "still": "remotion still src/index.ts InitAiDemo"
+    "render:02": "remotion render src/index.ts ProjectSshDemo out/02-project-ssh-terminal.mp4",
+    "still": "remotion still src/index.ts InitAiDemo",
+    "still:02": "remotion still src/index.ts ProjectSshDemo"
   },
   "dependencies": {
     "@remotion/cli": "^4.0.518",
