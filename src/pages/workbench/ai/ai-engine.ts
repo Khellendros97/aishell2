@@ -60,7 +60,7 @@
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, LlmConfig, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
+import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, LlmConfig, NoteRef, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon, type IconName } from '../../../icons';
 import {
   aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, getState, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
@@ -624,6 +624,7 @@ function cloneChatSession(s: ChatSession): ChatSession {
       browserRefs: m.browserRefs.map((ref) => ({ ...ref })),
       browserPageRefs: (m.browserPageRefs ?? []).map((ref) => ({ ...ref })),
       skillRefs: m.skillRefs.map((ref) => ({ ...ref, scope: [...ref.scope] })),
+      noteRefs: (m.noteRefs ?? []).map((ref) => ({ ...ref })),
       imageRefs: (m.imageRefs ?? []).map((ref) => ({ ...ref })),
       actions: m.actions.map((action) => ({ ...action })),
       ts: m.ts,
@@ -685,6 +686,7 @@ const pathRefs = new Map<string, PathRef>(); // 文件/目录路径引用 path -
 const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key -> 引用（key = `${name}:${ts}`，@browser:名称 标签）
 const pageRefs = new Map<string, BrowserPageRef>(); // 浏览器页面引用 id -> 引用（@page:页面标题 标签，@ 补全插入）
 const skillRefs = new Map<string, SkillRef>(); // 技能引用 key -> 引用（key = `${origin}:${name}`，@skill:名称 标签）
+const noteRefs = new Map<string, NoteRef>(); // 笔记引用 id -> 引用（@note:名称 标签，notes 面板「添加到对话」入口）
 /* 图片附件拆两个 Map：
    - historyImageRefs  历史消息缩略图/预览查找（renderMessage 灌入，跨会话累积）；
    - inputImageRefs    输入区待发图片（attachImages 写入、chip ✕ 删除、clearChips/挂面板清空）。
@@ -922,6 +924,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   browserRefs.clear();
   pageRefs.clear();
   skillRefs.clear();
+  noteRefs.clear();
   inputImageRefs.clear(); // 输入区待发图片随面板重挂清空（历史消息图片在 historyImageRefs，不受影响）
   serversCache = null;
   savedRange = null;
@@ -1167,6 +1170,24 @@ function createAiHandle() {
     skillRefs.set(key, ref);
     insertSkillChip(ref);
   },
+  /** 笔记引用（@note:名称 标签，发送时展开为笔记路径，AI 可循此读取笔记内容）；
+   *  notes 面板「添加到对话」入口；同一笔记重复添加时提示 */
+  addNoteRef(ref: NoteRef): void {
+    if (!ref || typeof ref.path !== 'string' || !ref.path.trim() || !ref.id) return;
+    const dup = [...noteRefs.values()].some((r) => r.path === ref.path);
+    if (dup) {
+      toast('该笔记引用已在输入框中');
+      return;
+    }
+    noteRefs.set(ref.id, ref);
+    insertNoteChip(ref);
+  },
+  /** 把一篇笔记转换为 Skill：新建 AI 会话，发送「笔记引用 + skill-management 技能引用 +
+   *  根据这篇笔记创建skill」指令（智能审批模式下手动确认后由 AI 生成 Skill） */
+  convertNoteToSkill(noteRef: NoteRef): void {
+    if (!noteRef || typeof noteRef.path !== 'string' || !noteRef.path.trim()) return;
+    void convertNoteToSkill(noteRef);
+  },
   /** 图片附件（explorer/SFTP 右键「添加到对话」对图片文件的入口）：
    *  物化由 attachImages 统一完成（vision 门槛 / 数量上限 / 后端嗅探都在那里） */
   addImageRef(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void {
@@ -1205,6 +1226,47 @@ async function startConversation(ctx: ProjectContext, prompt: string): Promise<v
   renderHistory();
   updateSendBtn();
   await send(text);
+}
+
+/** 把一篇笔记转换为 Skill（notes 面板右键「转换成skill」入口）：
+ *  新建 AI 会话，向输入区注入「笔记引用 @note:名称 + skill-management 技能引用 @skill:skill-management
+ *  + 指令文本 根据这篇笔记创建skill」，随后走标准 send() 路径（含首条标题、approval 裁决与 pi 调用）。
+ *  依赖工作台 AI 面板常驻挂载（keep-alive），故其 input/引用 Map 均可用；完成后由用户/审批决定生成。 */
+async function convertNoteToSkill(noteRef: NoteRef): Promise<void> {
+  const ctx = viewContext;
+  if (!ctx || unmounted) { toast('AI 面板尚未就绪'); return; }
+  await loadSessions();
+  if (viewContext !== ctx || unmounted) { toast('AI 面板已离开当前页面'); return; }
+  useWorkbench.getState().setAiVisible(true); // 展示 AI 面板让用户看到生成进度
+  const created = newSession();
+  ctx.activeSessionId = created.id;
+  activeSessionId = created.id;
+  await ensureSessionSubscription(ctx, created.id);
+  renderSessionBar();
+  renderHistory();
+  updateSendBtn();
+  /* 清空输入区残留（清空引用 Map 与 DOM），再注入本次转换的引用与指令 */
+  clearChips();
+  const note: NoteRef = { ...noteRef };
+  noteRefs.set(note.id, note);
+  insertNoteChip(note);
+  const skill: SkillRef = {
+    name: 'skill-management',
+    origin: 'global',
+    scope: ['all'],
+    description: '管理 AIShell 全局与项目 Skill。',
+  };
+  skillRefs.set(skillRefKey(skill), skill);
+  insertSkillChip(skill);
+  const promptText = document.createTextNode('根据这篇笔记创建skill');
+  input.appendChild(promptText);
+  input.focus();
+  const range = document.createRange();
+  range.selectNodeContents(input);
+  range.collapse(false);
+  const sel = window.getSelection();
+  if (sel) { sel.removeAllRanges(); sel.addRange(range); }
+  await send();
 }
 
 function openCurrentStaging(): void {
@@ -1629,6 +1691,7 @@ function finalize(sid: string): void {
     pathRefs: [],
     browserRefs: [],
     skillRefs: [],
+    noteRefs: [],
     actions: collectActions(p),
     ts: Date.now(),
   });
@@ -1653,6 +1716,7 @@ function leaveSession(sid: string, ctx: ProjectContext | null = viewContext): vo
         pathRefs: [],
         browserRefs: [],
         skillRefs: [],
+        noteRefs: [],
         actions: collectActions(p),
         ts: Date.now(),
       });
@@ -2310,6 +2374,8 @@ function buildMessageTokens(m: ChatMsg): MessageToken[] {
     push(`@page:${pageRefLabel(r)}`, '', 'page', `浏览器页面引用 ${pageRefLabel(r)}（${r.url}）`));
   (m.skillRefs ?? []).forEach((r) =>
     push(`@skill:${r.name}`, skillRefKey(r), 'skill', `技能引用「${r.name}」（${r.origin === 'global' ? '全局' : '项目'}）`));
+  (m.noteRefs ?? []).forEach((r) =>
+    push(`@note:${r.name}`, r.id, 'note', `笔记引用「${r.name}」· ${r.path}`));
   return out;
 }
 
@@ -2361,6 +2427,7 @@ function renderMessage(m: ChatMsg, sid: string): HTMLElement {
     m.fileRefs.forEach((ref) => fileRefs.set(ref.id, ref));
     (m.browserRefs ?? []).forEach((r) => browserRefs.set(`${r.name}:${r.ts}`, r));
     (m.imageRefs ?? []).forEach((r) => historyImageRefs.set(r.id, r));
+    (m.noteRefs ?? []).forEach((r) => noteRefs.set(r.id, r));
     /* 新版消息 content 内嵌 token：按 token 原位还原内嵌 chip（保留引用与文字的顺序）；
        旧会话 content 无 token（matched=0）→ 回退为消息上方 chip 行（历史布局） */
     const tokens = buildMessageTokens(m);
@@ -2506,6 +2573,7 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
         <div class="ai-suggest-head"><span class="ai-suggest-icon">${icon('terminal')}</span>
         <span class="ai-suggest-actions">
           <button class="btn small" type="button">粘贴到终端</button>
+          <button class="icon-btn ai-suggest-copy" type="button" title="复制命令到剪贴板">${icon('copy')}</button>
         </span></div>
         <code class="ai-suggest-main">${escapeHtml(p.body)}</code>
         <button class="icon-btn ai-qc-fav" type="button" title="收藏为命令收藏">${icon('star')}</button>
@@ -2586,6 +2654,7 @@ function autoResumeAfterModeSwitch(sid: string): void {
     pathRefs: [],
     browserRefs: [],
     skillRefs: [],
+    noteRefs: [],
     actions: [],
     ts: Date.now(),
   });
@@ -2875,6 +2944,19 @@ function onChatClick(e: MouseEvent): void {
     }
     return;
   }
+  /* 命令卡片的「复制到剪贴板」按钮：只复制命令原文，不触发卡片的粘贴动作 */
+  const copyBtn = target.closest('.ai-suggest-copy') as HTMLElement | null;
+  if (copyBtn) {
+    const card = copyBtn.closest('[data-action]') as HTMLElement | null;
+    if (card) {
+      e.preventDefault();
+      void navigator.clipboard.writeText(card.dataset.cmd ?? '').then(
+        () => toast('已复制到剪贴板', 'success'),
+        () => toast('复制到剪贴板失败', 'error'),
+      );
+    }
+    return;
+  }
   const card = target.closest('[data-action]') as HTMLElement | null;
   if (card) {
     if (card.dataset.action === 'paste') {
@@ -2902,8 +2984,8 @@ function onChatClick(e: MouseEvent): void {
   if (chip) {
     const id = chip.dataset.snapId ?? '';
     const kind = chip.dataset.kind ?? '';
-    // 服务器/路径/技能/页面引用无详情弹窗（title 已带说明）
-    if (kind === 'server' || kind === 'path' || kind === 'skill' || kind === 'page') return;
+    // 服务器/路径/技能/笔记/页面引用无详情弹窗（title 已带说明）
+    if (kind === 'server' || kind === 'path' || kind === 'skill' || kind === 'page' || kind === 'note') return;
     if (kind === 'file') openFileRefModal(fileRefs.get(id));
     else if (kind === 'browser') openBrowserRefModal(browserRefs.get(id));
     else if (kind === 'image') openImageModal(historyImageRefs.get(id) ?? inputImageRefs.get(id));
@@ -2968,6 +3050,10 @@ function chipToken(kind: string, id: string): string {
     case 'skill': {
       const r = skillRefs.get(id);
       return r ? `@skill:${r.name}` : '';
+    }
+    case 'note': {
+      const r = noteRefs.get(id);
+      return r ? `@note:${r.name}` : '';
     }
     case 'page': {
       const r = pageRefs.get(id);
@@ -3063,6 +3149,12 @@ function insertSkillChip(ref: SkillRef): void {
     `技能引用「${ref.name}」（${ref.origin === 'global' ? '全局' : '项目'}），✕ 移除`));
 }
 
+/** 笔记引用 chip：@note:名称，title 带完整路径，点击查看笔记 */
+function insertNoteChip(ref: NoteRef): void {
+  insertChipEl(makeInlineChip('note', ref.id, `@note:${ref.name}`,
+    `笔记引用「${ref.name}」，✕ 移除 · ${ref.path}`));
+}
+
 /** 浏览器页面引用 chip：@page:页面标题（@ 补全插入；发送时展开页面地址与标题） */
 function insertPageChip(ref: BrowserPageRef): void {
   const id = uid('page');
@@ -3088,6 +3180,7 @@ function onInlineChipClick(e: MouseEvent): void {
     else if (kind === 'browser') browserRefs.delete(id);
     else if (kind === 'page') pageRefs.delete(id);
     else if (kind === 'skill') skillRefs.delete(id);
+    else if (kind === 'note') noteRefs.delete(id);
     chip.remove();
     input.focus();
     return;
@@ -3185,6 +3278,7 @@ const clearChips = (): void => {
   browserRefs.clear();
   pageRefs.clear();
   skillRefs.clear();
+  noteRefs.clear();
   inputImageRefs.clear();
   savedRange = null;
   renderWorkareaChip(); // 固定工作区域标签不随发送清空，重新挂载
@@ -3759,7 +3853,8 @@ type ChipDatum =
   | { kind: 'path'; ref: PathRef }
   | { kind: 'browser'; ref: BrowserRef }
   | { kind: 'page'; ref: BrowserPageRef }
-  | { kind: 'skill'; ref: SkillRef };
+  | { kind: 'skill'; ref: SkillRef }
+  | { kind: 'note'; ref: NoteRef };
 
 function readInputSegments(): InputSegment[] {
   const segs: InputSegment[] = [];
@@ -3858,6 +3953,7 @@ async function send(textOverride?: string): Promise<void> {
   const brefs: BrowserRef[] = [];
   const pgrefs: BrowserPageRef[] = [];
   const skrefs: SkillRef[] = [];
+  const nrefs: NoteRef[] = [];
   const imgs: ImageRef[] = [];
   for (const seg of segments) {
     if (seg.kind !== 'chip' || seenIds.has(seg.id)) continue;
@@ -3903,11 +3999,17 @@ async function send(textOverride?: string): Promise<void> {
       seenIds.add(seg.id);
       chipData.set(seg.id, { kind: 'skill', ref: r });
       skrefs.push(r);
+    } else if (seg.chipKind === 'note') {
+      const r = noteRefs.get(seg.id);
+      if (!r) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'note', ref: r });
+      nrefs.push(r);
     }
   }
   inputImageRefs.forEach((r) => imgs.push(r));
   const text = segmentsToText(segments).trim();
-  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && pgrefs.length === 0 && skrefs.length === 0 && imgs.length === 0) return;
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && pgrefs.length === 0 && skrefs.length === 0 && nrefs.length === 0 && imgs.length === 0) return;
 
   // 只有新会话的第一条用户消息触发一次标题任务；后续消息永不自动改名。
   const shouldGenerateTitle = s.messages.length === 0 && !s.autoTitleTriggered;
@@ -3926,7 +4028,7 @@ async function send(textOverride?: string): Promise<void> {
     );
   }
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, imageRefs: imgs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, noteRefs: nrefs, imageRefs: imgs, actions: [], ts: Date.now() });
   if (shouldGenerateTitle) s.autoTitleTriggered = true;
   clearChips();
   pendingBy.set(sid, emptyPending());
@@ -4025,6 +4127,8 @@ async function buildPrompt(segments: InputSegment[], imgs: ImageRef[], chipData:
         return `\n\n[浏览器页面引用 @page:${pageRefLabel(d.ref)}]\n页面: ${d.ref.title || '（无标题）'} (${d.ref.url})\n可用 browser_read / browser_screenshot 读取该页面内容`;
       case 'skill':
         return `\n\n[技能引用 @skill:${d.ref.name}]\n名称: ${d.ref.name}（${d.ref.origin === 'global' ? '全局' : '项目'}）\nscope: ${d.ref.scope.join(', ') || '-'}\n描述: ${d.ref.description}`;
+      case 'note':
+        return `\n\n[笔记引用 @note:${d.ref.name}]\n路径: ${d.ref.path}\n请先读取该笔记文件内容再基于它作答。`;
     }
   };
   const parts: string[] = [];

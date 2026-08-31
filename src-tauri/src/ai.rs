@@ -128,7 +128,7 @@ const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
 /// ask/confirm 为通用交互工具（execute 内自带前端问答/确认卡片，交互即授权），三档模式可用。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm";
+const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
@@ -562,9 +562,16 @@ impl AiManager {
             })
             .collect();
         let global_skills = vec![loaded.global_root.to_string_lossy().into_owned()];
+        // 笔记根（工作区全局 <workspace>/.aishell/notes）：AI 读/写/列笔记的额外允许目录。
+        // 工作区未配置时为空（guard fail-closed 只保留项目根权限，等待工单到设置页配置）。
+        let notes_dirs = match self.store.notes_root() {
+            Ok(root) => vec![root.to_string_lossy().into_owned()],
+            Err(_) => vec![],
+        };
         let enc = |v: &[String]| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
         cmd.env("AISHELL_SKILL_DIRS", enc(&skill_dirs))
-            .env("AISHELL_GLOBAL_SKILLS_DIR", enc(&global_skills));
+            .env("AISHELL_GLOBAL_SKILLS_DIR", enc(&global_skills))
+            .env("AISHELL_NOTES_DIR", enc(&notes_dirs));
         if let Some(key) = brave_key {
             cmd.env("BRAVE_API_KEY", key);
         }
@@ -1569,6 +1576,28 @@ fn compute_approval_impact(
     }
 }
 
+/// 把笔记清单格式化为 AI 可读文本：先给绝对根目录（AI 据此拼绝对路径 read），再列目录与笔记（相对路径）。
+fn format_notes_listing(root: &std::path::Path, l: &crate::notes::NotesListing) -> String {
+    let mut out = format!("笔记绝对根目录：{}\n", root.display());
+    out.push_str("笔记清单（相对路径）：\n");
+    if l.dirs.is_empty() {
+        out.push_str("（无子目录）\n");
+    } else {
+        for d in &l.dirs {
+            out.push_str(&format!("目录: {d}/\n"));
+        }
+    }
+    out.push_str("笔记文件：\n");
+    if l.notes.is_empty() {
+        out.push_str("（暂无笔记，可请用户先在笔记面板创建）\n");
+    } else {
+        for n in &l.notes {
+            out.push_str(&format!("- {n}\n"));
+        }
+    }
+    out
+}
+
 /// 执行扩展内部动作请求，返回回写扩展的结果 JSON（{ok:true,text}|{ok:false,error}）。
 /// 会话级暂存动作（staging_*）与 run_command/sftp_upload 的自动备份都以 key 推导的
 /// session_id 为准（guard 不暴露任意 project/session 参数）。
@@ -1602,6 +1631,10 @@ async fn run_internal_action(
         "list_servers" => actions
             .list_servers(project_id)
             .map(|text| json!({"ok": true, "text": text})),
+        "notes_list" => Ok(match (store.notes_root(), crate::notes::notes_listing(store)) {
+            (Ok(root), Ok(l)) => json!({"ok": true, "text": format_notes_listing(&root, &l)}),
+            (Err(e), _) | (_, Err(e)) => json!({"ok": false, "error": e}),
+        }),
         "run_command" => {
             let intent = str_field("intent");
             let command = str_field("command");
@@ -2665,6 +2698,53 @@ mod tests {
         assert!(tools_agent.contains(",py"), "agent/yolo 工具集应含 py");
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
         assert!(!tools_suggest.contains(",py"), "suggest 工具集不应含 py");
+    }
+
+    #[test]
+    fn format_notes_listing_lists_dirs_and_notes() {
+        use std::path::Path;
+        let l = crate::notes::NotesListing {
+            dirs: vec!["a组".to_string(), "b组/子".to_string()],
+            notes: vec!["b组/x.md".to_string(), "顶层.md".to_string()],
+        };
+        let root = Path::new("C:/ws/.aishell/notes");
+        let text = format_notes_listing(root, &l);
+        assert!(text.contains("C:/ws/.aishell/notes"), "应给出绝对根目录: {text}");
+        assert!(text.contains("目录: a组/"), "目录应列出: {text}");
+        assert!(text.contains("目录: b组/子/"), "嵌套目录应列出: {text}");
+        assert!(text.contains("- b组/x.md"), "笔记应列出: {text}");
+        assert!(text.contains("- 顶层.md"), "笔记应列出: {text}");
+    }
+
+    #[test]
+    fn guard_extension_whitelists_notes_and_registers_notes_list() {
+        // 笔记目录读/写白名单 + notes_list 工具探针：guard 读取 AISHELL_NOTES_DIR，
+        // read/write 允许笔记根；notes_list 注册且不限于 agent/yolo（不进 AI_ONLY_TOOLS）、不受控审批
+        assert!(
+            GUARD_EXT.contains("AISHELL_NOTES_DIR"),
+            "guard 应读取笔记根环境变量"
+        );
+        assert!(GUARD_EXT.contains("name: \"notes_list\""), "guard 应注册 notes_list 工具");
+        assert!(GUARD_EXT.contains("\"notes_list\""), "notes_list 应走 notes_list 动作桥");
+        let ai_only_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const AI_ONLY_TOOLS"))
+            .unwrap_or_default();
+        assert!(
+            !ai_only_line.contains("notes_list"),
+            "notes_list 应三档模式可用（不限于 agent/yolo）"
+        );
+        let controlled_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const CONTROLLED_TOOLS"))
+            .unwrap_or_default();
+        assert!(
+            !controlled_line.contains("notes_list"),
+            "notes_list 是只读查询，不应受控审批"
+        );
+        // 初始 --tools 集（suggest/agent/yolo 一致）应含 notes_list
+        let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
+        assert!(tools_suggest.contains("notes_list"), "suggest 工具集应含 notes_list");
     }
 
     #[test]

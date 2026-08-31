@@ -31,9 +31,9 @@ pub struct NotesListing {
     pub notes: Vec<String>,
 }
 
-/// 递归收集 notes 根下的目录与 .md 笔记(相对路径)。
-#[tauri::command]
-pub async fn notes_list_cmd(store: State<'_, Arc<Store>>) -> Result<NotesListing, String> {
+/// 递归收集 notes 根下的目录与 .md 笔记(相对路径,'/' 分隔,排序)。
+/// 供 notes_list_cmd 与 AI 的 notes_list 动作复用(同一数据形态)。
+pub(crate) fn notes_listing(store: &Store) -> Result<NotesListing, String> {
     let root = store.notes_root()?;
     let mut out = NotesListing {
         dirs: Vec::new(),
@@ -59,6 +59,11 @@ pub async fn notes_list_cmd(store: State<'_, Arc<Store>>) -> Result<NotesListing
     out.dirs.sort();
     out.notes.sort();
     Ok(out)
+}
+
+#[tauri::command]
+pub async fn notes_list_cmd(store: State<'_, Arc<Store>>) -> Result<NotesListing, String> {
+    notes_listing(&store)
 }
 
 /// 标题清洗:去掉文件系统非法字符与首尾空白(控制符一并剔除)。
@@ -573,5 +578,19 @@ mod tests {
         notes.sort();
         assert_eq!(dirs, vec!["a组", "b组", "b组/子"]);
         assert_eq!(notes, vec!["b组/x.md", "顶层.md"]);
+    }
+
+    #[test]
+    fn notes_listing_helper_recurses_and_sorts() {
+        // notes_listing 助手直接复用（notes_list_cmd 与 AI notes_list 动作共用同一形态）
+        let (store, root) = store_with_notes("listing-helper");
+        fs::create_dir_all(root.join("b组/子")).unwrap();
+        fs::create_dir_all(root.join("a组")).unwrap();
+        fs::write(root.join("b组/x.md"), "x").unwrap();
+        fs::write(root.join("b组/忽略.txt"), "x").unwrap();
+        fs::write(root.join("顶层.md"), "x").unwrap();
+        let listing = notes_listing(&store).unwrap();
+        assert_eq!(listing.dirs, vec!["a组", "b组", "b组/子"]);
+        assert_eq!(listing.notes, vec!["b组/x.md", "顶层.md"]);
     }
 }

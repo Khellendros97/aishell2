@@ -710,6 +710,19 @@ pub struct BrowserPageRef {
     pub ts: i64,
 }
 
+/// 笔记引用：UI 以 @note:笔记名称 标签呈现，发送时展开为笔记路径（AI 可循此读取笔记内容）。
+/// 笔记为工作区全局 <workspace>/.aishell/notes 下的 markdown 文件；path 为绝对路径。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRef {
+    /// 输入 chip / 历史消息引用的唯一 id
+    pub id: String,
+    /// 笔记绝对路径
+    pub path: String,
+    /// 笔记显示名（label，不含 .md 扩展名）
+    pub name: String,
+}
+
 /// 图片附件引用：UI 以缩略图呈现，发送时随 prompt 经 pi RPC images 字段传给多模态模型。
 /// path 指向落盘副本（<project>/.aishell/ai-images/，attach 时由后端物化），
 /// aishell.json 只存路径不存 base64（该文件整体原子重写，塞图会膨胀）。
@@ -757,6 +770,9 @@ pub struct ChatMsg {
     /// 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话无此字段时按空处理
     #[serde(default)]
     pub skill_refs: Vec<SkillRef>,
+    /// 笔记引用（@note:名称 标签，发送时展开为笔记路径）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub note_refs: Vec<NoteRef>,
     /// 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话无此字段时按空处理
     #[serde(default)]
     pub image_refs: Vec<ImageRef>,
@@ -3142,6 +3158,7 @@ mod tests {
             browser_refs: vec![],
             browser_page_refs: vec![],
             skill_refs: vec![],
+            note_refs: vec![],
             image_refs: vec![],
             actions: vec![],
             ts: 1,
@@ -3276,6 +3293,12 @@ mod tests {
                                 origin: "project".to_string(),
                                 scope: vec!["all".to_string()],
                                 description: "代码审查".to_string(),
+                            }],
+                            note_refs: vec![NoteRef {
+                                id: "note-1".to_string(),
+                                path: "D:/AIShellWorkspace/.aishell/notes/deploy.md"
+                                    .to_string(),
+                                name: "deploy".to_string(),
                             }],
                             image_refs: vec![ImageRef {
                                 id: "img-1".to_string(),
@@ -5538,6 +5561,7 @@ mod tests {
             browser_refs: vec![],
             browser_page_refs: vec![],
             skill_refs: vec![],
+            note_refs: vec![],
             image_refs: vec![],
             actions: vec![],
             ts: 1,
@@ -5560,6 +5584,7 @@ mod tests {
                     browser_refs: vec![],
                     browser_page_refs: vec![],
                     skill_refs: vec![],
+                    note_refs: vec![],
                     image_refs: vec![],
                     actions: vec![AiActionRecord {
                         tool_call_id: "call-1".to_string(),
@@ -5722,6 +5747,10 @@ mod tests {
             msg.browser_page_refs.is_empty(),
             "旧数据应兼容为空浏览器页面引用列表"
         );
+        assert!(
+            msg.note_refs.is_empty(),
+            "旧数据应兼容为空笔记引用列表"
+        );
     }
 
     #[test]
@@ -5743,6 +5772,27 @@ mod tests {
         let back: ChatMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(back.browser_page_refs.len(), 1);
         assert_eq!(back.browser_page_refs[0].title, "控制台");
+    }
+
+    #[test]
+    fn chat_msg_note_refs_roundtrip_camel_case() {
+        // 笔记引用字段按 camelCase 往返（与前端 ChatMsg.noteRefs 对齐）
+        let m = ChatMsg {
+            note_refs: vec![NoteRef {
+                id: "note-1".to_string(),
+                path: "D:/AIShellWorkspace/.aishell/notes/deploy.md".to_string(),
+                name: "deploy".to_string(),
+            }],
+            ..test_chat_msg("user", "看看 @note:deploy")
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains("\"noteRefs\""),
+            "序列化应为 camelCase: {json}"
+        );
+        let back: ChatMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.note_refs.len(), 1);
+        assert_eq!(back.note_refs[0].name, "deploy");
     }
 
     #[test]

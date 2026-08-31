@@ -230,6 +230,17 @@ export interface BrowserPageRef {
   ts: number;
 }
 
+/** 笔记引用：UI 以 @note:笔记名称 标签呈现，发送时展开为笔记路径（AI 可循此读取笔记内容）。
+ *  笔记为工作区全局 <workspace>/.aishell/notes 下的 markdown 文件；path 为绝对路径。 */
+export interface NoteRef {
+  /** 输入 chip / 历史消息引用的唯一 id */
+  id: string;
+  /** 笔记绝对路径 */
+  path: string;
+  /** 笔记显示名（label，不含 .md 扩展名） */
+  name: string;
+}
+
 /** 图片附件：UI 以缩略图呈现，发送时经 ai_chat 的 images 参数（pi RPC images 字段）传给多模态模型 */
 export interface ImageRef {
   id: string;
@@ -318,6 +329,8 @@ export interface ChatMsg {
   browserPageRefs?: BrowserPageRef[];
   /** 技能引用（@skill:名称 标签，发送时展开名/来源/scope/描述）；旧会话为空 */
   skillRefs: SkillRef[];
+  /** 笔记引用（@note:名称 标签，发送时展开为笔记路径）；旧会话为空 */
+  noteRefs: NoteRef[];
   /** 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话为空 */
   imageRefs?: ImageRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */

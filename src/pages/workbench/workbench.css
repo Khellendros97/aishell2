@@ -35,6 +35,10 @@
    复制 #sidebar-content 的滚动/布局语义，使面板内 container.scrollTop 等行为不变 */
 .wbs-panel-root { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 
+/* 侧栏折叠：隐藏面板内容与分隔条，仅保留 activity-bar 图标栏（图标栏点击自动展开） */
+#workbench.sidebar-collapsed #sidebar,
+#workbench.sidebar-collapsed #sidebar-resizer { display: none; }
+
 /* 左右面板可调宽分隔条；支持鼠标拖拽与键盘方向键微调 */
 .wb-resize-handle {
   position: relative; z-index: 4; flex: none; width: 6px; height: 100%;

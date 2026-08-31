@@ -216,6 +216,8 @@ export default function (pi: ExtensionAPI) {
 	const globalSkillsDir = envDirs("AISHELL_GLOBAL_SKILLS_DIR");
 	/** 本次最终加载的启用技能目录清单（read/grep/find/ls 额外允许根，含全局技能目录） */
 	const skillDirs = envDirs("AISHELL_SKILL_DIRS");
+	/** 笔记根（工作区全局 <workspace>/.aishell/notes）：AI 读/写/列笔记的额外允许目录；工作区未配置时为空 */
+	const notesDirs = envDirs("AISHELL_NOTES_DIR");
 	const insideAny = (dirs: string[], targetLower: string): boolean =>
 		dirs.some((d) => inside(d, targetLower));
 
@@ -421,8 +423,8 @@ export default function (pi: ExtensionAPI) {
 				const raw = rawPath();
 				const p = path.resolve(cwd, raw);
 				const lower = p.toLowerCase();
-				// 项目根 + 最终启用技能目录（含全局技能目录；技能正文按绝对 SKILL.md 路径 read）
-				if (!inside(root, lower) && !insideAny(skillDirs, lower)) {
+				// 项目根 + 最终启用技能目录（含全局技能目录；技能正文按绝对 SKILL.md 路径 read）+ 笔记根
+				if (!inside(root, lower) && !insideAny(skillDirs, lower) && !insideAny(notesDirs, lower)) {
 					return { block: true, reason: `AIShell 权限边界:只能读项目目录内的文件(拒绝:${raw})。` };
 				}
 				return undefined;
@@ -444,15 +446,15 @@ export default function (pi: ExtensionAPI) {
 				const p = path.resolve(cwd, raw);
 				const lower = p.toLowerCase();
 				const limit = mode === "suggest" ? writableRoot : root;
-				// 全局技能根内 write/edit 在 suggest 沿用「.aishell 内可写且无需受控审批」语义；
+				// 全局技能根与笔记根内 write/edit 在 suggest 沿用「.aishell 内可写且无需受控审批」语义；
 				// agent/yolo 照常由 CONTROLLED_TOOLS 触发审批
-				if (!inside(limit, lower) && !insideAny(globalSkillsDir, lower)) {
+				if (!inside(limit, lower) && !insideAny(globalSkillsDir, lower) && !insideAny(notesDirs, lower)) {
 					return {
 						block: true,
 						reason:
 							mode === "suggest"
-								? `AIShell 权限边界:只能写项目 .aishell/ 或全局技能目录下的文件(拒绝:${raw})。修改项目文件请改为在回复中输出命令卡,让用户在终端执行。`
-								: `AIShell 权限边界:只能写项目目录或全局技能目录内的文件(拒绝:${raw})。`,
+								? `AIShell 权限边界:只能写项目 .aishell/、全局技能目录或笔记目录下的文件(拒绝:${raw})。修改项目文件请改为在回复中输出命令卡,让用户在终端执行。`
+								: `AIShell 权限边界:只能写项目目录、全局技能目录或笔记目录内的文件(拒绝:${raw})。`,
 					};
 				}
 				return undefined;
@@ -533,6 +535,9 @@ export default function (pi: ExtensionAPI) {
 				return undefined;
 			case "list_servers":
 				// 只读查询：项目绑定的可操作服务器列表（无路径参数）
+				return undefined;
+			case "notes_list":
+				// 只读查询：工作区全局笔记清单（目录 + .md 文件，相对路径）；三档模式可用
 				return undefined;
 			case "db_query": {
 				// 仅工作/全自动模式提供；参数校验（白名单权威裁决在 Rust）
@@ -1016,6 +1021,22 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
 			return await rustAction(ctx, toolCallId, { action: "list_servers" });
+		},
+	});
+
+	pi.registerTool({
+		name: "notes_list",
+		label: "列出笔记",
+		description:
+			"查询工作区全局笔记清单：返回笔记绝对根目录（<workspace>/.aishell/notes）与其中的目录、.md 笔记相对路径（按名称排序）。帮助 AI 找到用户可能引用的笔记；拿到笔记相对或绝对路径后，用 read 读取笔记正文（笔记目录已加入读白名单）。",
+		promptSnippet: "列出工作区全局笔记",
+		promptGuidelines: [
+			"用户提到某篇笔记、或需要基于笔记内容作答/创建 Skill 时，先调用 notes_list 拿到笔记清单与绝对根目录，再 read 读取对应 .md 文件正文（read 传 <笔记绝对根目录>/<相对路径>）。",
+			"相对路径形如 部署/deploy.md（根为 <workspace>/.aishell/notes）；read 时直接用结果给出的绝对根目录拼接相对路径，避免受当前工作目录影响。",
+		],
+		parameters: Type.Object({}),
+		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, { action: "notes_list" });
 		},
 	});
 

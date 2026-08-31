@@ -10,7 +10,7 @@
  * 与后端的接口点:无(纯前端状态);项目数据事实源仍在 Rust 端 aishell.json。
  */
 import { create } from 'zustand';
-import type { BrowserRef, FileRef, PathRef, Project, ServerRef, SkillRef, TermSnapshot } from '../types';
+import type { BrowserRef, FileRef, NoteRef, PathRef, Project, ServerRef, SkillRef, TermSnapshot } from '../types';
 import type { IconName } from '../icons';
 import { toast } from '../ui';
 
@@ -62,6 +62,10 @@ export interface AiHandle {
   addBrowserRef?(ref: BrowserRef): void;
   /** 技能引用(@skill:名称 标签,发送时展开名/来源/scope/描述) */
   addSkillRef?(ref: SkillRef): void;
+  /** 笔记引用(@note:名称 标签,发送时展开为笔记路径;notes 面板「添加到对话」入口) */
+  addNoteRef?(ref: NoteRef): void;
+  /** 把一篇笔记转换为 Skill:新建 AI 会话并发送「笔记引用 + skill-management 技能引用 + 指令文本」 */
+  convertNoteToSkill?(ref: NoteRef): void;
   /** 图片附件(explorer/SFTP 右键「添加到对话」对图片文件的入口;物化与上限校验在引擎内) */
   addImageRef?(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void;
   /** 当前 AI 会话 ID;会话尚未加载时返回 null。 */
@@ -81,6 +85,8 @@ interface WorkbenchState {
   activeId: string | null;
   panel: PanelKey;
   aiVisible: boolean;
+  /** 左侧功能面板(sidebar)是否折叠隐藏(折叠时仅保留 activity-bar 图标栏) */
+  sidebarCollapsed: boolean;
   openTab(options: OpenTabOptions): Tab | null;
   closeTab(id: string): void;
   activateTab(id: string): void;
@@ -88,6 +94,7 @@ interface WorkbenchState {
   /** 切换侧栏面板;commands 有准入(活跃标签须为终端),不满足时 toast 并拒绝 */
   setPanel(panel: PanelKey): void;
   setAiVisible(visible: boolean): void;
+  setSidebarCollapsed(collapsed: boolean): void;
   setProject(project: Project | null): void;
   /** 工作台实例销毁时复位(换项目重建 / 应用内销毁路径) */
   reset(): void;
@@ -142,6 +149,7 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
   activeId: null,
   panel: 'explorer',
   aiVisible: true,
+  sidebarCollapsed: false,
 
   openTab({ id, type, title, data = {}, onClose = null, activate = true }) {
     const s = get();
@@ -203,6 +211,10 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
     set({ aiVisible: visible });
   },
 
+  setSidebarCollapsed(collapsed) {
+    set({ sidebarCollapsed: collapsed });
+  },
+
   setProject(project) {
     set({ project });
   },
@@ -210,7 +222,7 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
   reset() {
     tabApis.clear();
     wbHandles.ai = null;
-    set({ project: null, tabs: [], activeId: null, panel: 'explorer', aiVisible: true });
+    set({ project: null, tabs: [], activeId: null, panel: 'explorer', aiVisible: true, sidebarCollapsed: false });
   },
 }));
 

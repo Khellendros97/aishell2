@@ -19,7 +19,7 @@ import type { Project, ServerRef } from '../../types';
 import { Topbar } from '../../components/Topbar';
 import { Icon } from '../../shared/Icon';
 import {
-  useWorkbench, wbHandles, type PanelKey, type Tab,
+  useWorkbench, wbEvents, wbHandles, type PanelKey, type Tab,
 } from '../../stores/workbench';
 import { PANELS } from './sidebar/panels';
 import { TAB_TYPES } from './tabs/registry';
@@ -137,6 +137,7 @@ export interface WorkbenchProps {
 export default function Workbench({ active, targetParam, onReady, onFail }: WorkbenchProps): JSX.Element {
   const panel = useWorkbench((s) => s.panel);
   const aiVisible = useWorkbench((s) => s.aiVisible);
+  const sidebarCollapsed = useWorkbench((s) => s.sidebarCollapsed);
   const tabs = useWorkbench((s) => s.tabs);
   const activeId = useWorkbench((s) => s.activeId);
   const project = useWorkbench((s) => s.project);
@@ -187,6 +188,36 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /* ---------- 项目数据变更(欢迎页/设置/命令面板广播 aishell:data-changed):重同步项目 ----------
+     keep-alive 下本组件常驻挂载,编辑项目路径/名称/绑定服务器后返回工作台必须用最新值:
+     重拉项目 → setProject 覆盖内存单例 → 再触发 project-changed 让 explorer/服务器等面板
+     重建根与刷新(对照 ServersPanel 的 setProject 语义)。已在跑会话不销毁,仅后续操作用新路径。 */
+  useEffect(() => {
+    const onDataChanged = (): void => {
+      void (async () => {
+        try {
+          const state = await getState();
+          const cur = useWorkbench.getState().project;
+          if (!cur) return;
+          const next = state.projects.find((p) => p.id === cur.id);
+          if (!next) return; // 项目被删:删除动作走实例销毁路径,此处保持现状
+          const changed = next.path !== cur.path
+            || next.name !== cur.name
+            || (next.serverIds ?? []).join() !== (cur.serverIds ?? []).join()
+            || next.folder !== cur.folder;
+          if (changed) {
+            useWorkbench.getState().setProject(next);
+            wbEvents.emit('project-changed');
+          }
+        } catch {
+          /* getState 失败(后端未就绪)静默 */
+        }
+      })();
+    };
+    window.addEventListener('aishell:data-changed', onDataChanged);
+    return () => window.removeEventListener('aishell:data-changed', onDataChanged);
+  }, []);
+
   /* ---------- 实例销毁:关闭全部标签(触发各组件清理→term_close 等后端回收)并复位 ---------- */
   useEffect(() => () => {
     const s = useWorkbench.getState();
@@ -212,19 +243,23 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     if (s.panel === 'commands' && (!activeTab || activeTab.type !== 'terminal')) s.setPanel('explorer');
   }, [activeId, panel]);
 
-  /* ---------- activity-bar 点击:面板切换 / 浏览器标签页入口 / AI 面板开关 ---------- */
+  /* ---------- activity-bar 点击:面板切换 / 浏览器标签页入口 / AI 面板开关 / 侧栏折叠 ---------- */
   const onActivityClick = (e: ReactMouseEvent<HTMLDivElement>): void => {
     const iconEl = (e.target as HTMLElement).closest('.activity-icon');
     if (!iconEl) return;
     const p = iconEl.getAttribute('data-panel');
     const s = useWorkbench.getState();
+    if (p === 'sidebar-toggle') { s.setSidebarCollapsed(!s.sidebarCollapsed); return; }
     if (p === 'ai') { s.setAiVisible(!s.aiVisible); return; }
     if (p === 'browser') {
       // 浏览器是中央标签页(非侧栏面板):固定 id 单实例,openTab 同 id 去重激活
       s.openTab({ id: 'browser', type: 'browser', title: '浏览器' });
       return;
     }
-    if (!p || p === s.panel) return;
+    if (!p) return;
+    // 侧栏折叠时点击任意面板图标:先展开侧栏再切换面板
+    if (s.sidebarCollapsed) s.setSidebarCollapsed(false);
+    if (p === s.panel) return;
     s.setPanel(p as PanelKey);
   };
 
@@ -264,8 +299,14 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     <>
       <Topbar activePage={null} />
       <div id="workbench-shell">
-        <div id="workbench" ref={workbenchRef} aria-hidden={!active}>
+        <div id="workbench" ref={workbenchRef} aria-hidden={!active} className={sidebarCollapsed ? 'sidebar-collapsed' : ''}>
           <div id="activity-bar" ref={activityBarRef} onClick={onActivityClick}>
+            <div
+              className="activity-icon"
+              data-panel="sidebar-toggle"
+              title={sidebarCollapsed ? '展开侧栏' : '折叠侧栏'}
+              aria-label={sidebarCollapsed ? '展开侧栏' : '折叠侧栏'}
+            ><Icon name={sidebarCollapsed ? 'chevronRight' : 'chevronLeft'} /></div>
             <div className={`activity-icon${panel === 'explorer' ? ' active' : ''}`} data-panel="explorer" title="文件资源管理器"><Icon name="folder" /></div>
             <div className={`activity-icon${panel === 'servers' ? ' active' : ''}`} data-panel="servers" title="服务器列表"><Icon name="monitor" /></div>
             <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
