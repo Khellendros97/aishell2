@@ -86,6 +86,16 @@ pub struct ClientConflict {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientConfigCounts {
+    pub projects: usize,
+    pub servers: usize,
+    pub credentials: usize,
+    pub command_folders: usize,
+    pub project_folders: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSyncStatus {
@@ -101,6 +111,8 @@ pub struct ClientSyncStatus {
     pub quota: ClientQuota,
     pub limits: ClientLimits,
     pub device: Option<ClientDevice>,
+    /// 云端核心配置（core_config）里各实体的数量，反映已备份到云端的配置规模。
+    pub config_counts: Option<ClientConfigCounts>,
 }
 
 impl Default for ClientSyncStatus {
@@ -118,6 +130,7 @@ impl Default for ClientSyncStatus {
             quota: ClientQuota::default(),
             limits: ClientLimits::default(),
             device: None,
+            config_counts: None,
         }
     }
 }
@@ -170,6 +183,21 @@ impl CloudSyncManager {
         Ok((id.to_string(), capabilities))
     }
 
+    /// 云同步会把云端项目配置落到 workspace 下重建本机目录，未配置 workspace 不允许同步。
+    fn require_workspace(&self) -> Result<(), String> {
+        let configured = self
+            .store
+            .settings()
+            .workspace_dir
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if configured {
+            Ok(())
+        } else {
+            Err("请先在设置中配置 Workspace 目录，再进行云同步（云端项目需要在该目录下创建本机项目目录）".to_string())
+        }
+    }
+
     pub(crate) fn api(&self) -> Result<SyncApi<ReqwestTransport>, String> {
         Ok(SyncApi::new(ReqwestTransport::from_cloud(
             Arc::clone(&self.cloud),
@@ -213,6 +241,13 @@ impl CloudSyncManager {
 
     pub(crate) fn local_store(&self) -> &CloudSyncStore {
         &self.local
+    }
+
+    /// 记录云端核心配置（core_config）各实体的数量，供前端展示「已备份到云端的配置规模」。
+    fn record_config_counts(&self, payload: &CoreConfigPayloadV1) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.status.config_counts = Some(config_counts(payload));
+        }
     }
 
     pub(crate) fn app_handle(&self) -> &AppHandle {
@@ -291,6 +326,8 @@ impl CloudSyncManager {
         validate_password(password)?;
         let (user_id, caps) = self.user_context()?;
         if !caps.data_sync && !caps.file_backup { return Err("当前账号未开通云同步或文件备份能力".into()); }
+        // 仅开通文件备份的账号不需要 workspace；有数据同步能力的账号初始化后必然同步项目。
+        if caps.data_sync { self.require_workspace()?; }
         let api = self.api()?;
         let mut state = self.ensure_device(&api, &user_id).await?;
         let remote = api.status().await.map_err(|error| error.to_string())?;
@@ -393,6 +430,7 @@ impl CloudSyncManager {
         let _guard = self.sync_lock.lock().await;
         let (user_id, caps) = self.user_context()?;
         if !caps.data_sync { return Err("当前账号未开通用户数据同步能力".into()); }
+        self.require_workspace()?;
         let vault = self.vault_key()?;
         let api = self.api()?;
         let mut state = self.ensure_device(&api, &user_id).await?;
@@ -502,6 +540,8 @@ impl CloudSyncManager {
         match item.entity_type.as_str() {
             CORE_ENTITY_TYPE => {
                 let remote: CoreConfigPayloadV1 = serde_json::from_slice(plaintext).map_err(|error| format!("云端核心配置格式损坏: {error}"))?;
+                // 拉取到云端核心配置后记录其规模（项目/服务器/凭据等计数）。
+                self.record_config_counts(&remote);
                 let local_state = self.store.sync_snapshot()?;
                 let local = from_app_state(&local_state);
                 let baseline: Option<CoreConfigPayloadV1> = self.local.load_baseline(user_id, CORE_ENTITY_TYPE, CORE_ENTITY_ID).map_err(|error| error.to_string())?;
@@ -609,6 +649,8 @@ impl CloudSyncManager {
             self.submit_pending(api, user_id, state, &pending, remote_status.limits.max_batch_items.max(1) as usize).await?;
         }
         self.local.save_baseline(user_id, CORE_ENTITY_TYPE, CORE_ENTITY_ID, &core).map_err(|error| error.to_string())?;
+        // 推送后记录本机核心配置规模（本机已与云端就这些配置达成一致）。
+        self.record_config_counts(&core);
         Ok(())
     }
 
@@ -719,7 +761,75 @@ fn client_quota(quota: &SyncQuota) -> ClientQuota { ClientQuota { used_bytes: qu
 fn client_limits(limits: &SyncLimits, quota: &SyncQuota) -> ClientLimits { ClientLimits { max_batch_items: limits.max_batch_items, max_batch_bytes: limits.max_batch_bytes, inline_payload_bytes: limits.inline_payload_bytes, max_backup_bytes: limits.max_single_file_bytes, max_backup_files: quota.backup_object_limit, max_concurrent_backups: 0 } }
 fn client_device(device: Device, current: Option<&str>) -> ClientDevice { ClientDevice { is_current: current == Some(device.id.as_str()), id: device.id, name: device.name, revoked: device.revoked, last_seen_at: Some(device.last_seen_at), created_at: Some(device.created_at) } }
 fn entity_key(entity_type: &str, entity_id: &str) -> String { format!("{entity_type}:{entity_id}") }
+fn config_counts(payload: &CoreConfigPayloadV1) -> ClientConfigCounts {
+    ClientConfigCounts {
+        projects: payload.projects.len(),
+        servers: payload.servers.len(),
+        credentials: payload.credentials.len(),
+        command_folders: payload.command_folders.len(),
+        project_folders: payload.project_folders.len(),
+    }
+}
 fn validate_password(password: &str) -> Result<(), String> { if password.chars().count() < 8 { Err("云同步密码至少需要 8 个字符".into()) } else { Ok(()) } }
 fn now_unix_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0) }
 fn now_rfc3339ish() -> String { format!("{}", SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_secs()).unwrap_or(0)) }
 fn sync_error_text(error: ApiError) -> String { if error.code == "QUOTA_EXCEEDED" { "云端空间不足，请删除旧备份或数据后重试".into() } else { error.to_string() } }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{AiMode, AuthType};
+    use super::super::core_config::{
+        CoreCredentialV1, CoreProjectV1, CoreQuickCommandV1, CoreServerV1,
+    };
+
+    fn payload() -> CoreConfigPayloadV1 {
+        CoreConfigPayloadV1 {
+            project_folders: vec!["开发".into(), "测试".into()],
+            projects: vec![CoreProjectV1 {
+                id: "p1".into(),
+                name: "项目".into(),
+                server_ids: vec![],
+                quick_commands: vec![CoreQuickCommandV1 {
+                    id: "qc1".into(),
+                    title: "t".into(),
+                    command: "c".into(),
+                    folder: String::new(),
+                    global: false,
+                }],
+                folder: String::new(),
+                ai_mode: AiMode::Suggest,
+            }],
+            credentials: vec![CoreCredentialV1 {
+                id: "c1".into(),
+                name: "c".into(),
+                auth_type: AuthType::Password,
+                username: "u".into(),
+            }],
+            servers: vec![CoreServerV1 {
+                id: "s1".into(),
+                name: "s".into(),
+                host: "h".into(),
+                port: 22,
+                auth_type: AuthType::Password,
+                username: "u".into(),
+                credential_id: None,
+                locked: false,
+                is_bastion: false,
+                bastion_id: None,
+                tags: vec![],
+            }],
+            command_folders: vec!["命令".into()],
+        }
+    }
+
+    #[test]
+    fn config_counts_tallies_entities() {
+        let counts = config_counts(&payload());
+        assert_eq!(counts.projects, 1);
+        assert_eq!(counts.servers, 1);
+        assert_eq!(counts.credentials, 1);
+        assert_eq!(counts.command_folders, 1);
+        assert_eq!(counts.project_folders, 2);
+    }
+}

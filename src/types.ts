@@ -149,6 +149,14 @@ export interface SyncStatus {
   quota: SyncQuota;
   limits: SyncLimits;
   device: SyncDevice | null;
+  /** 云端核心配置（core_config）各实体的数量；未同步过为 null */
+  configCounts?: {
+    projects: number;
+    servers: number;
+    credentials: number;
+    commandFolders: number;
+    projectFolders: number;
+  } | null;
 }
 
 /** 云端文件备份条目；锁定时 name/rootMeta 可为空，避免泄露本地路径 */

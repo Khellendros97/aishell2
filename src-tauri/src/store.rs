@@ -1169,6 +1169,92 @@ fn normalize_ws(ws: &str) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// 项目目录名清洗：Windows 非法字符与控制字符替换为 `_`，不允许以点/空格结尾，空名回退 `project`。
+pub(crate) fn sanitize_project_dir_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned
+        .trim()
+        .trim_end_matches(['.', ' '])
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        "project".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 路径占用比较键：Windows 大小写不敏感、分隔符与结尾斜杠归一。
+pub(crate) fn project_path_key(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
+/// 在 workspace 下为项目分配未被占用的目录并创建（含 `.aishell/`）；同名冲突追加 `-2`/`-3`…。
+/// 供云同步拉取新项目与历史无路径项目迁移复用。
+pub(crate) fn alloc_project_dir_in_workspace(
+    workspace: &str,
+    name: &str,
+    taken: &HashSet<String>,
+) -> Result<String, String> {
+    let base = sanitize_project_dir_name(name);
+    let mut candidate = PathBuf::from(workspace).join(&base);
+    let mut suffix = 2;
+    while taken.contains(&project_path_key(&candidate.to_string_lossy())) {
+        candidate = PathBuf::from(workspace).join(format!("{base}-{suffix}"));
+        suffix += 1;
+    }
+    fs::create_dir_all(candidate.join(".aishell"))
+        .map_err(|e| format!("创建项目目录 {} 失败: {e}", candidate.to_string_lossy()))?;
+    Ok(candidate.to_string_lossy().into_owned())
+}
+
+/// 云同步历史数据修复：早期版本从云端拉取的项目没有本机路径（`path` 为空），
+/// 在 workspace 下按项目名补建目录。单个项目失败跳过（下次启动/保存设置时重试），返回修复数量。
+pub(crate) fn ensure_project_paths_in_workspace(state: &mut AppState) -> usize {
+    let Some(workspace) = state
+        .settings
+        .workspace_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return 0;
+    };
+    let mut taken: HashSet<String> = state
+        .projects
+        .iter()
+        .filter_map(|p| p.path.as_deref())
+        .map(project_path_key)
+        .collect();
+    let mut fixed = 0;
+    for project in &mut state.projects {
+        if project
+            .path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+        {
+            continue;
+        }
+        let Ok(dir) = alloc_project_dir_in_workspace(&workspace, &project.name, &taken) else {
+            continue;
+        };
+        taken.insert(project_path_key(&dir));
+        project.path = Some(dir);
+        fixed += 1;
+    }
+    fixed
+}
+
 /// 会话内全部自由文本脱敏（消息正文/快照/文件引用/动作摘要与意图），返回是否有变更。幂等：
 /// 已脱敏内容再次处理字符串不变，不会误报 changed。
 /// 先做会话级值收集（跨消息共享同一凭据的 KV 值），再逐字段替换——
@@ -1241,6 +1327,22 @@ impl Store {
         // 服务器凭据迁移必须先于 known_secrets：会话脱敏应读取迁移后的
         // credential:<id>，不能在旧 server:<id> 已删除后才发现新凭据。
         store.migrate_legacy_credentials()?;
+        // 云同步历史迁移：早期版本从云端拉取的项目没有本机路径（path 为空），workspace
+        // 已配置时在其下按项目名补建目录。只在有变更时落盘，避免每次启动无谓写盘唤醒云同步。
+        let fixed_projects = {
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            ensure_project_paths_in_workspace(&mut guard)
+        };
+        if fixed_projects > 0 {
+            let guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            store.persist_locked(&guard)?;
+        }
         // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
         // 加载时按现行规则清洗，有变更立即原子写回。
         // （云分支不做默认模型迁移：对外模型 id 仍是 deepseek-v4-flash，无需升级。）
@@ -1458,6 +1560,8 @@ impl Store {
                 }
             }
             s.settings = settings.clone();
+            // 首次配置/切换 workspace 后，顺带修复云同步拉取的无本机路径项目（单个失败跳过）。
+            ensure_project_paths_in_workspace(s);
             Ok(())
         })
     }
@@ -3659,6 +3763,65 @@ mod tests {
         drop(guard);
         // 默认 state 序列化后仍是合法 camelCase 文件
         assert!(!store.is_config_complete());
+    }
+
+    #[test]
+    fn sanitize_project_dir_name_handles_windows_invalid() {
+        assert_eq!(
+            sanitize_project_dir_name("a/b\\c:d*e?f\"g<h>i|j"),
+            "a_b_c_d_e_f_g_h_i_j"
+        );
+        assert_eq!(sanitize_project_dir_name("   "), "project");
+        assert_eq!(sanitize_project_dir_name("名称. "), "名称");
+    }
+
+    #[test]
+    fn ensure_project_paths_fixes_only_pathless_projects() {
+        let ws = temp_config_dir("proj-path-ws");
+        let mut state = AppState {
+            settings: Settings {
+                workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                ..Settings::default()
+            },
+            ..AppState::default()
+        };
+        let project = |id: &str, name: &str, path: Option<&str>| Project {
+            id: id.into(),
+            name: name.into(),
+            path: path.map(str::to_string),
+            server_ids: vec![],
+            quick_commands: vec![],
+            folder: String::new(),
+            ai_mode: AiMode::Suggest,
+        };
+        state.projects.push(project("a", "有路径", Some("C:/keep")));
+        state.projects.push(project("b", "无路径", None));
+        state.projects.push(project("c", "同名", None));
+        state.projects.push(project("d", "同名", None));
+
+        let fixed = ensure_project_paths_in_workspace(&mut state);
+        assert_eq!(fixed, 3);
+        assert_eq!(state.projects[0].path.as_deref(), Some("C:/keep"));
+        assert_eq!(
+            state.projects[1].path.as_deref(),
+            Some(ws.join("无路径").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            state.projects[2].path.as_deref(),
+            Some(ws.join("同名").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            state.projects[3].path.as_deref(),
+            Some(ws.join("同名-2").to_string_lossy().as_ref())
+        );
+        assert!(ws.join("无路径").join(".aishell").is_dir());
+        // 幂等：全部有路径后不再变更。
+        assert_eq!(ensure_project_paths_in_workspace(&mut state), 0);
+        // 未配置 workspace 时不做任何事。
+        state.settings.workspace_dir = None;
+        state.projects[1].path = None;
+        assert_eq!(ensure_project_paths_in_workspace(&mut state), 0);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

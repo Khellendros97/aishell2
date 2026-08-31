@@ -13,7 +13,7 @@ import {
   cloudSyncChangePassword, cloudSyncDeleteAll, cloudSyncDevices, cloudSyncInitialize,
   cloudSyncLock, cloudSyncNow, cloudSyncRenameDevice, cloudSyncResolveConflict,
   cloudSyncRevokeDevice, cloudSyncReregisterDevice, cloudSyncStatus, cloudSyncUnlock,
-  onCloudBackupChanged, onCloudSyncChanged, openDialog,
+  getState, onCloudBackupChanged, onCloudSyncChanged, openDialog,
 } from '../../api';
 import { confirmDialog, promptDialog, toast } from '../../ui';
 import { Icon } from '../../shared/Icon';
@@ -41,7 +41,11 @@ function formatBytes(bytes: number): string {
 
 function formatTime(value: string | null | undefined): string {
   if (!value) return '暂无';
-  const date = new Date(value);
+  const trimmed = value.trim();
+  // 本机状态（lastSuccessAt 等）下发的是 Unix 秒字符串；云端返回的设备/备份时间是 RFC3339
+  const date = /^\d+$/.test(trimmed)
+    ? new Date(Number(trimmed) * (trimmed.length >= 12 ? 1 : 1000))
+    : new Date(trimmed);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
 }
 
@@ -169,6 +173,15 @@ export function CloudSyncView({ status, onGoLogin }: CloudSyncViewProps): JSX.El
   const [passwordMode, setPasswordMode] = useState<PasswordMode | null>(null);
   const [conflict, setConflict] = useState<SyncConflict | null>(null);
   const [restoreBackup, setRestoreBackup] = useState<CloudBackup | null>(null);
+  // null = 尚未读取；空串 = 未配置。云同步要求先配置 Workspace 目录（云端项目要落在其下）。
+  const [workspaceDir, setWorkspaceDir] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getState().then((state) => { if (!cancelled) setWorkspaceDir(state.settings?.workspaceDir ?? ''); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const workspaceMissing = workspaceDir !== null && workspaceDir.trim() === '';
 
   const enabled = !!status?.serverUrl && !!status.loggedIn && capabilityEnabled(status.capabilities, 'dataSync');
   const backupEnabled = enabled && capabilityEnabled(status?.capabilities ?? null, 'fileBackup');
@@ -290,11 +303,12 @@ export function CloudSyncView({ status, onGoLogin }: CloudSyncViewProps): JSX.El
     <div className="cloud-sync-view">
       <div className="sync-toolbar"><span className={`sync-state sync-state-${sync?.status || 'idle'}`}><Icon name={locked ? 'lock' : sync?.syncing ? 'sync' : 'cloudSync'} /> {stateLabel}</span>
         <button className="btn small" onClick={() => void refresh()}><Icon name="refresh" /> 刷新</button>
-        {locked ? <button className="btn primary small" onClick={() => setPasswordMode(sync?.initialized ? 'unlock' : 'initialize')}>{sync?.initialized ? '解锁云同步' : '设置同步密码'}</button> : <>
-          <button className="btn primary small" onClick={() => void doSync()} disabled={!!sync?.syncing}><Icon name="sync" /> 立即同步</button>
+        {locked ? <button className="btn primary small" disabled={workspaceMissing && !sync?.initialized} onClick={() => setPasswordMode(sync?.initialized ? 'unlock' : 'initialize')}>{sync?.initialized ? '解锁云同步' : '设置同步密码'}</button> : <>
+          <button className="btn primary small" onClick={() => void doSync()} disabled={!!sync?.syncing || workspaceMissing}><Icon name="sync" /> 立即同步</button>
           <button className="btn small" onClick={() => { void cloudSyncLock().then(setSync).catch((errorValue) => toast(`锁定失败：${errorText(errorValue)}`, 'error')); }}><Icon name="lock" /> 锁定</button>
         </>}
       </div>
+      {workspaceMissing ? <div className="form-error sync-error">请先在「设置」中配置 Workspace 目录，再进行云同步：从云端拉取的项目需要在该目录下创建本机项目目录。<button className="btn small" onClick={() => { window.location.hash = '#/settings'; }}>前往设置</button></div> : null}
       {error ? <div className="form-error sync-error">{error}</div> : null}
       <div className="sync-summary-grid">
         <div className="sync-stat"><span>最近成功同步</span><strong>{formatTime(sync?.lastSuccessAt ?? sync?.lastSyncAt)}</strong></div>
@@ -302,6 +316,15 @@ export function CloudSyncView({ status, onGoLogin }: CloudSyncViewProps): JSX.El
         <div className="sync-stat"><span>同步空间</span><strong>{formatBytes(quota.usedBytes)} / {formatBytes(quota.totalBytes)}</strong></div>
         <div className="sync-stat"><span>备份空间</span><strong>{formatBytes(quota.backupUsedBytes)} / {formatBytes(quota.backupTotalBytes)}</strong></div>
       </div>
+      <section className="sync-section"><h4><Icon name="cloudSync" /> 配置同步规模</h4>
+        {sync?.configCounts ? <div className="sync-summary-grid">
+          <div className="sync-stat"><span>项目配置</span><strong>{sync.configCounts.projects}</strong></div>
+          <div className="sync-stat"><span>服务器配置</span><strong>{sync.configCounts.servers}</strong></div>
+          <div className="sync-stat"><span>登录凭据</span><strong>{sync.configCounts.credentials}</strong></div>
+          <div className="sync-stat"><span>项目文件夹</span><strong>{sync.configCounts.projectFolders}</strong></div>
+          <div className="sync-stat"><span>命令文件夹</span><strong>{sync.configCounts.commandFolders}</strong></div>
+        </div> : <div className="hint">尚未同步过核心配置。</div>}
+      </section>
       <section className="sync-section"><h4><Icon name="device" /> 设备管理</h4>
         {!locked ? <><div className="sync-device-list">{devices.length === 0 ? <div className="hint">暂无设备信息</div> : devices.map((device) => <div className="sync-device" key={device.id || device.deviceId}>
           <Icon name={device.isCurrent ? 'monitor' : 'device'} /><span className="sync-device-name">{device.name}{device.isCurrent ? '（本机）' : ''}</span><span className="hint">最近活动：{formatTime(device.lastSeenAt)}</span>

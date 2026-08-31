@@ -2,13 +2,17 @@
 //!
 //! 本模块刻意不序列化 `AppState`：项目 `path`、凭据/服务器 `key_path` 和所有
 //! session/keyring 数据均为本机数据。与云端交换的字段以 `store.rs` 为准。
+//! 拉取云端新项目时不上云/不下发路径，而是在本机 workspace 下按项目名重建目录。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::store::{AiMode, AppState, AuthType, Credential, Project, QuickCommand, Server};
+use crate::store::{
+    alloc_project_dir_in_workspace, project_path_key, AiMode, AppState, AuthType, Credential,
+    Project, QuickCommand, Server,
+};
 
 /// 核心配置同步协议 v1。字段白名单是协议的一部分，不要改为直接序列化 AppState。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +161,8 @@ pub fn from_app_state(state: &AppState) -> CoreConfigPayloadV1 {
 }
 
 /// 应用完整远端核心配置。所有引用先校验，失败时不修改 state。
+/// 项目路径是本机数据：本机已有项目保留原路径；云端新项目（或本机路径缺失的）
+/// 在 workspace 下按项目名创建目录，workspace 未配置时保持空路径（由启动迁移补建）。
 pub fn apply_remote(state: &mut AppState, payload: &CoreConfigPayloadV1) -> Result<(), String> {
     let project_paths: BTreeMap<&str, Option<String>> = state
         .projects
@@ -174,13 +180,36 @@ pub fn apply_remote(state: &mut AppState, payload: &CoreConfigPayloadV1) -> Resu
         .map(|s| (s.id.as_str(), s.key_path.clone()))
         .collect();
 
-    let projects: Vec<Project> = payload
-        .projects
-        .iter()
-        .map(|p| Project {
+    let workspace = state
+        .settings
+        .workspace_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut taken: HashSet<String> = project_paths
+        .values()
+        .flatten()
+        .map(|p| project_path_key(p))
+        .collect();
+
+    let mut projects: Vec<Project> = Vec::with_capacity(payload.projects.len());
+    for p in &payload.projects {
+        let path = match project_paths.get(p.id.as_str()).cloned().flatten() {
+            Some(path) if !path.trim().is_empty() => Some(path),
+            _ => match &workspace {
+                Some(ws) => {
+                    let dir = alloc_project_dir_in_workspace(ws, &p.name, &taken)?;
+                    taken.insert(project_path_key(&dir));
+                    Some(dir)
+                }
+                None => None,
+            },
+        };
+        projects.push(Project {
             id: p.id.clone(),
             name: p.name.clone(),
-            path: project_paths.get(p.id.as_str()).cloned().unwrap_or(None),
+            path,
             server_ids: p.server_ids.clone(),
             quick_commands: p
                 .quick_commands
@@ -195,8 +224,8 @@ pub fn apply_remote(state: &mut AppState, payload: &CoreConfigPayloadV1) -> Resu
                 .collect(),
             folder: p.folder.clone(),
             ai_mode: p.ai_mode,
-        })
-        .collect();
+        });
+    }
     let credentials: Vec<Credential> = payload
         .credentials
         .iter()
@@ -530,12 +559,12 @@ fn merge_entity(
             }
         }
         (Some(b), Some(l), None) => {
-            if l == b {
-                None
-            } else {
+            // core_config 是云端全量快照：云端缺失某实体不代表「被删除」，
+            // 本地也未删除时不应丢项目（否则从残缺的云端拉取会清空本地配置）。
+            if l != b {
                 record_conflicts(kind, id, Some(b), Some(l), None, conflicts);
-                Some(l.clone())
             }
+            Some(l.clone())
         }
     }
 }
@@ -868,6 +897,71 @@ mod tests {
         assert_eq!(state.credentials[1].key_path, "");
         assert_eq!(state.servers[0].key_path, "C:/s");
         assert_eq!(state.servers[1].key_path, "");
+    }
+
+    #[test]
+    fn apply_assigns_workspace_dir_for_new_projects() {
+        let ws = std::env::temp_dir().join(format!("aishell-core-test-ws-{}", std::process::id()));
+        let mut state = AppState {
+            settings: crate::store::Settings {
+                workspace_dir: Some(ws.to_string_lossy().into_owned()),
+                ..crate::store::Settings::default()
+            },
+            ..AppState::default()
+        };
+        state.projects.push(Project {
+            id: "p1".into(),
+            name: "老项目".into(),
+            path: Some("C:/keep".into()),
+            server_ids: vec!["s1".into()],
+            quick_commands: vec![],
+            folder: String::new(),
+            ai_mode: AiMode::Suggest,
+        });
+        // 本机已有 p1（路径必须保留）；p2 名字含 Windows 非法字符；p3 与 p2 清洗后同名。
+        let remote = CoreConfigPayloadV1 {
+            projects: vec![
+                p("p1", "老项目", &["s1"]),
+                p("p2", "新/项目", &["s1"]),
+                p("p3", "新_项目", &["s1"]),
+            ],
+            ..payload()
+        };
+        apply_remote(&mut state, &remote).unwrap();
+        assert_eq!(state.projects[0].path.as_deref(), Some("C:/keep"));
+        let dir2 = ws.join("新_项目");
+        let dir3 = ws.join("新_项目-2");
+        assert_eq!(
+            state.projects[1].path.as_deref(),
+            Some(dir2.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            state.projects[2].path.as_deref(),
+            Some(dir3.to_string_lossy().as_ref())
+        );
+        assert!(dir2.join(".aishell").is_dir());
+        assert!(dir3.join(".aishell").is_dir());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn merge_keeps_local_when_remote_missing_unmodified_project() {
+        let base = CoreConfigPayloadV1 {
+            projects: vec![p("p1", "A", &["s1"]), p("p2", "B", &["s1"])],
+            ..payload()
+        };
+        let local = base.clone();
+        // 云端是全量快照但缺 p2（云端被清空/未同步该实体）。
+        let mut remote = CoreConfigPayloadV1 {
+            projects: vec![p("p1", "A", &["s1"])],
+            ..payload()
+        };
+        remote.credentials = payload().credentials;
+        remote.servers = payload().servers;
+        let (merged, conflicts) = merge_three_way(&base, &local, &remote);
+        assert!(conflicts.is_empty());
+        assert_eq!(merged.projects.len(), 2);
+        assert!(merged.projects.iter().any(|x| x.id == "p2"));
     }
 
     #[test]
