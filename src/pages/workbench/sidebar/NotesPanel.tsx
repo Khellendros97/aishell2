@@ -14,10 +14,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   fsCreate, fsDelete, fsList, fsMove, getState, notesRoot, setUiExpanded,
 } from '../../../api';
-import { DND_MIME, useWorkbench, wbEvents } from '../../../stores/workbench';
-import { confirmDialog, showContextMenu, toast, type CtxItem } from '../../../ui';
+import { DND_MIME, useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
+import { confirmDialog, showContextMenu, toast, uid, type CtxItem } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
+import type { NoteRef } from '../../../types';
 import { openNote } from '../tabs/NoteTab';
 import { openLocalFile } from '../tabs/EditorTab';
 import { openPublishReportModal } from '../notes/PublishReportModal';
@@ -225,6 +226,12 @@ function NotesPanelBody(): JSX.Element {
     e.preventDefault();
     e.stopPropagation();
     const abs = `${rootAbs}/${node.path}`;
+    const isNote = !node.isDir && node.name.toLowerCase().endsWith('.md');
+    const noteRefOf = (): NoteRef => ({
+      id: uid('note'),
+      path: abs,
+      name: node.name.replace(/\.md$/i, ''),
+    });
     showContextMenu(e.clientX, e.clientY, [
       { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => openNode(node) },
       ...(!node.isDir && node.name.toLowerCase().endsWith('.md') ? [
@@ -234,6 +241,19 @@ function NotesPanelBody(): JSX.Element {
         'sep' as const,
         { label: '新建笔记', iconName: 'note', action: () => panelApi?.startCreate(false, node.path) } as CtxItem,
         { label: '新建目录', iconName: 'folderPlus', action: () => panelApi?.startCreate(true, node.path) } as CtxItem,
+      ] : []),
+      ...(isNote ? [
+        'sep' as const,
+        { label: '添加到对话', iconName: 'chatPlus', action: () => {
+          const ref = noteRefOf();
+          if (wbHandles.ai?.addNoteRef) wbHandles.ai.addNoteRef(ref);
+          else toast('AI 面板尚未就绪');
+        } } as CtxItem,
+        { label: '转换成skill', iconName: 'sparkles', action: () => {
+          const ref = noteRefOf();
+          if (wbHandles.ai?.convertNoteToSkill) wbHandles.ai.convertNoteToSkill(ref);
+          else toast('AI 面板尚未就绪');
+        } } as CtxItem,
       ] : []),
       'sep',
       { label: '重命名', iconName: 'pencil', action: () => setInline({ kind: 'rename', rel: node.path }) } as CtxItem,
