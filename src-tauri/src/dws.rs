@@ -30,10 +30,63 @@ const REPORT_MAX_TOKENS: u32 = 8192;
 /// 失败返回中文可操作错误:NotFound = 未安装;非零退出码剥 stdout JSON 的 error.message
 /// 或 stderr 摘要;认证类错误追加 dws auth login 引导。
 async fn run_dws_in(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new("dws");
-    cmd.args(args).kill_on_drop(true);
+    // 优先按当前进程 PATH 直接执行(dws 已加入应用进程 PATH 的常规场景,零开销)。
+    match spawn_dws(args, cwd, None).await {
+        Ok(stdout) => return Ok(stdout),
+        Err(e) if !is_dws_missing(&e) => return Err(e),
+        Err(_) => {}
+    }
+    // 未命中:可能装在登录 shell 的 PATH 才能看到的位置(nvm/scoop/brew 等工具把可执行加到
+    // profile PATH,而应用进程 PATH 是启动时的快照)。回退经登录 shell 执行(与内置终端一致),
+    // 覆盖 PATH 快照外的 dws 安装。
+    let (shell, command) = try_shell_dws(args, cwd)?;
+    match spawn_dws(args, cwd, Some((shell.as_str(), command.as_str()))).await {
+        Ok(stdout) => Ok(stdout),
+        Err(e) if is_dws_missing(&e) => Err("未检测到 dws 命令，请先安装钉钉 CLI（dws）".to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+/// 组装经登录 shell(Git Bash)执行 dws 的 (shell 路径, 命令文本)。
+/// 命令形如 `cd '<cwd>' && dws <arg>'...`;login shell 启动会切回 $HOME,故有 cwd 时须先 cd。
+fn try_shell_dws(args: &[&str], cwd: Option<&Path>) -> Result<(String, String), String> {
+    let shell = crate::term::find_shell().ok_or_else(crate::term::shell_missing_msg)?;
+    let mut command = String::new();
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        command.push_str("cd ");
+        command.push_str(&shell_quote(&dir.to_string_lossy()));
+        command.push_str(" && ");
+    }
+    command.push_str("dws");
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    Ok((shell, command))
+}
+
+/// spawn 并执行 dws。exec_override = Some((shell, command)) 时经登录 shell 执行;
+/// None 直接用当前进程 PATH 的 dws。
+async fn spawn_dws(
+    args: &[&str],
+    cwd: Option<&Path>,
+    exec_override: Option<(&str, &str)>,
+) -> Result<String, String> {
+    let mut cmd = match exec_override {
+        Some((shell, command)) => {
+            let mut c = tokio::process::Command::new(shell);
+            c.arg("--login").arg("-c").arg(command);
+            c
+        }
+        None => tokio::process::Command::new("dws"),
+    };
+    cmd.args(if exec_override.is_some() { &[] as &[&str] } else { args })
+        .kill_on_drop(true);
+    // 经登录 shell 时,login 会切到 $HOME,故 cwd 已内联进 command;直接执行时补 current_dir。
+    if exec_override.is_none() {
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
     }
     // Windows 下隐藏控制台窗口(与 ai.rs 的 pi 启动一致)
     #[cfg(windows)]
@@ -50,6 +103,11 @@ async fn run_dws_in(args: &[&str], cwd: Option<&Path>) -> Result<String, String>
                 format!("执行 dws 失败: {e}")
             }
         })?;
+    classify_dws_output(out)
+}
+
+/// 统一处理 dws 进程输出:成功返回 stdout,失败剥出可读错误。
+fn classify_dws_output(out: std::process::Output) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if out.status.success() {
         return Ok(stdout);
@@ -66,6 +124,20 @@ async fn run_dws_in(args: &[&str], cwd: Option<&Path>) -> Result<String, String>
     } else {
         format!("dws 命令失败: {detail}")
     }))
+}
+
+/// 判断错误是否由「dws 不存在」引起(直接执行 NotFound,或登录 shell 报 command not found)。
+fn is_dws_missing(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    msg.starts_with("未检测到 dws")
+        || lower.contains("command not found")
+        || lower.contains("is not recognized")
+        || lower.contains("不是内部或外部命令")
+}
+
+/// POSIX 单引号转义(供登录 shell 的命令文本承载含空格/引号/中文的 dws 参数)。
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// 无 cwd 要求的 dws 调用(多数命令)。
@@ -545,5 +617,23 @@ mod tests {
         assert!(resolve_note_path(&root, outside.to_str().unwrap()).is_err());
         assert!(resolve_note_path(&root, root.join("missing.md").to_str().unwrap()).is_err());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shell_quote_wraps_in_single_quotes_and_escapes_inner() {
+        assert_eq!(shell_quote("auth"), "'auth'");
+        assert_eq!(shell_quote("c:/a b/笔记.md"), "'c:/a b/笔记.md'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        // 含反斜杠与 $ 的 JSON 内容在单引号内保持字面量,不展开不转义
+        assert_eq!(shell_quote(r#"{"path":"C:\x\y"}"#), "'{\"path\":\"C:\\x\\y\"}'");
+    }
+
+    #[test]
+    fn dws_missing_detects_not_found_variants() {
+        assert!(is_dws_missing("未检测到 dws 命令，请先安装钉钉 CLI（dws）"));
+        assert!(is_dws_missing("dws: command not found"));
+        assert!(is_dws_missing("'dws' is not recognized as an internal or external command"));
+        assert!(!is_dws_missing("dws 命令失败: 认证 token 无效"));
+        assert!(!is_dws_missing("执行 dws 失败: timeout"));
     }
 }

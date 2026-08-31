@@ -17,6 +17,8 @@ import { icon } from '../../../icons';
 import {
   dwsAuthStatus, dwsReportGenerate, dwsReportSubmit, dwsReportTemplates, getState, setUiExpanded,
 } from '../../../api';
+import { confirmDialog, toast } from '../../../ui';
+import { useWorkbench, wbHandles } from '../../../stores/workbench';
 import type { DwsReportContent, DwsTemplate } from '../../../types';
 import './publish-report.css';
 
@@ -32,6 +34,9 @@ let activeModal: { close: () => void } | null = null;
 
 /** 模版记忆在 uiExpanded 的 key(值 = [templateId],复用目录展开状态的持久化通道) */
 const LAST_TEMPLATE_KEY = 'dws:lastReportTemplate';
+
+/** 交由 AI 助手安装 dws 的任务提示词。 */
+const AI_INSTALL_PROMPT = '帮我安装钉钉 CLI（dws）：https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli';
 
 type Step = 'auth' | 'template' | 'preview' | 'done';
 
@@ -106,6 +111,27 @@ export function openPublishReportModal(opts: PublishReportModalOpts): void {
     if (foot) foot.innerHTML = `<span class="pr-busy">${icon('loader')}${esc(text)}</span>`;
   };
 
+  /** dws 未安装时:确认后交给 AI 助手自动安装(AI 面板新建会话发送任务,AI 自行调工具安装)。 */
+  const startAiInstall = async (): Promise<void> => {
+    const confirmed = await confirmDialog({
+      title: '使用 AI 助手自动安装',
+      message: '发现 dws（钉钉 CLI）不存在，是否使用 AI 助手自动安装？',
+    });
+    if (!confirmed) return;
+    const start = wbHandles.ai?.startConversation;
+    if (!start) {
+      toast('AI 助手尚未就绪，请稍后到工作台打开 AI 面板重试', 'error');
+      return;
+    }
+    // 打开 AI 面板便于用户查看 AI 安装进度。
+    useWorkbench.getState().setAiVisible(true);
+    try {
+      await start(AI_INSTALL_PROMPT);
+    } catch (err) {
+      toast(`正在通知 AI 助手：${String(err)}`, 'error');
+    }
+  };
+
   /* ---------- 步骤 1:认证检测 ---------- */
   const renderAuth = (): void => {
     render('auth', '<div class="pr-busy">' + icon('loader') + '正在检测 dws 认证状态…</div>', '');
@@ -115,7 +141,8 @@ export function openPublishReportModal(opts: PublishReportModalOpts): void {
           render('auth', `
             <div class="pr-guide">未检测到 dws 命令，请先安装钉钉 CLI（dws）后再使用本功能。</div>`,
             `<button class="btn" data-act="cancel">取消</button>
-             <button class="btn primary" data-act="recheck">重新检测</button>`);
+             <button class="btn primary" data-act="ai-install">使用 AI 助手自动安装</button>
+             <button class="btn" data-act="recheck">重新检测</button>`);
         } else if (!st.authenticated) {
           render('auth', `
             <div class="pr-guide">未检测到钉钉认证，请先在终端执行 <code>dws auth login</code> 完成认证，然后点击「重新检测」。</div>`,
@@ -125,6 +152,7 @@ export function openPublishReportModal(opts: PublishReportModalOpts): void {
           void loadTemplates();
         }
         root.querySelector('[data-act=recheck]')?.addEventListener('click', renderAuth);
+        root.querySelector('[data-act=ai-install]')?.addEventListener('click', () => void startAiInstall());
       },
       (err: unknown) => {
         render('auth', '',
