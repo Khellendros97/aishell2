@@ -1,0 +1,24 @@
+{
+  "name": "aishell-video",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AIShell 产品教学动画(Remotion)",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts InitAiDemo out/01-init-ai-demo.mp4",
+    "render:02": "remotion render src/index.ts ProjectSshDemo out/02-project-ssh-terminal.mp4",
+    "render:03": "remotion render src/index.ts FileSftpDemo out/03-file-sftp.mp4",
+    "render:04": "remotion render src/index.ts AiModeDemo out/04-ai-mode-db-pipeline.mp4",
+    "still": "remotion still src/index.ts InitAiDemo",
+    "still:02": "remotion still src/index.ts ProjectSshDemo",
+    "still:03": "remotion still src/index.ts FileSftpDemo",
+    "still:04": "remotion still src/index.ts AiModeDemo"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.518",
+    "@types/react": "^18.3.31",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "^4.0.518"
+  }
+}

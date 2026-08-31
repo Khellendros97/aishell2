@@ -36,6 +36,8 @@ src-tauri/resources/python-embed/
 __pycache__/
 src-tauri/target
 tmp/
+# Remotion 教学视频渲染产物(video/ 工程源码入库,产物不入库)
+video/out/
 # 本地云配置文件（含 client_secret，绝不入库；debug 构建读 dev.env，release 构建读 release.env）
 dev.env
 release.env
