@@ -15,7 +15,9 @@ pub mod fsops;
 pub mod sftp;
 pub mod skills;
 pub mod ssh;
+pub mod ssh_keys;
 pub mod store;
+pub mod tunnel;
 pub mod term;
 pub mod trace;
 pub mod xshell;
@@ -144,19 +146,30 @@ pub fn run() {
                 ssh.clone(),
                 staging.clone(),
             ));
+            // SSH 隧道：配置存 aishell.json，运行态内存；启动时自动重建上次 enabled 的隧道
+            let tunnels = Arc::new(tunnel::TunnelManager::new());
+            tunnels.set_app(app.handle().clone());
             // AI 会话 trace：注入日志目录与持久化开关初值（需在 manage(store) 移动前读取）
             trace::init(config_dir.join("ai-trace"), store.trace_enabled());
-            app.manage(store);
-            app.manage(ssh);
+            app.manage(store.clone());
+            app.manage(ssh.clone());
             app.manage(terms);
             app.manage(ai.clone());
             app.manage(staging);
             app.manage(mcp.clone());
             app.manage(browser);
+            app.manage(tunnels.clone());
             // 启动时按持久化配置同步监听（有已启用设备则自动拉起）
             tauri::async_runtime::spawn(async move {
                 mcp.sync().await;
             });
+            // 启动时自动重建上次 enabled 的 SSH 隧道（失败仅记录，不影响启动）
+            tauri::async_runtime::spawn(tunnel::recover(
+                app.handle().clone(),
+                ssh,
+                store,
+                tunnels,
+            ));
             term::set_debug_app(app.handle().clone());
             // AI 会话 trace：启动 7 天过期清理任务（启动即清一次 + 每 24h）
             trace::spawn_cleanup_task();
@@ -255,6 +268,15 @@ pub fn run() {
             sftp::sftp_unique_name,
             sftp::sftp_create,
             ssh::ssh_exec,
+            ssh::ssh_deploy_public_key,
+            ssh_keys::ssh_default_keypair_dir,
+            ssh_keys::ssh_detect_keypair,
+            ssh_keys::ssh_generate_keypair,
+            tunnel::tunnel_list,
+            tunnel::tunnel_save,
+            tunnel::tunnel_start,
+            tunnel::tunnel_stop,
+            tunnel::tunnel_delete,
             skills::skills_list,
             skills::skill_read,
             skills::skill_save,

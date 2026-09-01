@@ -1,6 +1,6 @@
 [package]
 name = "aishell"
-version = "0.7.6"
+version = "0.7.7"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -60,6 +60,8 @@ unicode-segmentation = "1"
 sha2 = "0.10"
 hex = "0.4"
 similar = "2.7"
+# 生成 SSH 密钥对（ssh-key 0.7 的 random 要求 rand_core 0.10 的 CryptoRng）
+rand = "0.10"
 # Skill 系统 frontmatter 解析（serde_yaml 已归档，采用维护中的 serde_yaml_ng）
 serde_yaml_ng = "0.9.36"
 # MCP 服务端（Streamable HTTP，仅绑定 127.0.0.1）：hyper 1 已在依赖树（reqwest 带入），

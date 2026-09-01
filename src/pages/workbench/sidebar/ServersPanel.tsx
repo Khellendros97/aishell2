@@ -694,6 +694,16 @@ function ServersPanelBody(): JSX.Element {
     });
   };
 
+  /** SSH 隧道：一服务器一标签（同 id 去重，openTab 命中即激活）；关闭标签不停隧道（服务语义） */
+  const openTunnel = (s: Server): void => {
+    useWorkbench.getState().openTab({
+      id: `tunnel:${s.id}`,
+      type: 'tunnel',
+      title: 'SSH 隧道 · ' + s.name,
+      data: { serverId: s.id, serverName: s.name },
+    });
+  };
+
   const toggleLock = (s: Server): void => {
     void setServerLocked(s.id, !s.locked)
       .then(() => wbEvents.emit('project-changed'))
@@ -859,7 +869,7 @@ function ServersPanelBody(): JSX.Element {
                   {expanded ? (
                     <>
                       <div className="wbs-server-tags">
-                        <span className="tag">{s.authType === 'key' ? <><Icon name="key" /> 密钥</> : '密码'}</span>
+                        <span className="tag">{s.authType === 'password' ? '密码' : <><Icon name="key" /> {s.authType === 'publickey' ? 'SSH 公钥' : '密钥'}</>}</span>
                         {s.isBastion ? (
                           <span className="tag purple"><Icon name="server" /> 堡垒机</span>
                         ) : s.bastionId ? (
@@ -892,6 +902,7 @@ function ServersPanelBody(): JSX.Element {
                               { label: 'MCP', iconName: 'plug', disabled: s.locked, disabledTip: '服务器已锁定（不允许 AI 访问），MCP 不可用', action: () => openMcpModal(s) },
                               { label: '数据库连接', iconName: 'database', action: () => setDbServer(s) },
                               { label: 'SSH跳转设置', iconName: 'link', action: () => void openJumpEdit(s) },
+                              { label: 'SSH 隧道', iconName: 'tunnel', action: () => openTunnel(s) },
                             ]);
                           }}>
                           <Icon name="more" />

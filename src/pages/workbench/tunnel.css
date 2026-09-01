@@ -1,0 +1,48 @@
+/* SSH 隧道标签页（TunnelTab.tsx）：头部 / 列表 / 状态点 / 编辑器布局。 */
+
+.tunnel-tab {
+  display: flex; flex-direction: column;
+  height: 100%; overflow: hidden; padding: 14px 18px;
+}
+
+.tunnel-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  margin-bottom: 14px;
+}
+
+.tunnel-title {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 15px; font-weight: 600;
+}
+
+.tunnel-list {
+  display: flex; flex-direction: column; gap: 10px;
+  overflow: auto; flex: 1; min-height: 0;
+}
+
+.tunnel-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px;
+}
+
+.tunnel-card-body { min-width: 0; }
+.tunnel-card-name {
+  display: flex; align-items: center; gap: 10px;
+}
+.tunnel-card-name strong {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.tunnel-status { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-2); }
+.tunnel-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-2); }
+.tunnel-status.running { color: #2e9e5b; }
+.tunnel-status.running .dot { background: #2e9e5b; }
+
+.tunnel-card-route { font-size: 12px; color: var(--text-1); margin-top: 4px; }
+.tunnel-card-error { font-size: 12px; color: var(--red); margin-top: 4px; }
+
+.tunnel-card-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.tunnel-modal { width: 520px; }
+.tunnel-modal .field-row { display: flex; gap: 10px; }
+.tunnel-modal .field-row .field { flex: 1; }

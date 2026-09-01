@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "aishell"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -104,6 +104,7 @@ dependencies = [
  "keyring",
  "percent-encoding",
  "portable-pty",
+ "rand 0.10.2",
  "regex",
  "reqwest 0.12.28",
  "russh",

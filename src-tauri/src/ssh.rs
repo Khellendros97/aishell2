@@ -34,11 +34,24 @@ const NSSSH_PRIVATE_KEY_HEADER: &[u8] = b"---- BEGIN NSSSH PRIVATE KEY ----";
 /// 「重新设置登录凭据」对话框，展示时剥掉此前缀。与 src/api.ts SSH_AUTH_FAILED_PREFIX 保持一致。
 pub const AUTH_FAILED_PREFIX: &str = "[SSH认证失败]";
 
+/// 公钥(密钥对)认证被拒的稳定前缀：密钥对目录内的私钥已尝试，服务器尚未保存对应公钥，
+/// 前端 terminal.ts 据此弹出「输入密码自动部署公钥」对话框。与 src/api.ts SSH_NEED_DEPLOY_KEY_PREFIX 保持一致。
+pub const NEED_DEPLOY_PREFIX: &str = "[SSH需部署公钥]";
+
 /// 认证失败的中文错误（带原始错误摘要）：用户名、密码或密钥不正确，或认证方法不被服务器支持。
 fn auth_failed_msg(server: &store::Server, detail: &str) -> String {
     format!(
         "{AUTH_FAILED_PREFIX}服务器「{}」（{}:{}）认证失败：用户名、密码或密钥不正确，\
          请重新设置后重试（原始错误：{detail}）",
+        server.name, server.host, server.port
+    )
+}
+
+/// 公钥(密钥对)认证被拒的错误：服务器尚未保存该公钥，给出「输密码自动部署」引导。
+fn need_deploy_msg(server: &store::Server) -> String {
+    format!(
+        "{NEED_DEPLOY_PREFIX}服务器「{}」（{}:{}）尚未保存您的公钥；\
+         输入一次密码即可自动部署到 authorized_keys（之后改用公钥免密登录）",
         server.name, server.host, server.port
     )
 }
@@ -326,6 +339,72 @@ impl SshManager {
         }
     }
 
+    /// 把密钥对公钥部署到服务器 authorized_keys（ssh-copy-id 等价实现）：
+    /// 用用户本次输入的密码认证登录（不进连接池），执行幂等追加命令后即断开。
+    /// 仅公钥(密钥对)认证的服务器支持；密码一次性使用、不进 keyring。
+    pub async fn deploy_public_key(&self, server_id: &str, password: &str) -> Result<(), String> {
+        let server = self
+            .store
+            .server(server_id)
+            .ok_or_else(|| format!("服务器不存在：{server_id}"))?;
+        if server.auth_type != store::AuthType::PublicKey {
+            return Err("仅「SSH 公钥(密钥对)」认证的服务器支持自动部署公钥".to_string());
+        }
+        if password.is_empty() {
+            return Err("密码不能为空".to_string());
+        }
+        let pubkey = crate::ssh_keys::read_public_key_line(&server.key_path)?;
+        let command = deploy_command(&pubkey)?;
+        // 密码认证建连（password_override：走给定密码而非 keyring），不进连接池。
+        let handle = self.connect_handle(&server, Some(password)).await?;
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("打开服务器会话通道失败：{e}"))?;
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .map_err(|e| format!("启动远端命令失败：{e}"))?;
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut exit_code: Option<i32> = None;
+        let read = async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
+                    ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
+                    ChannelMsg::Eof => {}
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(60), read).await.is_err() {
+            let _ = channel.eof().await;
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "deploy timeout", "en")
+                .await;
+            return Err("部署公钥超时（60s），请检查网络后重试".to_string());
+        }
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "deploy done", "en")
+            .await;
+        if exit_code != Some(0) {
+            let out_text = String::from_utf8_lossy(&stdout);
+            let err_text = String::from_utf8_lossy(&stderr);
+            return Err(format!(
+                "部署公钥失败（退出码 {}）：{}{}",
+                exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "未知".into()),
+                out_text.trim(),
+                err_text.trim()
+            ));
+        }
+        Ok(())
+    }
+
     /* ---------- 内部 ---------- */
 
     async fn live_handle(&self, server_id: &str) -> Option<Arc<client::Handle<CliHandler>>> {
@@ -429,7 +508,10 @@ impl SshManager {
     }
 
     /// 在已建立 SSH 会话的 handle 上完成用户认证（各 10s 超时）。
-    /// 直连（connect_handle）与跳板（connect_via_jump）共用；password_override 仅供测试注入。
+    /// 直连（connect_handle）与跳板（connect_via_jump）共用。
+    /// password_override 有值时强制走密码认证（与服务器 authType 无关）：
+    /// 测试注入与「公钥部署」都靠它——部署的目标服务器本身是 PublicKey，
+    /// 但需要的是用用户本次输入的密码登录一次（见 deploy_public_key）。
     async fn authenticate_handle(
         &self,
         handle: client::Handle<CliHandler>,
@@ -437,15 +519,29 @@ impl SshManager {
         password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
         let mut handle = handle;
-        let accepted = match server.auth_type {
-            store::AuthType::Password => {
-                let password = match password_override {
-                    Some(p) => p.to_string(),
-                    None => self
-                        .store
-                        .read_server_secret(server)
-                        .map_err(|e| format!("读取服务器「{}」的密码失败：{e}", server.name))?,
-                };
+        let accepted = match (server.auth_type, password_override) {
+            // 显式密码：无论服务器认证类型一律密码认证
+            (_, Some(password)) => {
+                let res = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    handle.authenticate_password(&server.username, password.to_string()),
+                )
+                .await
+                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|e| {
+                    if is_auth_failure(&e) {
+                        auth_failed_msg(server, &e.to_string())
+                    } else {
+                        format!("认证服务器「{}」失败：{e}", server.name)
+                    }
+                })?;
+                res.success()
+            }
+            (store::AuthType::Password, None) => {
+                let password = self
+                    .store
+                    .read_server_secret(server)
+                    .map_err(|e| format!("读取服务器「{}」的密码失败：{e}", server.name))?;
                 let res = tokio::time::timeout(
                     Duration::from_secs(10),
                     handle.authenticate_password(&server.username, password),
@@ -461,7 +557,7 @@ impl SshManager {
                 })?;
                 res.success()
             }
-            store::AuthType::Key => {
+            (store::AuthType::Key, None) => {
                 let key = russh::keys::load_secret_key(&server.key_path, None).map_err(|e| match e {
                     russh::keys::Error::KeyIsEncrypted => format!(
                         "MVP 暂不支持带密码短语的密钥，请改用无短语密钥（{}:{}）",
@@ -494,6 +590,46 @@ impl SshManager {
                     }
                 })?;
                 res.success()
+            }
+            (store::AuthType::PublicKey, None) => {
+                // 密钥对目录内推导私钥（探测规则见 ssh_keys::detect_keypair）。
+                let private_path = crate::ssh_keys::derive_private_key_path(&server.key_path)?;
+                let key = russh::keys::load_secret_key(&private_path, None).map_err(|e| match e {
+                    russh::keys::Error::KeyIsEncrypted => format!(
+                        "MVP 暂不支持带密码短语的密钥，请改用无短语密钥（{}:{}）",
+                        server.host, server.port
+                    ),
+                    other => format!(
+                        "读取服务器「{}」的私钥失败（{private_path}）：{other}",
+                        server.name
+                    ),
+                })?;
+                let key = russh::keys::PrivateKeyWithHashAlg::new(
+                    Arc::new(key),
+                    handle
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|e| format!("获取服务器「{}」的签名算法支持失败：{e}", server.name))?
+                        .flatten(),
+                );
+                let res = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    handle.authenticate_publickey(&server.username, key),
+                )
+                .await
+                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|e| {
+                    if is_auth_failure(&e) {
+                        auth_failed_msg(server, &e.to_string())
+                    } else {
+                        format!("认证服务器「{}」失败：{e}", server.name)
+                    }
+                })?;
+                // 认证被拒（服务器还没存公钥）→ 引导输密码部署。
+                if !res.success() {
+                    return Err(need_deploy_msg(server));
+                }
+                true
             }
         };
         if !accepted {
@@ -548,6 +684,26 @@ impl SshManager {
 /// 超时后中断远端命令并返回已收集的输出（退出码为 null，前端按失败提示）。
 const SSH_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 部署公钥的远端命令（ssh-copy-id 等价，幂等：grep 命中则跳过追加）。
+/// 公钥行以单引号注入 shell，因此须拒绝单引号/换行（防注入与多行污染），
+/// 且须为单行（read_public_key_line 已校验 OpenSSH 格式）。
+fn deploy_command(pubkey_line: &str) -> Result<String, String> {
+    let line = pubkey_line.trim();
+    if line.is_empty() {
+        return Err("公钥内容为空，无法部署".to_string());
+    }
+    if line.contains('\'') || line.contains('\n') || line.contains('\r') {
+        return Err(
+            "公钥内容包含非法字符（单引号/换行），无法部署：请检查密钥对目录内的 .pub 文件".to_string(),
+        );
+    }
+    Ok(format!(
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && \
+         chmod 600 ~/.ssh/authorized_keys && (grep -qxF '{line}' ~/.ssh/authorized_keys || \
+         echo '{line}' >> ~/.ssh/authorized_keys)"
+    ))
+}
+
 /// `ssh_exec` 直执结果（serde camelCase，与 src/types.ts SshExecResult 对齐）；
 /// `code` 为 null 表示命令超时被中断或通道未返回退出码。
 #[derive(Debug, Clone, Serialize)]
@@ -575,6 +731,17 @@ pub async fn ssh_exec(
         stdout: res.stdout,
         stderr: res.stderr,
     })
+}
+
+/// 部署公钥(密钥对)凭据的公钥到服务器 authorized_keys（ssh-copy-id 等价）。
+/// 前端「输入密码自动部署」弹框调用：密码一次性使用，不进 keyring。
+#[tauri::command]
+pub async fn ssh_deploy_public_key(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+    password: String,
+) -> Result<(), String> {
+    ssh.deploy_public_key(&server_id, &password).await
 }
 
 #[cfg(test)]
@@ -621,6 +788,31 @@ mod tests {
         assert!(!is_auth_failure(&russh::Error::HUP));
         assert!(!is_auth_failure(&russh::Error::ConnectionTimeout));
         assert!(!is_auth_failure(&russh::Error::Kex));
+    }
+
+    #[test]
+    fn deploy_command_appends_idempotently_and_rejects_unsafe_lines() {
+        // 合法公钥行 → 幂等追加（grep 命中即跳过）。
+        let line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcd user@host";
+        let cmd = deploy_command(line).unwrap();
+        assert!(cmd.contains("mkdir -p ~/.ssh"));
+        assert!(cmd.contains("chmod 700 ~/.ssh"));
+        assert!(cmd.contains("grep -qxF"));
+        assert!(cmd.contains(line));
+        assert!(cmd.contains(&format!("echo '{}' >>", line)));
+        // 单引号/换行/空行 → 拒绝。
+        assert!(deploy_command("key' evil").is_err());
+        assert!(deploy_command("key\nmulti").is_err());
+        assert!(deploy_command("   ").is_err());
+    }
+
+    #[test]
+    fn need_deploy_msg_carries_stable_prefix() {
+        let mut server = key_server("/tmp/home/.ssh");
+        server.host = "10.0.0.1".to_string();
+        let msg = need_deploy_msg(&server);
+        assert!(msg.starts_with(NEED_DEPLOY_PREFIX));
+        assert!(msg.contains("尚未保存您的公钥"));
     }
 
     #[test]

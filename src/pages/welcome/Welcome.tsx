@@ -915,7 +915,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
                 <span className="ps-name ellipsis" title={s.name}>{s.name}</span>
                 <span className="ps-host mono">{s.host}:{s.port}</span>
                 <span className="ps-user">{s.username || '-'}</span>
-                {s.authType === 'key' ? <span className="tag yellow">密钥</span> : <span className="tag blue">密码</span>}
+                {s.authType === 'password' ? <span className="tag blue">密码</span> : <span className="tag yellow">{s.authType === 'publickey' ? 'SSH 公钥' : '密钥'}</span>}
                 <div className="ps-actions">
                   <button className="icon-btn" data-act="srv-edit" data-id={s.id} title="编辑服务器"
                     onClick={(e) => { e.stopPropagation(); openSrvModal(s, null); }}><Icon name="pencil" /></button>
@@ -958,7 +958,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
             >
               <div className="sc-head">
                 <span className="sc-name ellipsis" title={s.name}>{s.name}</span>
-                {s.authType === 'key' ? <span className="tag yellow">密钥</span> : <span className="tag blue">密码</span>}
+                {s.authType === 'password' ? <span className="tag blue">密码</span> : <span className="tag yellow">{s.authType === 'publickey' ? 'SSH 公钥' : '密钥'}</span>}
               </div>
               <div className="sc-meta mono">{s.host}:{s.port}</div>
             </div>

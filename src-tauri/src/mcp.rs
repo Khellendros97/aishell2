@@ -501,6 +501,7 @@ impl McpCore {
             let auth = match sv.auth_type {
                 AuthType::Password => "密码",
                 AuthType::Key => "密钥",
+                AuthType::PublicKey => "公钥(密钥对)",
             };
             lines.push(format!(
                 "- serverId={}，名称={}，地址={}:{}，用户={}，认证={}，状态={}",
