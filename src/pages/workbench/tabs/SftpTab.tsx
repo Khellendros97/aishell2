@@ -26,6 +26,10 @@
  *   且不会误伤其他标签的框选(legacy 模块级单例会)。
  * - 右键「打开终端」legacy 在菜单 action 内才查 getState,失败时 name 回退 'SSH' 但
  *   data.serverId 使用 st.serverId(正确);迁移保持该语义,仅把 Workbench 句柄换 store。
+ * - 条目上按下鼠标 = 原生 HTML5 拖拽起点(如拖去本地文件管理器),legacy 的框选 marquee
+ *   仍跟踪 window mousemove,拖拽途中画出选框、松开误改选中集;现条目按下不启动框选。
+ * - 选中带焦点语义(与本地文件管理器对称):面板外按下鼠标即失焦并清空选中,快捷键随之
+ *   失效——修复「选中 SFTP b 后点选本地 a,按 Delete 连带删除 b」的双删除。
  *
  * 导出签名契约:export function SftpTab({ tab, active }: TabProps),TabProps import 自
  * '../../../stores/workbench'(registry.ts 接线,不得变更)。
@@ -90,6 +94,8 @@ interface SftpTabState {
   seq: number;
   /** 平铺视图框选/单击选中的条目路径集合(目录切换时清空) */
   sel: Set<string>;
+  /** 本面板是否持有焦点(最近一次按下鼠标在面板内);快捷键门禁之一,失焦即清空选中 */
+  hasFocus: boolean;
   /** 最近一次渲染的带完整远端路径条目(菜单多选操作的数据源) */
   renderEntries: RemoteEntry[];
   /** 下次 loadDir 成功后要聚焦(选中+滚动)的条目路径;不存在则静默跳过 */
@@ -302,6 +308,7 @@ function applyFocus(st: SftpTabState): void {
   if (!st.renderEntries.some((e) => e.path === focus)) return;
   st.sel.clear();
   st.sel.add(focus);
+  st.hasFocus = true; // 程序化聚焦 = 面板接管焦点(上传/粘贴/改名落地后的定位,快捷键随之可用)
   renderView(st);
   requestAnimationFrame(() => {
     const row = Array.from(st.els.body.querySelectorAll<HTMLElement>('[data-path]'))
@@ -1386,7 +1393,8 @@ function buildGrid(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[]):
 
 /**
  * 平铺视图拖拽框选:fixed 选框随鼠标更新,松开时与条目矩形求交加入选中集。
- *  mousedown 绑在 grid 父容器(.sf-body)上——起点可能落在 body 的 padding 空白区。
+ *  mousedown 绑在 grid 父容器(.sf-body)上——起点可能落在 body 的 padding 空白区;
+ *  条目上的按下不启动框选(那是原生拖拽起点,见 onDown)。
  *  监听器模块级单套:renderView 重建 grid 前先 teardown,避免旧闭包把选中集清空。
  *  React 差异:记录归属 tab id(marqueeOwnerId),卸载时只拆自己的监听。
  */
@@ -1401,6 +1409,9 @@ function bindGridMarquee(grid: HTMLElement, st: SftpTabState): void {
   let box: HTMLDivElement | null = null;
   const onDown = (e: MouseEvent): void => {
     if (e.button !== 0 || st.loading) return;
+    // 条目上按下 = 原生 HTML5 拖拽起点(如拖去本地文件管理器),不启动框选跟踪:
+    // 否则拖拽期间 window mousemove 会画出选框、松开还误改选中集
+    if ((e.target as Element).closest?.('.sf-item, .sf-table tr')) return;
     startX = e.clientX;
     startY = e.clientY;
     dragging = true;
@@ -1688,6 +1699,7 @@ export function SftpTab({ tab, active: _active }: TabProps): JSX.Element {
       error: '',
       seq: 0,
       sel: new Set<string>(),
+      hasFocus: false,
       renderEntries: [],
       pendingFocus: null,
       query: '',
@@ -1707,6 +1719,21 @@ export function SftpTab({ tab, active: _active }: TabProps): JSX.Element {
     bindRootContextMenu(root, st);
     void initHome(st);
 
+    /* 焦点语义:面板外按下鼠标 = 失焦并清空选中(与本地文件管理器对称,防跨面板误操作)。
+       只摘 .sel 类不 renderView:右键菜单项点击也在面板外,重渲会把菜单动作捕获的
+       行元素变成孤儿(行内重命名会写进脱离 DOM 的节点)。 */
+    const onDocMouseDown = (e: MouseEvent): void => {
+      if (root.contains(e.target as Node)) {
+        st.hasFocus = true;
+        return;
+      }
+      st.hasFocus = false;
+      if (!st.sel.size) return;
+      st.sel.clear();
+      st.els.body.querySelectorAll('.sel').forEach((el) => el.classList.remove('sel'));
+    };
+    document.addEventListener('mousedown', onDocMouseDown);
+
     /* 命令式句柄注册(legacy 渲染器返回的 api,供侧栏「上传到服务器」等外部入口按 tab id 获取) */
     tabApis.set(tab.id, {
       getCwd: () => st.cwd,
@@ -1721,6 +1748,9 @@ export function SftpTab({ tab, active: _active }: TabProps): JSX.Element {
     const onKey = (e: KeyboardEvent): void => {
       const activeTab = getActiveTab(useWorkbench.getState());
       if (!activeTab || activeTab.id !== tab.id || activeTab.type !== 'sftp') return;
+      // 焦点不在本面板(点击过其他区域)时不劫持:主区激活标签仍是自己、但焦点已到
+      // 侧栏文件管理器等处时,靠焦点归属避免同一按键删两边的文件
+      if (!st.hasFocus) return;
       if (st.loading) return;
       const ae = document.activeElement;
       const typing = ae instanceof HTMLInputElement
@@ -1781,6 +1811,7 @@ export function SftpTab({ tab, active: _active }: TabProps): JSX.Element {
       /* 卸载(tab 关闭):移除 window 快捷键与历史下拉的 document 级监听、按归属拆除框选
          监听(legacy 不拆,残留闭包引用已移除 DOM)、注销命令式句柄与状态表。 */
       window.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onDocMouseDown);
       if (marqueeOwnerId === tab.id) {
         marqueeTeardown?.();
         marqueeTeardown = null;
