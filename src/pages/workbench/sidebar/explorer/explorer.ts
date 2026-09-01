@@ -26,7 +26,8 @@
  * - 选中带焦点语义(legacy 无):点击面板外(终端/SFTP/菜单浮层等)即失焦清空选中,
  *   快捷键随之失效——修复「选中本地 a 后点选 SFTP 的 b,按 Delete 连带删除 a」的双删除;
  * - 树空白区(含文件行)也是应用内拖放落点 = 项目根目录(remote 下载 / local 移动),
- *   悬停时高亮根行提示落点;legacy 只收 OS 文件拖入。
+ *   悬停时高亮根行提示落点;legacy 只收 OS 文件拖入。拖放监听挂容器级(树随轮询重建、
+ *   OS 拖入的 dragleave relatedTarget 为 null,挂树级会丢高亮),dragleave 走预约清除。
  */
 import { icon } from '../../../../icons';
 import {
@@ -785,52 +786,8 @@ function render(): void {
     e.preventDefault();
     showRootMenu(e.clientX, e.clientY, root);
   });
-  /* 树空白区(含文件行)= 应用内拖放落点,落到项目根目录(remote 下载 / local 移动),
-     也是 OS 文件拖入导入根目录的落点;悬停时高亮根行提示落点。
-     目录行的 dragover/drop 已 preventDefault,冒泡到这里时以 defaultPrevented 区分,
-     跳过处理并让位给目标行高亮,不会重复下载/移动/导入。 */
-  const rootRow = (): HTMLElement | null =>
-    tree.querySelector<HTMLElement>(`.wbs-explorer-row[data-path="${CSS.escape(root.path)}"]`);
-  tree.addEventListener('dragover', (e) => {
-    if (!e.dataTransfer || e.defaultPrevented) {
-      // 已被目录行 dragover 接管:摘掉根行高亮,避免与目标行双高亮
-      rootRow()?.classList.remove('wbs-explorer-drop');
-      return;
-    }
-    const types = Array.from(e.dataTransfer.types);
-    if (!types.includes(DND_MIME) && !types.includes('Files')) return;
-    e.preventDefault();
-    /* 本地树内拖拽=移动;远端 / OS 文件=复制(与目录行 dragover 同语义) */
-    e.dataTransfer.dropEffect = draggingNode ? 'move' : 'copy';
-    rootRow()?.classList.add('wbs-explorer-drop');
-  });
-  tree.addEventListener('dragleave', (e) => {
-    if (!tree.contains(e.relatedTarget as Node)) rootRow()?.classList.remove('wbs-explorer-drop');
-  });
-  tree.addEventListener('drop', (e) => {
-    rootRow()?.classList.remove('wbs-explorer-drop');
-    if (!e.dataTransfer || e.defaultPrevented) return;
-    const raw = (() => { try { return e.dataTransfer!.getData(DND_MIME); } catch { return ''; } })();
-    if (raw) {
-      e.preventDefault();
-      let data: { source: string; path: string; name: string; isDir: boolean; serverId?: string } | null = null;
-      try { data = JSON.parse(raw); } catch { return; }
-      if (!data) return;
-      /* 空白落点 = 项目根目录(与拖到根行等价) */
-      if (data.source === 'local') {
-        void moveNode(data.path, data.name, data.isDir, root);
-        return;
-      }
-      if (data.source === 'remote' && data.serverId) {
-        void downloadTo({ path: data.path, name: data.name, serverId: data.serverId }, root);
-      }
-      return;
-    }
-    if (e.dataTransfer.files.length > 0) {
-      e.preventDefault();
-      void importOsFiles(e.dataTransfer, root);
-    }
-  });
+  /* 拖放落点(应用内载荷 + OS 文件)挂容器级,见 mountExplorer:树随轮询重建、
+     OS 拖入的 dragleave relatedTarget 为 null,挂树级会丢高亮/丢落点 */
   appendNode(tree, root, 0, true);
   container.appendChild(tree);
   container.scrollTop = scrollTop;
@@ -946,6 +903,75 @@ export function mountExplorer(el: HTMLElement): () => void {
   if (pending) void doReveal(pending);
   startPolling();
   window.addEventListener('keydown', onKeyDown);
+  /* ---------- 树/面板空白区拖放落点(挂容器级,挂载期一次) ----------
+     树空白区(含文件行)= 项目根目录落点:remote 下载 / local 移动 / OS 文件导入,
+     悬停时高亮根行提示。不挂 tree 的原因:树随轮询/刷新整体重建,监听随旧节点报废,
+     高亮类也会被抹掉;且 OS 拖入的 dragleave relatedTarget 为 null(Chromium 不暴露
+     外部来源),按 relatedTarget 判"已离开"会在行间移动时误摘高亮。故:
+     - dragover 持续重设高亮(浏览器 ~350ms/次 + 每次移动),目录行已 preventDefault 的
+       事件冒泡到此时以 defaultPrevented 区分,让位给目标行高亮;
+     - dragleave 只"预约"下一拍清除,期间任何 dragover 都会取消预约——真离开/取消拖拽
+       时才真正摘掉,行间移动/OS 拖入零误摘;
+     - drop 时 defaultPrevented 表示行级已处理,不重复下载/移动/导入。 */
+  const dragHintRow = (): HTMLElement | null => {
+    const root = getRoot();
+    if (!root || !container) return null;
+    return container.querySelector<HTMLElement>(`.wbs-explorer-row[data-path="${CSS.escape(root.path)}"]`);
+  };
+  let dragHintTimer: number | null = null;
+  const clearDragHint = (): void => {
+    if (dragHintTimer !== null) { window.clearTimeout(dragHintTimer); dragHintTimer = null; }
+    dragHintRow()?.classList.remove('wbs-explorer-drop');
+  };
+  const onContainerDragOver = (e: DragEvent): void => {
+    if (!e.dataTransfer) return;
+    if (e.defaultPrevented) {
+      // 已被目录行 dragover 接管:摘掉根行高亮,避免与目标行双高亮;
+      // 但悬停的就是根行自身时,高亮由行级 handler 负责,容器级不插手
+      const row = (e.target as Element).closest?.('.wbs-explorer-row');
+      if (!row || row !== dragHintRow()) clearDragHint();
+      return;
+    }
+    const types = Array.from(e.dataTransfer.types);
+    if (!types.includes(DND_MIME) && !types.includes('Files')) return;
+    e.preventDefault();
+    /* 本地树内拖拽=移动;远端 / OS 文件=复制(与目录行 dragover 同语义) */
+    e.dataTransfer.dropEffect = draggingNode ? 'move' : 'copy';
+    if (dragHintTimer !== null) { window.clearTimeout(dragHintTimer); dragHintTimer = null; }
+    dragHintRow()?.classList.add('wbs-explorer-drop');
+  };
+  const onContainerDragLeave = (): void => {
+    if (dragHintTimer !== null) return;
+    dragHintTimer = window.setTimeout(clearDragHint, 0);
+  };
+  const onContainerDrop = (e: DragEvent): void => {
+    clearDragHint();
+    if (!e.dataTransfer || e.defaultPrevented) return;
+    const root = getRoot();
+    if (!root) return;
+    const raw = (() => { try { return e.dataTransfer!.getData(DND_MIME); } catch { return ''; } })();
+    if (raw) {
+      e.preventDefault();
+      let data: { source: string; path: string; name: string; isDir: boolean; serverId?: string } | null = null;
+      try { data = JSON.parse(raw); } catch { return; }
+      if (!data) return;
+      if (data.source === 'local') {
+        void moveNode(data.path, data.name, data.isDir, root);
+        return;
+      }
+      if (data.source === 'remote' && data.serverId) {
+        void downloadTo({ path: data.path, name: data.name, serverId: data.serverId }, root);
+      }
+      return;
+    }
+    if (e.dataTransfer.files.length > 0) {
+      e.preventDefault();
+      void importOsFiles(e.dataTransfer, root);
+    }
+  };
+  container.addEventListener('dragover', onContainerDragOver);
+  container.addEventListener('dragleave', onContainerDragLeave);
+  container.addEventListener('drop', onContainerDrop);
   /* 焦点语义:面板外按下鼠标 = 失焦并清空选中(防 Delete 等快捷键跨面板误伤另一侧文件)。
      只摘 .sel 类不整树重渲:contextmenu 菜单项点击也在容器外,重渲会把菜单动作捕获的
      行元素变成孤儿(重命名 / 行内新建会写进脱离 DOM 的节点)。 */
@@ -965,6 +991,10 @@ export function mountExplorer(el: HTMLElement): () => void {
     offProjectChanged();
     window.removeEventListener('keydown', onKeyDown);
     document.removeEventListener('mousedown', onDocMouseDown);
+    el.removeEventListener('dragover', onContainerDragOver);
+    el.removeEventListener('dragleave', onContainerDragLeave);
+    el.removeEventListener('drop', onContainerDrop);
+    clearDragHint(); // 拖拽途中切走面板时摘掉根行高亮并取消预约清除
     if (pollTimer !== null) { window.clearInterval(pollTimer); pollTimer = null; }
     invalidateLoads(); // 作废在途 fsList/loadDir/refreshAll,旧 token 结果不再渲染
     setRenderHook(null);
