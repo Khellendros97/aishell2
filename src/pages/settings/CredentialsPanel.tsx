@@ -3,9 +3,12 @@
  * 对照 .proto/settings.html / .proto/settings.js 的设置导航与服务器认证表单规格；
  * 后端接口点：get_state、upsert_credential、delete_credential。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { AppState, AuthType, Credential } from '../../types';
-import { deleteCredential, getState, openDialog, upsertCredential } from '../../api';
+import {
+  deleteCredential, getState, openDialog, sshDefaultKeypairDir, sshDetectKeypair,
+  sshGenerateKeypair, upsertCredential,
+} from '../../api';
 import { confirmDialog, toast, uid } from '../../ui';
 import { Icon } from '../../shared/Icon';
 
@@ -33,6 +36,38 @@ export function CredentialsPanel({ initialState, onChanged }: Props): JSX.Elemen
   const [fields, setFields] = useState<CredentialFields>(EMPTY_FIELDS);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  /** 密钥对目录探测状态（仅 publickey 认证显示；检测规则在后端 ssh_keys.rs，前端只展示） */
+  const [kp, setKp] = useState<{ status: 'idle' | 'busy' | 'found' | 'missing'; name?: string }>({ status: 'idle' });
+  const kpTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /** 目录输入防抖探测：结果驱动「已识别 / 未发现可生成」提示 */
+  const runDetect = (dir: string): void => {
+    if (kpTimer.current) { clearTimeout(kpTimer.current); kpTimer.current = null; }
+    const d = dir.trim();
+    if (d.length < 3) { setKp({ status: 'idle' }); return; }
+    kpTimer.current = setTimeout(() => {
+      setKp({ status: 'busy' });
+      void sshDetectKeypair(d).then((info) => {
+        setKp(info ? { status: 'found', name: info.name } : { status: 'missing' });
+      }).catch(() => setKp({ status: 'idle' }));
+    }, 500);
+  };
+
+  /** 「未发现密钥对」按钮：后端生成 ed25519 密钥对（防覆盖，已存在时拒绝）并刷新探测 */
+  const onGenerateKeypair = async (): Promise<void> => {
+    const dir = fields.keyPath.trim();
+    if (!dir) return;
+    setKp({ status: 'busy' });
+    try {
+      const info = await sshGenerateKeypair(dir);
+      setKp({ status: 'found', name: info.name });
+      toast(`密钥对已生成：${info.name}（无密码短语）`, 'success');
+    } catch (err) {
+      setKp({ status: 'missing' });
+      toast(String(err), 'error');
+    }
+  };
 
   useEffect(() => { setState(initialState); }, [initialState]);
 
@@ -63,6 +98,7 @@ export function CredentialsPanel({ initialState, onChanged }: Props): JSX.Elemen
     setEditing(null);
     setFields(EMPTY_FIELDS);
     setError(null);
+    setKp({ status: 'idle' });
     setModalOpen(true);
   };
   const openEdit = (credential: Credential): void => {
@@ -76,6 +112,7 @@ export function CredentialsPanel({ initialState, onChanged }: Props): JSX.Elemen
     });
     setError(null);
     setModalOpen(true);
+    if (credential.authType === 'publickey') runDetect(credential.keyPath);
   };
   const close = (): void => {
     if (busy) return;
@@ -89,17 +126,27 @@ export function CredentialsPanel({ initialState, onChanged }: Props): JSX.Elemen
       setFields((current) => ({ ...current, keyPath: path }));
     }
   };
+  const browseKeypairDir = async (): Promise<void> => {
+    const path = await openDialog({ directory: true });
+    if (typeof path === 'string' && path) {
+      setFields((current) => ({ ...current, keyPath: path }));
+      runDetect(path);
+    }
+  };
   const save = async (): Promise<void> => {
     const name = fields.name.trim();
     if (!name) { setError('凭据名称不能为空'); return; }
-    if (fields.authType === 'key' && !fields.keyPath.trim()) { setError('请填写密钥文件路径'); return; }
+    if (fields.authType !== 'password' && !fields.keyPath.trim()) {
+      setError(fields.authType === 'publickey' ? '请填写密钥对目录' : '请填写密钥文件路径');
+      return;
+    }
     if (!fields.username.trim()) { setError('请填写账号'); return; }
     const credential: Credential = {
       id: editing?.id ?? uid('cred'),
       name,
       authType: fields.authType,
       username: fields.username.trim(),
-      keyPath: fields.authType === 'key' ? fields.keyPath.trim() : '',
+      keyPath: fields.authType === 'password' ? '' : fields.keyPath.trim(),
     };
     setBusy(true);
     setError(null);
@@ -158,9 +205,9 @@ export function CredentialsPanel({ initialState, onChanged }: Props): JSX.Elemen
                   </div>
                 </div>
                 <div className="credential-meta">
-                  <span className="tag">{credential.authType === 'key' ? '密钥' : '账号密码'}</span>
+                  <span className="tag">{credential.authType === 'password' ? '账号密码' : credential.authType === 'publickey' ? 'SSH 公钥' : '密钥'}</span>
                   <span><Icon name="user" /> {credential.username || '未设账号'}</span>
-                  {credential.authType === 'key' ? <span className="mono credential-path">{credential.keyPath || '未设路径'}</span> : <span>密码不回显</span>}
+                  {credential.authType !== 'password' ? <span className="mono credential-path">{credential.keyPath || '未设路径'}</span> : <span>密码不回显</span>}
                 </div>
                 <div className="credential-refs">
                   <Icon name="server" /> 引用服务器 {referenced.length} 台
@@ -180,9 +227,32 @@ export function CredentialsPanel({ initialState, onChanged }: Props): JSX.Elemen
             <div className="modal-head"><h3>{editing ? '编辑凭据' : '新建凭据'}</h3><button className="icon-btn" title="关闭" onClick={close}><Icon name="x" /></button></div>
             <div className="modal-body">
               <div className="field"><label>凭据名称<span className="req">*</span></label><input className="input" autoFocus value={fields.name} placeholder="例如：生产环境部署账号" onChange={(event) => { const value = event.currentTarget.value; setFields((current) => ({ ...current, name: value })); }} /></div>
-              <div className="field"><label>认证方式</label><select className="select" value={fields.authType} onChange={(event) => { const authType = event.currentTarget.value as AuthType; setFields((current) => ({ ...current, authType, password: '' })); }}><option value="password">账号密码</option><option value="key">密钥</option></select></div>
+              <div className="field"><label>认证方式</label><select className="select" value={fields.authType} onChange={(event) => {
+                // 局部变量先取出再进 updater（React 事件对象不跨异步读取）
+                const authType = event.currentTarget.value as AuthType;
+                const currentKeyPath = fields.keyPath.trim();
+                setFields((current) => ({ ...current, authType, password: '' }));
+                if (authType === 'publickey') {
+                  if (currentKeyPath) {
+                    runDetect(currentKeyPath);
+                  } else {
+                    // 首次切到公钥认证且无路径：自动填用户主目录 `.ssh`（后端给默认值）
+                    setKp({ status: 'busy' });
+                    void sshDefaultKeypairDir().then((dir) => {
+                      setFields((current) => (current.keyPath.trim() ? current : { ...current, keyPath: dir }));
+                      runDetect(dir);
+                    }).catch(() => setKp({ status: 'idle' }));
+                  }
+                } else {
+                  if (kpTimer.current) { clearTimeout(kpTimer.current); kpTimer.current = null; }
+                  setKp({ status: 'idle' });
+                }
+              }}><option value="password">账号密码</option><option value="key">密钥</option><option value="publickey">SSH 公钥（密钥对）</option></select></div>
               <div className="field"><label>账号<span className="req">*</span></label><input className="input" value={fields.username} placeholder="例如：deploy" onChange={(event) => { const value = event.currentTarget.value; setFields((current) => ({ ...current, username: value })); }} /></div>
-              {fields.authType === 'password' ? <div className="field"><label>密码</label><input className="input" type="password" placeholder={editing ? '留空表示保持原密码' : '输入后保存到系统凭据库'} value={fields.password} onChange={(event) => { const value = event.currentTarget.value; setFields((current) => ({ ...current, password: value })); }} /></div> : <div className="field"><label>密钥文件路径<span className="req">*</span></label><div className="path-row"><input className="input mono" value={fields.keyPath} placeholder="C:\\Users\\demo\\.ssh\\id_ed25519" onChange={(event) => { const value = event.currentTarget.value; setFields((current) => ({ ...current, keyPath: value })); }} /><button type="button" className="btn" onClick={() => void browseKey()}>浏览…</button></div></div>}
+              {fields.authType === 'password' ? <div className="field"><label>密码</label><input className="input" type="password" placeholder={editing ? '留空表示保持原密码' : '输入后保存到系统凭据库'} value={fields.password} onChange={(event) => { const value = event.currentTarget.value; setFields((current) => ({ ...current, password: value })); }} /></div> : fields.authType === 'key' ? <div className="field"><label>密钥文件路径<span className="req">*</span></label><div className="path-row"><input className="input mono" value={fields.keyPath} placeholder="C:\\Users\\demo\\.ssh\\id_ed25519" onChange={(event) => { const value = event.currentTarget.value; setFields((current) => ({ ...current, keyPath: value })); }} /><button type="button" className="btn" onClick={() => void browseKey()}>浏览…</button></div></div> : <div className="field"><label>密钥对目录<span className="req">*</span></label><div className="path-row"><input className="input mono" value={fields.keyPath} placeholder="C:\\Users\\demo\\.ssh" onChange={(event) => { const value = event.currentTarget.value; setFields((current) => ({ ...current, keyPath: value })); runDetect(value); }} /><button type="button" className="btn" onClick={() => void browseKeypairDir()}>浏览…</button></div>
+                {/* 目录探测结果：已识别密钥对 / 未发现时提供一键生成（生成规则见 ssh_keys.rs） */}
+                {kp.status === 'found' ? <div className="hint ok">已识别密钥对：{kp.name}</div> : kp.status === 'missing' ? <button type="button" className="btn small ghost keypair-gen" onClick={() => void onGenerateKeypair()}>未发现密钥对，点击立即生成</button> : kp.status === 'busy' ? <div className="hint">探测目录中…</div> : <div className="hint">目录内按 id_ed25519 / id_rsa / id_ecdsa 顺序识别（私钥 + 同名 .pub 需并存）</div>}
+              </div>}
               {error ? <div className="form-error">{error}</div> : null}
             </div>
             <div className="modal-foot"><button className="btn" onClick={close} disabled={busy}>取消</button><button className="btn primary" onClick={() => void save()} disabled={busy}>{busy ? '保存中…' : '保存'}</button></div>

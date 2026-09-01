@@ -16,6 +16,7 @@ import BrowserTab from './BrowserTab';
 import SkillHubTab from './SkillHubTab';
 import { TraceTab } from './TraceTab';
 import { NoteTab } from './NoteTab';
+import { TunnelTab } from './TunnelTab';
 
 export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   terminal: TerminalTab,
@@ -27,4 +28,5 @@ export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   'skill-hub': SkillHubTab,
   trace: TraceTab,
   note: NoteTab,
+  tunnel: TunnelTab,
 };

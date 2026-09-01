@@ -849,6 +849,8 @@ fn credential_secret_payload(store: &Store, credential: &Credential) -> Option<C
             let secret = String::from_utf8(bytes).ok()?;
             payload(SECRET_TYPE_PRIVATE_KEY, secret, Some(key_file_name))
         }
+        // 公钥(密钥对)凭据的 key_path 指向用户自管目录(~/.ssh 等)，不收编、不进云同步。
+        AuthType::PublicKey => None
     }
 }
 

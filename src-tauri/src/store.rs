@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::cloud_sync::ssh_keys;
+use crate::ssh_keys;
+use crate::tunnel::TunnelConfig;
 
 // ---------------------------------------------------------------- 数据模型
 
@@ -244,6 +245,9 @@ impl Default for Settings {
 pub enum AuthType {
     Password,
     Key,
+    /// SSH 公钥(密钥对):key_path 存密钥对目录(如 `~/.ssh`),认证用目录内标准命名的私钥,
+    /// 服务器未部署公钥时由用户提供一次密码自动部署。私钥不进 keyring、不收编。
+    PublicKey,
 }
 
 /// AI 助手执行模式（按项目持久化）：
@@ -951,6 +955,10 @@ pub struct AppState {
     /// 放在 AppState 顶层而非 Settings：设置页保存时整体提交 Settings 表单，表单无此字段会被覆盖。
     #[serde(default)]
     pub trace_enabled: bool,
+    /// SSH 隧道配置（本地端口转发 -L 等价；enabled = 上次启用状态，重启时自动重建）。
+    /// 旧配置无此字段按空列表。运行态（监听/错误）不落盘，由 tunnel.rs 即时合并。
+    #[serde(default)]
+    pub ssh_tunnels: Vec<crate::tunnel::TunnelConfig>,
 }
 
 /// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
@@ -1455,7 +1463,7 @@ impl Store {
             store.persist_locked(&guard)?;
         }
         // 密钥收编迁移：早期版本密钥型凭据/服务器可能仍指向外部私钥文件，workspace
-        // 已配置时复制进 `.aishell/ssh-key/` 保管目录并改写 key_path（云同步只认保管目录）。
+        // 已配置时复制进 `.aishell/ssh-key/` 保管目录并改写 key_path（云同步只认保管目录，单个失败跳过）。
         let adopted_keys = {
             let mut guard = store
                 .state
@@ -1689,7 +1697,7 @@ impl Store {
             s.settings = settings.clone();
             // 首次配置/切换 workspace 后，顺带修复云同步拉取的无本机路径项目（单个失败跳过）。
             ensure_project_paths_in_workspace(s);
-            // 首次配置/切换 workspace 后，顺带收编仍在外部的外部私钥（单个失败跳过）。
+            // 首次配置/切换 workspace 后，顺带收编仍在外部的私钥（单个失败跳过）。
             adopt_managed_ssh_keys(s);
             Ok(())
         })
@@ -1991,7 +1999,12 @@ impl Store {
         let copied_secret = copy_from
             .as_deref()
             .and_then(|id| self.secrets.get(&keyring_account_credential(id)).ok());
-        let secret_update = if credential.auth_type == AuthType::Key {
+        // 公钥(密钥对)类型与 Key 一样不向 keyring 写密码:部署公钥所需的密码是用户
+        // 连接时一次性输入的,不进系统凭据库。
+        let secret_update = if matches!(
+            credential.auth_type,
+            AuthType::Key | AuthType::PublicKey
+        ) {
             Some(None)
         } else if let Some(value) = password {
             Some(Some(value.to_string()))
@@ -2065,7 +2078,8 @@ impl Store {
         if credential.id.trim().is_empty() || credential.name.trim().is_empty() {
             return Err("凭据名称不能为空".to_string());
         }
-        // 密钥认证先把外部私钥收编进 workspace 保管目录，之后云同步只需同步保管目录内容。
+        // 密钥认证先把外部私钥收编进 workspace 保管目录，之后云同步只需同步保管目录内容，
+        // 引用服务器镜像同一保管路径。
         if credential.auth_type == AuthType::Key {
             if let Some(adopted) = self.adopt_key_path(&credential.key_path) {
                 credential.key_path = adopted;
@@ -2073,7 +2087,12 @@ impl Store {
         }
         let account = keyring_account_credential(&credential.id);
         let old_secret = self.secrets.get(&account).ok();
-        let secret_update = if credential.auth_type == AuthType::Key {
+        // 公钥(密钥对)类型与 Key 一样不向 keyring 写密码:部署公钥所需的密码是用户
+        // 连接时一次性输入的,不进系统凭据库。
+        let secret_update = if matches!(
+            credential.auth_type,
+            AuthType::Key | AuthType::PublicKey
+        ) {
             Some(None)
         } else {
             password.map(|value| Some(value.to_string()))
@@ -3092,6 +3111,33 @@ impl Store {
         ssh_keys::adopt_key_into_workspace(workspace, key_path)
     }
 
+    /// SSH 隧道配置列表（全部；运行态见 tunnel.rs TunnelManager）。
+    pub fn tunnels_all(&self) -> Vec<TunnelConfig> {
+        self.state
+            .lock()
+            .map(|g| g.ssh_tunnels.clone())
+            .unwrap_or_default()
+    }
+
+    /// 保存隧道配置（按 id upsert，原子落盘）。
+    pub fn save_tunnel(&self, cfg: TunnelConfig) -> Result<(), String> {
+        self.with_state(|state| {
+            match state.ssh_tunnels.iter_mut().find(|t| t.id == cfg.id) {
+                Some(slot) => *slot = cfg.clone(),
+                None => state.ssh_tunnels.push(cfg.clone()),
+            }
+            Ok(())
+        })
+    }
+
+    /// 删除隧道配置（运行中的隧道由 tunnel_delete 先 stop 再调这里）。
+    pub fn delete_tunnel(&self, id: &str) -> Result<(), String> {
+        self.with_state(|state| {
+            state.ssh_tunnels.retain(|t| t.id != id);
+            Ok(())
+        })
+    }
+
     /// 系统任务项目：不落入 AppState.projects，按当前 workspace 合成并确保目录存在。
     /// 任务项目固定使用 `<workspace>/.aishell/tasks`，没有 workspace 时返回可执行的中文错误。
     pub fn task_project(&self) -> Result<Project, String> {
@@ -3413,24 +3459,39 @@ pub async fn set_theme(store: State<'_, Arc<Store>>, theme: Theme) -> Result<(),
 #[tauri::command]
 pub async fn upsert_server(
     store: State<'_, Arc<Store>>,
+    ssh: State<'_, Arc<crate::ssh::SshManager>>,
     server: Server,
     password: Option<String>,
     credential_mode: Option<CredentialSaveMode>,
 ) -> Result<ServerSaveResult, String> {
-    store.save_server_with_credential(
-        server,
+    let saved = store.save_server_with_credential(
+        server.clone(),
         password.as_deref(),
         credential_mode.unwrap_or_default(),
-    )
+    )?;
+    // 认证配置可能已变（如切换认证方式）：断开该服务器旧连接，下次操作按新配置重连；
+    // 否则连接池里的旧会话（密码/密钥已认证过）会被继续复用，修改不生效。
+    if matches!(saved, ServerSaveResult::Saved { .. }) {
+        ssh.disconnect(&server.id).await;
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
 pub async fn upsert_credential(
     store: State<'_, Arc<Store>>,
+    ssh: State<'_, Arc<crate::ssh::SshManager>>,
     credential: Credential,
     password: Option<String>,
 ) -> Result<Credential, String> {
-    store.upsert_credential(credential, password.as_deref())
+    let saved = store.upsert_credential(credential.clone(), password.as_deref())?;
+    // 凭据认证信息变更：断开所有引用它的服务器连接，下次连接按新凭据重连。
+    for server in store.servers_all() {
+        if server.credential_id.as_deref() == Some(&credential.id) {
+            ssh.disconnect(&server.id).await;
+        }
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -3449,11 +3510,14 @@ pub async fn clear_unreferenced_credentials(
 pub async fn delete_server(
     store: State<'_, Arc<Store>>,
     mcp: State<'_, Arc<crate::mcp::McpService>>,
+    ssh: State<'_, Arc<crate::ssh::SshManager>>,
     id: String,
 ) -> Result<(), String> {
     store.delete_server(&id)?;
     // 级联清理 MCP 设备配置后同步监听（可能需停止）
     mcp.sync().await;
+    // 服务器已删除：断开连接池残留连接（一直挂着会常驻 TCP 直到 watcher 检测）
+    ssh.disconnect(&id).await;
     Ok(())
 }
 
@@ -3864,6 +3928,7 @@ mod tests {
             // 记录值必须带当前播种代际标记（裸 workspace 是 gen1 旧记录，会触发补种写盘）
             seeded_skill_workspaces: vec![seed_marker("D:\\AIShellWorkspace")],
             trace_enabled: false,
+            ssh_tunnels: vec![],
         }
     }
 
@@ -4446,10 +4511,9 @@ mod tests {
         };
         store.upsert_credential(credential, None).unwrap();
         let stored = store.credentials_all().remove(0);
-        let expected_name = crate::cloud_sync::ssh_keys::key_file_name_for_content(
-            &fs::read(&external).unwrap(),
-        );
-        let expected_path = crate::cloud_sync::ssh_keys::managed_key_dir(&workspace.to_string_lossy())
+        let expected_name =
+            crate::ssh_keys::key_file_name_for_content(&fs::read(&external).unwrap());
+        let expected_path = crate::ssh_keys::managed_key_dir(&workspace.to_string_lossy())
             .join(expected_name);
         // key_path 已改写为 workspace 保管路径，内容与原文件一致，原文件保持不动（复制而非移动）。
         assert_eq!(stored.key_path, expected_path.to_string_lossy());
@@ -4489,9 +4553,11 @@ mod tests {
             .into_iter()
             .find(|c| c.id == credential_id)
             .unwrap();
-        assert!(saved.key_path.starts_with(&crate::cloud_sync::ssh_keys::managed_key_dir(
-            &workspace.to_string_lossy()
-        ).to_string_lossy().to_string()));
+        assert!(saved.key_path.starts_with(
+            crate::ssh_keys::managed_key_dir(&workspace.to_string_lossy())
+                .to_string_lossy()
+                .as_ref()
+        ));
         assert_eq!(credential.key_path, saved.key_path);
         assert_eq!(fs::read(&saved.key_path).unwrap(), b"SERVER-KEY-CONTENT");
         let _ = fs::remove_dir_all(&config);
@@ -4558,8 +4624,7 @@ mod tests {
 
         // c1 收编(1) + s1 镜像(1) + s2 就地收编并回写 c2(1)。
         assert_eq!(adopt_managed_ssh_keys(&mut state), 3);
-        let managed_dir =
-            crate::cloud_sync::ssh_keys::managed_key_dir(&workspace.to_string_lossy());
+        let managed_dir = crate::ssh_keys::managed_key_dir(&workspace.to_string_lossy());
         let c1 = state.credentials.iter().find(|c| c.id == "c1").unwrap();
         let c2 = state.credentials.iter().find(|c| c.id == "c2").unwrap();
         let s1 = state.servers.iter().find(|s| s.id == "s1").unwrap();
@@ -4599,6 +4664,143 @@ mod tests {
             state.credentials[0].key_path,
             key_file.to_string_lossy().into_owned()
         );
+        let _ = fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn publickey_credential_keeps_dir_and_no_keyring_secret() {
+        let config = temp_config_dir("pubkey-cred");
+        let workspace = config.parent().unwrap().join("pubkey-cred-ws");
+        let store = test_store(config.clone());
+        store
+            .with_candidate_state(|state| {
+                state.settings.workspace_dir = Some(workspace.to_string_lossy().into_owned());
+                Ok(())
+            })
+            .unwrap();
+        let key_dir = config.join("keypair-home");
+        let credential = Credential {
+            id: "pk1".into(),
+            name: "pk".into(),
+            auth_type: AuthType::PublicKey,
+            username: "u".into(),
+            key_path: key_dir.to_string_lossy().into_owned(),
+        };
+        store.upsert_credential(credential, Some("deploy-pwd-passed")).unwrap();
+        let stored = store.credentials_all().remove(0);
+        // key_path 原样保存(不被收编复制、不指向 .aishell/ssh-key),密码不进 keyring。
+        assert_eq!(stored.key_path, key_dir.to_string_lossy());
+        assert!(!stored.key_path.starts_with(
+            crate::ssh_keys::managed_key_dir(&workspace.to_string_lossy())
+                .to_string_lossy()
+                .as_ref()
+        ));
+        assert!(store
+            .secrets
+            .get(&keyring_account_credential("pk1"))
+            .is_err());
+        let _ = fs::remove_dir_all(&config);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn save_server_publickey_mirrors_dir_without_adoption() {
+        let config = temp_config_dir("pubkey-srv");
+        let workspace = config.parent().unwrap().join("pubkey-srv-ws");
+        let store = test_store(config.clone());
+        store
+            .with_candidate_state(|state| {
+                state.settings.workspace_dir = Some(workspace.to_string_lossy().into_owned());
+                Ok(())
+            })
+            .unwrap();
+        let key_dir = config.join("keypair-home");
+        let mut server = credential_test_server("pk-srv", "10.9.9.9");
+        server.auth_type = AuthType::PublicKey;
+        server.key_path = key_dir.to_string_lossy().into_owned();
+        store.upsert_server(server, None).unwrap();
+
+        let saved = store.server("pk-srv").unwrap();
+        let credential_id = saved.credential_id.expect("服务器保存后必有关联凭据");
+        let credential = store
+            .credentials_all()
+            .into_iter()
+            .find(|c| c.id == credential_id)
+            .unwrap();
+        // 目录路径镜像到凭据,两端都不被收编,keyring 无密码。
+        assert_eq!(saved.key_path, key_dir.to_string_lossy());
+        assert_eq!(credential.auth_type, AuthType::PublicKey);
+        assert_eq!(credential.key_path, saved.key_path);
+        assert!(store.secrets.get(&keyring_account_credential(&credential_id)).is_err());
+        let _ = fs::remove_dir_all(&config);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn adopt_managed_ssh_keys_ignores_publickey() {
+        let config = temp_config_dir("adopt-pubkey");
+        let workspace = config.parent().unwrap().join("adopt-pubkey-ws");
+        let mut state = AppState::default();
+        state.settings.workspace_dir = Some(workspace.to_string_lossy().into_owned());
+        let key_dir = config.join("keypair-home");
+        state.credentials.push(Credential {
+            id: "c1".into(),
+            name: "c1".into(),
+            auth_type: AuthType::PublicKey,
+            username: "u".into(),
+            key_path: key_dir.to_string_lossy().into_owned(),
+        });
+        assert_eq!(adopt_managed_ssh_keys(&mut state), 0);
+        assert_eq!(
+            state.credentials[0].key_path,
+            key_dir.to_string_lossy().into_owned()
+        );
+        let _ = fs::remove_dir_all(&config);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn tunnel_crud_roundtrip_and_old_config_compat() {
+        let config = temp_config_dir("tunnel-crud");
+        let store = test_store(config.clone());
+        // 触发一次写盘（test_store 起于内存态，save_tunnel 首次落盘）。
+        let cfg = crate::tunnel::TunnelConfig {
+            id: "t1".into(),
+            server_id: "s1".into(),
+            name: "db".into(),
+            bind_addr: "127.0.0.1".into(),
+            local_port: 3307,
+            target_host: "".into(),
+            target_port: 3306,
+            enabled: true,
+        };
+        store.save_tunnel(cfg.clone()).unwrap();
+        // 旧配置无 ssh_tunnels 字段 → 空列表（serde default 兼容）。
+        let state_path = config.join(STATE_FILE);
+        let sample = fs::read(&state_path).expect("save_tunnel 后应有配置文件");
+        let mut value: serde_json::Value = serde_json::from_slice(&sample).unwrap();
+        value.as_object_mut().unwrap().remove("sshTunnels");
+        fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = test_store(config.clone());
+        assert!(reloaded.tunnels_all().is_empty());
+
+        let mut all = store.tunnels_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0], cfg);
+        // upsert 同 id 更新。
+        let mut updated = cfg.clone();
+        updated.local_port = 3308;
+        store.save_tunnel(updated.clone()).unwrap();
+        all = store.tunnels_all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0], updated);
+        // 删除。
+        store.delete_tunnel("t1").unwrap();
+        assert!(store.tunnels_all().is_empty());
+        // 重启（Store 从磁盘读）仍一致。
+        store.save_tunnel(cfg.clone()).unwrap();
+        let store2 = test_store(config.clone());
+        assert_eq!(store2.tunnels_all()[0], cfg);
         let _ = fs::remove_dir_all(&config);
     }
 

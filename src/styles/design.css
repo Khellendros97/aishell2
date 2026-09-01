@@ -121,6 +121,9 @@ html, body {
 .btn.danger-solid:hover { background: #ee7a81; }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-1); }
 .btn.ghost:hover { background: var(--bg-hover); color: var(--text-0); }
+/* 密钥对表单「未发现密钥对，点击立即生成」：蓝色文字引导（区别于灰色说明文案） */
+.btn.ghost.keypair-gen { color: var(--accent); }
+.btn.ghost.keypair-gen:hover { color: var(--accent-hover); }
 .btn.small { padding: 3px 10px; font-size: 12px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
