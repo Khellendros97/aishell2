@@ -4,6 +4,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
@@ -12,7 +13,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::cloud::CloudManager;
-use crate::store::{CloudCapabilities, Store};
+use crate::store::{AuthType, CloudCapabilities, Credential, Store};
 
 use super::api::{ApiError, ReqwestTransport, SyncApi};
 use super::core_config::{apply_remote, from_app_state, merge_three_way, CoreConfigPayloadV1};
@@ -31,11 +32,16 @@ use super::protocol::{
     MutationsRequest, PutKeyEnvelopeRequest, RegisterDeviceRequest, SyncItem, SyncLimits,
     SyncQuota, UpdateDeviceRequest, UploadPartRequest,
 };
+use super::ssh_keys;
 use super::state::{CloudSyncStore, EntityState, OutboxEntry, UserSyncState};
 
 const CORE_ENTITY_TYPE: &str = "core_config";
 const CORE_ENTITY_ID: &str = "default";
 const CREDENTIAL_ENTITY_TYPE: &str = "credential_secret";
+/// 凭据秘密类型：登录密码。
+const SECRET_TYPE_PASSWORD: &str = "password";
+/// 凭据秘密类型：SSH 私钥文件内容（keyFileName 携带原始文件名）。
+const SECRET_TYPE_PRIVATE_KEY: &str = "privateKey";
 const VAULT_ACCOUNT_PREFIX: &str = "cloud-sync:vault:";
 const PERIODIC_INTERVAL: Duration = Duration::from_secs(300);
 const DIRTY_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -515,7 +521,7 @@ impl CloudSyncManager {
     }
 
     async fn apply_items(&self, api: &SyncApi<ReqwestTransport>, user_id: &str, vault: &[u8; 32], state: &mut UserSyncState, items: &[SyncItem]) -> Result<(), String> {
-        for item in items {
+        for item in core_first(items) {
             let key = entity_key(&item.entity_type, &item.entity_id);
             if item.tombstone || item.operation == "delete" {
                 self.apply_tombstone(user_id, item)?;
@@ -554,11 +560,17 @@ impl CloudSyncManager {
                 } else { remote.clone() };
                 self.store.with_candidate_state(|candidate| apply_remote(candidate, &merged))?;
                 self.local.save_baseline(user_id, CORE_ENTITY_TYPE, CORE_ENTITY_ID, &remote).map_err(|error| error.to_string())?;
+                // 凭据此刻已就位：回填此前乱序到达、暂存中的 SSH 私钥路径。
+                self.reconcile_key_stash(user_id)?;
             }
             CREDENTIAL_ENTITY_TYPE => {
                 let secret: CredentialSecretV1 = serde_json::from_slice(plaintext).map_err(|error| format!("云端凭据格式损坏: {error}"))?;
                 if secret.schema_version != 1 || secret.credential_id != item.entity_id { return Err("云端凭据标识不一致".into()); }
-                self.store.sync_write_secret(&Store::credential_secret_account(&secret.credential_id), &secret.secret)?;
+                match secret.secret_type.as_str() {
+                    SECRET_TYPE_PASSWORD => self.store.sync_write_secret(&Store::credential_secret_account(&secret.credential_id), &secret.secret)?,
+                    SECRET_TYPE_PRIVATE_KEY => self.apply_synced_private_key(user_id, &secret)?,
+                    other => return Err(format!("当前客户端不支持同步凭据类型 {other}，请升级 AIShell")),
+                }
             }
             NOTE_ENTITY_TYPE => {
                 let payload: NotePayloadV1 = serde_json::from_slice(plaintext).map_err(|error| format!("云端笔记格式损坏: {error}"))?;
@@ -578,7 +590,11 @@ impl CloudSyncManager {
 
     fn apply_tombstone(&self, user_id: &str, item: &SyncItem) -> Result<(), String> {
         match item.entity_type.as_str() {
-            CREDENTIAL_ENTITY_TYPE => self.store.sync_delete_secret(&Store::credential_secret_account(&item.entity_id)),
+            CREDENTIAL_ENTITY_TYPE => {
+                let result = self.store.sync_delete_secret(&Store::credential_secret_account(&item.entity_id));
+                let _ = self.local.delete_key_stash(user_id, &item.entity_id);
+                result
+            }
             NOTE_ENTITY_TYPE | NOTE_DIRECTORY_ENTITY_TYPE => {
                 let baseline: Option<NoteIndexRecordBaseline> = self.local.load_baseline(user_id, &item.entity_type, &item.entity_id).map_err(|error| error.to_string())?;
                 if let Some(record) = baseline {
@@ -590,6 +606,60 @@ impl CloudSyncManager {
             CORE_ENTITY_TYPE => Ok(()),
             _ => Ok(()),
         }
+    }
+
+    /// 应用云端同步来的 SSH 私钥：按内容哈希文件名写入 workspace 保管目录
+    /// `<workspace>/.aishell/ssh-key/`，并把 key_path 回填到凭据与其引用的服务器。
+    /// 凭据配置尚未拉到时（增量页乱序）先落盘并记入暂存，待 core_config 应用后由
+    /// reconcile_key_stash 回填。
+    fn apply_synced_private_key(&self, user_id: &str, secret: &CredentialSecretV1) -> Result<(), String> {
+        if secret.secret.trim().is_empty() { return Err("云端同步的 SSH 私钥内容为空".into()); }
+        // 密钥凭据不应残留历史密码；删除失败不阻塞恢复。
+        let _ = self.store.sync_delete_secret(&Store::credential_secret_account(&secret.credential_id));
+        let snapshot = self.store.sync_snapshot()?;
+        let existing_path = snapshot
+            .credentials
+            .iter()
+            .find(|credential| credential.id == secret.credential_id)
+            .map(|credential| credential.key_path.trim().to_string())
+            .filter(|path| !path.is_empty());
+        if let Some(path) = existing_path {
+            // 本机已有 key_path（如重装/同机恢复）：直接写回原路径，云端内容为准。
+            ssh_keys::write_key_file(Path::new(&path), &secret.secret)?;
+            ssh_keys::backfill_key_path(&self.store, &secret.credential_id, &path)?;
+            let _ = self.local.delete_key_stash(user_id, &secret.credential_id);
+            return Ok(());
+        }
+        let Some(dir) = ssh_keys::managed_key_dir_from_state(&snapshot) else {
+            return Err("请先在设置中配置 Workspace 目录，再恢复云同步的 SSH 私钥".into());
+        };
+        let file_name = ssh_keys::sanitize_key_file_name(
+            &secret.key_file_name.clone().unwrap_or_else(|| ssh_keys::key_file_name_for_content(secret.secret.as_bytes())),
+        );
+        let path = ssh_keys::alloc_key_path(&dir, &file_name, &secret.secret)?;
+        ssh_keys::write_key_file(&path, &secret.secret)?;
+        let path_text = path.to_string_lossy().into_owned();
+        let credential_exists = snapshot.credentials.iter().any(|credential| credential.id == secret.credential_id);
+        if credential_exists {
+            ssh_keys::backfill_key_path(&self.store, &secret.credential_id, &path_text)?;
+            let _ = self.local.delete_key_stash(user_id, &secret.credential_id);
+        } else {
+            self.local.save_key_stash(user_id, &secret.credential_id, &path).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// core_config 应用后回填此前乱序到达、暂存中的私钥路径（此刻凭据已存在）。
+    fn reconcile_key_stash(&self, user_id: &str) -> Result<(), String> {
+        let snapshot = self.store.sync_snapshot()?;
+        for credential in &snapshot.credentials {
+            if credential.auth_type != AuthType::Key || !credential.key_path.trim().is_empty() { continue; }
+            let Some(path) = self.local.load_key_stash(user_id, &credential.id).map_err(|error| error.to_string())? else { continue; };
+            let path_text = path.to_string_lossy().into_owned();
+            ssh_keys::backfill_key_path(&self.store, &credential.id, &path_text)?;
+            let _ = self.local.delete_key_stash(user_id, &credential.id);
+        }
+        Ok(())
     }
 
     fn record_core_conflicts(&self, conflicts: &[super::core_config::CoreConflict], remote_device: Option<String>) {
@@ -616,8 +686,7 @@ impl CloudSyncManager {
 
         let credential_ids: HashSet<String> = snapshot.credentials.iter().map(|credential| credential.id.clone()).collect();
         for credential in &snapshot.credentials {
-            let Ok(secret) = self.store.sync_read_secret(&Store::credential_secret_account(&credential.id)) else { continue; };
-            let payload = CredentialSecretV1 { schema_version: 1, credential_id: credential.id.clone(), secret_type: "password".into(), secret };
+            let Some(payload) = credential_secret_payload(&self.store, credential) else { continue; };
             let bytes = serde_json::to_vec(&payload).map_err(|error| format!("序列化凭据失败: {error}"))?;
             let hash = sha256_hex(&bytes);
             if state.entities.get(&entity_key(CREDENTIAL_ENTITY_TYPE, &credential.id)).and_then(|entity| entity.local_hash.as_deref()) != Some(hash.as_str()) {
@@ -705,6 +774,9 @@ impl CloudSyncManager {
         let (user_id, _) = self.user_context()?;
         self.api()?.delete_all_data().await.map_err(|error| error.to_string())?;
         let _ = self.store.sync_delete_secret(&Self::vault_account(&user_id));
+        // 云端已清空，本地游标/outbox/基线/暂存必须一并作废：否则实体 local_hash
+        // 与本机数据保持一致，重新初始化后配置与凭据不再上传，其他设备恢复不到数据。
+        let _ = self.local.delete_user_state(&user_id);
         if let Ok(mut runtime) = self.runtime.lock() { *runtime = RuntimeState::default(); }
         self.emit_status();
         Ok(())
@@ -733,9 +805,52 @@ impl CloudSyncManager {
     }
 }
 
+/// 凭据秘密同步载荷（schema 1，端到端加密信封内）：
+/// - `secretType = "password"`：`secret` 为登录密码，只进 keyring。
+/// - `secretType = "privateKey"`：`secret` 为 SSH 私钥文件内容，`keyFileName` = 内容哈希前 16 位
+///   （恢复端据此写入 `<workspace>/.aishell/ssh-key/`，同内容同名去重、异内容不同名）。
+///
+/// 老载荷无 keyFileName 字段可正常解析（serde default）；未知 secretType 报错提示升级，
+/// 绝不把未知内容误当密码写进 keyring。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CredentialSecretV1 { schema_version: u32, credential_id: String, secret_type: String, secret: String }
+struct CredentialSecretV1 {
+    schema_version: u32,
+    credential_id: String,
+    secret_type: String,
+    secret: String,
+    #[serde(default)]
+    key_file_name: Option<String>,
+}
+
+/// 组装单个凭据的上传载荷：密码凭据读 keyring，密钥凭据读私钥文件内容。
+/// 读不到（未设密码 / 未配置或缺失密钥文件）时返回 None，跳过该凭据的上传。
+fn credential_secret_payload(store: &Store, credential: &Credential) -> Option<CredentialSecretV1> {
+    let payload = |secret_type: &str, secret: String, key_file_name: Option<String>| {
+        Some(CredentialSecretV1 {
+            schema_version: 1,
+            credential_id: credential.id.clone(),
+            secret_type: secret_type.to_string(),
+            secret,
+            key_file_name,
+        })
+    };
+    match credential.auth_type {
+        AuthType::Password => {
+            let secret = store.sync_read_secret(&Store::credential_secret_account(&credential.id)).ok()?;
+            payload(SECRET_TYPE_PASSWORD, secret, None)
+        }
+        AuthType::Key => {
+            let path = credential.key_path.trim();
+            if path.is_empty() { return None; }
+            let bytes = std::fs::read(path).ok()?;
+            // 文件名 = 内容哈希：恢复端据此写入同一保管目录，天然去重防冲突。
+            let key_file_name = ssh_keys::key_file_name_for_content(&bytes);
+            let secret = String::from_utf8(bytes).ok()?;
+            payload(SECRET_TYPE_PRIVATE_KEY, secret, Some(key_file_name))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -761,6 +876,15 @@ fn client_quota(quota: &SyncQuota) -> ClientQuota { ClientQuota { used_bytes: qu
 fn client_limits(limits: &SyncLimits, quota: &SyncQuota) -> ClientLimits { ClientLimits { max_batch_items: limits.max_batch_items, max_batch_bytes: limits.max_batch_bytes, inline_payload_bytes: limits.inline_payload_bytes, max_backup_bytes: limits.max_single_file_bytes, max_backup_files: quota.backup_object_limit, max_concurrent_backups: 0 } }
 fn client_device(device: Device, current: Option<&str>) -> ClientDevice { ClientDevice { is_current: current == Some(device.id.as_str()), id: device.id, name: device.name, revoked: device.revoked, last_seen_at: Some(device.last_seen_at), created_at: Some(device.created_at) } }
 fn entity_key(entity_type: &str, entity_id: &str) -> String { format!("{entity_type}:{entity_id}") }
+
+/// 应用顺序：core_config 先于其他实体（SSH 私钥落盘依赖凭据与项目目录已就位）；
+/// 同组内保持云端相对顺序（稳定排序）。
+fn core_first(items: &[SyncItem]) -> Vec<&SyncItem> {
+    let mut ordered: Vec<&SyncItem> = items.iter().collect();
+    ordered.sort_by_key(|item| usize::from(item.entity_type != CORE_ENTITY_TYPE));
+    ordered
+}
+
 fn config_counts(payload: &CoreConfigPayloadV1) -> ClientConfigCounts {
     ClientConfigCounts {
         projects: payload.projects.len(),
@@ -831,5 +955,94 @@ mod tests {
         assert_eq!(counts.credentials, 1);
         assert_eq!(counts.command_folders, 1);
         assert_eq!(counts.project_folders, 2);
+    }
+
+    fn sync_item(entity_type: &str) -> SyncItem {
+        SyncItem {
+            cursor: None,
+            entity_type: entity_type.into(),
+            entity_id: "id".into(),
+            version: 1,
+            operation: "upsert".into(),
+            payload_schema_version: 1,
+            ciphertext: None,
+            blob_id: None,
+            encryption_meta: serde_json::Value::Null,
+            ciphertext_sha256: None,
+            ciphertext_size: 0,
+            tombstone: false,
+            updated_by_device_id: None,
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn core_config_items_apply_before_credential_items() {
+        let items = vec![
+            sync_item("credential_secret"),
+            sync_item("note"),
+            sync_item("core_config"),
+            sync_item("credential_secret"),
+        ];
+        let ordered = core_first(&items);
+        let types: Vec<&str> = ordered.iter().map(|item| item.entity_type.as_str()).collect();
+        assert_eq!(types, vec!["core_config", "credential_secret", "note", "credential_secret"]);
+    }
+
+    #[test]
+    fn credential_secret_payload_covers_password_and_private_key() {
+        let dir = std::env::temp_dir().join(format!("aishell-cred-payload-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::store::test_store(dir.clone());
+        let key_file = dir.join("id_ed25519");
+        std::fs::write(&key_file, "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n").unwrap();
+        let credential = |id: &str, auth_type: AuthType, key_path: String| Credential {
+            id: id.into(),
+            name: id.into(),
+            auth_type,
+            username: "u".into(),
+            key_path,
+        };
+        store
+            .with_candidate_state(|state| {
+                state.credentials.push(credential("c1", AuthType::Password, String::new()));
+                state.credentials.push(credential("c2", AuthType::Key, key_file.to_string_lossy().into_owned()));
+                state.credentials.push(credential("c3", AuthType::Key, String::new()));
+                Ok(())
+            })
+            .unwrap();
+        store.sync_write_secret(&Store::credential_secret_account("c1"), "pw-1").unwrap();
+        let snapshot = store.sync_snapshot().unwrap();
+        let by_id = |id: &str| snapshot.credentials.iter().find(|c| c.id == id).unwrap().clone();
+
+        let password = credential_secret_payload(&store, &by_id("c1")).unwrap();
+        assert_eq!(password.secret_type, "password");
+        assert_eq!(password.secret, "pw-1");
+        assert_eq!(password.key_file_name, None);
+
+        let key = credential_secret_payload(&store, &by_id("c2")).unwrap();
+        assert_eq!(key.secret_type, "privateKey");
+        assert!(key.secret.contains("OPENSSH"));
+        let expected_name = crate::cloud_sync::ssh_keys::key_file_name_for_content(
+            std::fs::read(&key_file).unwrap().as_slice(),
+        );
+        assert_eq!(key.key_file_name.as_deref(), Some(expected_name.as_str()));
+
+        // 密钥文件未配置时不上传该凭据。
+        assert!(credential_secret_payload(&store, &by_id("c3")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_secret_payload_parses_legacy_and_private_key_payloads() {
+        // 旧版本载荷没有 keyFileName 字段，必须可解析。
+        let legacy: CredentialSecretV1 = serde_json::from_str(
+            r#"{"schemaVersion":1,"credentialId":"c1","secretType":"password","secret":"pw"}"#,
+        ).unwrap();
+        assert_eq!(legacy.key_file_name, None);
+        let key: CredentialSecretV1 = serde_json::from_str(
+            r#"{"schemaVersion":1,"credentialId":"c2","secretType":"privateKey","secret":"KEY","keyFileName":"id_rsa"}"#,
+        ).unwrap();
+        assert_eq!(key.key_file_name.as_deref(), Some("id_rsa"));
     }
 }

@@ -11,6 +11,7 @@ pub mod engine;
 pub mod manager;
 pub mod notes_sync;
 pub mod protocol;
+pub mod ssh_keys;
 pub mod state;
 
 use std::sync::Arc;

@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::cloud_sync::ssh_keys;
+
 // ---------------------------------------------------------------- 数据模型
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -1271,6 +1273,99 @@ pub(crate) fn ensure_project_paths_in_workspace(state: &mut AppState) -> usize {
     fixed
 }
 
+/// 启动/切换 workspace 迁移：把仍在使用外部路径的密钥型凭据与服务器收编进
+/// `<workspace>/.aishell/ssh-key/`。凭据是 key_path 的事实源：先收编凭据并镜像到
+/// 引用服务器；未引用凭据（或凭据还没有密钥）的服务器就地收编并回写凭据。
+/// 单个失败跳过（下次启动/保存设置重试），返回变更条数（调用方仅在 >0 时落盘）。
+pub(crate) fn adopt_managed_ssh_keys(state: &mut AppState) -> usize {
+    let Some(workspace) = state
+        .settings
+        .workspace_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return 0;
+    };
+    let mut changed = 0;
+    // 1) 收编凭据自己的外部密钥。
+    for credential in &mut state.credentials {
+        if credential.auth_type != AuthType::Key || credential.key_path.trim().is_empty() {
+            continue;
+        }
+        if let Some(adopted) = ssh_keys::adopt_key_into_workspace(&workspace, &credential.key_path)
+        {
+            credential.key_path = adopted;
+            changed += 1;
+        }
+    }
+    // 凭据路径快照：镜像与孤儿判定都要按 id 查凭据，克隆一份避免借用冲突。
+    let credential_paths: HashMap<String, (AuthType, String)> = state
+        .credentials
+        .iter()
+        .map(|c| (c.id.clone(), (c.auth_type, c.key_path.clone())))
+        .collect();
+    // 2) 凭据的保管路径镜像到引用它的密钥服务器（与保存凭据时的镜像行为一致）。
+    for server in &mut state.servers {
+        if server.auth_type != AuthType::Key {
+            continue;
+        }
+        let Some((auth, path)) = server
+            .credential_id
+            .as_ref()
+            .and_then(|id| credential_paths.get(id))
+        else {
+            continue;
+        };
+        if *auth != AuthType::Key || path.trim().is_empty() {
+            continue;
+        }
+        if server.key_path != *path {
+            server.key_path = path.clone();
+            changed += 1;
+        }
+    }
+    // 3) 未引用凭据（或凭据还没有密钥路径）的密钥服务器：就地收编服务器自己的外部密钥。
+    let mut server_adoptions: Vec<(String, String)> = Vec::new();
+    for server in &state.servers {
+        if server.auth_type != AuthType::Key || server.key_path.trim().is_empty() {
+            continue;
+        }
+        if ssh_keys::is_managed_path(&server.key_path, &workspace) {
+            continue;
+        }
+        let credential_has_key = server
+            .credential_id
+            .as_ref()
+            .and_then(|id| credential_paths.get(id))
+            .is_some_and(|(auth, path)| *auth == AuthType::Key && !path.trim().is_empty());
+        if credential_has_key {
+            continue;
+        }
+        if let Some(adopted) = ssh_keys::adopt_key_into_workspace(&workspace, &server.key_path) {
+            server_adoptions.push((server.id.clone(), adopted));
+        }
+    }
+    for (server_id, adopted) in server_adoptions {
+        let Some(server) = state.servers.iter_mut().find(|s| s.id == server_id) else {
+            continue;
+        };
+        if let Some(credential_id) = server.credential_id.clone() {
+            if let Some(credential) = state
+                .credentials
+                .iter_mut()
+                .find(|c| c.id == credential_id)
+            {
+                credential.key_path = adopted.clone();
+            }
+        }
+        server.key_path = adopted;
+        changed += 1;
+    }
+    changed
+}
+
 /// 会话内全部自由文本脱敏（消息正文/快照/文件引用/动作摘要与意图），返回是否有变更。幂等：
 /// 已脱敏内容再次处理字符串不变，不会误报 changed。
 /// 先做会话级值收集（跨消息共享同一凭据的 KV 值），再逐字段替换——
@@ -1353,6 +1448,22 @@ impl Store {
             ensure_project_paths_in_workspace(&mut guard)
         };
         if fixed_projects > 0 {
+            let guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            store.persist_locked(&guard)?;
+        }
+        // 密钥收编迁移：早期版本密钥型凭据/服务器可能仍指向外部私钥文件，workspace
+        // 已配置时复制进 `.aishell/ssh-key/` 保管目录并改写 key_path（云同步只认保管目录）。
+        let adopted_keys = {
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            adopt_managed_ssh_keys(&mut guard)
+        };
+        if adopted_keys > 0 {
             let guard = store
                 .state
                 .lock()
@@ -1578,6 +1689,8 @@ impl Store {
             s.settings = settings.clone();
             // 首次配置/切换 workspace 后，顺带修复云同步拉取的无本机路径项目（单个失败跳过）。
             ensure_project_paths_in_workspace(s);
+            // 首次配置/切换 workspace 后，顺带收编仍在外部的外部私钥（单个失败跳过）。
+            adopt_managed_ssh_keys(s);
             Ok(())
         })
     }
@@ -1782,6 +1895,12 @@ impl Store {
         mode: CredentialSaveMode,
     ) -> Result<ServerSaveResult, String> {
         server.tags = normalize_tags(&server.tags);
+        // 密钥认证先把外部私钥收编进 workspace 保管目录（凭据跨项目共享，密钥随凭据走）。
+        if server.auth_type == AuthType::Key {
+            if let Some(adopted) = self.adopt_key_path(&server.key_path) {
+                server.key_path = adopted;
+            }
+        }
         self.validate_server(&server)?;
         let snapshot = self
             .state
@@ -1940,11 +2059,17 @@ impl Store {
     /// 保存凭据并同步所有引用服务器的认证镜像；password 为 None 保持原密码。
     pub fn upsert_credential(
         &self,
-        credential: Credential,
+        mut credential: Credential,
         password: Option<&str>,
     ) -> Result<Credential, String> {
         if credential.id.trim().is_empty() || credential.name.trim().is_empty() {
             return Err("凭据名称不能为空".to_string());
+        }
+        // 密钥认证先把外部私钥收编进 workspace 保管目录，之后云同步只需同步保管目录内容。
+        if credential.auth_type == AuthType::Key {
+            if let Some(adopted) = self.adopt_key_path(&credential.key_path) {
+                credential.key_path = adopted;
+            }
         }
         let account = keyring_account_credential(&credential.id);
         let old_secret = self.secrets.get(&account).ok();
@@ -2954,6 +3079,17 @@ impl Store {
         let root = PathBuf::from(ws).join(".aishell").join("notes");
         fs::create_dir_all(&root).map_err(|e| format!("创建笔记目录失败: {e}"))?;
         Ok(root)
+    }
+
+    /// 保存密钥型凭据/服务器时收编外部私钥（见 `ssh_keys::adopt_key_into_workspace`）。
+    pub(crate) fn adopt_key_path(&self, key_path: &str) -> Option<String> {
+        let settings = self.settings();
+        let workspace = settings
+            .workspace_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        ssh_keys::adopt_key_into_workspace(workspace, key_path)
     }
 
     /// 系统任务项目：不落入 AppState.projects，按当前 workspace 合成并确保目录存在。
@@ -4285,6 +4421,185 @@ mod tests {
         assert_eq!(store.clear_unreferenced_credentials().unwrap(), 1);
         assert!(store.credentials_all().is_empty());
         assert!(store.read_server_secret(&kept_server).is_err());
+    }
+
+    #[test]
+    fn upsert_credential_adopts_external_key_into_workspace() {
+        let config = temp_config_dir("adopt-cred");
+        let workspace = config.parent().unwrap().join("adopt-cred-ws");
+        let store = test_store(config.clone());
+        store
+            .with_candidate_state(|state| {
+                state.settings.workspace_dir = Some(workspace.to_string_lossy().into_owned());
+                Ok(())
+            })
+            .unwrap();
+        let external = config.join("origin-key");
+        fs::write(&external, "-----BEGIN OPENSSH PRIVATE KEY-----\nk1\n-----\n").unwrap();
+
+        let credential = Credential {
+            id: "c1".into(),
+            name: "c".into(),
+            auth_type: AuthType::Key,
+            username: "u".into(),
+            key_path: external.to_string_lossy().into_owned(),
+        };
+        store.upsert_credential(credential, None).unwrap();
+        let stored = store.credentials_all().remove(0);
+        let expected_name = crate::cloud_sync::ssh_keys::key_file_name_for_content(
+            &fs::read(&external).unwrap(),
+        );
+        let expected_path = crate::cloud_sync::ssh_keys::managed_key_dir(&workspace.to_string_lossy())
+            .join(expected_name);
+        // key_path 已改写为 workspace 保管路径，内容与原文件一致，原文件保持不动（复制而非移动）。
+        assert_eq!(stored.key_path, expected_path.to_string_lossy());
+        assert_eq!(fs::read(&stored.key_path).unwrap(), fs::read(&external).unwrap());
+        assert!(external.exists());
+
+        // 再次保存（key_path 已是保管路径）→ 幂等，不再改名复制。
+        store.upsert_credential(stored.clone(), None).unwrap();
+        assert_eq!(store.credentials_all()[0].key_path, stored.key_path);
+        let _ = fs::remove_dir_all(&config);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn upsert_server_adopts_key_and_mirrors_to_credential() {
+        let config = temp_config_dir("adopt-srv");
+        let workspace = config.parent().unwrap().join("adopt-srv-ws");
+        let store = test_store(config.clone());
+        store
+            .with_candidate_state(|state| {
+                state.settings.workspace_dir = Some(workspace.to_string_lossy().into_owned());
+                Ok(())
+            })
+            .unwrap();
+        let external = config.join("srv-key");
+        fs::write(&external, "SERVER-KEY-CONTENT").unwrap();
+
+        let mut server = credential_test_server("srv-key1", "10.0.0.1");
+        server.auth_type = AuthType::Key;
+        server.key_path = external.to_string_lossy().into_owned();
+        store.upsert_server(server, None).unwrap();
+
+        let saved = store.server("srv-key1").unwrap();
+        let credential_id = saved.credential_id.expect("密钥服务器保存后必有关联凭据");
+        let credential = store
+            .credentials_all()
+            .into_iter()
+            .find(|c| c.id == credential_id)
+            .unwrap();
+        assert!(saved.key_path.starts_with(&crate::cloud_sync::ssh_keys::managed_key_dir(
+            &workspace.to_string_lossy()
+        ).to_string_lossy().to_string()));
+        assert_eq!(credential.key_path, saved.key_path);
+        assert_eq!(fs::read(&saved.key_path).unwrap(), b"SERVER-KEY-CONTENT");
+        let _ = fs::remove_dir_all(&config);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn adopt_managed_ssh_keys_migrates_credentials_and_servers() {
+        let config = temp_config_dir("adopt-migrate");
+        let workspace = config.parent().unwrap().join("adopt-migrate-ws");
+        let mut state = AppState::default();
+        state.settings.workspace_dir = Some(workspace.to_string_lossy().into_owned());
+
+        let external_credential_key = config.join("cred-key");
+        fs::write(&external_credential_key, "CRED-KEY").unwrap();
+        let external_server_key = config.join("srv-key");
+        fs::write(&external_server_key, "SRV-KEY").unwrap();
+
+        state.credentials.push(Credential {
+            id: "c1".into(),
+            name: "c1".into(),
+            auth_type: AuthType::Key,
+            username: "u".into(),
+            key_path: external_credential_key.to_string_lossy().into_owned(),
+        });
+        state.credentials.push(Credential {
+            id: "c2".into(),
+            name: "c2".into(),
+            auth_type: AuthType::Key,
+            username: "u".into(),
+            key_path: String::new(),
+        });
+        let mut password_server = credential_test_server("s3", "10.0.0.3");
+        password_server.credential_id = Some("c1".into());
+        state.servers.push(Server {
+            id: "s1".into(),
+            name: "s1".into(),
+            host: "h".into(),
+            port: 22,
+            auth_type: AuthType::Key,
+            username: "u".into(),
+            key_path: external_credential_key.to_string_lossy().into_owned(),
+            credential_id: Some("c1".into()),
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        });
+        state.servers.push(Server {
+            id: "s2".into(),
+            name: "s2".into(),
+            host: "h".into(),
+            port: 22,
+            auth_type: AuthType::Key,
+            username: "u".into(),
+            key_path: external_server_key.to_string_lossy().into_owned(),
+            credential_id: Some("c2".into()),
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        });
+        state.servers.push(password_server);
+
+        // c1 收编(1) + s1 镜像(1) + s2 就地收编并回写 c2(1)。
+        assert_eq!(adopt_managed_ssh_keys(&mut state), 3);
+        let managed_dir =
+            crate::cloud_sync::ssh_keys::managed_key_dir(&workspace.to_string_lossy());
+        let c1 = state.credentials.iter().find(|c| c.id == "c1").unwrap();
+        let c2 = state.credentials.iter().find(|c| c.id == "c2").unwrap();
+        let s1 = state.servers.iter().find(|s| s.id == "s1").unwrap();
+        let s2 = state.servers.iter().find(|s| s.id == "s2").unwrap();
+        let s3 = state.servers.iter().find(|s| s.id == "s3").unwrap();
+        assert!(c1.key_path.starts_with(managed_dir.to_string_lossy().as_ref()));
+        assert_eq!(fs::read(&c1.key_path).unwrap(), b"CRED-KEY");
+        assert_eq!(s1.key_path, c1.key_path, "引用服务器镜像凭据保管路径");
+        assert_eq!(c2.key_path, s2.key_path, "孤儿服务器密钥收编后回写凭据");
+        assert_eq!(fs::read(&s2.key_path).unwrap(), b"SRV-KEY");
+        assert!(
+            !s3.key_path.starts_with(managed_dir.to_string_lossy().as_ref()),
+            "密码服务器不受影响"
+        );
+        assert!(external_credential_key.exists(), "复制而非移动");
+        // 幂等：再跑一遍无变更。
+        assert_eq!(adopt_managed_ssh_keys(&mut state), 0);
+        let _ = fs::remove_dir_all(&config);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn adopt_managed_ssh_keys_without_workspace_is_noop() {
+        let config = temp_config_dir("adopt-no-ws");
+        let mut state = AppState::default();
+        let key_file = config.join("k");
+        fs::write(&key_file, "KEY").unwrap();
+        state.credentials.push(Credential {
+            id: "c1".into(),
+            name: "c1".into(),
+            auth_type: AuthType::Key,
+            username: "u".into(),
+            key_path: key_file.to_string_lossy().into_owned(),
+        });
+        assert_eq!(adopt_managed_ssh_keys(&mut state), 0);
+        assert_eq!(
+            state.credentials[0].key_path,
+            key_file.to_string_lossy().into_owned()
+        );
+        let _ = fs::remove_dir_all(&config);
     }
 
     #[test]

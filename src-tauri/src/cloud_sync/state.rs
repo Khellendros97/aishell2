@@ -99,6 +99,13 @@ impl UserSyncState {
     }
 }
 
+/// 云同步拉到的 SSH 私钥在凭据配置尚未就位时的暂存记录（core_config 应用后回填 key_path）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct KeyStashRecord {
+    path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutboxEntry {
@@ -513,6 +520,71 @@ impl CloudSyncStore {
         }
     }
 
+    /// SSH 私钥暂存：凭据配置（core_config）尚未应用时先落盘到兜底目录并记录路径，
+    /// 待凭据应用后回填 key_path 再清除记录。
+    pub fn save_key_stash(
+        &self,
+        user_id: &str,
+        credential_id: &str,
+        path: &Path,
+    ) -> Result<(), StateError> {
+        validate_id(user_id)?;
+        validate_id(credential_id)?;
+        let record = KeyStashRecord {
+            path: path.to_string_lossy().into_owned(),
+        };
+        atomic_write_json(
+            &self
+                .user_dir(user_id)?
+                .join("key-stash")
+                .join(format!("{credential_id}.json")),
+            &record,
+        )
+    }
+
+    pub fn load_key_stash(
+        &self,
+        user_id: &str,
+        credential_id: &str,
+    ) -> Result<Option<PathBuf>, StateError> {
+        validate_id(user_id)?;
+        validate_id(credential_id)?;
+        let path = self
+            .user_dir(user_id)?
+            .join("key-stash")
+            .join(format!("{credential_id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let record: KeyStashRecord = read_json(&path)?;
+        Ok(Some(PathBuf::from(record.path)))
+    }
+
+    pub fn delete_key_stash(&self, user_id: &str, credential_id: &str) -> Result<bool, StateError> {
+        validate_id(user_id)?;
+        validate_id(credential_id)?;
+        let path = self
+            .user_dir(user_id)?
+            .join("key-stash")
+            .join(format!("{credential_id}.json"));
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// 清空某用户的全部本地同步状态（游标/outbox/基线/暂存等）。
+    /// 云端数据被删除后必须调用：否则实体 local_hash 不变会导致重新初始化后不再上传。
+    pub fn delete_user_state(&self, user_id: &str) -> Result<(), StateError> {
+        validate_id(user_id)?;
+        let directory = self.user_dir(user_id)?;
+        if directory.exists() {
+            fs::remove_dir_all(directory)?;
+        }
+        Ok(())
+    }
+
     pub fn list_backup_tasks<T: for<'de> Deserialize<'de>>(
         &self,
         user_id: &str,
@@ -747,6 +819,30 @@ mod tests {
         let root = temp_root();
         let store = CloudSyncStore::new(&root);
         assert!(store.open_blob("ABC").is_err());
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn key_stash_round_trips_and_user_state_delete_wipes_everything() {
+        let root = temp_root();
+        let store = CloudSyncStore::new(&root);
+        store.save_state(&UserSyncState::new("user-a").unwrap()).unwrap();
+        let key_path = root.join("keys").join("id_ed25519");
+        store.save_key_stash("user-a", "credential-1", &key_path).unwrap();
+        assert_eq!(
+            store.load_key_stash("user-a", "credential-1").unwrap(),
+            Some(key_path.clone())
+        );
+        assert_eq!(store.load_key_stash("user-a", "credential-2").unwrap(), None);
+        assert!(store.delete_key_stash("user-a", "credential-1").unwrap());
+        assert!(!store.delete_key_stash("user-a", "credential-1").unwrap());
+        store.delete_user_state("user-a").unwrap();
+        // 用户目录整体消失，状态回到全新实例。
+        assert_eq!(
+            store.load_state("user-a").unwrap().last_applied_cursor,
+            0
+        );
+        assert_eq!(store.load_key_stash("user-a", "credential-1").unwrap(), None);
+        let _ = fs::remove_dir_all(&root);
     }
 }
