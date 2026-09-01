@@ -15,6 +15,7 @@ import { DiffTab } from './DiffTab';
 import BrowserTab from './BrowserTab';
 import { TraceTab } from './TraceTab';
 import { NoteTab } from './NoteTab';
+import { TunnelTab } from './TunnelTab';
 
 export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   terminal: TerminalTab,
@@ -25,4 +26,5 @@ export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   browser: BrowserTab,
   trace: TraceTab,
   note: NoteTab,
+  tunnel: TunnelTab,
 };

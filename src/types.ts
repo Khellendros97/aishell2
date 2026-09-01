@@ -87,7 +87,8 @@ export interface McpStatus {
 /** 与 store.rs Theme serde lowercase 对齐 */
 export type Theme = 'dark' | 'light';
 
-export type AuthType = 'password' | 'key';
+/** 与 store.rs AuthType serde lowercase 对齐；publickey = SSH 公钥(密钥对)，keyPath 存密钥对目录 */
+export type AuthType = 'password' | 'key' | 'publickey';
 
 /** 系统凭据库条目；密码永不通过前端状态返回，password 认证只展示已保存状态。 */
 export interface Credential {
@@ -457,6 +458,34 @@ export interface SshExecResult {
   code: number | null;
   stdout: string;
   stderr: string;
+}
+
+/** 密钥对探测结果 —— 与 ssh_keys.rs KeyPairInfo serde camelCase 对齐 */
+export interface KeyPairInfo {
+  name: string;
+  privatePath: string;
+  publicPath: string;
+}
+
+/** SSH 隧道配置 —— 与 tunnel.rs TunnelConfig serde camelCase 对齐（keyPath 之外 list 形态） */
+export interface TunnelConfig {
+  id: string;
+  serverId: string;
+  name: string;
+  /** 本地监听地址；默认 127.0.0.1 */
+  bindAddr: string;
+  localPort: number;
+  /** 目标主机（远端服务器视角）；留空 = 服务器自身 */
+  targetHost: string;
+  targetPort: number;
+  /** 上次启用状态：重启时自动重建 */
+  enabled: boolean;
+}
+
+/** 隧道展示态 —— 与 tunnel.rs TunnelState 对齐（配置字段扁平展开 + 运行态） */
+export interface TunnelState extends TunnelConfig {
+  running: boolean;
+  error: string | null;
 }
 
 /** Xshell 会话导入结果 —— 与 Rust import_xshell_sessions 返回值 serde camelCase 对齐 */

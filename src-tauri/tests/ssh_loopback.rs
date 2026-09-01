@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use aishell_lib::ssh::SshManager;
 use aishell_lib::store::{AuthType, Server, Store};
+use aishell_lib::tunnel::{TunnelConfig, TunnelManager};
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, ChannelMsg};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -65,6 +66,22 @@ impl russh::server::Handler for EchoSession {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    /// 本地端口转发（direct-tcpip）通道：接受后 data() 已原样回显，等效于目标端口是回显服务
+    /// （隧道集成测试用；实际目标 host:port 不检查）。
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
@@ -250,6 +267,162 @@ async fn shell_echo_roundtrip() {
 
         ssh.disconnect("s1").await;
         // 关停 echo server，使 join! 两端都结束
+        shutdown.shutdown("test done".into());
+    };
+
+    let (server_res, ()) = tokio::join!(running, test_body);
+    server_res.expect("echo server 异常退出");
+}
+
+/// 回归：公钥(密钥对)服务器 + 显式密码（部署公钥路径 connect_direct）应走密码认证，
+/// 而不是 PublicKey 分支（修复前 deploy/测试注入的密码被 authType 分支忽略，
+/// 永远返回「[SSH需部署公钥]」错误）。key_path 指向不存在的目录，若误走
+/// PublicKey 分支会在认证前报「未发现密钥对」，密码认证成功则证明走对了分支。
+#[tokio::test]
+async fn publickey_server_with_explicit_password_authenticates_as_password() {
+    let socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 127.0.0.1:0 失败");
+    let addr = socket.local_addr().expect("取监听地址失败");
+    let config = Arc::new(russh::server::Config {
+        keys: vec![
+            russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM.as_bytes())
+                .expect("解析测试 host key 失败"),
+        ],
+        ..Default::default()
+    });
+    let mut server = EchoServer;
+    let running = server.run_on_socket(config, &socket);
+    let shutdown = running.handle();
+
+    let test_body = async {
+        let config_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-loopback-pk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let ssh = Arc::new(SshManager::new(store));
+
+        let server = Server {
+            id: "pk1".to_string(),
+            name: "loopback-pk".to_string(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            auth_type: AuthType::PublicKey,
+            username: "test".to_string(),
+            // 密钥对目录故意指向不存在的位置：走 PublicKey 分支必失败
+            key_path: std::env::temp_dir()
+                .join("aishell-no-such-keypair-dir")
+                .to_string_lossy()
+                .into_owned(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        };
+        ssh.connect_direct(server, Some("test"))
+            .await
+            .expect("显式密码应走密码认证成功（部署公钥场景）");
+
+        ssh.disconnect("pk1").await;
+        shutdown.shutdown("test done".into());
+    };
+
+    let (server_res, ()) = tokio::join!(running, test_body);
+    server_res.expect("echo server 异常退出");
+}
+
+/// 隧道(本地端口转发)回环集成测试：echo SSH server 接受 direct-tcpip 通道并回显，
+/// 断言经隧道本地端口 write → read 能拿到回显；停止后隧道端口不再接受连接。
+#[tokio::test]
+async fn tunnel_local_forward_roundtrip() {
+    let socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 127.0.0.1:0 失败");
+    let addr = socket.local_addr().expect("取监听地址失败");
+    let config = Arc::new(russh::server::Config {
+        keys: vec![
+            russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM.as_bytes())
+                .expect("解析测试 host key 失败"),
+        ],
+        ..Default::default()
+    });
+    let mut server = EchoServer;
+    let running = server.run_on_socket(config, &socket);
+    let shutdown = running.handle();
+
+    let test_body = async {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-loopback-tunnel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let ssh = Arc::new(SshManager::new(store.clone()));
+        let manager = TunnelManager::new();
+
+        // 密码认证入池（复用 SshManager 连接池；get_or_connect 依赖连接存在）
+        let server = Server {
+            id: "s1".to_string(),
+            name: "loopback".to_string(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            auth_type: AuthType::Password,
+            username: "test".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        };
+        ssh.connect_direct(server, Some("test"))
+            .await
+            .expect("连接 + 密码认证应成功");
+
+        // 找一个空闲本地端口作为隧道监听端口
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let cfg = TunnelConfig {
+            id: "tun1".into(),
+            server_id: "s1".into(),
+            name: "测试隧道".into(),
+            bind_addr: "127.0.0.1".into(),
+            local_port,
+            target_host: "127.0.0.1".into(),
+            target_port: 5432, // EchoServer 不检查目标，任选
+            enabled: true,
+        };
+        manager.start(&ssh, &cfg).await.expect("隧道启动应成功");
+        // start 幂等
+        manager.start(&ssh, &cfg).await.expect("重复启动应幂等成功");
+
+        // 经隧道本地端口连接：写 "hello tunnel" → 读回显
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .expect("连接隧道本地端口");
+        stream.write_all(b"hello tunnel").await.unwrap();
+        let mut buf = vec![0u8; 12];
+        stream.read_exact(&mut buf).await.expect("读到回显");
+        assert_eq!(&buf, b"hello tunnel");
+
+        // 停止后幂等：再停返回 false
+        assert!(manager.stop("tun1").await);
+        assert!(!manager.stop("tun1").await);
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", local_port)).await.is_err());
+
         shutdown.shutdown("test done".into());
     };
 

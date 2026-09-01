@@ -10,8 +10,8 @@
  */
 import { forwardRef, useImperativeHandle, useRef, useState } from 'react';
 import type { Credential, Server } from '../../types';
-import { openDialog } from '../../api';
-import { uid } from '../../ui';
+import { openDialog, sshDefaultKeypairDir, sshDetectKeypair, sshGenerateKeypair } from '../../api';
+import { toast, uid } from '../../ui';
 
 export interface ServerFormOptions {
   /** 双列紧凑布局（欢迎页内联区）；缺省单列（侧栏模态框） */
@@ -69,6 +69,38 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
     const [tagInput, setTagInput] = useState('');
     const nameRef = useRef<HTMLInputElement>(null);
 
+    /** 密钥对目录探测状态（仅 publickey 认证显示；检测规则在后端 ssh_keys.rs，前端只展示） */
+    const [kp, setKp] = useState<{ status: 'idle' | 'busy' | 'found' | 'missing'; name?: string }>({ status: 'idle' });
+    const kpTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    /** 目录输入防抖探测：输入即触发（500ms 防抖），探测结果驱动「已识别 / 未发现可生成」提示 */
+    const runDetect = (dir: string): void => {
+      if (kpTimer.current) { clearTimeout(kpTimer.current); kpTimer.current = null; }
+      const d = dir.trim();
+      if (d.length < 3) { setKp({ status: 'idle' }); return; }
+      kpTimer.current = setTimeout(() => {
+        setKp({ status: 'busy' });
+        void sshDetectKeypair(d).then((info) => {
+          setKp(info ? { status: 'found', name: info.name } : { status: 'missing' });
+        }).catch(() => setKp({ status: 'idle' }));
+      }, 500);
+    };
+
+    /** 「未发现密钥对」按钮：后端生成 ed25519 密钥对（防覆盖，已存在时拒绝）并刷新探测 */
+    const onGenerateKeypair = async (): Promise<void> => {
+      const dir = fields.keyPath.trim();
+      if (!dir) return;
+      setKp({ status: 'busy' });
+      try {
+        const info = await sshGenerateKeypair(dir);
+        setKp({ status: 'found', name: info.name });
+        toast(`密钥对已生成：${info.name}（无密码短语）`, 'success');
+      } catch (err) {
+        setKp({ status: 'missing' });
+        toast(String(err), 'error');
+      }
+    };
+
     /** 提交一个标签：去 # 前缀、trim、去重；回车 / 逗号 / 点候选 / 失焦时调用 */
     const commitTag = (raw: string): void => {
       const t = raw.trim().replace(/^#+/, '');
@@ -104,6 +136,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
         keyPath: credential.keyPath,
         password: '',
       } : { ...f, credentialId: null, password: '' });
+      if (credential?.authType === 'publickey') runDetect(credential.keyPath);
     };
 
     /* 浏览…：文件选择器选密钥（私钥无固定扩展名，不加过滤器） */
@@ -118,6 +151,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
        父组件任意时刻调 validate / buildServer / passwordValue 拿到的都是当前输入） */
     useImperativeHandle(ref, () => ({
       fill(server: Server | null): void {
+        const fillKeyPath = server?.keyPath ?? '';
         setFields({
           name: server?.name ?? '',
           host: server?.host ?? '',
@@ -125,12 +159,13 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           auth: server?.authType ?? 'password',
           username: server?.username ?? '',
           password: '', // 密码 / 密钥永不回显：编辑时留空 = 保持 keyring 原值
-          keyPath: server?.keyPath ?? '',
+          keyPath: fillKeyPath,
           credentialId: server?.credentialId ?? null,
           tags: server?.tags ?? [],
         });
         setTagInput('');
         setInvalid(EMPTY_INVALID);
+        if (server?.authType === 'publickey') runDetect(fillKeyPath);
       },
       validate(): string | null {
         const name = fields.name.trim();
@@ -152,7 +187,8 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           port: Number(fields.port) || 22,
           authType,
           username: fields.username.trim(),
-          keyPath: authType === 'key' ? fields.keyPath.trim() : '',
+          // publickey 的 keyPath 是密钥对目录，同样原样入库
+          keyPath: authType === 'password' ? '' : fields.keyPath.trim(),
           credentialId: fields.credentialId,
           locked: editing?.locked ?? false,
           // 堡垒机字段不在表单里：编辑时原样保留（目标主机经 SSH跳转设置绑定）
@@ -223,10 +259,31 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
           <select
             className="select"
             value={fields.auth}
-            onChange={(e) => { const v = e.currentTarget.value as Server['authType']; setFields((f) => ({ ...f, auth: v })); }}
+            onChange={(e) => {
+              // 局部变量先取出再进 updater（React 事件对象不跨异步读取）
+              const v = e.currentTarget.value as Server['authType'];
+              const currentKeyPath = fields.keyPath.trim();
+              setFields((f) => ({ ...f, auth: v }));
+              if (v === 'publickey') {
+                if (currentKeyPath) {
+                  runDetect(currentKeyPath);
+                } else {
+                  // 首次切到公钥认证且无路径：自动填用户主目录 `.ssh`（后端给默认值）
+                  setKp({ status: 'busy' });
+                  void sshDefaultKeypairDir().then((dir) => {
+                    setFields((f) => (f.keyPath.trim() ? f : { ...f, keyPath: dir }));
+                    runDetect(dir);
+                  }).catch(() => setKp({ status: 'idle' }));
+                }
+              } else {
+                if (kpTimer.current) { clearTimeout(kpTimer.current); kpTimer.current = null; }
+                setKp({ status: 'idle' });
+              }
+            }}
           >
             <option value="password">账号密码</option>
             <option value="key">密钥</option>
+            <option value="publickey">SSH 公钥（密钥对）</option>
           </select>
         </div>
         <div className="field">
@@ -238,7 +295,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
             onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, username: v })); }}
           />
         </div>
-        {/* 认证方式切换：仅显示对应密码 / 密钥路径字段（同侧栏原模态框 data-auth 约定） */}
+        {/* 认证方式切换：仅显示对应密码 / 密钥（对）路径字段（同侧栏原模态框 data-auth 约定） */}
         {fields.auth === 'password' ? (
           <div className="field" data-auth="password">
             <label>密码</label>
@@ -250,7 +307,7 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
               onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, password: v })); }}
             />
           </div>
-        ) : (
+        ) : fields.auth === 'key' ? (
           <div className="field" data-auth="key">
             <label>密钥文件路径</label>
             <div className="path-row">
@@ -262,6 +319,45 @@ export const ServerForm = forwardRef<ServerFormHandle, ServerFormOptions>(
               />
               <button type="button" className="btn" title="选择密钥文件" onClick={() => void onBrowseKey()}>浏览…</button>
             </div>
+          </div>
+        ) : (
+          <div className="field" data-auth="publickey">
+            <label>密钥对目录</label>
+            <div className="path-row">
+              <input
+                className="input mono"
+                placeholder="C:\\Users\\demo\\.ssh"
+                value={fields.keyPath}
+                onInput={(e) => {
+                  const v = e.currentTarget.value;
+                  setFields((f) => ({ ...f, keyPath: v }));
+                  runDetect(v);
+                }}
+              />
+              <button
+                type="button"
+                className="btn"
+                title="选择密钥对目录"
+                onClick={() => void openDialog({ directory: true }).then((path) => {
+                  if (typeof path === 'string' && path) {
+                    setFields((f) => ({ ...f, keyPath: path }));
+                    runDetect(path);
+                  }
+                })}
+              >浏览…</button>
+            </div>
+            {/* 目录探测结果：已识别密钥对 / 未发现时提供一键生成（生成规则见 ssh_keys.rs） */}
+            {kp.status === 'found' ? (
+              <div className="hint ok">已识别密钥对：{kp.name}</div>
+            ) : kp.status === 'missing' ? (
+              <button type="button" className="btn small ghost keypair-gen" onClick={() => void onGenerateKeypair()}>
+                未发现密钥对，点击立即生成
+              </button>
+            ) : kp.status === 'busy' ? (
+              <div className="hint">探测目录中…</div>
+            ) : (
+              <div className="hint">目录内按 id_ed25519 / id_rsa / id_ecdsa 顺序识别（私钥 + 同名 .pub 需并存）</div>
+            )}
           </div>
         )}
         {/* 标签：chip 编辑器，回车/逗号提交，候选来自现有全部 tag（搜索框 #tag 筛选用） */}

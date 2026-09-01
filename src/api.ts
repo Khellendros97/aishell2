@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserHistoryItem, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserHistoryItem, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -194,12 +194,45 @@ export const sftpCreate = (serverId: string, path: string, isDir: boolean) =>
    认证失败错误串的稳定前缀（与 ssh.rs AUTH_FAILED_PREFIX 保持一致）：terminal.ts 据此
    识别 SSH 认证失败并弹出重设凭据对话框；对话框展示时剥掉此前缀。 */
 export const SSH_AUTH_FAILED_PREFIX = '[SSH认证失败]';
+/** 公钥(密钥对)认证被拒的稳定前缀（与 ssh.rs NEED_DEPLOY_PREFIX 保持一致）：
+ *  terminal.ts 据此弹出「输入密码自动部署公钥」对话框。 */
+export const SSH_NEED_DEPLOY_KEY_PREFIX = '[SSH需部署公钥]';
 
 /** ssh_exec：复用服务器既有 SSH 连接（每 serverId 一条）直执单条命令，不走迷你终端。
  *  返回 { code, stdout, stderr }；code=null 表示命令超时被中断或未收到退出码。
  *  命令与结果由调用方写入 debug 日志（见 sftp.ts runRemoteCommand）。 */
 export const sshExec = (serverId: string, command: string) =>
   call<SshExecResult>('ssh_exec', { serverId, command });
+
+/** 部署公钥(密钥对)凭据的公钥到服务器 authorized_keys（ssh-copy-id 等价）。
+ *  密码一次性使用、不进系统凭据库；成功后下次连接即公钥免密登录。 */
+export const sshDeployPublicKey = (serverId: string, password: string) =>
+  call<void>('ssh_deploy_public_key', { serverId, password });
+
+/* ---------------- 密钥对（SSH 公钥凭据） ----------------
+   探测/生成均由后端同一定义（ssh_keys.rs），前端只展示结果。 */
+/** 密钥对目录默认值：用户主目录下 `.ssh`（不存在也返回，由探测/生成按需创建）。 */
+export const sshDefaultKeypairDir = () => call<string>('ssh_default_keypair_dir');
+/** 探测目录是否已有标准命名密钥对（id_ed25519/id_rsa/id_ecdsa，私钥+同名 .pub 并存）。 */
+export const sshDetectKeypair = (dir: string) => call<KeyPairInfo | null>('ssh_detect_keypair', { dir });
+/** 在目录下生成密钥对（ed25519、无密码短语；文件已存在时拒绝）。 */
+export const sshGenerateKeypair = (dir: string) => call<KeyPairInfo>('ssh_generate_keypair', { dir });
+
+/* ---------------- SSH 隧道（本地端口转发 -L 等价） ----------------
+   配置存 aishell.json（enabled = 重启自动重建），运行态在后端 tunnel.rs；tunnels:changed
+   事件驱动标签页刷新。关闭隧道标签页不停止隧道（服务语义，与终端/会话类资源区分）。 */
+/** 隧道列表（serverId 可选：按服务器过滤）。 */
+export const tunnelList = (serverId?: string) =>
+  call<TunnelState[]>('tunnel_list', { serverId: serverId ?? null });
+/** 保存隧道配置（按 id upsert）；enabled=true 时自动启动（失败 Err 返回错误文本）。 */
+export const tunnelSave = (tunnel: TunnelConfig) =>
+  call<TunnelState>('tunnel_save', { cfg: tunnel });
+export const tunnelStart = (id: string) => call<TunnelState>('tunnel_start', { id });
+export const tunnelStop = (id: string) => call<void>('tunnel_stop', { id });
+export const tunnelDelete = (id: string) => call<void>('tunnel_delete', { id });
+/** 隧道列表变更（启动/停止/保存/删除/重启恢复）后的全局通知。 */
+export const onTunnelsChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen('tunnels:changed', () => cb());
 
 /* ---------------- ai ---------------- */
 /** 后端发出的 AI 回合事件（key = `<projectId>:<sessionId>`）：

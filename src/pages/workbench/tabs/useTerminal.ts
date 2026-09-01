@@ -28,8 +28,9 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
 
 import {
-  SSH_AUTH_FAILED_PREFIX, getState, onTermData, onTermExit, openDialog, termClose, termCreate,
-  termInput, termRecordStart, termRecordStop, termResize, upsertProject,
+  SSH_AUTH_FAILED_PREFIX, SSH_NEED_DEPLOY_KEY_PREFIX, getState, onTermData, onTermExit, openDialog,
+  sshDeployPublicKey, termClose, termCreate, termInput, termRecordStart, termRecordStop, termResize,
+  upsertProject,
 } from '../../../api';
 import type { TermKind } from '../../../api';
 import type { QuickCommand, Server, ServerRef, TermSnapshot } from '../../../types';
@@ -674,12 +675,21 @@ class TermSession {
   /**
    * 建连错误分流（待优化 4）：后端以 SSH_AUTH_FAILED_PREFIX 前缀标记认证失败
    * （密码/密钥错误等，见 ssh.rs auth_failed_msg）→ 弹「重设登录凭据」对话框，
-   * 用户修正后自动重试连接。
+   * 用户修正后自动重试连接；
+   * SSH_NEED_DEPLOY_KEY_PREFIX 标记公钥(密钥对)认证被拒（服务器尚未存公钥，
+   * 见 ssh.rs need_deploy_msg）→ 弹「输入密码自动部署公钥」对话框。
+   * AI 触发场景不会走到这里：后端错误文本直接返回，不弹任何框。
    */
   private handleConnectError(msg: string): void {
+    const data = this.tab.data as { serverId?: string };
+    if (msg.startsWith(SSH_NEED_DEPLOY_KEY_PREFIX)) {
+      if (!data.serverId) return;
+      dbg(`${this.sid} fe-need-deploy-key, opening deploy dialog`);
+      void showDeployKeyDialog(data.serverId, msg, () => void this.connectAfterAuthFix());
+      return;
+    }
     if (!msg.startsWith(SSH_AUTH_FAILED_PREFIX)) return;
     // tab.data 由打开方构造（见 openTab 调用处），serverId 为 SSH 终端固定字段
-    const data = this.tab.data as { serverId?: string };
     if (!data.serverId) return;
     dbg(`${this.sid} fe-auth-failed, opening fix dialog`);
     void showAuthFixDialog(data.serverId, msg, () => void this.connectAfterAuthFix());
@@ -938,6 +948,101 @@ class TermSession {
   }
 }
 
+/* ---------- 公钥(密钥对)部署密码对话框 ---------- */
+
+/**
+ * 公钥(密钥对)认证被拒时弹出（由 TermSession.handleConnectError 触发）：
+ * 服务器尚未保存该公钥，用户输入一次密码 → ssh_deploy_public_key 自动部署到
+ * authorized_keys（ssh-copy-id 等价，幂等）；部署成功后回调 onDeployed 自动重连。
+ * 密码一次性使用，不进系统凭据库（展示时剥掉后端机器识别前缀）。
+ */
+async function showDeployKeyDialog(serverId: string, errorMsg: string, onDeployed: () => void): Promise<void> {
+  const state = await getState().catch(() => null);
+  const server = state?.servers.find((s) => s.id === serverId);
+  if (!server) return; // 服务器已被删除：无从部署，不弹框
+
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  const displayErr = errorMsg.startsWith(SSH_NEED_DEPLOY_KEY_PREFIX)
+    ? errorMsg.slice(SSH_NEED_DEPLOY_KEY_PREFIX.length)
+    : errorMsg;
+  mask.innerHTML = `
+    <div class="modal authfix-modal">
+      <div class="modal-head">
+        <h3>自动部署公钥 · 需要一次密码</h3>
+        <button class="icon-btn authfix-close" title="关闭">${icon('x')}</button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label>提示</label>
+          <div class="authfix-err">
+            <pre></pre>
+          </div>
+        </div>
+        <div class="authfix-divider"></div>
+        <div class="field">
+          <label>账户</label>
+          <div class="hint deploy-account"></div>
+        </div>
+        <div class="field">
+          <label>密码<span class="req">*</span></label>
+          <input class="input authfix-password" type="password" placeholder="一次性输入，仅用于本次部署，不会保存">
+        </div>
+        <div class="authfix-error"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn authfix-cancel">取消</button>
+        <button class="btn primary authfix-deploy">部署并连接</button>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  requestAnimationFrame(() => mask.classList.add('open'));
+
+  const errEl = mask.querySelector('.authfix-error') as HTMLElement;
+  const passwordEl = mask.querySelector('.authfix-password') as HTMLInputElement;
+  const deployBtn = mask.querySelector('.authfix-deploy') as HTMLButtonElement;
+  const pre = mask.querySelector('.authfix-err pre')!;
+  const accountEl = mask.querySelector('.deploy-account')!;
+
+  pre.textContent = displayErr;
+  // 账户信息用 textContent 注入，避免服务器名含 HTML 文本时被解释
+  accountEl.textContent = `${server.name}（${server.host}:${server.port}） · ${server.username} 的登录密码仅用于本次部署，不会保存`;
+
+  const close = (): void => {
+    mask.classList.remove('open');
+    setTimeout(() => mask.remove(), 160);
+  };
+  mask.querySelector('.authfix-close')!.addEventListener('click', close);
+  mask.querySelector('.authfix-cancel')!.addEventListener('click', close);
+  mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && mask.isConnected) close();
+  }, { once: true });
+
+  passwordEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') void deploy(); });
+  deployBtn.addEventListener('click', () => void deploy());
+  passwordEl.focus();
+
+  async function deploy(): Promise<void> {
+    const password = passwordEl.value;
+    if (!password) { errEl.textContent = '请输入密码'; return; }
+    errEl.textContent = '';
+    deployBtn.disabled = true;
+    try {
+      await sshDeployPublicKey(serverId, password);
+      passwordEl.value = '';
+      toast('公钥已部署，正在重新连接…', 'success');
+      close();
+      onDeployed();
+    } catch (err) {
+      // 密码错误等：剥掉认证失败前缀展示（与 authfix 对话框一致）
+      const e = String(err);
+      errEl.textContent = e.startsWith(SSH_AUTH_FAILED_PREFIX) ? e.slice(SSH_AUTH_FAILED_PREFIX.length) : e;
+      deployBtn.disabled = false;
+    }
+  }
+}
+
 /* ---------- SSH 认证失败重设凭据对话框（待优化 4） ---------- */
 
 /**
@@ -983,6 +1088,7 @@ async function showAuthFixDialog(serverId: string, errorMsg: string, onSaved: ()
           <select class="select authfix-auth">
             <option value="password">账号密码</option>
             <option value="key">密钥文件</option>
+            <option value="publickey">SSH 公钥（密钥对）</option>
           </select>
         </div>
         <div class="field authfix-f-password">
@@ -991,7 +1097,7 @@ async function showAuthFixDialog(serverId: string, errorMsg: string, onSaved: ()
           <div class="hint">密码只保存到系统钥匙串（account server:${serverId}），不会写入任何配置文件</div>
         </div>
         <div class="field authfix-f-key">
-          <label>密钥文件路径</label>
+          <label class="authfix-keylabel">密钥文件路径</label>
           <div class="input-row">
             <input class="input mono authfix-keypath" spellcheck="false" placeholder="C:\\Users\\demo\\.ssh\\id_ed25519">
             <button class="btn authfix-browse">浏览…</button>
@@ -1020,9 +1126,15 @@ async function showAuthFixDialog(serverId: string, errorMsg: string, onSaved: ()
   authEl.value = server.authType;
   keypathEl.value = server.keyPath;
   const syncAuth = (): void => {
-    const key = authEl.value === 'key';
-    mask.querySelector('.authfix-f-password')!.classList.toggle('hidden', key);
-    mask.querySelector('.authfix-f-key')!.classList.toggle('hidden', !key);
+    const kind = authEl.value;
+    mask.querySelector('.authfix-f-password')!.classList.toggle('hidden', kind !== 'password');
+    mask.querySelector('.authfix-f-key')!.classList.toggle('hidden', kind === 'password');
+    // publickey 的路径字段是「密钥对目录」，文案随认证方式切换
+    const keyLabel = mask.querySelector('.authfix-keylabel')!;
+    keyLabel.textContent = kind === 'publickey' ? '密钥对目录' : '密钥文件路径';
+    keypathEl.placeholder = kind === 'publickey'
+      ? 'C:\\Users\\demo\\.ssh'
+      : 'C:\\Users\\demo\\.ssh\\id_ed25519';
   };
   authEl.addEventListener('change', syncAuth);
   syncAuth();
@@ -1051,13 +1163,16 @@ async function showAuthFixDialog(serverId: string, errorMsg: string, onSaved: ()
 
   async function save(): Promise<void> {
     const username = usernameEl.value.trim();
-    const authType = authEl.value === 'key' ? 'key' : 'password';
+    const authType = authEl.value === 'password' ? 'password' : authEl.value === 'publickey' ? 'publickey' : 'key';
     const password = passwordEl.value;
     const keyPath = keypathEl.value.trim();
     if (!username) { errEl.textContent = '请填写账号'; return; }
-    if (authType === 'key' && !keyPath) { errEl.textContent = '请填写密钥文件路径'; return; }
+    if (authType !== 'password' && !keyPath) {
+      errEl.textContent = authType === 'publickey' ? '请填写密钥对目录' : '请填写密钥文件路径';
+      return;
+    }
     errEl.textContent = '';
-    const next: Server = { ...srv, username, authType, keyPath: authType === 'key' ? keyPath : '' };
+    const next: Server = { ...srv, username, authType, keyPath: authType === 'password' ? '' : keyPath };
     // 密码留空 = 保持原值（后端 password=null 不触碰 keyring）
     const passwordOrNull = authType === 'password' ? (password || null) : null;
     saveBtn.disabled = true;

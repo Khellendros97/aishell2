@@ -1111,9 +1111,11 @@ impl AiActions {
                     ))
                 }
             };
-            if auth_type == AuthType::Key && sget("keyPath").is_empty() {
+            if matches!(auth_type, AuthType::Key | AuthType::PublicKey)
+                && sget("keyPath").is_empty()
+            {
                 return Err(format!(
-                    "导入项目：servers 第 {} 项 key 认证必须提供 keyPath",
+                    "导入项目：servers 第 {} 项密钥认证必须提供 keyPath（密钥文件或密钥对目录）",
                     i + 1
                 ));
             }
@@ -1651,6 +1653,7 @@ impl AiActions {
                 let auth = match sv.auth_type {
                     crate::store::AuthType::Password => "密码",
                     crate::store::AuthType::Key => "密钥",
+                    crate::store::AuthType::PublicKey => "公钥(密钥对)",
                 };
                 lines.push(format!(
                     "- serverId={}，名称={}，地址={}:{}，用户={}，认证={}，状态={}",
