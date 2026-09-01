@@ -22,7 +22,11 @@
  * - 属性对话框 propModal 若随面板容器被销毁(切项目重建工作台)仍持有已脱离 DOM 的引用,
  *   后续「属性」点击不可见;React 版在 isConnected 检查失败时重建(附带到新容器);
  * - revealLocalPath 在容器未挂载时(切面板后的 React 渲染间隙)改为等待挂载接管,
- *   legacy 直接静默返回,切面板后立刻触发会定位失败。
+ *   legacy 直接静默返回,切面板后立刻触发会定位失败;
+ * - 选中带焦点语义(legacy 无):点击面板外(终端/SFTP/菜单浮层等)即失焦清空选中,
+ *   快捷键随之失效——修复「选中本地 a 后点选 SFTP 的 b,按 Delete 连带删除 a」的双删除;
+ * - 树空白区(含文件行)也是应用内拖放落点 = 项目根目录(remote 下载 / local 移动),
+ *   悬停时高亮根行提示落点;legacy 只收 OS 文件拖入。
  */
 import { icon } from '../../../../icons';
 import {
@@ -63,6 +67,8 @@ const FILE_STYLES: Record<string, { label: string; color: string }> = {
 let container: HTMLElement | null = null;
 /** 单击聚焦的当前行路径(快捷键操作目标;渲染时行加 .sel) */
 let selectedPath: string | null = null;
+/** 面板焦点态:最近一次按下鼠标在面板容器内才为 true;失焦后快捷键不再生效 */
+let panelFocused = false;
 /** 拖拽中的本地节点(dragover 据此决定 move/copy 光标;守卫在 moveNode 内) */
 let draggingNode: TreeNode | null = null;
 /** 属性对话框(一次性建 DOM 复用,模态框模式同 servers.ts;容器销毁后重建) */
@@ -779,18 +785,51 @@ function render(): void {
     e.preventDefault();
     showRootMenu(e.clientX, e.clientY, root);
   });
-  /* 树空白区也是 OS 拖入落点(落到根目录);行级 drop 已 stopPropagation,不会重复导入 */
+  /* 树空白区(含文件行)= 应用内拖放落点,落到项目根目录(remote 下载 / local 移动),
+     也是 OS 文件拖入导入根目录的落点;悬停时高亮根行提示落点。
+     目录行的 dragover/drop 已 preventDefault,冒泡到这里时以 defaultPrevented 区分,
+     跳过处理并让位给目标行高亮,不会重复下载/移动/导入。 */
+  const rootRow = (): HTMLElement | null =>
+    tree.querySelector<HTMLElement>(`.wbs-explorer-row[data-path="${CSS.escape(root.path)}"]`);
   tree.addEventListener('dragover', (e) => {
-    if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes('Files')) return;
+    if (!e.dataTransfer || e.defaultPrevented) {
+      // 已被目录行 dragover 接管:摘掉根行高亮,避免与目标行双高亮
+      rootRow()?.classList.remove('wbs-explorer-drop');
+      return;
+    }
+    const types = Array.from(e.dataTransfer.types);
+    if (!types.includes(DND_MIME) && !types.includes('Files')) return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'copy';
+    /* 本地树内拖拽=移动;远端 / OS 文件=复制(与目录行 dragover 同语义) */
+    e.dataTransfer.dropEffect = draggingNode ? 'move' : 'copy';
+    rootRow()?.classList.add('wbs-explorer-drop');
+  });
+  tree.addEventListener('dragleave', (e) => {
+    if (!tree.contains(e.relatedTarget as Node)) rootRow()?.classList.remove('wbs-explorer-drop');
   });
   tree.addEventListener('drop', (e) => {
-    if (!e.dataTransfer || e.dataTransfer.files.length === 0) return;
-    const root = getRoot();
-    if (!root) return;
-    e.preventDefault();
-    void importOsFiles(e.dataTransfer, root);
+    rootRow()?.classList.remove('wbs-explorer-drop');
+    if (!e.dataTransfer || e.defaultPrevented) return;
+    const raw = (() => { try { return e.dataTransfer!.getData(DND_MIME); } catch { return ''; } })();
+    if (raw) {
+      e.preventDefault();
+      let data: { source: string; path: string; name: string; isDir: boolean; serverId?: string } | null = null;
+      try { data = JSON.parse(raw); } catch { return; }
+      if (!data) return;
+      /* 空白落点 = 项目根目录(与拖到根行等价) */
+      if (data.source === 'local') {
+        void moveNode(data.path, data.name, data.isDir, root);
+        return;
+      }
+      if (data.source === 'remote' && data.serverId) {
+        void downloadTo({ path: data.path, name: data.name, serverId: data.serverId }, root);
+      }
+      return;
+    }
+    if (e.dataTransfer.files.length > 0) {
+      e.preventDefault();
+      void importOsFiles(e.dataTransfer, root);
+    }
   });
   appendNode(tree, root, 0, true);
   container.appendChild(tree);
@@ -824,6 +863,9 @@ function pasteTargetNode(): TreeNode | null {
 
 function onKeyDown(e: KeyboardEvent): void {
   if (useWorkbench.getState().panel !== 'explorer') return;
+  // 焦点不在本面板(点击过其他区域)时不劫持快捷键:侧栏面板为 explorer 而主区激活
+  // 标签是 SFTP 时,两侧的 Delete 监听都在场,靠焦点归属避免同一按键删两边的文件
+  if (!panelFocused) return;
   const ae = document.activeElement;
   const typing = ae instanceof HTMLInputElement
     || ae instanceof HTMLTextAreaElement
@@ -880,6 +922,7 @@ function onKeyDown(e: KeyboardEvent): void {
    使旧 token 全部失效)、清空容器引用。模块级树状态(根节点/展开集合/选中路径)跨挂载保留。 */
 export function mountExplorer(el: HTMLElement): () => void {
   container = el;
+  panelFocused = false; // 挂载即重置:重新显示面板后须在树内点击才恢复快捷键
   setRenderHook(render); // tree.ts 的加载/播种结果经此触发重绘
   const offProjectChanged = wbEvents.on('project-changed', () => {
     // 项目路径变化 → 重建根;仅 quickCommands 等变化 → 刷新已加载目录
@@ -903,9 +946,25 @@ export function mountExplorer(el: HTMLElement): () => void {
   if (pending) void doReveal(pending);
   startPolling();
   window.addEventListener('keydown', onKeyDown);
+  /* 焦点语义:面板外按下鼠标 = 失焦并清空选中(防 Delete 等快捷键跨面板误伤另一侧文件)。
+     只摘 .sel 类不整树重渲:contextmenu 菜单项点击也在容器外,重渲会把菜单动作捕获的
+     行元素变成孤儿(重命名 / 行内新建会写进脱离 DOM 的节点)。 */
+  const onDocMouseDown = (e: MouseEvent): void => {
+    if (!container) return;
+    if (container.contains(e.target as Node)) {
+      panelFocused = true;
+      return;
+    }
+    panelFocused = false;
+    if (selectedPath === null) return;
+    selectedPath = null;
+    container.querySelectorAll('.wbs-explorer-row.sel').forEach((el) => el.classList.remove('sel'));
+  };
+  document.addEventListener('mousedown', onDocMouseDown);
   return () => {
     offProjectChanged();
     window.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('mousedown', onDocMouseDown);
     if (pollTimer !== null) { window.clearInterval(pollTimer); pollTimer = null; }
     invalidateLoads(); // 作废在途 fsList/loadDir/refreshAll,旧 token 结果不再渲染
     setRenderHook(null);
