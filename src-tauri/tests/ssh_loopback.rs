@@ -399,6 +399,7 @@ async fn tunnel_local_forward_roundtrip() {
             id: "tun1".into(),
             server_id: "s1".into(),
             name: "测试隧道".into(),
+            kind: aishell_lib::tunnel::TunnelKind::Local,
             bind_addr: "127.0.0.1".into(),
             local_port,
             target_host: "127.0.0.1".into(),
@@ -423,6 +424,120 @@ async fn tunnel_local_forward_roundtrip() {
         assert!(!manager.stop("tun1").await);
         assert!(tokio::net::TcpStream::connect(("127.0.0.1", local_port)).await.is_err());
 
+        shutdown.shutdown("test done".into());
+    };
+
+    let (server_res, ()) = tokio::join!(running, test_body);
+    server_res.expect("echo server 异常退出");
+}
+
+/// SOCKS5 动态代理(ssh -D 等价)回环集成测试：SOCKS5 协商读出目标后走 direct-tcpip
+/// 转发(EchoServer 接受并回显)，分别覆盖 IPv4 目标与域名目标(ATYP=3,域名应原样
+/// 由远端解析——本测试 EchoServer 不检查目标，但字节路径全覆盖)。
+#[tokio::test]
+async fn tunnel_socks5_roundtrip() {
+    let socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 127.0.0.1:0 失败");
+    let addr = socket.local_addr().expect("取监听地址失败");
+    let config = Arc::new(russh::server::Config {
+        keys: vec![
+            russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM.as_bytes())
+                .expect("解析测试 host key 失败"),
+        ],
+        ..Default::default()
+    });
+    let mut server = EchoServer;
+    let running = server.run_on_socket(config, &socket);
+    let shutdown = running.handle();
+
+    let test_body = async {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-loopback-socks5-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let ssh = Arc::new(SshManager::new(_store.clone()));
+        let manager = TunnelManager::new();
+
+        let server = Server {
+            id: "s1".to_string(),
+            name: "loopback".to_string(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            auth_type: AuthType::Password,
+            username: "test".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        };
+        ssh.connect_direct(server, Some("test"))
+            .await
+            .expect("连接 + 密码认证应成功");
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let cfg = TunnelConfig {
+            id: "tun-socks".into(),
+            server_id: "s1".into(),
+            name: "动态代理".into(),
+            kind: aishell_lib::tunnel::TunnelKind::Dynamic,
+            bind_addr: "127.0.0.1".into(),
+            local_port,
+            target_host: String::new(),
+            target_port: 0,
+            enabled: true,
+        };
+        manager.start(&ssh, &cfg).await.expect("SOCKS5 隧道启动应成功");
+
+        /// SOCKS5 客户端：协商(无认证)+ CONNECT 指定目标,读回复码并做数据往返。
+        async fn socks_connect(local_port: u16, target: &[u8]) -> tokio::net::TcpStream {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+                .await
+                .expect("连接 SOCKS5 代理");
+            stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut method_resp = [0u8; 2];
+            stream.read_exact(&mut method_resp).await.unwrap();
+            assert_eq!(method_resp, [0x05, 0x00], "method selection 应回 [5,0]");
+            stream.write_all(target).await.unwrap();
+            let mut reply = [0u8; 10];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[0], 0x05);
+            assert_eq!(reply[1], 0x00, "CONNECT 应返回成功，实际回复 {:?}", reply);
+            stream
+        }
+
+        // IPv4 目标(ATYP=1):CONNECT 到 127.0.0.1:5432(EchoServer 不检查目标,直接回显)
+        let mut s = socks_connect(local_port, &[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x15, 0x38]).await;
+        s.write_all(b"hello ipv4").await.unwrap();
+        let mut buf = vec![0u8; 10];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello ipv4");
+        drop(s);
+
+        // 域名目标(ATYP=3):CONNECT 到 "example.test:8080",域名字节原样转发
+        let host = b"example.test";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&8080u16.to_be_bytes());
+        let mut s = socks_connect(local_port, &req).await;
+        s.write_all(b"hello domain").await.unwrap();
+        let mut buf = vec![0u8; 12];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello domain");
+
+        assert!(manager.stop("tun-socks").await);
         shutdown.shutdown("test done".into());
     };
 

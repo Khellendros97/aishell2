@@ -472,10 +472,12 @@ export interface TunnelConfig {
   id: string;
   serverId: string;
   name: string;
+  /** 隧道类型：local = 本地端口固定转发(-L)，dynamic = SOCKS5 动态代理(-D)。缺省 local */
+  kind: 'local' | 'dynamic';
   /** 本地监听地址；默认 127.0.0.1 */
   bindAddr: string;
   localPort: number;
-  /** 目标主机（远端服务器视角）；留空 = 服务器自身 */
+  /** 目标主机（远端服务器视角）；留空 = 服务器自身。dynamic 模式下无意义(保存时归零) */
   targetHost: string;
   targetPort: number;
   /** 上次启用状态：重启时自动重建 */

@@ -4317,6 +4317,7 @@ mod tests {
             id: "t1".into(),
             server_id: "s1".into(),
             name: "db".into(),
+            kind: crate::tunnel::TunnelKind::Local,
             bind_addr: "127.0.0.1".into(),
             local_port: 3307,
             target_host: "".into(),
