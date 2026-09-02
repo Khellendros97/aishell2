@@ -171,7 +171,7 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
     if (!host) { toast('请填写数据库主机', 'error'); return; }
     if (!Number.isInteger(port) || port <= 0 || port > 65535) { toast('端口无效', 'error'); return; }
     if (!user && form.kind !== 'redis') { toast('请填写数据库用户名', 'error'); return; }
-    if (isNew && !password) { toast('请填写数据库密码', 'error'); return; }
+    if (isNew && !password && form.kind !== 'redis') { toast('请填写数据库密码', 'error'); return; }
     if (!commands.length) { toast('请至少勾选一条 AI 可用命令', 'error'); return; }
     const connection: DbConnection = {
       id: form.id, name, kind: form.kind, host, port, user, database,
@@ -279,7 +279,7 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
             <div className="field">
               <label>密码</label>
               <input className="input mono" type="password" value={form?.password ?? ''}
-                placeholder={editingConn === null ? '必填' : '留空保持原密码'}
+                placeholder={form?.kind === 'redis' ? '无密码实例可留空' : editingConn === null ? '必填' : '留空保持原密码'}
                 onChange={(e) => { const v = e.currentTarget.value; setForm((f) => (f ? { ...f, password: v } : f)); }} />
             </div>
             <div className={`field db-cmds-field${isRedis ? ' hidden' : ''}`}>
