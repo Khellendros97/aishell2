@@ -22,6 +22,16 @@ use tokio::sync::watch;
 use crate::ssh::SshManager;
 use crate::store::Store;
 
+/// 隧道类型：Local = 本地端口固定转发(ssh -L 等价)；Dynamic = SOCKS5 动态代理(ssh -D 等价，
+/// 目标由客户端在 SOCKS5 握手时指定，DNS 走远端解析)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelKind {
+    #[default]
+    Local,
+    Dynamic,
+}
+
 /// 隧道配置（持久化；serde camelCase 与 src/types.ts TunnelConfig 对齐）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,13 +39,17 @@ pub struct TunnelConfig {
     pub id: String,
     pub server_id: String,
     pub name: String,
+    /// 隧道类型；旧配置无此字段按 Local（原行为）。
+    #[serde(default)]
+    pub kind: TunnelKind,
     /// 本地监听地址；默认 127.0.0.1（仅本机可连，安全）。
     pub bind_addr: String,
     /// 本地监听端口（1-65535；0 会重复利用端口，禁止）。
     pub local_port: u16,
     /// 目标主机（远端服务器视角）；空表示服务器自身，归一为 127.0.0.1。
+    /// Dynamic 模式下无意义（目标由 SOCKS5 客户端指定），保存时归零。
     pub target_host: String,
-    /// 目标端口（1-65535）。
+    /// 目标端口（1-65535）。Dynamic 模式下无意义，保存时归零。
     pub target_port: u16,
     /// 上次启用状态：重启时自动重建 enabled 的隧道。
     pub enabled: bool,
@@ -52,6 +66,7 @@ pub struct TunnelState {
 }
 
 /// 校验并归一化配置：空绑定地址/目标主机归一为 127.0.0.1，端口与名称非法即失败。
+/// Dynamic(SOCKS5)模式下目标字段无意义，归零保存防止脏数据。
 pub fn normalize_config(mut cfg: TunnelConfig) -> Result<TunnelConfig, String> {
     if cfg.id.trim().is_empty() {
         return Err("隧道缺少唯一标识".to_string());
@@ -63,14 +78,22 @@ pub fn normalize_config(mut cfg: TunnelConfig) -> Result<TunnelConfig, String> {
     if cfg.local_port == 0 {
         return Err("本地端口必须为 1-65535".to_string());
     }
-    if cfg.target_port == 0 {
-        return Err("目标端口必须为 1-65535".to_string());
-    }
     cfg.name = name.to_string();
     let bind_addr = cfg.bind_addr.trim();
     cfg.bind_addr = if bind_addr.is_empty() { "127.0.0.1" } else { bind_addr }.to_string();
-    let target_host = cfg.target_host.trim();
-    cfg.target_host = if target_host.is_empty() { "127.0.0.1" } else { target_host }.to_string();
+    match cfg.kind {
+        TunnelKind::Local => {
+            if cfg.target_port == 0 {
+                return Err("目标端口必须为 1-65535".to_string());
+            }
+            let target_host = cfg.target_host.trim();
+            cfg.target_host = if target_host.is_empty() { "127.0.0.1" } else { target_host }.to_string();
+        }
+        TunnelKind::Dynamic => {
+            cfg.target_host = String::new();
+            cfg.target_port = 0;
+        }
+    }
     Ok(cfg)
 }
 
@@ -195,7 +218,11 @@ async fn run_local(
                         let errors = Arc::clone(&errors);
                         let app = app.clone();
                         tokio::spawn(async move {
-                            match forward_one(&ssh, &cfg, stream).await {
+                            let result = match cfg.kind {
+                                TunnelKind::Local => forward_one(&ssh, &cfg, stream).await,
+                                TunnelKind::Dynamic => forward_dynamic(&ssh, &cfg, stream).await,
+                            };
+                            match result {
                                 Ok(()) => {
                                     let cleared = errors.lock().unwrap().remove(&cfg.id).is_some();
                                     if cleared {
@@ -251,6 +278,113 @@ async fn forward_one(
     Ok(())
 }
 
+/* ---------------- SOCKS5 动态代理(ssh -D 等价) ---------------- */
+
+/// SOCKS5 回复字节（10 字节；BND.ADDR/BND.PORT 用 0.0.0.0:0 占位，标准允许。
+/// code: 0x00 成功 / 0x05 连接拒绝(转发通道失败) / 0x07 命令不支持 / 0x08 地址类型不支持）。
+fn socks5_reply_bytes(code: u8) -> [u8; 10] {
+    [0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+}
+
+/// SOCKS5 协商：method 选择(仅接受无认证 0x00)→ CONNECT 请求解析(IPv4/域名/IPv6 目标)。
+/// 返回 (host, port) 或 reply 错误码（由调用方写回客户端再关闭）。
+async fn socks5_negotiate(stream: &mut TcpStream) -> Result<(String, u16), u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // [ver=5, nmethods, methods...]
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).await.map_err(|_| 0x01u8)?;
+    if head[0] != 0x05 {
+        return Err(0x07);
+    }
+    let mut methods = vec![0u8; head[1] as usize];
+    stream.read_exact(&mut methods).await.map_err(|_| 0x01u8)?;
+    if !methods.contains(&0x00) {
+        let _ = stream.write_all(&[0x05, 0xFF]).await; // 无可用认证方法
+        return Err(0x07);
+    }
+    stream
+        .write_all(&[0x05, 0x00])
+        .await
+        .map_err(|_| 0x01u8)?;
+
+    // CONNECT 请求：[ver, cmd, rsv, atyp, addr..., port_hi, port_lo]
+    let mut req = [0u8; 4];
+    stream.read_exact(&mut req).await.map_err(|_| 0x01u8)?;
+    if req[0] != 0x05 || req[1] != 0x01 {
+        return Err(0x07); // 仅支持 CONNECT
+    }
+    let host = match req[3] {
+        0x01 => {
+            let mut a = [0u8; 4];
+            stream.read_exact(&mut a).await.map_err(|_| 0x01u8)?;
+            a.map(|b| b.to_string()).join(".")
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.map_err(|_| 0x01u8)?;
+            let mut d = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut d).await.map_err(|_| 0x01u8)?;
+            // 域名字节原样转发给远端 sshd 解析（DNS 走远端是 -D 的价值），此处仅做 UTF-8 校验
+            String::from_utf8(d).map_err(|_| 0x04u8)?
+        }
+        0x04 => {
+            let mut a = [0u8; 16];
+            stream.read_exact(&mut a).await.map_err(|_| 0x01u8)?;
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        _ => return Err(0x08),
+    };
+    let mut port = [0u8; 2];
+    stream.read_exact(&mut port).await.map_err(|_| 0x01u8)?;
+    Ok((host, u16::from_be_bytes(port)))
+}
+
+/// Dynamic 隧道的单连接转发：SOCKS5 协商读出目标 → SSH 通道 direct-tcpip → 双向桥接。
+/// 协商失败回 SOCKS5 错误码再断开（客户端能看到「代理拒绝」而非 reset）；
+/// 通道打开失败回 0x05(连接拒绝)。
+async fn forward_dynamic(
+    ssh: &Arc<SshManager>,
+    cfg: &TunnelConfig,
+    stream: TcpStream,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = stream;
+    let (host, port) = match socks5_negotiate(&mut stream).await {
+        Ok(target) => target,
+        Err(code) => {
+            let _ = stream.write_all(&socks5_reply_bytes(code)).await;
+            return Err(format!("SOCKS5 协商失败（错误码 {code:#04x}）"));
+        }
+    };
+    let handle = ssh.get_or_connect(&cfg.server_id).await?;
+    let channel = match tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.channel_open_direct_tcpip(&host, port as u32, "127.0.0.1", 0),
+    )
+    .await
+    {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(e)) => {
+            let _ = stream.write_all(&socks5_reply_bytes(0x05)).await;
+            return Err(format!("打开到 {host}:{port} 的转发通道失败：{e}"));
+        }
+        Err(_) => {
+            let _ = stream.write_all(&socks5_reply_bytes(0x05)).await;
+            return Err(format!("打开到 {host}:{port} 的转发通道超时",));
+        }
+    };
+    stream
+        .write_all(&socks5_reply_bytes(0x00))
+        .await
+        .map_err(|e| format!("SOCKS5 成功回复发送失败: {e}"))?;
+    let mut channel = channel.into_stream();
+    tokio::io::copy_bidirectional(&mut channel, &mut stream)
+        .await
+        .map_err(|e| format!("转发数据中断：{e}"))?;
+    Ok(())
+}
+
 /// 启动时自动重建：上次 enabled 的隧道逐个尝试（失败仅记录，不阻塞启动）。
 pub async fn recover(
     app: AppHandle,
@@ -286,12 +420,36 @@ mod tests {
             id: id.into(),
             server_id: "s1".into(),
             name: name.into(),
+            kind: TunnelKind::Local,
             bind_addr: "".into(),
             local_port: 3307,
             target_host: "".into(),
             target_port: 3306,
             enabled: true,
         }
+    }
+
+    #[test]
+    fn normalize_dynamic_zeroes_target_fields() {
+        let mut c = cfg("t1", "socks");
+        c.kind = TunnelKind::Dynamic;
+        c.target_host = "example.com".into();
+        c.target_port = 8080;
+        let c = normalize_config(c).unwrap();
+        assert_eq!(c.target_host, "", "dynamic 模式目标字段归零");
+        assert_eq!(c.target_port, 0);
+        // dynamic 模式不需要目标端口校验(0 合法)
+        let mut c = cfg("t1", "socks");
+        c.kind = TunnelKind::Dynamic;
+        c.target_port = 0;
+        assert!(normalize_config(c).is_ok());
+    }
+
+    #[test]
+    fn socks5_reply_format() {
+        assert_eq!(socks5_reply_bytes(0x00), [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(socks5_reply_bytes(0x05)[1], 0x05, "第二字节是回复码");
+        assert_eq!(socks5_reply_bytes(0x08)[3], 0x01, "ATYP=IPv4 占位");
     }
 
     #[test]

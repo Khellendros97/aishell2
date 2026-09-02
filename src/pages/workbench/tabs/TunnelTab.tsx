@@ -18,6 +18,7 @@ import '../tunnel.css';
 
 interface EditorFields {
   name: string;
+  kind: TunnelConfig['kind'];
   bindAddr: string;
   localPort: string;
   targetHost: string;
@@ -25,7 +26,7 @@ interface EditorFields {
 }
 
 const EMPTY_EDITOR: EditorFields = {
-  name: '', bindAddr: '127.0.0.1', localPort: '', targetHost: '', targetPort: '',
+  name: '', kind: 'dynamic', bindAddr: '127.0.0.1', localPort: '', targetHost: '', targetPort: '',
 };
 
 function parsePort(raw: string): number | null {
@@ -68,6 +69,7 @@ export function TunnelTab({ tab }: TabProps): JSX.Element {
     setEditing(tunnel);
     setFields({
       name: tunnel.name,
+      kind: tunnel.kind,
       bindAddr: tunnel.bindAddr,
       localPort: String(tunnel.localPort),
       targetHost: tunnel.targetHost === '127.0.0.1' ? '' : tunnel.targetHost,
@@ -89,16 +91,18 @@ export function TunnelTab({ tab }: TabProps): JSX.Element {
     if (!name) { setError('请填写隧道名称'); return; }
     const localPort = parsePort(fields.localPort);
     if (!localPort) { setError('本地端口需为 1-65535 的整数'); return; }
-    const targetPort = parsePort(fields.targetPort);
-    if (!targetPort) { setError('目标端口需为 1-65535 的整数'); return; }
+    // dynamic(SOCKS5)模式：目标由客户端协商指定，目标字段归零
+    const targetPort = fields.kind === 'dynamic' ? 0 : parsePort(fields.targetPort);
+    if (fields.kind === 'local' && !targetPort) { setError('目标端口需为 1-65535 的整数'); return; }
     const cfg: TunnelConfig = {
       id: editing?.id ?? uid('tun'),
       serverId,
       name,
+      kind: fields.kind,
       bindAddr,
       localPort,
-      targetHost: fields.targetHost.trim(), // 空 = 后端归一为服务器自身
-      targetPort,
+      targetHost: fields.kind === 'dynamic' ? '' : fields.targetHost.trim(), // 空 = 后端归一为服务器自身
+      targetPort: targetPort ?? 0,
       enabled: true, // 保存即启用（用户点「保存」的意图是让隧道跑起来）
     };
     setBusy(true);
@@ -168,7 +172,7 @@ export function TunnelTab({ tab }: TabProps): JSX.Element {
                     <span className="dot" />{t.running ? '运行中' : '已停止'}
                   </span>
                 </div>
-                <div className="tunnel-card-route mono">{t.bindAddr}:{t.localPort} → {t.targetHost}:{t.targetPort}</div>
+                <div className="tunnel-card-route mono">{t.kind === 'dynamic' ? `${t.bindAddr}:${t.localPort} → SOCKS5 动态代理` : `${t.bindAddr}:${t.localPort} → ${t.targetHost}:${t.targetPort}`}</div>
                 {t.error ? <div className="tunnel-card-error">{t.error}</div> : null}
               </div>
               <div className="tunnel-card-actions">
@@ -193,11 +197,18 @@ export function TunnelTab({ tab }: TabProps): JSX.Element {
             <div className="modal-head"><h3>{editing ? '编辑隧道' : '新建隧道'}</h3><button className="icon-btn" title="关闭" onClick={closeEditor}><Icon name="x" /></button></div>
             <div className="modal-body">
               <div className="field"><label>名称<span className="req">*</span></label><input className="input" autoFocus value={fields.name} placeholder="例如：内网数据库" onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, name: v })); }} /></div>
+              <div className="field"><label>类型</label><select className="select" value={fields.kind} onChange={(e) => { const v = e.currentTarget.value as TunnelConfig['kind']; setFields((f) => ({ ...f, kind: v })); }}><option value="local">本地端口转发（-L，固定目标）</option><option value="dynamic">SOCKS5 动态代理（-D，目标由客户端指定）</option></select></div>
               <div className="field"><label>本地绑定地址</label><input className="input mono" value={fields.bindAddr} placeholder="127.0.0.1" onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, bindAddr: v })); }} /><div className="hint">默认 127.0.0.1 仅本机可访问；改 0.0.0.0 会暴露给局域网，请谨慎。</div></div>
               <div className="field-row">
                 <div className="field"><label>本地端口<span className="req">*</span></label><input className="input mono" value={fields.localPort} placeholder="3307" onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, localPort: v })); }} /></div>
-                <div className="field"><label>目标主机</label><input className="input mono" value={fields.targetHost} placeholder="localhost（服务器自身）" onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, targetHost: v })); }} /><div className="hint">以远端服务器视角填写（内网 IP 或 localhost）</div></div>
-                <div className="field"><label>目标端口<span className="req">*</span></label><input className="input mono" value={fields.targetPort} placeholder="3306" onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, targetPort: v })); }} /></div>
+                {fields.kind === 'local' ? (
+                  <>
+                    <div className="field"><label>目标主机</label><input className="input mono" value={fields.targetHost} placeholder="localhost（服务器自身）" onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, targetHost: v })); }} /><div className="hint">以远端服务器视角填写（内网 IP 或 localhost）</div></div>
+                    <div className="field"><label>目标端口<span className="req">*</span></label><input className="input mono" value={fields.targetPort} placeholder="3306" onChange={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, targetPort: v })); }} /></div>
+                  </>
+                ) : (
+                  <div className="field" style={{ flex: 1 }}><div className="hint">目标地址由客户端在 SOCKS5 握手时指定（浏览器/代理工具填 127.0.0.1:端口 即可；域名由远端解析）。</div></div>
+                )}
               </div>
               {error ? <div className="form-error">{error}</div> : null}
             </div>
