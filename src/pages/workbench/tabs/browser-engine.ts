@@ -32,7 +32,7 @@ import { showContextMenu, toast } from '../../../ui';
 import {
   browserBack, browserCloseView, browserEnsure, browserForward, browserHistoryAdd, browserHistoryList,
   browserNavigate, browserOpenDevtools, browserReload, browserSetInspect, browserSetRect,
-  browserSetVisible, onBrowserEvent, openDialog,
+  browserSetVisible, onBrowserEvent, onBrowserProxyChanged, openDialog,
 } from '../../../api';
 import type { BrowserEvent, BrowserHistoryItem, BrowserRef } from '../../../types';
 import { wbHandles } from '../../../stores/workbench';
@@ -92,6 +92,7 @@ let viewEl: HTMLDivElement | null = null;
 let pagesEl: HTMLElement | null = null;
 let ro: ResizeObserver | null = null;
 let unlistenFn: (() => void) | null = null;
+let unlistenProxyFn: (() => void) | null = null;
 
 /* ---------- 页面状态辅助 ---------- */
 
@@ -196,20 +197,26 @@ function setInspectState(on: boolean, silent = false): void {
 
 /* ---------- 导航 ---------- */
 
+async function navigatePage(p: PageState, input: string): Promise<string> {
+  const value = input.trim();
+  if (!value) throw new Error('地址不能为空');
+  await browserEnsure(p.id);
+  const normalized = await browserNavigate(p.id, value);
+  p.url = normalized;
+  p.hasNavigated = true;
+  updateHint();
+  applyVisibility();
+  syncRect();
+  updateAddress();
+  renderPagesBar();
+  return normalized;
+}
+
 async function navigate(input: string): Promise<void> {
   const p = activePage();
-  const value = input.trim();
-  if (!p || !value) return;
+  if (!p || !input.trim()) return;
   try {
-    await browserEnsure(p.id);
-    const normalized = await browserNavigate(p.id, value);
-    p.url = normalized;
-    p.hasNavigated = true;
-    updateHint();
-    applyVisibility();
-    syncRect();
-    updateAddress();
-    renderPagesBar();
+    await navigatePage(p, input);
   } catch (err) {
     toast(`无法打开: ${String(err)}`, 'error');
   }
@@ -229,16 +236,7 @@ export async function openInActivePage(input: string): Promise<string> {
   if (!value) throw new Error('地址不能为空');
   let p = activePage();
   if (!p) p = newPage();
-  await browserEnsure(p.id);
-  const normalized = await browserNavigate(p.id, value);
-  p.url = normalized;
-  p.hasNavigated = true;
-  updateHint();
-  applyVisibility();
-  syncRect();
-  updateAddress();
-  renderPagesBar();
-  return normalized;
+  return navigatePage(p, value);
 }
 
 /* ---------- 地址栏历史:导航事件防抖上报 + 输入下拉过滤 ---------- */
@@ -651,28 +649,30 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     } else if (ev.kind === 'ai-navigate' && ev.url) {
       toast(`AI 正在打开: ${ev.url}`);
     } else if (ev.kind === 'new-window' && ev.url) {
-      /* 新窗口拦截（main 侧引入）：后端拒绝弹窗并把地址经 browser:event new-window 送来，这里开新标签页 */
       const target = newPage();
-      void (async () => {
-        try {
-          await browserEnsure(target.id);
-          const normalized = await browserNavigate(target.id, ev.url!);
-          target.url = normalized;
-          target.hasNavigated = true;
-          updateHint();
-          applyVisibility();
-          syncRect();
-          updateAddress();
-          renderPagesBar();
-        } catch (err) {
-          toast(`无法在新页面打开: ${String(err)}`, 'error');
-        }
-      })();
+      void navigatePage(target, ev.url).catch((err) => {
+        toast(`无法在新页面打开: ${String(err)}`, 'error');
+      });
     } else if (ev.kind === 'element') {
       handleElementSelected(ev);
     }
   }).then((fn) => {
     if (containerEl === container) unlistenFn = fn;
+    else fn();
+  });
+
+  /* 代理变更(设置页保存 SOCKS5 代理后广播):后端已关闭全部子视图,
+     已导航页面按 URL 自动重建(代理只能在子 webview 创建时注入,重建即生效) */
+  void onBrowserProxyChanged(() => {
+    if (containerEl !== container) return;
+    for (const p of pages) {
+      if (!p.hasNavigated || !p.url || p.url === 'about:blank') continue;
+      void navigatePage(p, p.url).catch((err) => {
+        toast(`代理变更后重建页面失败: ${String(err)}`, 'error');
+      });
+    }
+  }).then((fn) => {
+    if (containerEl === container) unlistenProxyFn = fn;
     else fn();
   });
 
@@ -715,6 +715,7 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     overlayObserver.disconnect();
     window.removeEventListener('resize', syncRect);
     if (unlistenFn) { unlistenFn(); unlistenFn = null; }
+    if (unlistenProxyFn) { unlistenProxyFn(); unlistenProxyFn = null; }
     container.querySelector('.browser-toolbar')?.removeEventListener('click', onToolbarClick);
     pagesEl?.removeEventListener('click', onPagesClick);
     pagesEl?.removeEventListener('contextmenu', onPagesContextMenu);

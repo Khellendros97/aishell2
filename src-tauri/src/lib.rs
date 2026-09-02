@@ -413,6 +413,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             browser::browser_open_devtools,
             browser::browser_close_view,
             browser::browser_publish_skillhub,
+            browser::browser_set_proxy,
             browser::browser_history_add,
             browser::browser_history_list,
             update::update_status,

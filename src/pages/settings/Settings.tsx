@@ -16,6 +16,7 @@ import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, saveSe
 import { navigate } from '../../router';
 import { toast, confirmDialog } from '../../ui';
 import { CredentialsPanel } from './CredentialsPanel';
+import { BrowserPanel } from './BrowserPanel';
 import { Icon } from '../../shared/Icon';
 import type { IconName } from '../../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -58,7 +59,7 @@ interface McpStatusLine {
 }
 
 /** 左侧导航分类：MCP 归功能特性；快捷键页只读。 */
-type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api' | 'credentials' | 'about';
+type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api' | 'credentials' | 'about' | 'browser';
 
 const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'features', label: '功能特性', icon: 'zap' },
@@ -67,6 +68,7 @@ const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'shortcuts', label: '快捷键', icon: 'key' },
   { id: 'api', label: 'API 接口', icon: 'plug' },
   { id: 'about', label: '关于与更新', icon: 'info' },
+  { id: 'browser', label: '浏览器', icon: 'globe' },
 ];
 
 function pageFromParams(params: URLSearchParams): SettingsPage {
@@ -423,6 +425,9 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
         <main id="settings-content">
           {page === 'credentials' && (
             <CredentialsPanel initialState={appState} onChanged={(next) => { dbRef.current = next; setAppState(next); }} />
+          )}
+          {page === 'browser' && (
+            <BrowserPanel initialState={appState} onChanged={(next) => { dbRef.current = next; setAppState(next); }} />
           )}
           {page === 'appearance' && (
           <section id="panel-appearance" className="settings-panel">
