@@ -316,8 +316,8 @@ class TermSession {
         { label: '复制', iconName: 'copy', disabled: !this.term.hasSelection(), action: () => this.copySelection() },
         { label: '粘贴', iconName: 'clipboard', action: () => void this.pasteClipboard() },
         this.recording
-          ? { label: '停止录制', iconName: 'circle', action: () => void this.stopRecording(false) }
-          : { label: '开始录制', iconName: 'circle', action: () => void this.startRecording() },
+          ? { label: '停止录制', iconName: 'circle', action: () => { void this.stopRecording(false); this.term.focus(); } }
+          : { label: '开始录制', iconName: 'circle', action: () => { void this.startRecording(); this.term.focus(); } },
         { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
       ]);
     });
@@ -425,18 +425,22 @@ class TermSession {
   }
 
   /* ---------- 输入：转发后端 + 区块追踪 ---------- */
-  /** 复制当前选区到系统剪贴板(清洗 ANSI 转义/控制符;无选区时静默) */
+  /** 复制当前选区到系统剪贴板(清洗 ANSI 转义/控制符;无选区时静默)；
+      复制后焦点交还终端（右键菜单的 DOM 按钮点击会夺走焦点，不还回则回车等按键不再进 xterm） */
   private copySelection(): void {
     const sel = this.term.getSelection();
     if (sel) void copyText(cleanCopiedText(sel));
+    this.term.focus();
   }
 
-  /** 读系统剪贴板并粘贴进终端（走 xterm paste 路径，保留 bracketed paste 语义与区块追踪） */
+  /** 读系统剪贴板并粘贴进终端（走 xterm paste 路径，保留 bracketed paste 语义与区块追踪）；
+      粘贴后焦点交还终端（理由同 copySelection） */
   private async pasteClipboard(): Promise<void> {
     try {
       const text = await navigator.clipboard.readText();
       if (text) this.term.paste(text);
     } catch { /* 剪贴板读取失败（权限等）静默 */ }
+    this.term.focus();
   }
 
   private onUserInput(data: string): void {
