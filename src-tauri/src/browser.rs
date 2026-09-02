@@ -180,10 +180,50 @@ impl BrowserManager {
         let view_id_load = view_id.to_string();
         let view_id_title = view_id.to_string();
         let view_id_new_window = view_id.to_string();
-        let builder = WebviewBuilder::new(
+
+        // 内置浏览器代理：按当前 browser_proxy 求值（tunnel 源时隧道必须正在运行，否则回落直连）。
+        // 代理只能在子 webview 创建时注入（WebView2 环境级），运行中改不动——代理变更走
+        // browser_set_proxy(关闭所有现有视图,前端按事件重建)。
+        // 重要：启用代理时子 webview 用独立数据目录——同一 user-data-dir 下不同
+        // additional_browser_args 的环境会被 WebView2 按 Chromium 单例语义忽略/冲突，
+        // 表现为「新建子视图卡住不加载」。
+        let proxy_cfg = {
+            let store = handle.state::<Arc<crate::store::Store>>();
+            let tunnels = handle.state::<Arc<crate::tunnel::TunnelManager>>();
+            crate::store::resolve_proxy_addr(
+                &store.browser_proxy(),
+                &store.tunnels_all(),
+                &tunnels.running_ids(),
+            )
+            .map(|(host, port)| {
+                // IPv6 地址需包 []（--proxy-server=socks5://[::1]:port）。
+                // wry 的 additional_browser_args 是覆盖式（unwrap_or_else），传了代理参数会丢掉
+                // tauri 默认的 --disable-features 串（mini menu / smart screen），这里拼回保持一致。
+                // bypass-list 用 <-loopback>：移除 Chromium 对 localhost/127.0.0.1/::1 的「隐式
+                // 永不走代理」规则——经代理访问远端服务器自身的回环服务是 -D 隧道的核心用法。
+                let host_fmt = if host.contains(':') { format!("[{host}]") } else { host };
+                format!(
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                     --proxy-server=socks5://{host_fmt}:{port} \
+                     --proxy-bypass-list=\"<-loopback>\""
+                )
+            })
+        };
+        let mut builder = WebviewBuilder::new(
             label,
             WebviewUrl::External(Url::parse("about:blank").map_err(|e| format!("初始地址非法: {e}"))?),
-        )
+        );
+        if let Some(args) = proxy_cfg {
+            builder = builder.additional_browser_args(&args);
+            // 独立数据目录：与无代理环境隔离，避免同 data-dir 不同 args 冲突；
+            // 同时让代理浏览的 cookie/缓存与直连完全隔离（更干净的隐私语义）
+            let data_dir = app_handle()
+                .and_then(|h| h.path().app_local_data_dir().ok())
+                .map(|d| d.join("browser-proxy"))
+                .ok_or_else(|| "无法获取应用数据目录".to_string())?;
+            builder = builder.data_directory(data_dir);
+        }
+        let builder = builder
         .initialization_script(INSPECTOR_JS)
         // 子 webview 是独立原生表面，由 WebView2 直接处理 Ctrl+滚轮缩放
         .zoom_hotkeys_enabled(true)
@@ -555,6 +595,16 @@ impl BrowserManager {
             }
         }
         Ok(())
+    }
+
+    /// 关闭所有子 webview（代理变更后重建用；单页失败不影响其余）。
+    pub fn close_all(&self) {
+        let ids: Vec<String> = self.views.lock().unwrap().keys().cloned().collect();
+        for id in ids {
+            if let Err(e) = self.close_view(&id) {
+                eprintln!("[browser] 关闭页面 {id} 失败: {e}");
+            }
+        }
     }
 }
 
@@ -937,6 +987,23 @@ pub async fn browser_close_view(
     view_id: String,
 ) -> Result<(), String> {
     mgr.close_view(&view_id)
+}
+
+/// 保存内置浏览器 SOCKS5 代理配置（AppState 顶层,不走 Settings 整表单）：
+/// 代理只能在子 webview 创建时注入——保存后关闭所有现有子 webview 并广播
+/// `browser:proxy-changed`,前端标签页按 URL 自动重建。
+#[tauri::command]
+pub async fn browser_set_proxy(
+    mgr: State<'_, Arc<BrowserManager>>,
+    store: State<'_, Arc<crate::store::Store>>,
+    cfg: crate::store::BrowserProxyConfig,
+) -> Result<(), String> {
+    store.set_browser_proxy(cfg)?;
+    mgr.close_all();
+    if let Some(app) = app_handle() {
+        let _ = app.emit("browser:proxy-changed", ());
+    }
+    Ok(())
 }
 
 /* ---------------- 地址栏历史（持久化在 AppState.browserHistory，store.rs） ---------------- */

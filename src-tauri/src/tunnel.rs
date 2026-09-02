@@ -142,6 +142,11 @@ impl TunnelManager {
         self.running.lock().unwrap().contains_key(id)
     }
 
+    /// 运行中的隧道 id 集合（内置浏览器代理由隧道提供时求值用）。
+    pub fn running_ids(&self) -> std::collections::HashSet<String> {
+        self.running.lock().unwrap().keys().cloned().collect()
+    }
+
     /// 启动隧道：先 bind 本地端口（失败立即返回，含端口占用），预连服务器把认证/网络错误
     /// 在启动阶段暴露（此后转发连接懒连，服务器断开会自动重连）。幂等：已运行直接成功。
     pub async fn start(&self, ssh: &Arc<SshManager>, cfg: &TunnelConfig) -> Result<(), String> {

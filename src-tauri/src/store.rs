@@ -268,6 +268,80 @@ pub struct Server {
     pub tags: Vec<String>,
 }
 
+/// 内置浏览器 SOCKS5 代理配置（AppState 顶层字段，不走 Settings 整表单——防止整表单保存时覆盖）：
+/// 仅作用于内置浏览器子 webview（WebView2 browser args），不影响主窗口。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserProxyConfig {
+    /// 是否启用代理。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 代理来源：'tunnel' = 从运行中的 SSH 动态隧道选一个；'manual' = 手动输入地址。
+    #[serde(default)]
+    pub source: BrowserProxySource,
+    /// source=tunnel 时的隧道 id（须为 running 且 kind=dynamic 的动态隧道）。
+    #[serde(default)]
+    pub tunnel_id: Option<String>,
+    /// source=manual 时的代理主机。
+    #[serde(default)]
+    pub host: String,
+    /// source=manual 时的代理端口（0 非法，启用时校验）。
+    #[serde(default)]
+    pub port: u16,
+}
+
+impl BrowserProxyConfig {
+    /// 由来源推断的「是否生效」判断（不查隧道运行态，那在 resolve_proxy_addr 里）：
+    /// enabled + manual 时 host/port 非空；enabled + tunnel 时 tunnel_id 非空。
+    pub fn is_configured(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.source {
+            BrowserProxySource::Tunnel => self
+                .tunnel_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()),
+            BrowserProxySource::Manual => !self.host.trim().is_empty() && self.port != 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserProxySource {
+    #[default]
+    Tunnel,
+    Manual,
+}
+
+/// 求当前生效的 SOCKS5 代理地址：enabled + 配置完整 +（tunnel 源时隧道在运行）才有值。
+/// running_ids 由 TunnelManager 提供（运行中的隧道 id 集合）；传空集合即「不考虑运行态」
+/// （设置页展示候选时用）。manual 源直接用 host:port。
+pub fn resolve_proxy_addr(
+    cfg: &BrowserProxyConfig,
+    tunnels: &[crate::tunnel::TunnelConfig],
+    running_ids: &HashSet<String>,
+) -> Option<(String, u16)> {
+    if !cfg.is_configured() {
+        return None;
+    }
+    match cfg.source {
+        BrowserProxySource::Manual => Some((cfg.host.trim().to_string(), cfg.port)),
+        BrowserProxySource::Tunnel => {
+            let id = cfg.tunnel_id.as_deref()?;
+            let tunnel = tunnels.iter().find(|t| t.id == id)?;
+            if tunnel.kind != crate::tunnel::TunnelKind::Dynamic {
+                return None;
+            }
+            if !running_ids.contains(id) {
+                return None;
+            }
+            Some((tunnel.bind_addr.clone(), tunnel.local_port))
+        }
+    }
+}
+
 /// 数据库类型（AI 受管查询通道）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -860,6 +934,10 @@ pub struct AppState {
     /// 旧配置无此字段按空列表。运行态（监听/错误）不落盘，由 tunnel.rs 即时合并。
     #[serde(default)]
     pub ssh_tunnels: Vec<crate::tunnel::TunnelConfig>,
+    /// 内置浏览器 SOCKS5 代理配置（AppState 顶层，不进 Settings 整表单；代理仅作用于
+    /// 内置浏览器子 webview，浏览器标签页重建时生效）。
+    #[serde(default)]
+    pub browser_proxy: BrowserProxyConfig,
 }
 
 /// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
@@ -2768,6 +2846,54 @@ impl Store {
         })
     }
 
+    /// 内置浏览器代理配置（clone）。
+    pub fn browser_proxy(&self) -> BrowserProxyConfig {
+        self.state
+            .lock()
+            .map(|g| g.browser_proxy.clone())
+            .unwrap_or_default()
+    }
+
+    /// 保存内置浏览器代理配置：enabled 时校验字段完整（tunnel 源要求隧道存在且为 dynamic）；
+    /// 校验通过后原子落盘。隧道运行态不在此校验（运行时变化由 ensure 时 resolve 兜底回落直连）。
+    pub fn set_browser_proxy(&self, cfg: BrowserProxyConfig) -> Result<(), String> {
+        if cfg.enabled {
+            match cfg.source {
+                BrowserProxySource::Tunnel => {
+                    let id = cfg.tunnel_id.as_deref().unwrap_or_default();
+                    if id.trim().is_empty() {
+                        return Err("请选择运行中的 SSH 隧道".to_string());
+                    }
+                    let exists = {
+                        let guard = self
+                            .state
+                            .lock()
+                            .map_err(|_| "store 状态锁损坏".to_string())?;
+                        guard
+                            .ssh_tunnels
+                            .iter()
+                            .any(|t| t.id == id && t.kind == crate::tunnel::TunnelKind::Dynamic)
+                    };
+                    if !exists {
+                        return Err("所选隧道不存在或不是 SOCKS5 动态代理".to_string());
+                    }
+                }
+                BrowserProxySource::Manual => {
+                    if cfg.host.trim().is_empty() {
+                        return Err("请填写代理主机地址".to_string());
+                    }
+                    if cfg.port == 0 {
+                        return Err("代理端口必须为 1-65535".to_string());
+                    }
+                }
+            }
+        }
+        self.with_state(|state| {
+            state.browser_proxy = cfg;
+            Ok(())
+        })
+    }
+
     /// 系统任务项目：不落入 AppState.projects，按当前 workspace 合成并确保目录存在。
     /// 任务项目固定使用 `<workspace>/.aishell/tasks`，没有 workspace 时返回可执行的中文错误。
     pub fn task_project(&self) -> Result<Project, String> {
@@ -3553,6 +3679,7 @@ mod tests {
             seeded_skill_workspaces: vec![seed_marker("D:\\AIShellWorkspace")],
             trace_enabled: false,
             ssh_tunnels: vec![],
+            browser_proxy: BrowserProxyConfig::default(),
         }
     }
 
@@ -4306,6 +4433,71 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&config);
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn browser_proxy_resolve_branches() {
+        use crate::tunnel::{TunnelConfig, TunnelKind};
+        let tunnel = TunnelConfig {
+            id: "t1".into(),
+            server_id: "s1".into(),
+            name: "proxy".into(),
+            kind: TunnelKind::Dynamic,
+            bind_addr: "127.0.0.1".into(),
+            local_port: 1080,
+            target_host: String::new(),
+            target_port: 0,
+            enabled: true,
+        };
+        // 未启用 → None
+        let mut cfg = BrowserProxyConfig::default();
+        assert!(resolve_proxy_addr(&cfg, std::slice::from_ref(&tunnel), &HashSet::new()).is_none());
+        // manual + 完整 → 直接用 host:port
+        cfg.enabled = true;
+        cfg.source = BrowserProxySource::Manual;
+        cfg.host = " 127.0.0.1 ".into();
+        cfg.port = 1080;
+        assert_eq!(
+            resolve_proxy_addr(&cfg, std::slice::from_ref(&tunnel), &HashSet::new()),
+            Some(("127.0.0.1".into(), 1080))
+        );
+        // tunnel 源但隧道未运行 → None(回落直连)
+        cfg.source = BrowserProxySource::Tunnel;
+        cfg.tunnel_id = Some("t1".into());
+        assert!(resolve_proxy_addr(&cfg, std::slice::from_ref(&tunnel), &HashSet::new()).is_none());
+        // 隧道运行中 → 用隧道监听地址
+        let running: HashSet<String> = ["t1".to_string()].into_iter().collect();
+        assert_eq!(
+            resolve_proxy_addr(&cfg, std::slice::from_ref(&tunnel), &running),
+            Some(("127.0.0.1".into(), 1080))
+        );
+        // 隧道 id 不存在 → None
+        cfg.tunnel_id = Some("nope".into());
+        assert!(resolve_proxy_addr(&cfg, &[tunnel], &running).is_none());
+    }
+
+    #[test]
+    fn browser_proxy_save_validates_when_enabled() {
+        let config = temp_config_dir("proxy-save");
+        let store = test_store(config.clone());
+        // manual 空 host → Err;空 port → Err
+        let mut cfg = BrowserProxyConfig {
+            enabled: true,
+            source: BrowserProxySource::Manual,
+            tunnel_id: None,
+            host: String::new(),
+            port: 0,
+        };
+        assert!(store.set_browser_proxy(cfg.clone()).is_err());
+        cfg.host = "127.0.0.1".into();
+        cfg.port = 1080;
+        store.set_browser_proxy(cfg.clone()).unwrap();
+        assert_eq!(store.browser_proxy(), cfg);
+        // disabled → 不校验直接保存
+        let off = BrowserProxyConfig { enabled: false, ..BrowserProxyConfig::default() };
+        store.set_browser_proxy(off.clone()).unwrap();
+        assert_eq!(store.browser_proxy(), off);
+        let _ = fs::remove_dir_all(&config);
     }
 
     #[test]

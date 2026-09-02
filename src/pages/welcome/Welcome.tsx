@@ -63,6 +63,8 @@ const EMPTY_STATE: AppState = {
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
   seededSkillWorkspaces: [],
   traceEnabled: false,
+  sshTunnels: [],
+  browserProxy: { enabled: false, source: 'tunnel', tunnelId: null, host: '', port: 0 },
 };
 
 /**

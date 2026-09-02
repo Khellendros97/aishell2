@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserHistoryItem, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -349,6 +349,14 @@ export const browserHistoryList = (query: string, limit = 8) =>
   call<BrowserHistoryItem[]>('browser_history_list', { query, limit });
 export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
   listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
+
+/** 保存内置浏览器 SOCKS5 代理配置：保存即生效——关闭所有现有浏览器子视图并广播
+ *  browser:proxy-changed，标签页按 URL 自动重建（代理只能在子 webview 创建时注入）。 */
+export const browserSetProxy = (cfg: BrowserProxyConfig) =>
+  call<void>('browser_set_proxy', { cfg });
+/** 代理配置变更通知（browser_set_proxy 保存后广播）；浏览器标签页据此自动重建。 */
+export const onBrowserProxyChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen('browser:proxy-changed', () => cb());
 
 /* ---------------- staging（会话级远程文件暂存，自动备份） ----------------
    快照在 AI 修改远程文件前自动创建；本组命令供「文件暂存区」面板 / diff 标签使用。

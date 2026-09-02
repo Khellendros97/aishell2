@@ -323,6 +323,7 @@ pub fn run() {
             browser::browser_set_inspect,
             browser::browser_open_devtools,
             browser::browser_close_view,
+            browser::browser_set_proxy,
             browser::browser_history_add,
             browser::browser_history_list,
         ])

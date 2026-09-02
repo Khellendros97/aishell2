@@ -32,7 +32,7 @@ import { showContextMenu, toast } from '../../../ui';
 import {
   browserBack, browserCloseView, browserEnsure, browserForward, browserHistoryAdd, browserHistoryList,
   browserNavigate, browserOpenDevtools, browserReload, browserSetInspect, browserSetRect,
-  browserSetVisible, onBrowserEvent, openDialog,
+  browserSetVisible, onBrowserEvent, onBrowserProxyChanged, openDialog,
 } from '../../../api';
 import type { BrowserEvent, BrowserHistoryItem, BrowserRef } from '../../../types';
 import { wbHandles } from '../../../stores/workbench';
@@ -92,6 +92,7 @@ let viewEl: HTMLDivElement | null = null;
 let pagesEl: HTMLElement | null = null;
 let ro: ResizeObserver | null = null;
 let unlistenFn: (() => void) | null = null;
+let unlistenProxyFn: (() => void) | null = null;
 
 /* ---------- 页面状态辅助 ---------- */
 
@@ -658,6 +659,21 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     else fn();
   });
 
+  /* 代理变更(设置页保存 SOCKS5 代理后广播):后端已关闭全部子视图,
+     已导航页面按 URL 自动重建(代理只能在子 webview 创建时注入,重建即生效) */
+  void onBrowserProxyChanged(() => {
+    if (containerEl !== container) return;
+    for (const p of pages) {
+      if (!p.hasNavigated || !p.url || p.url === 'about:blank') continue;
+      void navigatePage(p, p.url).catch((err) => {
+        toast(`代理变更后重建页面失败: ${String(err)}`, 'error');
+      });
+    }
+  }).then((fn) => {
+    if (containerEl === container) unlistenProxyFn = fn;
+    else fn();
+  });
+
   /* 重挂后显隐状态强制重发一次(后端不跨挂载记忆) */
   pages.forEach((p) => { p.shownApplied = false; });
   applyVisibility();
@@ -697,6 +713,7 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     overlayObserver.disconnect();
     window.removeEventListener('resize', syncRect);
     if (unlistenFn) { unlistenFn(); unlistenFn = null; }
+    if (unlistenProxyFn) { unlistenProxyFn(); unlistenProxyFn = null; }
     container.querySelector('.browser-toolbar')?.removeEventListener('click', onToolbarClick);
     pagesEl?.removeEventListener('click', onPagesClick);
     pagesEl?.removeEventListener('contextmenu', onPagesContextMenu);

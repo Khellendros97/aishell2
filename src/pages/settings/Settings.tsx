@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
 import type { AppState, LlmConfig, Settings as AppSettings, Theme } from '../../types';
 import { CredentialsPanel } from './CredentialsPanel';
+import { BrowserPanel } from './BrowserPanel';
 import { getMcpStatus, getState, openDialog, saveSettings, setMcpPort, setTheme } from '../../api';
 import { toast } from '../../ui';
 import { Icon } from '../../shared/Icon';
@@ -52,7 +53,7 @@ interface McpStatusLine {
 }
 
 /** 左侧导航分类：MCP 是 AIShell 作为服务端供外部工具接入，归功能特性；快捷键页只读。 */
-type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api' | 'credentials';
+type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api' | 'credentials' | 'browser';
 
 const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'features', label: '功能特性', icon: 'zap' },
@@ -60,6 +61,7 @@ const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'appearance', label: '外观', icon: 'monitor' },
   { id: 'shortcuts', label: '快捷键', icon: 'key' },
   { id: 'api', label: 'API 接口', icon: 'plug' },
+  { id: 'browser', label: '浏览器', icon: 'globe' },
 ];
 
 interface ShortcutItem {
@@ -307,6 +309,9 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
         <main id="settings-content">
           {page === 'credentials' && (
             <CredentialsPanel initialState={appState} onChanged={(next) => { dbRef.current = next; setAppState(next); }} />
+          )}
+          {page === 'browser' && (
+            <BrowserPanel initialState={appState} onChanged={(next) => { dbRef.current = next; setAppState(next); }} />
           )}
           {page === 'appearance' && (
           <section id="panel-appearance" className="settings-panel">
