@@ -102,8 +102,8 @@ export function openAiDbApprovalModal(opts: {
           <input class="input mono" disabled value="${isRedis || !detail.database ? '—' : esc(detail.database)}"></div>
         <div class="field db-cmds-field"><label>目标服务器</label>
           <input class="input" disabled value="${esc(opts.serverName)}（${esc(detail.serverId)}）"></div>
-        <div class="field db-cmds-field"><label>密码<span class="req">*</span></label>
-          <input class="input mono" data-f="password" type="password" placeholder="请输入数据库密码（保存在系统凭据库，AI 不可见）" autocomplete="off"></div>
+        <div class="field db-cmds-field"><label>密码${isRedis ? '' : '<span class="req">*</span>'}</label>
+          <input class="input mono" data-f="password" type="password" placeholder="${isRedis ? '无密码实例可留空' : '请输入数据库密码'}（保存在系统凭据库，AI 不可见）" autocomplete="off"></div>
         <div class="field db-cmds-field"><label>查询权限</label>
           <div class="db-cmds" data-cmds></div>
           <div class="hint">只读命令 AI 可直接执行；勾选写命令后，AI 执行前需人工审批。</div>
@@ -142,7 +142,7 @@ export function openAiDbApprovalModal(opts: {
     submitting = true;
     btn.disabled = true;
     const password = (root.querySelector('[data-f=password]') as HTMLInputElement).value;
-    if (!password) {
+    if (!password && detail.kind !== 'redis') { // redis 支持无密码实例，空密码合法
       submitting = false;
       btn.disabled = incomplete;
       (root.querySelector('[data-f=password]') as HTMLInputElement).focus();
