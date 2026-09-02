@@ -278,7 +278,14 @@ async fn forward_one(
     Ok(())
 }
 
-/* ---------------- SOCKS5 动态代理(ssh -D 等价) ---------------- */
+/* ---------------- SOCKS 动态代理(ssh -D 等价，兼容 SOCKS4/4a) ---------------- */
+
+/// SOCKS 版本（决定协商格式与回复字节布局）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocksVersion {
+    V4,
+    V5,
+}
 
 /// SOCKS5 回复字节（10 字节；BND.ADDR/BND.PORT 用 0.0.0.0:0 占位，标准允许。
 /// code: 0x00 成功 / 0x05 连接拒绝(转发通道失败) / 0x07 命令不支持 / 0x08 地址类型不支持）。
@@ -286,27 +293,92 @@ fn socks5_reply_bytes(code: u8) -> [u8; 10] {
     [0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
 }
 
-/// SOCKS5 协商：method 选择(仅接受无认证 0x00)→ CONNECT 请求解析(IPv4/域名/IPv6 目标)。
-/// 返回 (host, port) 或 reply 错误码（由调用方写回客户端再关闭）。
-async fn socks5_negotiate(stream: &mut TcpStream) -> Result<(String, u16), u8> {
+/// SOCKS4 回复字节（8 字节；status 90(0x5A)=granted / 91(0x5B)=rejected）。
+fn socks4_reply_bytes(granted: bool) -> [u8; 8] {
+    [0x00, if granted { 0x5A } else { 0x5B }, 0, 0, 0, 0, 0, 0]
+}
+
+/// 按版本的成功回复（协商完成、转发通道已建立）。
+fn socks_success_reply(version: SocksVersion) -> Vec<u8> {
+    match version {
+        SocksVersion::V4 => socks4_reply_bytes(true).to_vec(),
+        SocksVersion::V5 => socks5_reply_bytes(0x00).to_vec(),
+    }
+}
+
+/// 按版本的失败回复（协商失败/转发通道打开失败；调用方写回客户端再断开）。
+fn socks_failure_reply(version: SocksVersion, code_v5: u8) -> Vec<u8> {
+    match version {
+        SocksVersion::V4 => socks4_reply_bytes(false).to_vec(),
+        SocksVersion::V5 => socks5_reply_bytes(code_v5).to_vec(),
+    }
+}
+
+/// 读 NUL 结尾字符串（SOCKS4 的 userid / SOCKS4a 的域名），上限防垃圾数据刷屏。
+async fn read_nul_string<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await.map_err(|_| 0x01u8)?;
+        if b[0] == 0 {
+            break;
+        }
+        buf.push(b[0]);
+        if buf.len() > 255 {
+            return Err(0x01);
+        }
+    }
+    Ok(buf)
+}
+
+/// SOCKS4/4a 协商（已消费 ver=0x04）：[cmd=CONNECT, port(be), ip(4), userid(NUL)]
+/// 后跟可选 domain(NUL)——SOCKS4a：ip=0.0.0.x(x≠0)时后接域名（DNS 走远端解析，同 v5 域名）。
+async fn socks4_negotiate<S>(stream: &mut S) -> Result<(String, u16), u8>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut head = [0u8; 3]; // cmd + port_hi + port_lo
+    stream.read_exact(&mut head).await.map_err(|_| 0x01u8)?;
+    if head[0] != 0x01 {
+        return Err(0x07); // 仅支持 CONNECT
+    }
+    let port = u16::from_be_bytes([head[1], head[2]]);
+    let mut ip = [0u8; 4];
+    stream.read_exact(&mut ip).await.map_err(|_| 0x01u8)?;
+    let _userid = read_nul_string(stream).await?; // SOCKS4 忽略 userid
+
+    // SOCKS4a：ip 形如 0.0.0.x(x≠0)时,域名接在 userid 后
+    if ip[..3] == [0, 0, 0] && ip[3] != 0 {
+        let domain = read_nul_string(stream).await?;
+        let host = String::from_utf8(domain).map_err(|_| 0x04u8)?;
+        return Ok((host, port));
+    }
+    if ip == [0, 0, 0, 0] {
+        return Err(0x04); // 0.0.0.0 无域名 = 非法目标
+    }
+    Ok((ip.map(|b| b.to_string()).join("."), port))
+}
+
+/// SOCKS5 协商（已消费 ver=0x05）：method 选择(仅接受无认证 0x00)→ CONNECT 解析。
+async fn socks5_negotiate<S>(stream: &mut S) -> Result<(String, u16), u8>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // [ver=5, nmethods, methods...]
-    let mut head = [0u8; 2];
-    stream.read_exact(&mut head).await.map_err(|_| 0x01u8)?;
-    if head[0] != 0x05 {
-        return Err(0x07);
-    }
-    let mut methods = vec![0u8; head[1] as usize];
+    // [nmethods, methods...]
+    let mut nmethods = [0u8; 1];
+    stream.read_exact(&mut nmethods).await.map_err(|_| 0x01u8)?;
+    let mut methods = vec![0u8; nmethods[0] as usize];
     stream.read_exact(&mut methods).await.map_err(|_| 0x01u8)?;
     if !methods.contains(&0x00) {
         let _ = stream.write_all(&[0x05, 0xFF]).await; // 无可用认证方法
         return Err(0x07);
     }
-    stream
-        .write_all(&[0x05, 0x00])
-        .await
-        .map_err(|_| 0x01u8)?;
+    stream.write_all(&[0x05, 0x00]).await.map_err(|_| 0x01u8)?;
 
     // CONNECT 请求：[ver, cmd, rsv, atyp, addr..., port_hi, port_lo]
     let mut req = [0u8; 4];
@@ -340,9 +412,33 @@ async fn socks5_negotiate(stream: &mut TcpStream) -> Result<(String, u16), u8> {
     Ok((host, u16::from_be_bytes(port)))
 }
 
-/// Dynamic 隧道的单连接转发：SOCKS5 协商读出目标 → SSH 通道 direct-tcpip → 双向桥接。
-/// 协商失败回 SOCKS5 错误码再断开（客户端能看到「代理拒绝」而非 reset）；
-/// 通道打开失败回 0x05(连接拒绝)。
+/// 版本嗅探 + 分流：SOCKS5(ver=0x05) 与 SOCKS4/4a(ver=0x04) 自动识别。
+/// 返回 (host, port, version)；错误码附带版本（ver 非法时 version=None，调用方不回字节直接断）。
+async fn socks_negotiate<S>(stream: &mut S) -> Result<(String, u16, SocksVersion), (Option<SocksVersion>, u8)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut ver = [0u8; 1];
+    stream
+        .read_exact(&mut ver)
+        .await
+        .map_err(|_| (None, 0x01u8))?;
+    match ver[0] {
+        0x04 => socks4_negotiate(stream)
+            .await
+            .map(|(h, p)| (h, p, SocksVersion::V4))
+            .map_err(|code| (Some(SocksVersion::V4), code)),
+        0x05 => socks5_negotiate(stream)
+            .await
+            .map(|(h, p)| (h, p, SocksVersion::V5))
+            .map_err(|code| (Some(SocksVersion::V5), code)),
+        _ => Err((None, 0x07)), // 不是 SOCKS 握手（如 HTTP）
+    }
+}
+
+/// Dynamic 隧道的单连接转发：SOCKS 协商(自动 v4/v5)读出目标 → SSH 通道 direct-tcpip
+/// → 按版本回成功字节 → 双向桥接。协商/通道失败按版本回对应错误码再断开。
 async fn forward_dynamic(
     ssh: &Arc<SshManager>,
     cfg: &TunnelConfig,
@@ -350,11 +446,14 @@ async fn forward_dynamic(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
     let mut stream = stream;
-    let (host, port) = match socks5_negotiate(&mut stream).await {
+    let (host, port, version) = match socks_negotiate(&mut stream).await {
         Ok(target) => target,
-        Err(code) => {
-            let _ = stream.write_all(&socks5_reply_bytes(code)).await;
-            return Err(format!("SOCKS5 协商失败（错误码 {code:#04x}）"));
+        Err((version, code)) => {
+            // 版本已知(v4/v5 内部失败)才回错误字节;ver 非法(非 SOCKS)不回,直接断
+            if let Some(v) = version {
+                let _ = stream.write_all(&socks_failure_reply(v, code)).await;
+            }
+            return Err(format!("SOCKS 协商失败（错误码 {code:#04x}）"));
         }
     };
     let handle = ssh.get_or_connect(&cfg.server_id).await?;
@@ -366,18 +465,18 @@ async fn forward_dynamic(
     {
         Ok(Ok(channel)) => channel,
         Ok(Err(e)) => {
-            let _ = stream.write_all(&socks5_reply_bytes(0x05)).await;
+            let _ = stream.write_all(&socks_failure_reply(version, 0x05)).await;
             return Err(format!("打开到 {host}:{port} 的转发通道失败：{e}"));
         }
         Err(_) => {
-            let _ = stream.write_all(&socks5_reply_bytes(0x05)).await;
-            return Err(format!("打开到 {host}:{port} 的转发通道超时",));
+            let _ = stream.write_all(&socks_failure_reply(version, 0x05)).await;
+            return Err(format!("打开到 {host}:{port} 的转发通道超时"));
         }
     };
     stream
-        .write_all(&socks5_reply_bytes(0x00))
+        .write_all(&socks_success_reply(version))
         .await
-        .map_err(|e| format!("SOCKS5 成功回复发送失败: {e}"))?;
+        .map_err(|e| format!("SOCKS 成功回复发送失败: {e}"))?;
     let mut channel = channel.into_stream();
     tokio::io::copy_bidirectional(&mut channel, &mut stream)
         .await
@@ -450,6 +549,61 @@ mod tests {
         assert_eq!(socks5_reply_bytes(0x00), [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(socks5_reply_bytes(0x05)[1], 0x05, "第二字节是回复码");
         assert_eq!(socks5_reply_bytes(0x08)[3], 0x01, "ATYP=IPv4 占位");
+    }
+
+    #[test]
+    fn socks4_reply_format() {
+        assert_eq!(socks4_reply_bytes(true), [0, 0x5A, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(socks4_reply_bytes(false), [0, 0x5B, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// SOCKS4 协商：IPv4 目标。
+    #[tokio::test]
+    async fn socks4_negotiate_ipv4_target() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let client_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // ver=4, cmd=CONNECT, port=0x1F90(8080), ip=127.0.0.1, userid="u"
+            client
+                .write_all(&[0x04, 0x01, 0x1F, 0x90, 127, 0, 0, 1, b'u', 0])
+                .await
+                .unwrap();
+        });
+        let (host, port, _version) = socks_negotiate(&mut server).await.unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8080);
+        client_task.await.unwrap();
+    }
+
+    /// SOCKS4a 协商：ip=0.0.0.1 时后接域名（域名走远端解析）。
+    #[tokio::test]
+    async fn socks4a_negotiate_domain_target() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let client_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // ver=4, cmd=CONNECT, port=0x1F90, ip=0.0.0.1(4a 标记), userid 空, domain="example.test"
+            let mut req = vec![0x04, 0x01, 0x1F, 0x90, 0, 0, 0, 1, 0];
+            req.extend_from_slice(b"example.test");
+            req.push(0);
+            client.write_all(&req).await.unwrap();
+        });
+        let (host, port, _version) = socks_negotiate(&mut server).await.unwrap();
+        assert_eq!(host, "example.test");
+        assert_eq!(port, 8080);
+        client_task.await.unwrap();
+    }
+
+    /// 非 SOCKS 协议(ver=0x47 'G')应被嗅探拒绝(返回 Unknown 版本)。
+    #[tokio::test]
+    async fn socks_negotiate_rejects_non_socks() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let client_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        });
+        let err = socks_negotiate(&mut server).await.unwrap_err();
+        assert_eq!(err, (None, 0x07));
+        client_task.await.unwrap();
     }
 
     #[test]

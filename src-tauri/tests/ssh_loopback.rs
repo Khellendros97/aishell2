@@ -545,6 +545,115 @@ async fn tunnel_socks5_roundtrip() {
     server_res.expect("echo server 异常退出");
 }
 
+/// SOCKS4/4a 回环集成测试：隧道 dynamic 模式接受 SOCKS4(IPv4 目标)与 SOCKS4a
+/// (0.0.0.x + 域名)协商,转发路径与 SOCKS5 相同。
+#[tokio::test]
+async fn tunnel_socks4_roundtrip() {
+    let socket = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("绑定 127.0.0.1:0 失败");
+    let addr = socket.local_addr().expect("取监听地址失败");
+    let config = Arc::new(russh::server::Config {
+        keys: vec![
+            russh::keys::PrivateKey::from_openssh(HOST_KEY_PEM.as_bytes())
+                .expect("解析测试 host key 失败"),
+        ],
+        ..Default::default()
+    });
+    let mut server = EchoServer;
+    let running = server.run_on_socket(config, &socket);
+    let shutdown = running.handle();
+
+    let test_body = async {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "aishell-ssh-loopback-socks4-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let store = Arc::new(Store::new(config_dir).expect("Store::new 应成功"));
+        let ssh = Arc::new(SshManager::new(store));
+        let manager = TunnelManager::new();
+
+        let server = Server {
+            id: "s1".to_string(),
+            name: "loopback".to_string(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            auth_type: AuthType::Password,
+            username: "test".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        };
+        ssh.connect_direct(server, Some("test"))
+            .await
+            .expect("连接 + 密码认证应成功");
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let cfg = TunnelConfig {
+            id: "tun-socks4".into(),
+            server_id: "s1".into(),
+            name: "动态代理".into(),
+            kind: aishell_lib::tunnel::TunnelKind::Dynamic,
+            bind_addr: "127.0.0.1".into(),
+            local_port,
+            target_host: String::new(),
+            target_port: 0,
+            enabled: true,
+        };
+        manager.start(&ssh, &cfg).await.expect("SOCKS4 隧道启动应成功");
+
+        // SOCKS4(IPv4 目标):ver=4, cmd=CONNECT, port=0x1538(5432), ip=127.0.0.1, userid 空
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .expect("连接 SOCKS4 代理");
+        s.write_all(&[0x04, 0x01, 0x15, 0x38, 127, 0, 0, 1, 0])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 8];
+        s.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x5A, "SOCKS4 应回 granted(0x5A),实际 {:?}", reply);
+        s.write_all(b"hello socks4").await.unwrap();
+        let mut buf = vec![0u8; 12];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello socks4");
+        drop(s);
+
+        // SOCKS4a(域名目标):ip=0.0.0.1, userid 空, domain="example.test"
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .expect("连接 SOCKS4a 代理");
+        let mut req = vec![0x04, 0x01, 0x1F, 0x90, 0, 0, 0, 1, 0];
+        req.extend_from_slice(b"example.test");
+        req.push(0);
+        s.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 8];
+        s.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x5A, "SOCKS4a 应回 granted(0x5A),实际 {:?}", reply);
+        s.write_all(b"hello socks4a").await.unwrap();
+        let mut buf = vec![0u8; 13];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello socks4a");
+
+        assert!(manager.stop("tun-socks4").await);
+        shutdown.shutdown("test done".into());
+    };
+
+    let (server_res, ()) = tokio::join!(running, test_body);
+    server_res.expect("echo server 异常退出");
+}
+
 /// 远程 exec 集成测试：`ssh.exec` 复用连接执行单条命令，
 /// 断言 stdout/stderr/退出码（echo server 的 exec 分支：`printf X` → stdout X，stderr 空，exit 0）。
 #[tokio::test]
