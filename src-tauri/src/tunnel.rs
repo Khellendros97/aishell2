@@ -10,7 +10,7 @@
 //! 接口点：lib.rs 注册命令 + setup 时 manage(TunnelManager) 并 spawn recover
 //! （启动时自动重建 enabled 隧道）；前端 api.ts tunnel_* 封装、标签页 TunnelTab.tsx 管理展示。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -95,6 +95,37 @@ pub fn normalize_config(mut cfg: TunnelConfig) -> Result<TunnelConfig, String> {
         }
     }
     Ok(cfg)
+}
+
+/// 端口冲突错误前缀：命令层检测到目标端口已被其它「正在运行」的隧道绑定时返回
+/// `{PREFIX}该端口已被「xxx」占用`，前端 TunnelTab 据此弹「是否关闭冲突隧道」确认框
+/// （确认后带 close_conflict=true 重试，见 tunnel_start / tunnel_save）。
+pub const PORT_CONFLICT_PREFIX: &str = "[隧道端口冲突]";
+
+/// 两个监听地址是否会在同一端口上互斥：地址相同，或任一方绑定 0.0.0.0
+/// （通配地址与任何具体地址重叠，操作系统不允许二者同时监听同一端口）。
+fn bind_addrs_conflict(a: &str, b: &str) -> bool {
+    a == b || a == "0.0.0.0" || b == "0.0.0.0"
+}
+
+/// 找出与 cfg 抢同一监听端口的「正在运行」隧道（排除 cfg 自身；配置允许端口重复，
+/// 冲突只在启动时按运行态判定）。
+fn port_conflicts(
+    all: &[TunnelConfig],
+    running_ids: &HashSet<String>,
+    cfg: &TunnelConfig,
+) -> Vec<TunnelConfig> {
+    all.iter()
+        .filter(|t| t.id != cfg.id && running_ids.contains(&t.id))
+        .filter(|t| t.local_port == cfg.local_port && bind_addrs_conflict(&t.bind_addr, &cfg.bind_addr))
+        .cloned()
+        .collect()
+}
+
+/// 端口冲突的可识别错误（payload = 冲突隧道名，前端截掉前缀后拼「是否将其关闭」）。
+fn conflict_error(conflicts: &[TunnelConfig]) -> String {
+    let names = conflicts.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join("」「");
+    format!("{PORT_CONFLICT_PREFIX}该端口已被「{names}」占用")
 }
 
 /// 运行中的隧道句柄：stop 通知监听循环退出（各 1s 轮询 accept 的超时保证能退出），
@@ -199,6 +230,15 @@ impl TunnelManager {
                 error: errors.get(&cfg.id).cloned(),
             })
             .collect()
+    }
+
+    /// 启动失败写入 errors 表并广播 tunnels:changed。供 recover 静默重建用：
+    /// enabled 但没跑起来的隧道在 UI 行内显示原因（否则只有 eprintln，用户不可见）。
+    pub fn record_start_failure(&self, id: &str, err: String) {
+        self.errors.lock().unwrap().insert(id.to_string(), err);
+        if let Some(app) = self.app_handle() {
+            let _ = app.emit("tunnels:changed", ());
+        }
     }
 }
 
@@ -489,7 +529,9 @@ async fn forward_dynamic(
     Ok(())
 }
 
-/// 启动时自动重建：上次 enabled 的隧道逐个尝试（失败仅记录，不阻塞启动）。
+/// 启动时自动重建：上次 enabled 的隧道逐个尝试（失败写入 errors 表供 UI 行内展示，
+/// 不弹交互、不阻塞启动）。恢复阶段检测到端口冲突直接给出可读原因（无用户在场，
+/// 不做「关闭对方」的自动取舍，先启动者胜出）。
 pub async fn recover(
     app: AppHandle,
     ssh: Arc<SshManager>,
@@ -502,8 +544,14 @@ pub async fn recover(
         .filter(|cfg| cfg.enabled)
         .collect::<Vec<_>>();
     for cfg in configs {
-        if let Err(e) = manager.start(&ssh, &cfg).await {
+        let conflicts = port_conflicts(&store.tunnels_all(), &manager.running_ids(), &cfg);
+        let result = match conflicts.split_first() {
+            Some((first, _)) => Err(format!("本地端口 {} 已被隧道「{}」占用", cfg.local_port, first.name)),
+            None => manager.start(&ssh, &cfg).await,
+        };
+        if let Err(e) = result {
             eprintln!("[tunnel] 恢复「{}」失败：{e}", cfg.name);
+            manager.record_start_failure(&cfg.id, e);
         }
     }
     let _ = app.emit("tunnels:changed", ());
@@ -513,6 +561,27 @@ pub async fn recover(
 
 fn on_changed(app: &AppHandle) {
     let _ = app.emit("tunnels:changed", ());
+}
+
+/// 命令层统一的「先解冲突再启动」：目标端口已被其它运行中隧道占时，close_conflict=false
+/// 返回带 [`PORT_CONFLICT_PREFIX`] 的可识别错误（前端弹确认框后带 true 重试）；
+/// true 先停掉所有冲突隧道再启动（启动仍可能因非隧道进程占用/认证失败而报错）。
+async fn start_resolving_conflicts(
+    manager: &TunnelManager,
+    ssh: &Arc<SshManager>,
+    cfg: &TunnelConfig,
+    conflicts: Vec<TunnelConfig>,
+    close_conflict: bool,
+) -> Result<(), String> {
+    if !conflicts.is_empty() {
+        if !close_conflict {
+            return Err(conflict_error(&conflicts));
+        }
+        for c in &conflicts {
+            manager.stop(&c.id).await;
+        }
+    }
+    manager.start(ssh, cfg).await
 }
 
 #[cfg(test)]
@@ -631,6 +700,50 @@ mod tests {
         assert!(normalize_config(c).is_err(), "目标端口 0 拒绝");
     }
 
+    #[test]
+    fn bind_addrs_conflict_cases() {
+        assert!(bind_addrs_conflict("127.0.0.1", "127.0.0.1"));
+        assert!(bind_addrs_conflict("0.0.0.0", "127.0.0.1"), "通配地址与具体地址重叠");
+        assert!(bind_addrs_conflict("127.0.0.1", "0.0.0.0"));
+        assert!(!bind_addrs_conflict("127.0.0.1", "192.168.1.5"), "两个具体地址互不重叠");
+    }
+
+    #[test]
+    fn port_conflicts_filters_running_and_port() {
+        let mut t1 = cfg("t1", "a");
+        t1.bind_addr = "127.0.0.1".into();
+        let mut t2 = cfg("t2", "b");
+        t2.bind_addr = "127.0.0.1".into();
+        let mut t3 = cfg("t3", "c");
+        t3.bind_addr = "127.0.0.1".into();
+        t3.local_port = 3308;
+        let mut t4 = cfg("t4", "d");
+        t4.bind_addr = "0.0.0.0".into();
+        let all = vec![t1.clone(), t2, t3, t4];
+        let running: HashSet<String> = ["t2", "t3", "t4"].iter().map(|s| s.to_string()).collect();
+        // 查询 t1(127.0.0.1:3307)：命中 t2(同端口运行中)与 t4(0.0.0.0 通配)；t3 端口不同不算
+        let ids: Vec<String> = port_conflicts(&all, &running, &t1).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["t2", "t4"]);
+        // 未运行的配置允许端口重复：t2 不在运行表时不冲突
+        let only_t4: HashSet<String> = ["t4"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = port_conflicts(&all, &only_t4, &t1).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["t4"]);
+        // 自身即使运行中也不与自己冲突（保存路径先停旧实例，这里双保险）
+        let self_running: HashSet<String> = ["t1"].iter().map(|s| s.to_string()).collect();
+        assert!(port_conflicts(&all, &self_running, &t1).is_empty());
+    }
+
+    #[test]
+    fn conflict_error_carries_prefix_and_names() {
+        let mut a = cfg("t1", "数据库隧道");
+        a.bind_addr = "127.0.0.1".into();
+        let mut b = cfg("t2", "socks");
+        b.bind_addr = "0.0.0.0".into();
+        let err = conflict_error(&[a, b]);
+        assert!(err.starts_with(PORT_CONFLICT_PREFIX), "前端按前缀识别冲突错误");
+        assert!(err.contains("数据库隧道」「socks"), "多个冲突隧道名以「」「」连接");
+    }
+
     #[tokio::test]
     async fn states_merges_running_without_mutation() {
         let manager = TunnelManager::new();
@@ -680,6 +793,7 @@ pub async fn tunnel_save(
     store: State<'_, Arc<Store>>,
     ssh: State<'_, Arc<SshManager>>,
     mut cfg: TunnelConfig,
+    close_conflict: Option<bool>,
 ) -> Result<TunnelState, String> {
     cfg = normalize_config(cfg)?;
     if store.server(&cfg.server_id).is_none() {
@@ -692,7 +806,11 @@ pub async fn tunnel_save(
     }
     store.save_tunnel(cfg.clone())?;
     if cfg.enabled {
-        if let Err(e) = manager.start(&ssh, &cfg).await {
+        let conflicts = port_conflicts(&store.tunnels_all(), &manager.running_ids(), &cfg);
+        if let Err(e) =
+            start_resolving_conflicts(&manager, &ssh, &cfg, conflicts, close_conflict.unwrap_or(false))
+                .await
+        {
             // 配置已落盘（enabled 保留），启动失败经 Err 透传给前端展示；下次重试可恢复
             on_changed(&app);
             return Err(e);
@@ -713,13 +831,16 @@ pub async fn tunnel_start(
     store: State<'_, Arc<Store>>,
     ssh: State<'_, Arc<SshManager>>,
     id: String,
+    close_conflict: Option<bool>,
 ) -> Result<TunnelState, String> {
-    let cfg = store
-        .tunnels_all()
-        .into_iter()
+    let all = store.tunnels_all();
+    let cfg = all
+        .iter()
         .find(|cfg| cfg.id == id)
+        .cloned()
         .ok_or_else(|| format!("隧道不存在：{id}"))?;
-    manager.start(&ssh, &cfg).await?;
+    let conflicts = port_conflicts(&all, &manager.running_ids(), &cfg);
+    start_resolving_conflicts(&manager, &ssh, &cfg, conflicts, close_conflict.unwrap_or(false)).await?;
     on_changed(&app);
     Ok(manager.states(&[cfg]).into_iter().next().expect("states 至少返回 1 项"))
 }

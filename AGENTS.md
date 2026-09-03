@@ -43,11 +43,11 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 - **工作台状态**:`src/stores/workbench.ts`(zustand)— `useWorkbench`(tabs/activeId/panel/aiVisible/project 与 openTab/closeTab/setPanel 等动作)、`wbEvents`(仅 `project-changed`、`staging-changed` 两条通知)、`tabApis`(标签组件挂载时注册命令式句柄,如 TerminalApi)、`wbHandles.ai`(AI 面板句柄)、`getActiveTerminalApi()`、`DND_MIME` 拖拽载荷约定 `{source, path, name, isDir, serverId?}`。
 - **标签/面板注册表**:新标签类型往 `src/pages/workbench/tabs/registry.ts`(`TAB_TYPES`)接线;新侧栏面板往 `src/pages/workbench/sidebar/panels.ts`(`PANELS`,模块导出 `SidebarPanelDef { title, HeadActions?, Panel }`)接线,别另起注册机制。
 - **SSH 连接复用**:终端和 SFTP 共用 `ssh.rs` 的 `SshManager`(每 serverId 一条连接),断开在 `SshManager::disconnect`。
-- **SSH 隧道(本地转发 -L)**:配置在 `AppState.ssh_tunnels`(`tunnel.rs` TunnelConfig,serde camelCase),运行态只在内存(监听任务/停止信号);`TunnelManager` 启动时先 bind 本地端口再预连服务器(认证/网络错误尽早返回),转发复用 SshManager 连接池的 `direct-tcpip` 通道,单条转发连接失败只断该连接;`enabled=true` 的隧道重启时由 lib.rs `tunnel::recover` 自动重建(失败仅记录)。标签页只是管理界面,**关闭标签不停隧道**(与终端/会话类资源相反);变更后 emit `tunnels:changed`,WebSocket 之外的事件模式照 sftp:progress 先例。
+- **SSH 隧道(-L/-D)**:配置在 `AppState.ssh_tunnels`(`tunnel.rs` TunnelConfig,serde camelCase),运行态只在内存(监听任务/停止信号);`TunnelManager` 启动时先 bind 本地端口再预连服务器(认证/网络错误尽早返回),转发复用 SshManager 连接池的 `direct-tcpip` 通道,单条转发连接失败只断该连接。**配置允许端口重复,冲突只在启动时按运行态判定**:目标端口已被其它运行中隧道绑定时返回 `[隧道端口冲突]` 前缀错误,前端弹「是否关闭占用方」确认后带 `closeConflict=true` 重试(tunnel_start/tunnel_save 都有 `close_conflict` 参数);recover 静默重建不做交互取舍,失败(含冲突)写 errors 表经行内错误展示。`Settings.tunnel_auto_start`(默认开)关闭时,lib.rs 退出钩子(Destroyed)调 `disable_all_tunnels` 把全部隧道置禁用,下次启动不恢复。标签页只是管理界面,**关闭标签不停隧道**(与终端/会话类资源相反);变更后 emit `tunnels:changed`,WebSocket 之外的事件模式照 sftp:progress 先例。
 - **命令区块追踪**:终端没有 OSC 133,区块边界靠前端输入行缓冲近似(见 tabs/useTerminal.ts `cleanBlockLines` 提示符清洗,含 `[user@host ~]$` SSH 风格)。
 - **AI 输出协议**:pi 的系统提示词约定 ```command 围栏 = 可粘贴终端的命令卡、```text 围栏 = 可插入输入框的文本卡;改提示词或渲染器要两边(ai.rs / ai/ai-engine.ts)同步。
 - **AI 输入区引用 tag**:contenteditable 内嵌原子 chip,content 落盘保留 token(`@term:<id>`、`@file:名` 等);新增引用类型要同步 `chipToken`(发送侧 token 生成)与 `buildMessageTokens`(历史侧 token 还原),两处不一致历史消息会回退纯文本。
-- **内置浏览器多页面**:browser.rs 按 viewId 持有多个子 webview(标签栏每页一个,右侧页面栏默认折叠),browser_* 命令/事件全带 viewId;AI 四件套目标视图 = 可视页面 → 最近浏览页面 → 专用 "ai" 页面(`ai_target`)。
+- **内置浏览器多页面**:browser.rs 按 viewId 持有多个子 webview(标签栏每页一个,右侧页面栏默认折叠),browser_* 命令/事件全带 viewId;AI 四件套目标视图 = 可视页面 → 最近浏览页面 → 专用 "ai" 页面(`ai_target`)。地址栏历史(`browserHistory`,record_browser_history MRU 上限 200,无定期清除)与收藏夹(`browserFavorites`,整列表覆盖写 `browser_set_favorites`,交互照 SFTP 收藏:地址栏星标 + 下拉)都存 AppState 顶层;下拉浮层打开期间必须隐藏子 webview 让位。
 - **内置技能播种**:skills.rs `seed_builtin_skill_files` 带 `.builtin-sha256` 侧车——磁盘文件与侧车一致(用户没改过)时推送内置内容更新,用户改过则保留;新增内置技能还要 bump store.rs `SEED_GENERATION`(否则老工作区不补种新技能)。
 
 ## 代码风格
