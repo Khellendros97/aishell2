@@ -323,6 +323,9 @@ export function CloudSyncView({ status, onGoLogin }: CloudSyncViewProps): JSX.El
           <div className="sync-stat"><span>登录凭据</span><strong>{sync.configCounts.credentials}</strong></div>
           <div className="sync-stat"><span>项目文件夹</span><strong>{sync.configCounts.projectFolders}</strong></div>
           <div className="sync-stat"><span>命令文件夹</span><strong>{sync.configCounts.commandFolders}</strong></div>
+          <div className="sync-stat"><span>SSH 隧道</span><strong>{sync.configCounts.tunnels}</strong></div>
+          <div className="sync-stat"><span>SFTP 收藏</span><strong>{sync.configCounts.sftpFavorites}</strong></div>
+          <div className="sync-stat"><span>浏览器收藏</span><strong>{sync.configCounts.browserFavorites}</strong></div>
         </div> : <div className="hint">尚未同步过核心配置。</div>}
       </section>
       <section className="sync-section"><h4><Icon name="device" /> 设备管理</h4>

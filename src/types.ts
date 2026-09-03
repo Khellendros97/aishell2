@@ -158,6 +158,9 @@ export interface SyncStatus {
     credentials: number;
     commandFolders: number;
     projectFolders: number;
+    tunnels: number;
+    sftpFavorites: number;
+    browserFavorites: number;
   } | null;
 }
 

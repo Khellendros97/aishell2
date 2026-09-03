@@ -100,6 +100,9 @@ pub struct ClientConfigCounts {
     pub credentials: usize,
     pub command_folders: usize,
     pub project_folders: usize,
+    pub tunnels: usize,
+    pub sftp_favorites: usize,
+    pub browser_favorites: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -894,6 +897,9 @@ fn config_counts(payload: &CoreConfigPayloadV1) -> ClientConfigCounts {
         credentials: payload.credentials.len(),
         command_folders: payload.command_folders.len(),
         project_folders: payload.project_folders.len(),
+        tunnels: payload.ssh_tunnels.len(),
+        sftp_favorites: payload.sftp_favorites.iter().map(|g| g.favorites.len()).sum(),
+        browser_favorites: payload.browser_favorites.len(),
     }
 }
 fn validate_password(password: &str) -> Result<(), String> { if password.chars().count() < 8 { Err("云同步密码至少需要 8 个字符".into()) } else { Ok(()) } }
@@ -905,8 +911,10 @@ fn sync_error_text(error: ApiError) -> String { if error.code == "QUOTA_EXCEEDED
 mod tests {
     use super::*;
     use crate::store::{AiMode, AuthType};
+    use crate::tunnel::TunnelKind;
     use super::super::core_config::{
-        CoreCredentialV1, CoreProjectV1, CoreQuickCommandV1, CoreServerV1,
+        CoreBrowserFavoriteV1, CoreCredentialV1, CoreProjectV1, CoreQuickCommandV1,
+        CoreSftpFavoriteV1, CoreSftpFavoritesV1, CoreServerV1, CoreTunnelV1,
     };
 
     fn payload() -> CoreConfigPayloadV1 {
@@ -946,6 +954,28 @@ mod tests {
                 tags: vec![],
             }],
             command_folders: vec!["命令".into()],
+            ssh_tunnels: vec![CoreTunnelV1 {
+                id: "t1".into(),
+                server_id: "s1".into(),
+                name: "db".into(),
+                kind: TunnelKind::Local,
+                bind_addr: "127.0.0.1".into(),
+                local_port: 3307,
+                target_host: String::new(),
+                target_port: 3306,
+            }],
+            sftp_favorites: vec![CoreSftpFavoritesV1 {
+                server_id: "s1".into(),
+                favorites: vec![
+                    CoreSftpFavoriteV1 { path: "/var/www".into(), title: "web".into() },
+                    CoreSftpFavoriteV1 { path: "/var/log".into(), title: String::new() },
+                ],
+            }],
+            browser_favorites: vec![CoreBrowserFavoriteV1 {
+                url: "https://example.com".into(),
+                title: "示例".into(),
+            }],
+            settings: None,
         }
     }
 
@@ -957,6 +987,9 @@ mod tests {
         assert_eq!(counts.credentials, 1);
         assert_eq!(counts.command_folders, 1);
         assert_eq!(counts.project_folders, 2);
+        assert_eq!(counts.tunnels, 1);
+        assert_eq!(counts.sftp_favorites, 2);
+        assert_eq!(counts.browser_favorites, 1);
     }
 
     fn sync_item(entity_type: &str) -> SyncItem {
