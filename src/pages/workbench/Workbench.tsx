@@ -10,12 +10,12 @@
  * - panes 常驻挂载(keep-alive),active 仅切显隐 —— 终端/SSH/AI 会话不随标签切换销毁。
  * 项目装载失败自行导航回欢迎页并 onFail();实例销毁(换项目)时关闭全部标签并复位 store。
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent, RefObject } from 'react';
-import { getState } from '../../api';
+import { getState, onTunnelsChanged, tunnelList } from '../../api';
 import { navigate } from '../../router';
 import { toast, promptDialog, showContextMenu, uid, type CtxMenuItems } from '../../ui';
-import type { Project, ServerRef } from '../../types';
+import type { Project, ServerRef, TunnelState } from '../../types';
 import { Topbar } from '../../components/Topbar';
 import { Icon } from '../../shared/Icon';
 import {
@@ -236,6 +236,21 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     refreshProgress();
   }, []);
 
+  /* ---------- 底边栏运行中隧道角标:挂载拉一次 + tunnels:changed 驱动刷新(全服务器,不过滤) ---------- */
+  const [runningTunnels, setRunningTunnels] = useState<TunnelState[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const refresh = (): void => {
+      void tunnelList()
+        .then((list) => { if (alive) setRunningTunnels(list.filter((t) => t.running)); })
+        .catch(() => { /* 后端未就绪静默,下次 tunnels:changed 再刷 */ });
+    };
+    refresh();
+    let unlisten: (() => void) | null = null;
+    void onTunnelsChanged(refresh).then((u) => { unlisten = u; });
+    return () => { alive = false; unlisten?.(); };
+  }, []);
+
   /* ---------- 正在显示 commands 时活跃标签变为非终端(或 null)→ 自动切回 explorer ---------- */
   useEffect(() => {
     const s = useWorkbench.getState();
@@ -372,6 +387,14 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
           </div>
           <div className="statusbar-progress" id="workbench-progress" aria-live="polite"></div>
           <div className="statusbar-right">
+            {runningTunnels.length > 0 && (
+              <span
+                className="statusbar-item statusbar-tunnels"
+                title={`运行中的 SSH 隧道（${runningTunnels.length}）：${runningTunnels.map((t) => `${t.name}（${t.bindAddr}:${t.localPort}）`).join('、')}`}
+              >
+                <Icon name="tunnel" />{runningTunnels.length}
+              </span>
+            )}
             <button
               type="button"
               className={`statusbar-ai-toggle${aiVisible ? ' active' : ''}`}

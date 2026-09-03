@@ -84,11 +84,14 @@ body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-selec
   color: var(--text-1); font-size: 11px;
 }
 .statusbar-left, .statusbar-right { display: flex; align-items: center; min-width: 0; }
-.statusbar-left { gap: 12px; }
+.statusbar-left, .statusbar-right { gap: 12px; }
 .statusbar-item, .statusbar-ai-toggle { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
 .statusbar-item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .statusbar-item .ic, .statusbar-ai-toggle .ic { flex: none; }
 .statusbar-active-tab { max-width: 260px; color: var(--text-2); }
+/* 运行中隧道角标：数量醒目，title 列明细 */
+.statusbar-tunnels { color: var(--green); flex: none; }
+.statusbar-tunnels .ic { color: inherit; }
 .statusbar-ai-toggle {
   height: 22px; padding: 0 8px; border: 1px solid transparent; border-radius: var(--radius-s);
   background: transparent; color: var(--text-1); cursor: pointer; font: inherit;

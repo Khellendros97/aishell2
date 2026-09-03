@@ -58,6 +58,7 @@ const EMPTY_STATE: AppState = {
     approvalMode: 'smart',
     autoBackupRemoteFiles: true,
     compactServerList: false,
+    tunnelAutoStart: true,
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
@@ -65,6 +66,7 @@ const EMPTY_STATE: AppState = {
   traceEnabled: false,
   sshTunnels: [],
   browserProxy: { enabled: false, source: 'tunnel', tunnelId: null, host: '', port: 0 },
+  browserFavorites: [],
 };
 
 /**

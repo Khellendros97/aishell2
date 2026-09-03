@@ -124,6 +124,11 @@ pub struct Settings {
     /// 旧配置无此字段时按关闭处理（默认关闭，保持完整卡片）
     #[serde(default)]
     pub compact_server_list: bool,
+    /// AIShell 启动时自动恢复上次 enabled 的 SSH 隧道；关闭后退出时自动禁用所有隧道
+    /// （见 [`Store::disable_all_tunnels`]），下次启动不再恢复（运行期手动启动不受影响）。
+    /// 旧配置无此字段时按开启处理（默认开启，保持原行为）。
+    #[serde(default = "default_true")]
+    pub tunnel_auto_start: bool,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -139,6 +144,7 @@ impl Default for Settings {
             approval_mode: ApprovalMode::default(),
             auto_backup_remote_files: true,
             compact_server_list: false,
+            tunnel_auto_start: true,
         }
     }
 }
@@ -429,6 +435,16 @@ pub struct BrowserHistoryEntry {
     pub title: String,
     /// 最近一次访问的毫秒时间戳
     pub ts: u64,
+}
+
+/// 内置浏览器收藏夹条目（照 SftpFavorite 形态：url 即键，无独立 id/时间戳，顺序 = 添加序，
+/// 由前端整列表维护）。URL 为对外展示形态，与历史/地址栏一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFavorite {
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
 }
 
 /// 历史过滤（纯函数）：query 小写化后按子串匹配 URL 与标题（空 query = 不过滤），
@@ -911,6 +927,10 @@ pub struct AppState {
     /// 旧配置无此字段按空列表解析。
     #[serde(default)]
     pub browser_history: Vec<BrowserHistoryEntry>,
+    /// 内置浏览器收藏夹（全局平铺，url 即键，按添加序，由前端整列表覆盖写，见 set_browser_favorites）。
+    /// 旧配置无此字段按空列表解析。
+    #[serde(default)]
+    pub browser_favorites: Vec<BrowserFavorite>,
     /// 服务器数据库连接（AI 受管查询通道）：serverId → 连接列表。密码在 keyring。
     /// 旧配置无此字段按空 map 解析。
     #[serde(default)]
@@ -2369,6 +2389,15 @@ impl Store {
         filter_browser_history(&guard.browser_history, query, limit)
     }
 
+    /// 写入内置浏览器收藏夹（整列表覆盖，按添加序，url 去重由前端维护——照 SFTP 收藏夹模式）。
+    /// 前端防抖后调用。一次 with_state 原子落盘。
+    pub fn set_browser_favorites(&self, favorites: Vec<BrowserFavorite>) -> Result<(), String> {
+        self.with_state(|s| {
+            s.browser_favorites = favorites;
+            Ok(())
+        })
+    }
+
     /// 写入某服务器的 SFTP 收藏夹（路径 + 标题，按添加顺序）。
     /// 前端防抖后调用，仅覆盖该 serverId 不影响其他服务器。一次 with_state 原子落盘。
     pub fn set_sftp_favorites(
@@ -2844,6 +2873,21 @@ impl Store {
             state.ssh_tunnels.retain(|t| t.id != id);
             Ok(())
         })
+    }
+
+    /// 退出钩子用：「启动时自动启动隧道」开关关闭时把所有隧道置为禁用，下次启动不自动恢复。
+    /// 没有 enabled 项时跳过落盘（避免每次退出都白写一次盘）。返回是否有变更。
+    pub fn disable_all_tunnels(&self) -> bool {
+        if !self.tunnels_all().iter().any(|t| t.enabled) {
+            return false;
+        }
+        self.with_state(|state| {
+            for t in state.ssh_tunnels.iter_mut() {
+                t.enabled = false;
+            }
+            Ok(())
+        })
+        .is_ok()
     }
 
     /// 内置浏览器代理配置（clone）。
@@ -3499,6 +3543,7 @@ mod tests {
                 approval_mode: ApprovalMode::Smart,
                 auto_backup_remote_files: true,
                 compact_server_list: false,
+                tunnel_auto_start: true,
             },
             credentials: vec![
                 Credential {
@@ -3655,6 +3700,7 @@ mod tests {
             sftp_history: HashMap::new(),
             sftp_favorites: HashMap::new(),
             browser_history: Vec::new(),
+            browser_favorites: Vec::new(),
             db_connections: HashMap::new(),
             mcp: McpServiceConfig::default(),
             mcp_devices: {
@@ -6522,6 +6568,7 @@ mod tests {
                     approval_mode: ApprovalMode::Smart,
                     auto_backup_remote_files: true,
                     compact_server_list: false,
+                    tunnel_auto_start: true,
                 },
                 Some("sk-test-key"),
                 None,
@@ -6715,6 +6762,7 @@ mod tests {
                     approval_mode: ApprovalMode::Smart,
                     auto_backup_remote_files: true,
                     compact_server_list: false,
+                    tunnel_auto_start: true,
                 },
                 None,
                 Some("bsk-1"),
@@ -7654,6 +7702,81 @@ mod tests {
         let reopened =
             Store::with_secrets(dir, std::sync::Arc::new(MemorySecrets::default())).unwrap();
         assert!(!reopened.browser_history_filtered("", usize::MAX).is_empty());
+    }
+
+    /// 浏览器收藏夹：整列表覆盖写（第二次写入替换全部，照 SFTP 收藏夹模式）；
+    /// 落盘可重开；旧配置无 browserFavorites 字段按空列表解析。
+    #[test]
+    fn browser_favorites_overwrite_and_reopen() {
+        let dir = temp_config_dir("browser-favorites");
+        let store = test_store(dir.clone());
+        store
+            .set_browser_favorites(vec![
+                BrowserFavorite { url: "https://a.com/".into(), title: "A".into() },
+                BrowserFavorite { url: "https://b.com/".into(), title: String::new() },
+            ])
+            .unwrap();
+        store
+            .set_browser_favorites(vec![BrowserFavorite {
+                url: "https://c.com/".into(),
+                title: "C".into(),
+            }])
+            .unwrap();
+        assert_eq!(store.state.lock().unwrap().browser_favorites.len(), 1, "整列表覆盖");
+        drop(store);
+        let reopened =
+            Store::with_secrets(dir.clone(), std::sync::Arc::new(MemorySecrets::default())).unwrap();
+        let favorites = reopened.state.lock().unwrap().browser_favorites.clone();
+        assert_eq!(favorites.len(), 1);
+        assert_eq!(favorites[0].url, "https://c.com/");
+        // 旧配置无该字段 → serde default 空列表
+        let state_path = dir.join(STATE_FILE);
+        let raw = fs::read(&state_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value.as_object_mut().unwrap().remove("browserFavorites");
+        fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let legacy = test_store(dir);
+        assert!(legacy.state.lock().unwrap().browser_favorites.is_empty());
+    }
+
+    /// 「退出时禁用所有隧道」：enabled 全部清零并落盘；无 enabled 项时幂等返回 false；
+    /// 旧配置 settings 无 tunnelAutoStart 字段按开启（保持原恢复行为）。
+    #[test]
+    fn disable_all_tunnels_and_auto_start_default() {
+        let config = temp_config_dir("tunnel-disable");
+        let store = test_store(config.clone());
+        let mk = |id: &str, enabled: bool| crate::tunnel::TunnelConfig {
+            id: id.into(),
+            server_id: "s1".into(),
+            name: id.into(),
+            kind: crate::tunnel::TunnelKind::Dynamic,
+            bind_addr: "127.0.0.1".into(),
+            local_port: 8080,
+            target_host: String::new(),
+            target_port: 0,
+            enabled,
+        };
+        store.save_tunnel(mk("t1", true)).unwrap();
+        store.save_tunnel(mk("t2", false)).unwrap();
+        assert!(store.disable_all_tunnels());
+        assert!(store.tunnels_all().iter().all(|t| !t.enabled), "enabled 应全部清零");
+        assert!(!store.disable_all_tunnels(), "已全部禁用时应幂等跳过");
+        // 旧配置：settings 无 tunnelAutoStart 字段 → 默认 true（重启自动恢复保持原行为）
+        let state_path = config.join(STATE_FILE);
+        let raw = fs::read(&state_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("tunnelAutoStart");
+        fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = test_store(config);
+        assert!(reloaded.settings().tunnel_auto_start, "旧配置无字段默认开启");
+        assert!(reloaded.tunnels_all().iter().all(|t| !t.enabled), "禁用态应已落盘");
     }
 
     /// 浏览器历史过滤：URL 与标题均参与、大小写不敏感；空 query 不过滤保持 MRU 序。

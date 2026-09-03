@@ -37,6 +37,7 @@ interface SysFields {
   autoBackup: boolean;
   mcpPort: string;
   compactServerList: boolean;
+  tunnelAutoStart: boolean;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -44,6 +45,7 @@ const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '', compactServerList: false,
+  tunnelAutoStart: true,
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -190,6 +192,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       autoBackup: s.settings.autoBackupRemoteFiles ?? true,
       mcpPort: String(s.mcp?.port ?? 8945),
       compactServerList: s.settings.compactServerList ?? false,
+      tunnelAutoStart: s.settings.tunnelAutoStart ?? true,
     });
     void refreshMcpStatus();
   };
@@ -275,6 +278,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       approvalMode: fields.approvalMode,
       autoBackupRemoteFiles: fields.autoBackup,
       compactServerList: fields.compactServerList,
+      tunnelAutoStart: fields.tunnelAutoStart,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -429,6 +433,19 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, autoBackup: checked })); }}
                 />
                 <div className="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>SSH 隧道</legend>
+              <div className="field">
+                <label>AIShell 启动时自动启动隧道</label>
+                <input
+                  id="f-tunnel-auto-start"
+                  type="checkbox"
+                  checked={fields.tunnelAutoStart}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, tunnelAutoStart: checked })); }}
+                />
+                <div className="hint">开启后，上次处于启用状态的 SSH 隧道随 AIShell 启动自动恢复。关闭后：AIShell 退出时会自动把所有隧道设为禁用（下次启动不再恢复），运行期间手动启动隧道不受影响</div>
               </div>
             </fieldset>
             <fieldset className="llm-group">

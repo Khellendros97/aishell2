@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -224,10 +224,13 @@ export const sshGenerateKeypair = (dir: string) => call<KeyPairInfo>('ssh_genera
 /** 隧道列表（serverId 可选：按服务器过滤）。 */
 export const tunnelList = (serverId?: string) =>
   call<TunnelState[]>('tunnel_list', { serverId: serverId ?? null });
-/** 保存隧道配置（按 id upsert）；enabled=true 时自动启动（失败 Err 返回错误文本）。 */
-export const tunnelSave = (tunnel: TunnelConfig) =>
-  call<TunnelState>('tunnel_save', { cfg: tunnel });
-export const tunnelStart = (id: string) => call<TunnelState>('tunnel_start', { id });
+/** 保存隧道配置（按 id upsert）；enabled=true 时自动启动（失败 Err 返回错误文本）。
+ *  closeConflict=true 表示用户已确认关闭占用端口的冲突隧道（首次尝试撞冲突时后端返回
+ *  「[隧道端口冲突]」前缀错误，前端确认后带 true 重试）。 */
+export const tunnelSave = (tunnel: TunnelConfig, closeConflict = false) =>
+  call<TunnelState>('tunnel_save', { cfg: tunnel, closeConflict });
+export const tunnelStart = (id: string, closeConflict = false) =>
+  call<TunnelState>('tunnel_start', { id, closeConflict });
 export const tunnelStop = (id: string) => call<void>('tunnel_stop', { id });
 export const tunnelDelete = (id: string) => call<void>('tunnel_delete', { id });
 /** 隧道列表变更（启动/停止/保存/删除/重启恢复）后的全局通知。 */
@@ -347,6 +350,10 @@ export const browserHistoryAdd = (url: string, title: string) =>
 /** 地址栏历史下拉数据源：query 对 URL/标题做大小写不敏感子串过滤，limit 默认 8，返回 MRU 序 */
 export const browserHistoryList = (query: string, limit = 8) =>
   call<BrowserHistoryItem[]>('browser_history_list', { query, limit });
+/** 写入收藏夹：前端维护整列表（url 去重、添加/移除、防抖回写），后端整列表覆盖落盘；
+ *  读取走 getState().browserFavorites。 */
+export const browserSetFavorites = (favorites: BrowserFavorite[]) =>
+  call<void>('browser_set_favorites', { favorites });
 export const onBrowserEvent = (cb: (ev: BrowserEvent) => void): Promise<UnlistenFn> =>
   listen<BrowserEvent>('browser:event', (e) => cb(e.payload));
 

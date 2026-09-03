@@ -24,17 +24,21 @@
  * - 地址栏历史:导航/标题事件防抖上报后端;地址栏聚焦展开最近记录(最多 8 条),
  *   输入按子串过滤(URL/标题,大小写不敏感),↑↓ 选择 / Enter 打开 / Esc 关闭 / 点击打开;
  *   下拉打开期间隐藏全部页面 webview(原生表面永远盖住 DOM,须让其让位,与遮罩避让同机制);
+ * - 收藏夹(照 SFTP 收藏夹模式):地址栏内右端星标收藏/取消当前页(标题可编辑),
+ *   工具栏星标按钮展开收藏下拉(标题+地址,✕ 移除,点击导航);列表全局平铺在
+ *   aishell.json browserFavorites,前端整列表维护、防抖整表回写 browser_set_favorites,
+ *   读取走 getState().browserFavorites 播种;下拉打开期间同样隐藏子 webview 让位;
  * - 页面增删/切换(关闭最后一页自动补一页空白页)。
  * 挂载契约:每次挂载完整初始化 DOM/监听/观察,清理函数完整回收;引擎状态跨挂载保留。
  */
 import { icon } from '../../../icons';
-import { showContextMenu, toast } from '../../../ui';
+import { promptDialog, showContextMenu, toast } from '../../../ui';
 import {
   browserBack, browserCloseView, browserEnsure, browserForward, browserHistoryAdd, browserHistoryList,
-  browserNavigate, browserOpenDevtools, browserReload, browserSetInspect, browserSetRect,
-  browserSetVisible, onBrowserEvent, onBrowserProxyChanged, openDialog,
+  browserNavigate, browserOpenDevtools, browserReload, browserSetFavorites, browserSetInspect, browserSetRect,
+  browserSetVisible, getState, onBrowserEvent, onBrowserProxyChanged, openDialog,
 } from '../../../api';
-import type { BrowserEvent, BrowserHistoryItem, BrowserRef } from '../../../types';
+import type { BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserRef } from '../../../types';
 import { wbHandles } from '../../../stores/workbench';
 
 /* ---------- 模块级状态(跨标签切换保留;各页面 webview 在 Rust 侧) ---------- */
@@ -94,6 +98,19 @@ let ro: ResizeObserver | null = null;
 let unlistenFn: (() => void) | null = null;
 let unlistenProxyFn: (() => void) | null = null;
 
+/* ---------- 收藏夹(全局平铺;照 SFTP 收藏夹模式:前端整列表维护,防抖整表回写) ---------- */
+
+/** 收藏回写防抖窗口 */
+const FAV_SAVE_DEBOUNCE_MS = 300;
+/** 收藏列表(null = 尚未从 getState 播种);url 即键,顺序 = 添加序 */
+let favorites: BrowserFavorite[] | null = null;
+let favSaveTimer: ReturnType<typeof setTimeout> | null = null;
+/** 收藏夹下拉展开态(展开期间隐藏子 webview 让位,同历史下拉) */
+let favOpen = false;
+let starBtn: HTMLButtonElement | null = null;
+let favToggleBtn: HTMLButtonElement | null = null;
+let favDropEl: HTMLDivElement | null = null;
+
 /* ---------- 页面状态辅助 ---------- */
 
 function activePage(): PageState | null {
@@ -142,9 +159,10 @@ function syncRect(): void {
 }
 
 function applyVisibility(): void {
-  // 五重条件:页面活跃 && 标签激活 && 工作台可见(路由停留) && 无全屏遮罩 && 历史下拉未开 && 已发生导航
-  // (历史下拉是 DOM,压不过原生子 webview,打开期间必须让页面整体隐藏,与遮罩避让同机制)
-  const base = tabActive && workbenchActive && !overlayOpen && !histOpen;
+  // 六重条件:页面活跃 && 标签激活 && 工作台可见(路由停留) && 无全屏遮罩 && 历史下拉未开
+  // && 收藏夹下拉未开 && 已发生导航(下拉是 DOM,压不过原生子 webview,打开期间必须让页面
+  // 整体隐藏,与遮罩避让同机制)
+  const base = tabActive && workbenchActive && !overlayOpen && !histOpen && !favOpen;
   for (const p of pages) {
     if (!p.hasNavigated) {
       p.shownApplied = false;
@@ -341,6 +359,104 @@ async function commitHistoryItem(it: BrowserHistoryItem): Promise<void> {
   await navigate(it.url);
 }
 
+/* ---------- 收藏夹:地址栏星标收藏当前页 + 工具栏按钮展开收藏下拉 ---------- */
+
+/** 播种收藏列表(每引擎生命周期一次;失败保持 null,下次挂载重试) */
+function ensureFavorites(): void {
+  if (favorites) return;
+  void getState()
+    .then((s) => {
+      favorites = s.browserFavorites ?? [];
+      updateStarBtn();
+      if (favOpen) renderFavDrop();
+    })
+    .catch(() => { /* 后端未就绪:保持 null,下次挂载重试 */ });
+}
+
+function isFavorited(url: string): boolean {
+  return !!favorites?.some((f) => f.url === url);
+}
+
+/** 星标态跟随活跃页面(切页/导航事件后调用) */
+function updateStarBtn(): void {
+  const p = activePage();
+  const on = !!p && p.hasNavigated && isFavorited(p.url);
+  starBtn?.classList.toggle('active', on);
+  if (starBtn) starBtn.title = on ? '取消收藏当前页' : '收藏当前页';
+}
+
+function scheduleFavoritesSave(): void {
+  if (favSaveTimer) clearTimeout(favSaveTimer);
+  favSaveTimer = setTimeout(() => {
+    favSaveTimer = null;
+    if (favorites) {
+      void browserSetFavorites(favorites).catch((err) =>
+        console.warn('[browser] 收藏夹保存失败:', err),
+      );
+    }
+  }, FAV_SAVE_DEBOUNCE_MS);
+}
+
+/** 星标点击:已收藏直接移除;未收藏弹窗编辑标题(默认页面标题)后追加。取消不产生变更。 */
+async function toggleFavorite(): Promise<void> {
+  const p = activePage();
+  if (!p || !p.hasNavigated || !p.url || p.url === 'about:blank') {
+    toast('请先在地址栏打开一个页面', 'error');
+    return;
+  }
+  if (!favorites) favorites = [];
+  const idx = favorites.findIndex((f) => f.url === p.url);
+  if (idx >= 0) {
+    favorites.splice(idx, 1);
+  } else {
+    const input = await promptDialog({ title: '收藏页面', label: '标题', defaultValue: pageDisplayTitle(p) });
+    if (input === null) return;
+    favorites.push({ url: p.url, title: input.trim() || pageDisplayTitle(p) });
+  }
+  updateStarBtn();
+  scheduleFavoritesSave();
+  if (favOpen) renderFavDrop();
+}
+
+function renderFavDrop(): void {
+  const el = favDropEl;
+  if (!el) return;
+  el.innerHTML = favorites?.length
+    ? favorites
+        .map(
+          (f, i) =>
+            `<div class="browser-history-item" data-fav-idx="${i}">
+              <span class="browser-history-ic">${icon('star')}</span>
+              <span class="browser-history-text">
+                <span class="browser-history-title">${escapeText(f.title || f.url)}</span>
+                <span class="browser-history-url">${escapeText(f.url)}</span>
+              </span>
+              <button class="browser-fav-rm" data-fav-rm="${i}" title="移除收藏">${icon('x')}</button>
+            </div>`,
+        )
+        .join('')
+    : '<div class="browser-fav-empty">暂无收藏;打开页面后点地址栏右侧星标收藏</div>';
+}
+
+function openFavDrop(): void {
+  favOpen = true;
+  favToggleBtn?.classList.add('active');
+  renderFavDrop();
+  if (favDropEl) favDropEl.style.display = 'block';
+  applyVisibility(); // 下拉是 DOM,压不过原生子 webview,打开期间让位
+}
+
+function closeFavDrop(): void {
+  const was = favOpen;
+  favOpen = false;
+  favToggleBtn?.classList.remove('active');
+  if (favDropEl) {
+    favDropEl.style.display = 'none';
+    favDropEl.innerHTML = '';
+  }
+  if (was) applyVisibility();
+}
+
 /* ---------- 页面增删切换 ---------- */
 
 function newPage(): PageState {
@@ -365,6 +481,7 @@ function setActivePage(id: string): void {
   updateAddress();
   updateHint();
   updateInspectBtn();
+  updateStarBtn();
   syncRect();
   renderPagesBar();
 }
@@ -478,9 +595,12 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
       <div class="browser-address-wrap">
         <input class="browser-address" type="text" spellcheck="false"
           placeholder="输入网址或本地 HTML 路径,回车打开" />
+        <button class="icon-btn browser-star" data-act="star" title="收藏当前页">${icon('star')}</button>
         <div class="browser-history-drop" style="display:none"></div>
+        <div class="browser-fav-drop" style="display:none"></div>
       </div>
       <button class="icon-btn" data-act="local" title="打开本地 HTML 文件">${icon('folderOpen')}</button>
+      <button class="icon-btn browser-fav-toggle" data-act="favorites" title="收藏夹">${icon('star')}</button>
       <button class="icon-btn browser-inspect-btn" data-act="inspect"
         title="检查元素:点击页面元素加入 AI 对话">${icon('inspect')}</button>
       <button class="icon-btn" data-act="devtools" title="开发者工具(该视图的 F12)">${icon('wrench')}</button>
@@ -501,6 +621,10 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
   hintEl = container.querySelector<HTMLDivElement>('.browser-hint');
   viewEl = container.querySelector<HTMLDivElement>('.browser-view');
   pagesEl = container.querySelector<HTMLElement>('.browser-pages');
+  starBtn = container.querySelector<HTMLButtonElement>('.browser-star');
+  favToggleBtn = container.querySelector<HTMLButtonElement>('.browser-fav-toggle');
+  favDropEl = container.querySelector<HTMLDivElement>('.browser-fav-drop');
+  ensureFavorites();
 
   /* 恢复页面状态(模块级 pages 跨挂载保留);没有页面时补一页空白页 */
   if (!pages.length) newPage();
@@ -518,6 +642,16 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     const act = btn.dataset.act;
     if (act === 'local') {
       void openLocalFile();
+      return;
+    }
+    // 收藏夹下拉/星标不依赖已导航页面(下拉要能在空白页浏览收藏;星标自行提示)
+    if (act === 'favorites') {
+      if (favOpen) closeFavDrop();
+      else openFavDrop();
+      return;
+    }
+    if (act === 'star') {
+      void toggleFavorite();
       return;
     }
     const p = activePage();
@@ -575,6 +709,7 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
   };
   const onAddressFocus = (): void => {
     editingAddress = true;
+    closeFavDrop(); // 两个下拉互斥:编辑地址时收起收藏夹
     // 聚焦即展开最近记录(无记录时 refresh 内部自动收起)
     void refreshHistoryDrop();
   };
@@ -594,6 +729,30 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     if (it && addressInput) void commitHistoryItem(it);
   };
   histDropEl?.addEventListener('mousedown', onHistoryMouseDown);
+  /** 收藏夹行 mousedown 保焦点防 blur 抢关;✕ 移除,行点击导航当前页 */
+  const onFavDropMouseDown = (e: MouseEvent): void => {
+    const rm = (e.target as HTMLElement).closest<HTMLElement>('[data-fav-rm]');
+    if (rm) {
+      e.preventDefault();
+      const idx = Number(rm.dataset.favRm);
+      if (favorites && favorites[idx]) {
+        favorites.splice(idx, 1);
+        updateStarBtn(); // 移除的可能正是当前页
+        scheduleFavoritesSave();
+        renderFavDrop();
+      }
+      return;
+    }
+    const row = (e.target as HTMLElement).closest<HTMLElement>('[data-fav-idx]');
+    if (!row) return;
+    e.preventDefault();
+    const f = favorites?.[Number(row.dataset.favIdx)];
+    if (!f) return;
+    closeFavDrop();
+    if (addressInput) addressInput.value = f.url;
+    void navigate(f.url);
+  };
+  favDropEl?.addEventListener('mousedown', onFavDropMouseDown);
   addressInput?.addEventListener('keydown', onAddressKey);
   addressInput?.addEventListener('input', onAddressInput);
   addressInput?.addEventListener('focus', onAddressFocus);
@@ -632,6 +791,7 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
       updateHint();
       applyVisibility();
       updateAddress();
+      updateStarBtn();
       renderPagesBar();
       if (page) queueHistoryRecord(page.url, page.title);
     } else if (ev.kind === 'title' && ev.title && page) {
@@ -702,6 +862,7 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     updateAddress();
     updateHint();
     updateInspectBtn();
+    updateStarBtn();
     renderPagesBar();
     applyVisibility();
     syncRect();
@@ -723,12 +884,20 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     addressInput?.removeEventListener('focus', onAddressFocus);
     addressInput?.removeEventListener('blur', onAddressBlur);
     histDropEl?.removeEventListener('mousedown', onHistoryMouseDown);
+    favDropEl?.removeEventListener('mousedown', onFavDropMouseDown);
     closeHistoryDrop();
+    closeFavDrop();
     // 未落库的防抖条目随卸载立即上报(页面访问是既成事实,不因标签关闭而丢)
     if (histTimer) { clearTimeout(histTimer); histTimer = null; }
     const pending = histPending;
     histPending = null;
     if (pending) void browserHistoryAdd(pending.url, pending.title).catch(() => {});
+    // 未回写的收藏变更随卸载立即上报(有在途防抖才写,避免每次关标签都白写一次盘)
+    if (favSaveTimer) {
+      clearTimeout(favSaveTimer);
+      favSaveTimer = null;
+      if (favorites) void browserSetFavorites(favorites).catch(() => {});
+    }
     container.innerHTML = '';
     addressInput = null;
     histDropEl = null;
@@ -736,6 +905,9 @@ export function mountBrowser(container: HTMLElement, active: boolean): () => voi
     hintEl = null;
     viewEl = null;
     pagesEl = null;
+    starBtn = null;
+    favToggleBtn = null;
+    favDropEl = null;
     ro = null;
     tabActive = false;
     applyVisibility(); // 标签关闭:隐藏全部页面 webview(Rust 侧保留,再开同 id 标签恢复)

@@ -34,6 +34,16 @@ function parsePort(raw: string): number | null {
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
 }
 
+/** 后端端口冲突错误的可识别前缀（tunnel.rs PORT_CONFLICT_PREFIX），命中说明目标端口
+ *  已被其它「正在运行」的隧道绑定（配置允许端口重复，冲突只在启动时按运行态判定）。 */
+const PORT_CONFLICT_PREFIX = '[隧道端口冲突]';
+
+/** 解析端口冲突错误：命中返回去掉前缀的冲突描述（「该端口已被「xxx」占用」），否则 null。 */
+function conflictDetail(err: unknown): string | null {
+  const msg = String(err);
+  return msg.startsWith(PORT_CONFLICT_PREFIX) ? msg.slice(PORT_CONFLICT_PREFIX.length) : null;
+}
+
 export function TunnelTab({ tab }: TabProps): JSX.Element {
   const { serverId, serverName } = tab.data as { serverId: string; serverName?: string };
   const [tunnels, setTunnels] = useState<TunnelState[]>([]);
@@ -107,18 +117,53 @@ export function TunnelTab({ tab }: TabProps): JSX.Element {
     };
     setBusy(true);
     setError(null);
-    try {
-      await tunnelSave(cfg);
+    const finishSave = (): void => {
       toast(editing ? '隧道已更新' : '隧道已创建', 'success');
       setEditorOpen(false);
       setEditing(null);
-      await load();
+    };
+    try {
+      try {
+        await tunnelSave(cfg);
+        finishSave();
+      } catch (err) {
+        // 配置已落盘但启动失败：端口冲突 → 询问是否关闭占用方隧道后重试；其余原因展示给用户
+        const conflict = conflictDetail(err);
+        if (!conflict) throw err;
+        if (await confirmDialog({
+          title: '端口已被占用',
+          message: `${conflict}，是否将其关闭？`,
+          okText: '关闭并启动',
+        })) {
+          await tunnelSave(cfg, true);
+          finishSave();
+        } else {
+          setError(`${conflict}；隧道已保存但未启动`);
+        }
+      }
     } catch (err) {
-      // 配置已落盘但启动失败（端口占用/认证失败等）：保留编辑器展示原因
       setError(String(err));
-      await load();
     } finally {
+      await load();
       setBusy(false);
+    }
+  };
+
+  /** 启动隧道（含端口冲突确认）：撞冲突时弹「是否关闭占用方」，确认后带 closeConflict 重试。 */
+  const startTunnel = async (id: string): Promise<void> => {
+    try {
+      await tunnelStart(id);
+    } catch (err) {
+      const conflict = conflictDetail(err);
+      if (!conflict) throw err;
+      if (await confirmDialog({
+        title: '端口已被占用',
+        message: `${conflict}，是否将其关闭？`,
+        okText: '关闭并启动',
+      })) {
+        await tunnelStart(id, true);
+      }
+      // 取消：保持现状（该行仍是已停止），不再打扰
     }
   };
 
@@ -127,7 +172,7 @@ export function TunnelTab({ tab }: TabProps): JSX.Element {
       if (tunnel.running) {
         await tunnelStop(tunnel.id);
       } else {
-        await tunnelStart(tunnel.id);
+        await startTunnel(tunnel.id);
       }
       await load();
     } catch (err) {

@@ -163,11 +163,11 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 mcp.sync().await;
             });
-            // 启动时自动重建上次 enabled 的 SSH 隧道（失败仅记录，不影响启动）
+            // 启动时自动重建上次 enabled 的 SSH 隧道（失败经 errors 表在 UI 行内展示，不影响启动）
             tauri::async_runtime::spawn(tunnel::recover(
                 app.handle().clone(),
                 ssh,
-                store,
+                store.clone(),
                 tunnels,
             ));
             term::set_debug_app(app.handle().clone());
@@ -191,9 +191,15 @@ pub fn run() {
                         }
                     });
                 }
+                // 退出收尾：杀 AI 会话；「AIShell 启动时自动启动隧道」关闭时把所有隧道置为禁用，
+                // 下次启动不再自动恢复（设置-功能特性 tunnel_auto_start，见 tunnel.rs recover）
+                let store_exit = store.clone();
                 win.on_window_event(move |_ev| {
                     if let tauri::WindowEvent::Destroyed = _ev {
                         ai.kill_all();
+                        if !store_exit.settings().tunnel_auto_start {
+                            store_exit.disable_all_tunnels();
+                        }
                     }
                 });
             }
@@ -326,6 +332,7 @@ pub fn run() {
             browser::browser_set_proxy,
             browser::browser_history_add,
             browser::browser_history_list,
+            browser::browser_set_favorites,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

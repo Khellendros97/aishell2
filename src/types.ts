@@ -35,6 +35,8 @@ export interface Settings {
   autoBackupRemoteFiles: boolean;
   /** 服务器紧凑布局：开启后工作台侧栏服务器卡片默认折叠（仅图标/名称/IP），点击展开；旧配置无此字段按关闭 */
   compactServerList: boolean;
+  /** AIShell 启动时自动恢复上次 enabled 的 SSH 隧道；关闭后退出时自动禁用所有隧道；旧配置无此字段按开启 */
+  tunnelAutoStart: boolean;
 }
 
 /** MCP 服务全局配置（AppState 顶层字段）—— 与 store.rs McpServiceConfig serde camelCase 对齐。
@@ -315,6 +317,15 @@ export interface BrowserHistoryItem {
   ts: number;
 }
 
+/** 内置浏览器收藏夹条目（照 SftpFavorite 形态：url 即键无独立 id，顺序 = 添加序；
+ *  前端整列表维护，browser_set_favorites 整列表覆盖写，读取走 get_state.browserFavorites） */
+export interface BrowserFavorite {
+  /** 对外展示形态 URL（本地文件即 file:///），可直接作为导航输入 */
+  url: string;
+  /** 收藏标题（默认页面标题，用户可编辑） */
+  title: string;
+}
+
 export interface ChatMsg {
   role: 'user' | 'assistant';
   content: string;
@@ -392,6 +403,8 @@ export interface AppState {
   sshTunnels: TunnelConfig[];
   /** 内置浏览器 SOCKS5 代理配置（只作用于内置浏览器子 webview）；旧配置无此字段按未启用 */
   browserProxy: BrowserProxyConfig;
+  /** 内置浏览器收藏夹（全局平铺，url 即键，按添加序）；旧配置无此字段为空数组 */
+  browserFavorites: BrowserFavorite[];
 }
 
 /** AI 会话 trace 条目（trace.rs TraceEntry serde camelCase 对齐）：text 为后端已格式化的单行展示文本 */

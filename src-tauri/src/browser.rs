@@ -1033,6 +1033,18 @@ pub async fn browser_history_list(
     Ok(store.browser_history_filtered(&q, limit))
 }
 
+/* ---------------- 收藏夹（持久化在 AppState.browserFavorites，store.rs；读取走 get_state） ---------------- */
+
+/// 写入收藏夹：前端维护整列表（添加/移除/防抖回写，照 SFTP 收藏夹模式），
+/// 后端整列表覆盖落盘。URL 为对外展示形态，与地址栏/历史一致。
+#[tauri::command]
+pub async fn browser_set_favorites(
+    store: State<'_, Arc<crate::store::Store>>,
+    favorites: Vec<crate::store::BrowserFavorite>,
+) -> Result<(), String> {
+    store.set_browser_favorites(favorites)
+}
+
 /* ---------------- 注入脚本：console 钩子（常开）+ 检查元素（休眠态，Rust eval 激活） ---------------- */
 
 const INSPECTOR_JS: &str = r##"(function () {
