@@ -60,8 +60,9 @@ enum TermBackend {
 }
 
 /* ---------------- 诊断：SSH 通道收发元信息落盘（只记时间戳/方向/长度,不记内容） ---------------- */
-/// 默认开启,便于抓取现场卡死(如 SSH vi 无响应)的事后证据;AISHELL_TERM_LOG=0 显式关闭,
-/// AISHELL_TERM_LOG=<path> 改路径。体积极小(每条消息一行),启动时超 2MB 截断重建。
+/// 默认开启,便于抓取现场卡死(如 SSH vi 无响应)的事后证据;AISHELL_TERM_LOG=0 显式关闭
+/// (落盘与 `debug:log` 事件一并静默,见 diag),AISHELL_TERM_LOG=<path> 改路径。
+/// 体积极小(每条消息一行),启动时超 2MB 截断重建。
 fn diag_tx() -> Option<&'static std::sync::mpsc::Sender<String>> {
     use std::sync::LazyLock;
     static TX: LazyLock<Option<std::sync::mpsc::Sender<String>>> = LazyLock::new(|| {
@@ -92,9 +93,10 @@ fn diag_tx() -> Option<&'static std::sync::mpsc::Sender<String>> {
         std::thread::spawn(move || {
             use std::io::BufWriter;
             let mut w = BufWriter::new(f);
+            // 不逐行 flush：BufWriter 满 8KB 自动落盘即可。逐行 flush 在满速输出
+            // （tar -v 等每秒数千行）时每行一次 syscall，还会被杀毒 minifilter 放大。
             for line in rx {
                 let _ = writeln!(w, "{line}");
-                let _ = w.flush();
             }
         });
         Some(tx)
@@ -110,20 +112,47 @@ pub fn set_debug_app(app: AppHandle) {
 }
 
 /// 追加一行带毫秒时间戳的诊断日志；失败静默（绝不影响终端主路径）。
-/// 同时落盘（diag_tx）与广播 `debug:log`（前端 Debug 面板实时流）。
+/// 同时落盘（diag_tx）与广播 `debug:log`（前端 Debug 面板实时流，带速率限制）。
 /// pub(crate)：pythoninstall（Python 运行时探测）等模块复用同一事件流。
+/// `AISHELL_TERM_LOG=0` 时整体静默（含 `debug:log` 事件，不只是写盘）——诊断打点
+/// 曾在 SSH 每包路径上把事件风暴引入主线程（事件经 tao send_event 逐条 marshal
+/// 到主线程执行 ExecuteScript），开关必须能整体关掉。
 pub(crate) fn diag(msg: &str) {
+    let Some(tx) = diag_tx() else { return };
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let line = format!("{ms} {msg}");
-    if let Some(tx) = diag_tx() {
-        let _ = tx.send(line.clone());
-    }
+    let _ = tx.send(line.clone());
     if let Some(app) = DEBUG_APP.get() {
-        let _ = app.emit("debug:log", DebugLogPayload { line });
+        emit_debug_throttled(app, &line);
     }
+}
+
+/// `debug:log` 事件节流状态：滚动 1s 窗口起点(ms) 与已广播条数。
+static DIAG_EMIT: Mutex<(u64, u32)> = Mutex::new((0, 0));
+/// 每秒最多广播的诊断行数：写盘（后台线程）不受影响，仅事件限流。
+/// 防止未来任何热路径打点重新以数百条/秒以上的频率打主线程。
+const DIAG_EMIT_PER_SEC: u32 = 200;
+
+/// 带全局速率限制的 `debug:log` 广播：滚动 1s 窗口超出上限的行只落盘不广播
+/// （Debug 面板本就是环形缓冲最近 3000 行，丢弃中间几行不影响取证）。
+fn emit_debug_throttled(app: &AppHandle, line: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut st = DIAG_EMIT.lock().unwrap_or_else(|e| e.into_inner());
+    if now.saturating_sub(st.0) >= 1000 {
+        st.0 = now;
+        st.1 = 0;
+    }
+    if st.1 >= DIAG_EMIT_PER_SEC {
+        return;
+    }
+    st.1 += 1;
+    let _ = app.emit("debug:log", DebugLogPayload { line: line.to_string() });
 }
 
 /// 导出 Debug 面板日志到用户选定路径（前端 save 对话框拿路径后调此命令写盘）。
@@ -326,6 +355,12 @@ impl Recorder {
 
 /* ---------------- 终端管理器 ---------------- */
 
+/// SSH 读循环攒批参数：达到字节上限或时间窗口任一条件即 flush。
+/// 256KB 满速（约 40MB/s）下约 150 批/秒，主线程事件负载相比逐包 emit
+/// （数千/秒 ×2 路）降两个数量级；8ms 窗口对稀疏输出（按键回显）无感知延迟。
+const BATCH_MAX_BYTES: usize = 256 * 1024;
+const BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
+
 /// 统一终端管理器：id -> Arc<TermHandle>。本地与 SSH 对前端同构。
 pub struct TermManager {
     map: Mutex<HashMap<String, Arc<TermHandle>>>,
@@ -426,7 +461,11 @@ impl TermManager {
             let mgr = Arc::clone(self);
             let id2 = id.clone();
             std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
+                // 大读缓冲：ConPTY 有数据即返回（不等满），稀疏输出仍是小批；满速输出
+                // （cat/构建日志）时单次 read 尽量填满，事件率随块大小一起下降——
+                // 与 SSH 分支攒批同目标（emit 走 tao → 主线程逐条 ExecuteScript，
+                // 逐 4KB 块 emit 在高速输出时同样会打满主线程）。
+                let mut buf = vec![0u8; 256 * 1024];
                 // 多字节 UTF-8 字符可能断在 read 边界：carry 留住不完整尾字节与下一批拼接，
                 // 按块直接 lossy 会把断点字符替换成 U+FFFD（录制 tee 同样受损）
                 let mut carry: Vec<u8> = Vec::new();
@@ -519,19 +558,59 @@ impl TermManager {
             let mut code: Option<i32> = None;
             // 与本地读线程同型：多字节 UTF-8 字符可能断在 SSH 数据包边界，carry 跨包拼接
             let mut carry: Vec<u8> = Vec::new();
-            diag(&format!("read-task start id={id2}"));
-            loop {
-                match read_half.wait().await {
-                    Some(ChannelMsg::Data { data }) => {
-                        diag(&format!("recv id={id2} data len={}", data.len()));
-                        carry.extend_from_slice(&data);
-                        let keep = utf8_safe_prefix_len(&carry);
-                        let data = String::from_utf8_lossy(&carry[..keep]).into_owned();
-                        carry.drain(..keep);
-                        mgr.tee_record(&id2, &data);
-                        let r = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
+            // 攒批发射缓冲：连续 Data 合并到 BATCH_MAX_BYTES / BATCH_WINDOW 再 emit 一次。
+            // 满速输出（tar -v 大包等）时 SSH 每秒可达数千包，逐包 emit 会同时打满
+            // 主线程（事件经 tao send_event 逐条 marshal 到主线程 ExecuteScript）与
+            // 前端 JS，整窗无响应只能强杀（2026-09 用户事故，seq 2000 万行复现）。
+            // 攒批后事件率降 1-2 个数量级；批等待期间不调 wait()，russh 队列与 SSH
+            // 窗口自然对远端形成背压。稀疏输出（按键回显）每批等满 BATCH_WINDOW
+            //（8ms）超时即发，人无感知。
+            let mut batch = String::new();
+            let mut batch_pkts = 0usize;
+            let mut batch_bytes = 0usize;
+            // wait() = tokio mpsc recv()，官方保证取消安全：timeout 取消挂起的 wait
+            // 不会丢消息，未取出的仍在通道队列。
+            macro_rules! flush_batch {
+                () => {
+                    if !batch.is_empty() {
+                        let pkts = std::mem::take(&mut batch_pkts);
+                        let bytes = std::mem::take(&mut batch_bytes);
+                        diag(&format!("recv id={id2} batch pkts={pkts} len={bytes}"));
+                        mgr.tee_record(&id2, &batch);
+                        let r = app.emit(
+                            &format!("term:data:{id2}"),
+                            TermDataPayload { data: std::mem::take(&mut batch) },
+                        );
                         if let Err(e) = r {
                             diag(&format!("emit-err id={id2} err={e}"));
+                        }
+                    }
+                };
+            }
+            diag(&format!("read-task start id={id2}"));
+            loop {
+                // 批次有待发数据时限时等下一包：窗口内继续攒，超时即 flush
+                let msg = if batch.is_empty() {
+                    read_half.wait().await
+                } else {
+                    match tokio::time::timeout(BATCH_WINDOW, read_half.wait()).await {
+                        Ok(m) => m,
+                        Err(_) => {
+                            flush_batch!();
+                            continue;
+                        }
+                    }
+                };
+                match msg {
+                    Some(ChannelMsg::Data { data }) => {
+                        carry.extend_from_slice(&data);
+                        batch_pkts += 1;
+                        batch_bytes += data.len();
+                        let keep = utf8_safe_prefix_len(&carry);
+                        batch.push_str(&String::from_utf8_lossy(&carry[..keep]));
+                        carry.drain(..keep);
+                        if batch.len() >= BATCH_MAX_BYTES {
+                            flush_batch!();
                         }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
@@ -550,7 +629,8 @@ impl TermManager {
                     }
                 }
             }
-            // 通道结束：残留不完整序列按 lossy 冲出（与本地读线程同型）
+            // 通道结束：批次残余先冲出，再处理残留不完整序列（与本地读线程同型）
+            flush_batch!();
             if !carry.is_empty() {
                 let data = String::from_utf8_lossy(&carry).into_owned();
                 mgr.tee_record(&id2, &data);
