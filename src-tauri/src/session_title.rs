@@ -152,6 +152,7 @@ async fn request_title(
 /// trace（title_gen 类）：记录请求/各失败阶段/成功标题与耗时（不经 pi 的直连 LLM 调用）。
 async fn generate_title(
     store: Arc<Store>,
+    cloud: Arc<crate::cloud::CloudManager>,
     app: AppHandle,
     project_id: String,
     session_id: String,
@@ -164,16 +165,17 @@ async fn generate_title(
         crate::trace::log(&trace_key, "title_gen", json!({"kind": "skip", "detail": "首条消息超长，跳过标题生成"}));
         return;
     }
-    let Ok(api_key) = store.read_secret("llm:apikey") else {
-        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "读取 LLM API Key 失败"}));
+    let cfg = store.llm_config();
+    // 托管模式走公司服务器代理 + access_token（请求前续期）；个人模式走本地 baseUrl + keyring 密钥。
+    // 标题生成是锦上添花，取端点/令牌失败（未登录、未配置 key、续期失败）一律静默跳过。
+    let Ok((url, auth_token)) = cloud.llm_endpoint_and_token(&store, &cfg).await else {
+        crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "获取 LLM 端点/令牌失败，跳过标题生成"}));
         return;
     };
-    let cfg = store.llm_config();
     crate::trace::log(&trace_key, "title_gen", json!({
         "kind": "request",
         "detail": format!("模型={} 首条消息: {}", cfg.model_id, first_message),
     }));
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let Ok(client) = reqwest::Client::builder().timeout(TITLE_TIMEOUT).build() else {
         crate::trace::log(&trace_key, "title_gen", json!({"kind": "error", "detail": "创建 HTTP 客户端失败"}));
         return;
@@ -184,7 +186,7 @@ async fn generate_title(
     ];
     let title = 'retry: {
         for attempt in 0..=TITLE_MAX_REPAIRS {
-            match request_title(&client, &url, &api_key, &cfg.model_id, &messages).await {
+            match request_title(&client, &url, &auth_token, &cfg.model_id, &messages).await {
                 Ok(title) => break 'retry title,
                 Err(failure) => {
                     crate::trace::log(&trace_key, "title_gen", json!({
@@ -241,6 +243,7 @@ async fn generate_title(
 #[tauri::command]
 pub async fn ai_generate_session_title(
     store: State<'_, Arc<Store>>,
+    cloud: State<'_, Arc<crate::cloud::CloudManager>>,
     app: AppHandle,
     project_id: String,
     session_id: String,
@@ -264,8 +267,10 @@ pub async fn ai_generate_session_title(
         }
     }
     let store = Arc::clone(&store);
+    let cloud = Arc::clone(&cloud);
     tauri::async_runtime::spawn(generate_title(
         store,
+        cloud,
         app,
         project_id,
         session_id,

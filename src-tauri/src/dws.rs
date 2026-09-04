@@ -342,7 +342,8 @@ fn normalize_contents(items: &mut Vec<ReportContent>) {
 
 /// 直连 LLM 整理日志内容(照 notes.rs generate_note 模式;失败返回中文错误,不含 API Key)。
 async fn generate_report_contents(
-    store: &Store,
+    store: &Arc<Store>,
+    cloud: &Arc<crate::cloud::CloudManager>,
     fields: &[DwsTemplateField],
     note: &str,
 ) -> Result<Vec<ReportContent>, String> {
@@ -358,10 +359,11 @@ async fn generate_report_contents(
             "detail": format!("模型={} 模版字段 {} 个 笔记 {} 字节", cfg.model_id, fields.len(), user.len()),
         }),
     );
-    let api_key = store
-        .read_secret("llm:apikey")
-        .map_err(|_| "日志内容生成失败: 请先在设置中配置 LLM API Key".to_string())?;
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    // 托管模式走公司服务器代理 + access_token（请求前续期）；个人模式走本地 baseUrl + keyring 密钥
+    let (url, auth_token) = cloud
+        .llm_endpoint_and_token(store, &cfg)
+        .await
+        .map_err(|e| format!("日志内容生成失败: {e}"))?;
     let client = reqwest::Client::builder()
         .timeout(REPORT_LLM_TIMEOUT)
         .build()
@@ -377,7 +379,7 @@ async fn generate_report_contents(
     });
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Authorization", format!("Bearer {auth_token}"))
         .json(&body)
         .send()
         .await
@@ -429,6 +431,7 @@ fn resolve_note_path(root: &Path, note_path: &str) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn dws_report_generate(
     store: State<'_, Arc<Store>>,
+    cloud: State<'_, Arc<crate::cloud::CloudManager>>,
     template_name: String,
     note_path: String,
 ) -> Result<serde_json::Value, String> {
@@ -441,7 +444,7 @@ pub async fn dws_report_generate(
     if fields.is_empty() {
         return Err(format!("模版「{template_name}」没有可填字段，请换一个模版"));
     }
-    let items = generate_report_contents(&store, &fields, &note).await?;
+    let items = generate_report_contents(store.inner(), cloud.inner(), &fields, &note).await?;
     let contents = serde_json::to_string_pretty(&items)
         .map_err(|e| format!("日志内容生成失败: 序列化结果失败: {e}"))?;
     crate::trace::log(

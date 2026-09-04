@@ -161,7 +161,8 @@ const NOTE_SYSTEM_UPDATE: &str = "你是 AIShell 会话归档助手。将新会�
 /// 直连 LLM 生成/整合笔记。测试经 generate_note_with 注入假实现,不真发请求。
 /// 失败返回中文错误(不含 API Key);输出为空视为失败。
 async fn generate_note(
-    store: &Store,
+    store: &Arc<Store>,
+    cloud: &Arc<crate::cloud::CloudManager>,
     update: bool,
     existing_note: Option<&str>,
     transcript: &str,
@@ -185,10 +186,11 @@ async fn generate_note(
             "detail": format!("模型={} 模式={} 转录 {} 字节", cfg.model_id, if update { "update" } else { "new" }, user.len()),
         }),
     );
-    let api_key = store
-        .read_secret("llm:apikey")
-        .map_err(|_| "笔记生成失败: 请先在设置中配置 LLM API Key".to_string())?;
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    // 托管模式走公司服务器代理 + access_token（请求前续期）；个人模式走本地 baseUrl + keyring 密钥
+    let (url, auth_token) = cloud
+        .llm_endpoint_and_token(store, &cfg)
+        .await
+        .map_err(|e| format!("笔记生成失败: {e}"))?;
     let client = reqwest::Client::builder()
         .timeout(NOTE_TIMEOUT)
         .build()
@@ -204,7 +206,7 @@ async fn generate_note(
     });
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Authorization", format!("Bearer {auth_token}"))
         .json(&body)
         .send()
         .await
@@ -273,7 +275,8 @@ where
 /// 生成并落盘笔记(归档 new/update 与「生成笔记」命令共用):脱敏 → LLM 生成/整合 → 原子写。
 /// 返回笔记绝对路径;任一失败整体 Err,不写文件。
 async fn write_note(
-    store: &Store,
+    store: &Arc<Store>,
+    cloud: &Arc<crate::cloud::CloudManager>,
     mode: &str,
     title: Option<&str>,
     dir_rel: Option<&str>,
@@ -308,7 +311,7 @@ async fn write_note(
         (target, Some(existing))
     };
     // LLM 失败则整体 Err:不写文件。
-    let note = generate_note(store, mode == "update", existing.as_deref(), &transcript).await?;
+    let note = generate_note(store, cloud, mode == "update", existing.as_deref(), &transcript).await?;
     write_atomic(&target, &note)?;
     store.notify_sync_dirty();
     Ok(target.to_string_lossy().into_owned())
@@ -320,6 +323,7 @@ async fn write_note(
 #[allow(clippy::too_many_arguments)] // tauri 命令参数平铺是前端 invoke 契约,聚合反而绕路
 pub async fn session_archive(
     store: State<'_, Arc<Store>>,
+    cloud: State<'_, Arc<crate::cloud::CloudManager>>,
     mgr: State<'_, Arc<AiManager>>,
     project_id: String,
     session_id: String,
@@ -334,7 +338,8 @@ pub async fn session_archive(
     }
     let note_path = if mode != "only" {
         write_note(
-            &store,
+            store.inner(),
+            cloud.inner(),
             &mode,
             title.as_deref(),
             dir_rel.as_deref(),
@@ -356,6 +361,7 @@ pub async fn session_archive(
 #[tauri::command]
 pub async fn session_note(
     store: State<'_, Arc<Store>>,
+    cloud: State<'_, Arc<crate::cloud::CloudManager>>,
     mode: String,
     title: Option<String>,
     dir_rel: Option<String>,
@@ -366,7 +372,8 @@ pub async fn session_note(
         return Err(format!("生成笔记不支持模式: {mode}"));
     }
     write_note(
-        &store,
+        store.inner(),
+        cloud.inner(),
         &mode,
         title.as_deref(),
         dir_rel.as_deref(),

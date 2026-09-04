@@ -334,6 +334,35 @@ impl CloudManager {
         self.set_memory_access(&access, expires_in);
         Ok(access)
     }
+
+    /// 取直连 LLM 端点与鉴权 token：托管模式走公司服务器代理 + access_token（请求前续期），
+    /// 个人模式走本地 baseUrl + keyring 密钥。返回 (url, auth_token)。
+    /// 新增直连 LLM 调用点统一走这里，避免各分支遗漏托管适配（notes/session_title/dws 已改
+    /// 用它；smart_approval 因保留自家错误文案暂内置，后续可收敛到此）。
+    pub async fn llm_endpoint_and_token(
+        &self,
+        store: &Arc<Store>,
+        cfg: &crate::store::LlmConfig,
+    ) -> Result<(String, String), String> {
+        if store.cloud_mode() == CloudMode::Hosted {
+            // 请求前续期（CR-1.6）：access_token 有过期时间，续期失败（吊销/禁用）即报错返回
+            let token = self.valid_access_token(store).await?;
+            let server = server_url()
+                .ok_or_else(|| "当前构建未配置云服务，无法使用托管模式".to_string())?;
+            Ok((
+                format!("{server}/api/proxy/llm/v1/chat/completions"),
+                token,
+            ))
+        } else {
+            let api_key = store
+                .read_secret("llm:apikey")
+                .map_err(|_| "未配置 LLM API Key".to_string())?;
+            Ok((
+                format!("{}/chat/completions", cfg.base_url.trim_end_matches('/')),
+                api_key,
+            ))
+        }
+    }
 }
 
 fn now_unix() -> u64 {
