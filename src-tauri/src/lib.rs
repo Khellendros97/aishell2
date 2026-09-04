@@ -153,6 +153,9 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
                     let _ = app2.emit("config:changed", event);
                 }));
             }
+            // AI 空闲回收：周期清理长时间无交互的 pi 进程（会话历史在 session 文件，
+            // 下次对话自动重生），避免多会话常驻累积内存
+            ai.spawn_idle_reaper();
             // MCP 服务端：按已启用设备自动监听 127.0.0.1:<port>/mcp（见 mcp.rs）
             let mcp = Arc::new(mcp::McpService::new(
                 store.clone(),
