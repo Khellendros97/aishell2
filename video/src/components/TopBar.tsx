@@ -7,7 +7,7 @@ import React from 'react';
 import { C, FONT_UI } from '../theme';
 import { Icon, Logo } from '../ui';
 
-export const TopBar: React.FC<{ active: '项目' | '设置'; project?: string; accountHover?: boolean }> = ({
+export const TopBar: React.FC<{ active: '项目' | '设置' | '账号'; project?: string; accountHover?: boolean }> = ({
   active,
   project,
   accountHover,

@@ -105,6 +105,27 @@ export const ICONS = {
     '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
   link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
   message: '<path d="M21 12a8 8 0 0 1-8 8H4l2.3-2.9A8 8 0 1 1 21 12z"/>',
+  /* ---- 视频五(内置浏览器)补充,与主仓 src/icons.ts 同名条目一致 ---- */
+  inspect:
+    '<path d="M9 9l5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/>',
+  /* ---- 视频六(文件暂存区)补充,与主仓 src/icons.ts 同名条目一致 ---- */
+  restore:
+    '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+  diff:
+    '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/><path d="M6.5 9h3"/><path d="M8 7.5v3"/><path d="M14.5 15h3"/>',
+  /* ---- 视频七/八(SSH 隧道 + 云同步)补充,与主仓 src/icons.ts 同名条目一致 ---- */
+  tunnel:
+    '<circle cx="5" cy="19" r="2"/><circle cx="19" cy="5" r="2"/><path d="M5 17V5"/><path d="M19 7v12"/><path d="M9 13h6"/><path d="M2 17h6"/><path d="M16 5h6"/>',
+  cloudSync:
+    '<path d="M7 18a5 5 0 1 1 1-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 7.9"/><path d="M12 12v8"/><path d="m9 17 3 3 3-3"/>',
+  cloudBackup:
+    '<path d="M7 18a5 5 0 1 1 1-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 7.9"/><path d="M12 20V9"/><path d="m8 13 4-4 4 4"/>',
+  device:
+    '<rect x="5" y="2" width="14" height="20" rx="2"/><path d="M9 5h6"/><path d="M11 18h2"/>',
+  sync:
+    '<path d="M20 7h-5V2"/><path d="M4 17h5v5"/><path d="M5.5 9A7 7 0 0 1 20 7"/><path d="M18.5 15A7 7 0 0 1 4 17"/>',
+  chart:
+    '<path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>',
 } as const;
 
 export type IconName = keyof typeof ICONS;

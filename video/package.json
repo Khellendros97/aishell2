@@ -9,10 +9,18 @@
     "render:02": "remotion render src/index.ts ProjectSshDemo out/02-project-ssh-terminal.mp4",
     "render:03": "remotion render src/index.ts FileSftpDemo out/03-file-sftp.mp4",
     "render:04": "remotion render src/index.ts AiModeDemo out/04-ai-mode-db-pipeline.mp4",
+    "render:05": "remotion render src/index.ts BrowserDemo out/05-browser-ai.mp4",
+    "render:06": "remotion render src/index.ts StagingDemo out/06-staging.mp4",
+    "render:07": "remotion render src/index.ts SshTunnelDemo out/07-ssh-tunnel.mp4",
+    "render:08": "remotion render src/index.ts CloudSyncDemo out/08-cloud-sync.mp4",
     "still": "remotion still src/index.ts InitAiDemo",
     "still:02": "remotion still src/index.ts ProjectSshDemo",
     "still:03": "remotion still src/index.ts FileSftpDemo",
-    "still:04": "remotion still src/index.ts AiModeDemo"
+    "still:04": "remotion still src/index.ts AiModeDemo",
+    "still:05": "remotion still src/index.ts BrowserDemo",
+    "still:06": "remotion still src/index.ts StagingDemo",
+    "still:07": "remotion still src/index.ts SshTunnelDemo",
+    "still:08": "remotion still src/index.ts CloudSyncDemo"
   },
   "dependencies": {
     "@remotion/cli": "^4.0.518",
