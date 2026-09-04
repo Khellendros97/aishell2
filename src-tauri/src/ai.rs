@@ -285,6 +285,11 @@ pub struct AiProc {
     skill_fingerprint: String,
     /// 最近一次发送的 user prompt（已脱敏）；读取线程在回合结束时上报记忆沉淀用。
     last_prompt: Arc<Mutex<String>>,
+    /// 托管模式下 spawn 时注入的 access_token（个人模式为 None）。access_token 有过期时间，
+    /// 内存缓存过期会由 valid_access_token 刷新出新 token；ai_chat 发现进程持有的 token
+    /// 与本次续期结果不一致（token 已过期被轮换）时 kill/wait/摘除后按同一 session 文件重生，
+    /// 让常驻进程用上新的令牌，否则进程会一直用旧 token 请求而持续收到 401「登录令牌无效」。
+    cloud_token: Option<String>,
     /// 最近一次发起对话（ai_chat 发 prompt）的时刻；空闲回收线程据此判断是否超时回收。
     /// 生成/审批等待期间 busy=true 不参与回收判定，故只需在发送时刷新。
     last_active: Instant,
@@ -540,7 +545,10 @@ impl AiManager {
         let hosted = self.store.cloud_mode() == CloudMode::Hosted;
         // 托管模式：LLM 走公司服务器代理（token 由调用方续期传入，缺失即登录失效）
         let api_key = if hosted {
+            // clone 保留所有权，spawn 末尾写入 AiProc.cloud_token 供 ai_chat 对比令牌是否变化
             cloud_token
+                .as_ref()
+                .cloned()
                 .ok_or_else(|| "登录已过期，请前往账号页重新登录后使用公司服务".to_string())?
         } else {
             self.store
@@ -1228,6 +1236,7 @@ impl AiManager {
                 approvals,
                 skill_fingerprint: loaded.fingerprint,
                 last_prompt,
+                cloud_token,
                 last_active: Instant::now(),
             },
         );
@@ -2497,6 +2506,18 @@ pub async fn ai_chat(
         masked
     };
 
+    // 托管模式：请求前统一续期 access_token（token 有效期内内存缓存命中零成本，过期才走
+    // refresh_token 轮换）。进程 spawn 时注入的是启动那一刻的一次性令牌，长驻进程会随
+    // access_token 过期而失效（服务端返回 401「登录令牌无效」且进程本身不退出，ai_chat 若无
+    // 干预会一直拿旧令牌请求导致该会话不可用）。这里续期后与进程持有的 token 对比，
+    // 变化则重启进程让常驻进程用上新令牌（CR-1.6：请求前续期，避免请求中途 401；
+    // 刷新失败（吊销/禁用）在此返回中文引导错误，CR-3.4）。
+    let cloud_token = if mgr.store.cloud_mode() == crate::store::CloudMode::Hosted {
+        Some(cloud.valid_access_token(&mgr.store).await?)
+    } else {
+        None
+    };
+
     // 进程就绪检查：guard 限定在块内，避免跨 await 持有（MutexGuard 非 Send）
     let need_spawn = {
         let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
@@ -2508,16 +2529,6 @@ pub async fn ai_chat(
         }
         !procs.contains_key(&key)
     };
-    if need_spawn {
-        // 托管模式：spawn 前确保 access_token 有效（CR-1.6 请求前续期，避免请求中途 401）；
-        // 刷新失败（吊销/禁用）在此返回中文引导错误（CR-3.4）
-        let cloud_token = if mgr.store.cloud_mode() == crate::store::CloudMode::Hosted {
-            Some(cloud.valid_access_token(&mgr.store).await?)
-        } else {
-            None
-        };
-        mgr.spawn(&app, &key, &project_id, cloud_token)?;
-    }
     // 进程就绪与技能快照指纹判断：guard 收进块内，await（token 续期/spawn）前全部释放
     // （MutexGuard 非 Send，不能跨 await 持有）。指纹：UI/AI 修改、启停、增删技能后
     // 下一条消息即生效；工作区域切换不影响指纹。
@@ -2536,8 +2547,26 @@ pub async fn ai_chat(
             Some(p) => p.skill_fingerprint != fingerprint,
         }
     };
-    if needs_restart {
-        // 沿用 kill_keys 的取消审批 + kill/wait + 摘除流程；随后按同一 session 文件 spawn
+    // 托管 access_token 过期轮换检测：进程存在且技能指纹未变，但续期后的 token 与进程 spawn 时
+    // 持有的一次性旧令牌不一致（已过期被轮换）→ 需重启进程换新令牌，否则旧进程持续 401。
+    // 个人模式无过期令牌，恒 false。仅在 has 进程且未触发其它重建时才会进入锁内比较。
+    let token_changed = !need_spawn
+        && !needs_restart
+        && mgr.store.cloud_mode() == crate::store::CloudMode::Hosted
+        && {
+            let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+            procs
+                .get(&key)
+                .map(|p| p.cloud_token.as_deref() != cloud_token.as_deref())
+                .unwrap_or(false)
+        };
+
+    if need_spawn {
+        // 首次拉起（或旧进程已被上方清理）
+        mgr.spawn(&app, &key, &project_id, cloud_token.clone())?;
+    } else if needs_restart {
+        // 沿用 kill_keys 的取消审批 + kill/wait + 摘除流程；随后按同一 session 文件 spawn，
+        // 对话上下文经 session 落盘恢复
         {
             let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
             if let Some(mut old) = procs.remove(&key) {
@@ -2547,13 +2576,19 @@ pub async fn ai_chat(
                 let _ = old.child.wait();
             }
         }
-        // 托管模式：spawn 前同样确保 access_token 有效（与首次 spawn 同语义）
-        let cloud_token = if mgr.store.cloud_mode() == crate::store::CloudMode::Hosted {
-            Some(cloud.valid_access_token(&mgr.store).await?)
-        } else {
-            None
-        };
-        mgr.spawn(&app, &key, &project_id, cloud_token)?;
+        mgr.spawn(&app, &key, &project_id, cloud_token.clone())?;
+    } else if token_changed {
+        // 托管令牌过期轮换：kill/wait/摘除后按同一 session 文件重生，让常驻进程用上新令牌
+        {
+            let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+            if let Some(mut old) = procs.remove(&key) {
+                cancel_approvals(&mut old);
+                old.killed.store(true, Ordering::SeqCst);
+                let _ = old.child.kill();
+                let _ = old.child.wait();
+            }
+        }
+        mgr.spawn(&app, &key, &project_id, cloud_token.clone())?;
     }
     let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     let Some(proc) = procs.get_mut(&key) else {
