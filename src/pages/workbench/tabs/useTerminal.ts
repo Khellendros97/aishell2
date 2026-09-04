@@ -580,8 +580,13 @@ class TermSession {
       } else {
         block.output.push(block.pending);
         block.pending = parts[i];
-        if (block.output.length > MAX_BLOCK_LINES) block.output.shift();
       }
+    }
+    // 批末整段裁剪：满速输出（tar -v 等）一批可达数万行，每行 shift 是
+    // O(MAX_BLOCK_LINES) 数组搬移，O(n²) 会把 JS 线程钉死；批末一次 splice
+    // 语义等价（批内瞬时略超上限，展示/快照均取头尾，无行为差异）
+    if (block.output.length > MAX_BLOCK_LINES) {
+      block.output.splice(0, block.output.length - MAX_BLOCK_LINES);
     }
     this.scheduleDrawerRefresh();
   }

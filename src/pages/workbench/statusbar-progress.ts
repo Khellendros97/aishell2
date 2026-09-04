@@ -14,7 +14,9 @@
  * 多任务并存（上传 + 暂存 + 云备份）按 key 分槽：SFTP 任务用 taskId，暂存任务用 project:session，
  * 云备份任务用 cloud-backup:taskId。
  * 显式控制（showProgress / hideProgress）用于暂存/清理操作开始前的占位与异常收尾；done 事件
- * 到达会自动移除任务槽，无需调用方重复隐藏。
+ * 到达会自动移除任务槽，无需调用方重复隐藏。SFTP 面板的压缩/解压/快速备份（ssh_exec
+ * 直执长命令，无逐字节进度）也走显式控制：调用期间显示不确定 loading 槽（SftpTab
+ * runRemoteCommand 的 busyTitle 参数）。
  */
 import { cloudBackupCancel, onCloudBackupProgress, onSftpProgress, onStagingProgress } from '../../api';
 import type { CloudBackupProgress, SftpProgress, StagingProgress } from '../../types';

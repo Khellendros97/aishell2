@@ -51,7 +51,7 @@ import {
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
 import { revealLocalPath } from '../sidebar/ExplorerPanel';
-import { hideProgress } from '../statusbar-progress';
+import { hideProgress, showProgress } from '../statusbar-progress';
 
 interface SftpEls {
   body: HTMLElement;
@@ -562,30 +562,39 @@ function dbgLines(prefix: string, text: string): void {
  * 直执远端命令(待优化 5):走后端 ssh_exec 复用 SSH 连接执行单条命令(不再起迷你终端,
  * 规避登录时序竞态);命令行 / stdout / stderr / 退出码写入 debug 日志,
  * 完成后按退出码 toast 并刷新目录(成功且给了 focusPath 时聚焦落地条目)。
+ * busyTitle 传入时底边栏进度区显示不确定 loading 槽(压缩/解压/备份等长命令,
+ * ssh_exec 兜底超时 5 分钟);key 每次调用唯一,同面板连发多个操作各占一槽互不干扰,
+ * 成败/异常统一在 finally 收槽。chmod 等秒级命令不传,不占底栏。
  */
-async function runRemoteCommand(st: SftpTabState, command: string, doneToast: string, focusPath: string | null): Promise<void> {
-  dbg(`sftp ssh_exec ${st.serverId} $ ${command}`);
-  let res: SshExecResult;
+async function runRemoteCommand(st: SftpTabState, command: string, doneToast: string, focusPath: string | null, busyTitle?: string): Promise<void> {
+  const jobKey = busyTitle ? uid('sftpjob') : null;
+  if (busyTitle && jobKey) showProgress(busyTitle, jobKey);
   try {
-    res = await sshExec(st.serverId, command);
-  } catch (err) {
-    dbg(`sftp ssh_exec ${st.serverId} 失败: ${String(err)}`);
-    toast(String(err), 'error');
+    dbg(`sftp ssh_exec ${st.serverId} $ ${command}`);
+    let res: SshExecResult;
+    try {
+      res = await sshExec(st.serverId, command);
+    } catch (err) {
+      dbg(`sftp ssh_exec ${st.serverId} 失败: ${String(err)}`);
+      toast(String(err), 'error');
+      st.sel.clear();
+      void loadDir(st);
+      return;
+    }
+    dbgLines(`sftp ssh_exec ${st.serverId} stdout`, res.stdout);
+    dbgLines(`sftp ssh_exec ${st.serverId} stderr`, res.stderr);
+    dbg(`sftp ssh_exec ${st.serverId} exit=${res.code ?? 'null(超时中断或无退出码)'}`);
+    const success = res.code === 0;
+    toast(
+      success ? doneToast : `${doneToast}失败，详见 debug 日志`,
+      success ? 'success' : 'error',
+    );
     st.sel.clear();
-    void loadDir(st);
-    return;
+    if (success && focusPath) focusAfterRefresh(st, focusPath);
+    else void loadDir(st);
+  } finally {
+    if (jobKey) hideProgress(jobKey);
   }
-  dbgLines(`sftp ssh_exec ${st.serverId} stdout`, res.stdout);
-  dbgLines(`sftp ssh_exec ${st.serverId} stderr`, res.stderr);
-  dbg(`sftp ssh_exec ${st.serverId} exit=${res.code ?? 'null(超时中断或无退出码)'}`);
-  const success = res.code === 0;
-  toast(
-    success ? doneToast : `${doneToast}失败，详见 debug 日志`,
-    success ? 'success' : 'error',
-  );
-  st.sel.clear();
-  if (success && focusPath) focusAfterRefresh(st, focusPath);
-  else void loadDir(st);
 }
 
 /** 压缩选中条目为 tgz:单选目录/文件 → `名称.tgz`;多选 → 弹输入框指定包名(重名自动改名)。 */
@@ -614,7 +623,7 @@ async function compressRemote(st: SftpTabState, items: RemoteEntry[]): Promise<v
     const dest = await sftpUniqueName(st.serverId, parent, want);
     const names = items.map((i) => shQuote(i.name)).join(' ');
     const cmd = `tar czf ${shQuote(joinRemote(parent, dest))} -C ${shQuote(parent)} ${names}`;
-    await runRemoteCommand(st, cmd, `已压缩为 ${dest}`, joinRemote(parent, dest));
+    await runRemoteCommand(st, cmd, `已压缩为 ${dest}`, joinRemote(parent, dest), `正在压缩 ${dest}`);
   } catch (err) {
     toast(String(err), 'error');
   }
@@ -628,7 +637,7 @@ async function extractRemote(st: SftpTabState, it: RemoteEntry): Promise<void> {
     : `tar xzf ${shQuote(it.path)} -C ${shQuote(parent)}`;
   // 聚焦解压产物:通常与压缩包同名(去扩展名);产物名不同时 applyFocus 静默跳过
   const base = it.name.replace(/\.(tar\.gz|tgz|zip)$/i, '');
-  await runRemoteCommand(st, cmd, `已解压 ${it.name}`, joinRemote(parent, base));
+  await runRemoteCommand(st, cmd, `已解压 ${it.name}`, joinRemote(parent, base), `正在解压 ${it.name}`);
 }
 
 /** 快速备份:目录压缩为 `名称_bakYYYYMMDD-HHMM.tgz`;文件复制为 `名称_bakYYYYMMDD-HHMM`(保留原扩展名)。
@@ -644,7 +653,7 @@ function backupRemote(st: SftpTabState, item: RemoteEntry): void {
       const cmd = item.isDir
         ? `tar czf ${shQuote(joinRemote(parent, dest))} -C ${shQuote(parent)} ${shQuote(item.name)}`
         : `cp ${shQuote(item.path)} ${shQuote(joinRemote(parent, dest))}`;
-      await runRemoteCommand(st, cmd, `备份完成：${dest}`, joinRemote(parent, dest));
+      await runRemoteCommand(st, cmd, `备份完成：${dest}`, joinRemote(parent, dest), `正在备份 ${item.name}`);
     } catch (err) {
       toast(String(err), 'error');
     }
