@@ -55,6 +55,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::json;
@@ -65,6 +66,13 @@ use crate::ai_actions::{AiActions, SftpDownloadItem, SftpUploadItem, MAX_SFTP_BA
 use crate::ai_impact::{analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan};
 use crate::skills::{SkillOrigin, SkillSummary};
 use crate::store::{AiMode, ApprovalMode, Store};
+
+/// 空闲回收阈值：pi 进程空闲（非生成中、无待审批）超过该时长后由空闲回收线程回收。
+/// 会话历史在 session 文件落盘，下次 ai_chat 走 need_spawn 自动按同一 session 重生，
+/// 前端无感；多会话常驻不再累积内存。
+const IDLE_REAP_AFTER: Duration = Duration::from_secs(30 * 60);
+/// 空闲回收扫描间隔。
+const IDLE_REAP_SCAN_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// suggest 模式的系统提示（保持现状：无 bash，写仅 .aishell/）。
 const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
@@ -258,6 +266,9 @@ pub struct AiProc {
     /// 启动时技能快照指纹（origin|name|enabled|scope|正文 稳定序列化）；ai_chat 发现
     /// 该项目指纹变化时 kill/wait/摘除后按同一 session 文件重生，下一条消息即生效。
     skill_fingerprint: String,
+    /// 最近一次发起对话（ai_chat 发 prompt）的时刻；空闲回收线程据此判断是否超时回收。
+    /// 生成/审批等待期间 busy=true 不参与回收判定，故只需在发送时刷新。
+    last_active: Instant,
 }
 
 /// AI 进程管理器：每 key 一个长驻 pi 进程，进程生命周随工作台（ai_kill_project / Drop）结束。
@@ -1024,6 +1035,7 @@ impl AiManager {
                     killed,
                     approvals,
                     skill_fingerprint: loaded.fingerprint,
+                    last_active: Instant::now(),
                 },
             );
         Ok(())
@@ -1064,6 +1076,45 @@ impl AiManager {
                 let _ = proc.child.wait();
             }
         }
+    }
+
+    /// lib.rs setup 调用：启动空闲回收线程。pi 进程原本只随项目关闭/会话归档/应用退出回收，
+    /// 多会话常驻会累积内存；本线程周期扫描进程表，回收空闲（非 busy 且距上次发起对话
+    /// 超过 IDLE_REAP_AFTER）的进程。会话历史在 session 文件落盘，前端 pane 不受影响，
+    /// 下次 ai_chat 走 need_spawn 按同一 session 重生，用户无感。
+    /// 审批等待期间 busy=true 不会被回收；清理流程仍统一取消审批（与 kill_keys 同语义）。
+    pub fn spawn_idle_reaper(self: &Arc<Self>) {
+        let procs = Arc::clone(&self.procs);
+        thread::spawn(move || loop {
+            thread::sleep(IDLE_REAP_SCAN_EVERY);
+            let mut procs = procs.lock().unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            let idle: Vec<String> = procs
+                .iter()
+                .filter(|(_, p)| {
+                    !p.busy.load(Ordering::SeqCst)
+                        && now.duration_since(p.last_active) > IDLE_REAP_AFTER
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            // 保持进程表锁直到 kill/wait 完成（同 kill_keys，避免 ai_chat 重用待回收进程）
+            for key in idle {
+                if let Some(mut proc) = procs.remove(&key) {
+                    cancel_approvals(&mut proc);
+                    proc.killed.store(true, Ordering::SeqCst);
+                    let _ = proc.child.kill();
+                    let _ = proc.child.wait();
+                    crate::trace::log(
+                        &key,
+                        "idle_reap",
+                        json!({"detail": format!(
+                            "空闲超过 {} 分钟，回收 pi 进程（会话历史已落盘，下次对话自动恢复）",
+                            IDLE_REAP_AFTER.as_secs() / 60
+                        )}),
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -2154,6 +2205,8 @@ pub async fn ai_chat(
     let Some(proc) = procs.get_mut(&key) else {
         return Err("pi 进程未就绪".to_string());
     };
+    // 发起对话即活跃：空闲回收线程按 last_active 判定超时（生成/审批期间 busy=true 不会回收）
+    proc.last_active = Instant::now();
     let mut aborted_prev = false;
     if proc.busy.swap(true, Ordering::SeqCst) {
         cancel_approvals(proc);
