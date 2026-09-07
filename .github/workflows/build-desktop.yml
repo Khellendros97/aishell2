@@ -86,9 +86,11 @@ jobs:
           printf '%s' "$APPLE_API_KEY_P8" > "$P8"
           echo "APPLE_API_KEY_PATH=$P8" >> "$GITHUB_ENV"
 
-      # Tauri 不签 resources（踩坑记录），pi 必须在打包前补签；hardened runtime 默认禁 JIT，
-      # pi 内嵌 JS 引擎需要 entitlements 放行，否则签名后的包里 AI 引擎无法启动
-      - name: 补签 pi sidecar
+      # Tauri 不签 resources（踩坑记录），而 pi 分发版除主二进制外还有原生 .node 模块
+      # （clipboard / darwinModifiers 等预编译产物），公证要求所有嵌套 Mach-O 都带
+      # Developer ID + 安全时间戳，漏签即报 Invalid（3087721 未验签名 / 3087733 无时间戳）。
+      # hardened runtime 默认禁 JIT，pi 主二进制（内嵌 JS 引擎）需要 entitlements 放行
+      - name: 补签 pi sidecar 及原生模块
         if: env.APPLE_CERTIFICATE != ''
         run: |
           cat > "$RUNNER_TEMP/pi-entitlements.plist" <<'EOF'
@@ -102,9 +104,18 @@ jobs:
           </dict>
           </plist>
           EOF
+          # 主二进制带 JIT entitlements；其余 Mach-O（.node 模块）仅 Developer ID + 时间戳
           codesign --force --options runtime --timestamp \
             --entitlements "$RUNNER_TEMP/pi-entitlements.plist" \
             --sign "$APPLE_SIGNING_IDENTITY" src-tauri/resources/pi/pi
+          find src-tauri/resources/pi -type f ! -path "src-tauri/resources/pi/pi" -print0 |
+            while IFS= read -r -d '' f; do
+              if file "$f" | grep -q "Mach-O"; then
+                echo "==> 签名原生模块: $f"
+                codesign --force --options runtime --timestamp \
+                  --sign "$APPLE_SIGNING_IDENTITY" "$f"
+              fi
+            done
 
       - run: npm run tauri -- build --target ${{ matrix.target }}
         env:
