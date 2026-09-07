@@ -200,7 +200,7 @@ export function CredentialsPanel({ initialState, onChanged }: Props): JSX.Elemen
                 <div className="credential-card-head">
                   <div className="credential-name"><Icon name="key" /><strong title={credential.name}>{credential.name}</strong></div>
                   <div className="credential-actions">
-                    <button className="icon-btn" title="编辑凭据" onClick={() => openEdit(credential)}><Icon name="pencil" /></button>
+                    <button className="icon-btn" title="编辑凭据" onClick={() => openEdit(credential)}><Icon name="gear" /></button>
                     <button className="icon-btn danger" title="删除凭据" onClick={() => void remove(credential)}><Icon name="trash" /></button>
                   </div>
                 </div>

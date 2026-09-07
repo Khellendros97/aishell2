@@ -902,7 +902,11 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
             onClick={(e) => { e.stopPropagation(); toggleRow(p.id); }}>
             <Icon name={expanded ? 'chevronDown' : 'chevronRight'} />
           </button>
-          <span className="pr-name ellipsis" title={p.name}>{p.name}</span>
+          {/* 项目名可点击直接进入项目：链接只包住文字本身，名称右侧空白归整行（点击展开子表） */}
+          <span className="pr-name ellipsis">
+            <span className="pr-name-link" title={`${p.name}（点击进入项目）`}
+              onClick={(e) => { e.stopPropagation(); navigate('#/workbench?project=' + p.id); }}>{p.name}</span>
+          </span>
           <span className="pr-path mono ellipsis" title={displayPath}>{displayPath}</span>
           <span className="tag pr-count">{servers.length} 台服务器</span>
           <div className="pr-actions">
@@ -922,9 +926,15 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
                 <span className="ps-host mono">{s.host}:{s.port}</span>
                 <span className="ps-user">{s.username || '-'}</span>
                 {s.authType === 'password' ? <span className="tag blue">密码</span> : <span className="tag yellow">{s.authType === 'publickey' ? 'SSH 公钥' : '密钥'}</span>}
+                {/* 用户自定义标签（与侧栏服务器卡一致的 #hash chips，单行省略不撑高行） */}
+                {s.tags.length ? (
+                  <span className="ps-tags">
+                    {s.tags.map((t) => <span key={t} className="tag blue"><Icon name="hash" />{t}</span>)}
+                  </span>
+                ) : null}
                 <div className="ps-actions">
                   <button className="icon-btn" data-act="srv-edit" data-id={s.id} title="编辑服务器"
-                    onClick={(e) => { e.stopPropagation(); openSrvModal(s, null); }}><Icon name="pencil" /></button>
+                    onClick={(e) => { e.stopPropagation(); openSrvModal(s, null); }}><Icon name="gear" /></button>
                   <button className="icon-btn danger" data-act="srv-del" data-id={s.id} title="删除服务器"
                     onClick={(e) => { e.stopPropagation(); void deleteServerFlow(s); }}><Icon name="trash" /></button>
                 </div>
