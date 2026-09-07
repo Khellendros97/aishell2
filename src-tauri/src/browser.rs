@@ -37,6 +37,8 @@ const BROWSER_LABEL_PREFIX: &str = "browser";
 /// AI 专用兜底视图 id：无可视页面且用户从未浏览过任何页面时，AI 工具使用的隐藏视图。
 const AI_VIEW_ID: &str = "ai";
 /// console 环形缓冲上限（AI browser_console 每次最多取 200 条）
+/// mac 上唯一写入方是 cfg(windows) 的 WebMessageReceived 钩子，故放行 dead_code
+#[cfg_attr(not(windows), allow(dead_code))]
 const CONSOLE_CAP: usize = 500;
 /// 截图保留张数上限（<workspace>/.aishell/tmp/screenshot，超出删最旧）
 const SCREENSHOT_KEEP: usize = 20;
@@ -315,29 +317,34 @@ impl BrowserManager {
             .map_err(|e| format!("创建浏览器视图失败: {e}"))?;
         let _ = wv.hide();
 
-        // 页面回传通道：element（检查器选中）/ console（钩子）经 WebMessageReceived 进入
-        let mgr_msg = Arc::clone(self);
-        let view_id_msg = view_id.to_string();
-        let _ = wv.with_webview(move |pw| unsafe {
-            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
-            use windows::core::PWSTR;
-            use windows::Win32::System::Com::CoTaskMemFree;
-            let Ok(core) = pw.controller().CoreWebView2() else { return };
-            let handler = webview2_com::WebMessageReceivedEventHandler::create(Box::new(
-                move |_sender, args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
-                    let Some(args) = args else { return Ok(()) };
-                    let mut raw = PWSTR::null();
-                    if args.TryGetWebMessageAsString(&mut raw).is_ok() && !raw.is_null() {
-                        let msg = raw.to_string().unwrap_or_default();
-                        CoTaskMemFree(Some(raw.as_ptr().cast()));
-                        handle_page_message(&mgr_msg, &view_id_msg, &msg);
-                    }
-                    Ok(())
-                },
-            ));
-            let mut token = 0i64;
-            let _ = core.add_WebMessageReceived(&handler, &mut token);
-        });
+        // 页面回传通道：element（检查器选中）/ console（钩子）经 WebMessageReceived 进入。
+        // WebView2 专属互操作须 cfg(windows) 门控（依赖已门控，代码不门控 mac 编译直接报错）；
+        // 非 Windows 暂无等价钩子，页面上报类动作（element/console 回传）不可用，其余动作不受影响
+        #[cfg(windows)]
+        {
+            let mgr_msg = Arc::clone(self);
+            let view_id_msg = view_id.to_string();
+            let _ = wv.with_webview(move |pw| unsafe {
+                use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs;
+                use windows::core::PWSTR;
+                use windows::Win32::System::Com::CoTaskMemFree;
+                let Ok(core) = pw.controller().CoreWebView2() else { return };
+                let handler = webview2_com::WebMessageReceivedEventHandler::create(Box::new(
+                    move |_sender, args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
+                        let Some(args) = args else { return Ok(()) };
+                        let mut raw = PWSTR::null();
+                        if args.TryGetWebMessageAsString(&mut raw).is_ok() && !raw.is_null() {
+                            let msg = raw.to_string().unwrap_or_default();
+                            CoTaskMemFree(Some(raw.as_ptr().cast()));
+                            handle_page_message(&mgr_msg, &view_id_msg, &msg);
+                        }
+                        Ok(())
+                    },
+                ));
+                let mut token = 0i64;
+                let _ = core.add_WebMessageReceived(&handler, &mut token);
+            });
+        }
 
         {
             let mut views = self.views.lock().unwrap();
@@ -522,10 +529,19 @@ impl BrowserManager {
     /// AI 动作 browser_screenshot：CDP Page.captureScreenshot 截图存
     /// `<workspace>/.aishell/tmp/screenshot/<ms>.png`，仅保留最新 20 张，返回文件路径。
     /// 隐藏态先临时显示并移到屏幕外（离屏渲染，用户不可见），截完恢复。
+    /// mac 上提前返回不支持截图，放行该分支产生的 unused/unreachable 提示
+    #[cfg_attr(not(windows), allow(unused_variables, unreachable_code))]
     pub async fn screenshot(self: &Arc<Self>, project_path: &Path) -> Result<String, String> {
         let view_id = self.ai_target();
         self.ensure(&view_id).await?;
         let wv = self.webview_of(&view_id)?;
+        // 截图走 WebView2 的 CDP 调用（Windows 专属互操作，见下方 with_webview），
+        // 非 Windows 直接不支持，避免白做离屏展示
+        #[cfg(not(windows))]
+        {
+            let _ = &wv;
+            return Err("截图功能依赖 WebView2 DevTools 协议，暂仅支持 Windows".to_string());
+        }
         let (was_shown, rect) = {
             let views = self.views.lock().unwrap();
             let Some(v) = views.get(&view_id) else {
@@ -540,43 +556,49 @@ impl BrowserManager {
             // 等渲染管线出帧后再截图
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
-        let sent = wv.with_webview(move |pw| unsafe {
-            use windows::core::PCWSTR;
-            let Ok(core) = pw.controller().CoreWebView2() else { return };
-            let method = windows::core::HSTRING::from("Page.captureScreenshot");
-            let params = windows::core::HSTRING::from(r#"{"format":"png"}"#);
-            let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-                move |_err, result_json: String| {
-                    let out = (|| {
-                        let v: serde_json::Value = serde_json::from_str(&result_json)
-                            .map_err(|e| format!("截图结果解析失败: {e}"))?;
-                        let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                        if data.is_empty() {
-                            return Err("截图返回空数据（页面可能尚未渲染）".to_string());
-                        }
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
-                            .map_err(|e| format!("截图解码失败: {e}"))
-                    })();
-                    let _ = tx.send(out);
-                    Ok(())
+        #[cfg(windows)]
+        let outcome = {
+            let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+            let sent = wv.with_webview(move |pw| unsafe {
+                use windows::core::PCWSTR;
+                let Ok(core) = pw.controller().CoreWebView2() else { return };
+                let method = windows::core::HSTRING::from("Page.captureScreenshot");
+                let params = windows::core::HSTRING::from(r#"{"format":"png"}"#);
+                let handler = webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(
+                    Box::new(move |_err, result_json: String| {
+                        let out = (|| {
+                            let v: serde_json::Value = serde_json::from_str(&result_json)
+                                .map_err(|e| format!("截图结果解析失败: {e}"))?;
+                            let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                            if data.is_empty() {
+                                return Err("截图返回空数据（页面可能尚未渲染）".to_string());
+                            }
+                            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+                                .map_err(|e| format!("截图解码失败: {e}"))
+                        })();
+                        let _ = tx.send(out);
+                        Ok(())
+                    }),
+                );
+                let _ = core.CallDevToolsProtocolMethod(
+                    PCWSTR::from_raw(method.as_ptr()),
+                    PCWSTR::from_raw(params.as_ptr()),
+                    &handler,
+                );
+            });
+            match sent {
+                Err(e) => Err(format!("调用截图接口失败: {e}")),
+                Ok(()) => match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                    Ok(Ok(Ok(bytes))) => Ok(bytes),
+                    Ok(Ok(Err(e))) => Err(e),
+                    Ok(Err(_)) => Err("截图回调丢失".to_string()),
+                    Err(_) => Err("截图超时".to_string()),
                 },
-            ));
-            let _ = core.CallDevToolsProtocolMethod(
-                PCWSTR::from_raw(method.as_ptr()),
-                PCWSTR::from_raw(params.as_ptr()),
-                &handler,
-            );
-        });
-        let outcome = match sent {
-            Err(e) => Err(format!("调用截图接口失败: {e}")),
-            Ok(()) => match tokio::time::timeout(Duration::from_secs(10), rx).await {
-                Ok(Ok(Ok(bytes))) => Ok(bytes),
-                Ok(Ok(Err(e))) => Err(e),
-                Ok(Err(_)) => Err("截图回调丢失".to_string()),
-                Err(_) => Err("截图超时".to_string()),
-            },
+            }
         };
+        // 非 Windows 已在函数前部提前返回；此定义仅为类型完整性（unreachable 不影响编译）
+        #[cfg(not(windows))]
+        let outcome: Result<Vec<u8>, String> = Err(String::new());
         if !was_shown {
             let _ = wv.set_position(LogicalPosition::new(rect.0, rect.1));
             let _ = wv.set_size(LogicalSize::new(rect.2, rect.3));
@@ -610,6 +632,8 @@ impl BrowserManager {
 
 /* ---------------- 页面消息（WebMessageReceived）分发 ---------------- */
 
+/// mac 上唯一调用方是 cfg(windows) 的钩子闭包（tests 也用），故放行 dead_code
+#[cfg_attr(not(windows), allow(dead_code))]
 fn handle_page_message(mgr: &BrowserManager, view_id: &str, msg: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) else { return };
     match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
