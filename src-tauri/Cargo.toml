@@ -49,6 +49,10 @@ tokio = { version = "1.53.1", features = ["full"] }
 async-trait = "0.1.91"
 futures = "0.3.33"
 tauri-plugin-dialog = "2.7.2"
+# 系统通知（Windows toast）：AI 审批/ask/confirm/任务完成与耗时操作完成提醒（notify.rs，
+# 直接用 WinRT toast——不用 tauri-plugin-notification：其 JS 发送走 WebView2 Web Notification
+# 重复通知被吞，Rust 命令又接不到 on_activated（无法点击聚焦），未注册 AUMID 还回退 PowerShell 图标）
+tauri-winrt-notification = "0.7"
 base64 = "0.22"
 # 智能审批：直连 LLM API 判定操作是否危险（不走 pi）
 reqwest = { version = "0.12", features = ["json"] }

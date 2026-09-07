@@ -59,6 +59,8 @@ const EMPTY_STATE: AppState = {
     autoBackupRemoteFiles: true,
     compactServerList: false,
     tunnelAutoStart: true,
+    notifyAi: true,
+    notifyLongTasks: true,
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},

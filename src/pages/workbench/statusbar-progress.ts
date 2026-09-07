@@ -14,8 +14,14 @@
  * 到达会自动移除任务槽，无需调用方重复隐藏。SFTP 面板的压缩/解压/快速备份（ssh_exec
  * 直执长命令，无逐字节进度）也走显式控制：调用期间显示不确定 loading 槽（SftpTab
  * runRemoteCommand 的 busyTitle 参数）。
+ *
+ * 耗时操作完成通知：任务槽记录首次出现时刻（startedAt），done / completeProgress 收槽时
+ * 时长超过 NOTIFY_MIN_MS（30 秒）才发系统通知（开关与窗口焦点过滤在 shared/notify.ts）。
+ * hideProgress 保持静默（失败/异常兜底路径不发「完成」通知）；sftp done 依赖后端
+ * SftpProgress.ok（失败不发）。SFTP 面板压缩/解压/备份在成功分支改调 completeProgress。
  */
 import { onSftpProgress, onStagingProgress } from '../../api';
+import { NOTIFY_MIN_MS, notifyLongTask } from '../../shared/notify';
 import type { SftpProgress, StagingProgress } from '../../types';
 
 interface Task {
@@ -24,6 +30,8 @@ interface Task {
   /** 确定进度（0-100）或 null = 不确定（数据不足时显示滚动条） */
   pct: number | null;
   detail: string;
+  /** 任务槽首次出现时刻（耗时通知据此判定是否达到门槛） */
+  startedAt: number;
 }
 
 const tasks = new Map<string, Task>();
@@ -67,12 +75,36 @@ function formatBytes(n: number): string {
 
 function upsert(key: string, title: string, pct: number | null, detail: string): void {
   const prev = tasks.get(key);
-  tasks.set(key, { key, title, pct, detail });
+  tasks.set(key, { key, title, pct, detail, startedAt: prev?.startedAt ?? Date.now() });
   if (prev || rootEl()) render();
 }
 
 function finish(key: string): void {
   if (tasks.delete(key)) render();
+}
+
+/** 时长人类可读（秒 / 分秒） */
+function formatDuration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s} 秒`;
+  return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+}
+
+/** 由任务槽标题派生完成通知：「正在压缩 a.tgz」→ 标题「压缩完成」+ 名称「a.tgz」；
+ *  「上传 big.iso」→「上传完成」+「big.iso」；「上传中」→「上传完成」。 */
+function deriveDone(t: Task): { title: string; name: string } {
+  const base = t.title.replace(/^正在/, '');
+  const sp = base.indexOf(' ');
+  if (sp > 0) return { title: `${base.slice(0, sp)}完成`, name: base.slice(sp + 1) };
+  return { title: `${base.replace(/中$/, '')}完成`, name: '' };
+}
+
+/** 完成通知：超过耗时门槛（30 秒）才发；开关与窗口焦点过滤在 shared/notify.ts */
+function notifyDone(t: Task): void {
+  const dur = Date.now() - t.startedAt;
+  if (dur < NOTIFY_MIN_MS) return;
+  const { title, name } = deriveDone(t);
+  notifyLongTask(title, `${name ? `${name} · ` : ''}耗时 ${formatDuration(dur)}`);
 }
 
 /** 底边栏进度注册（幂等；工作台挂载后 #workbench-progress 容器出现，事件到达即显示） */
@@ -81,7 +113,10 @@ function ensureSubscribed(): void {
   subscribed = true;
   void onSftpProgress((p: SftpProgress) => {
     if (p.phase === 'done') {
+      const t = tasks.get(p.taskId);
       finish(p.taskId);
+      /* ok=false = 传输失败：收槽但不发完成通知（失败现场有 toast / debug 日志） */
+      if (t && p.ok !== false) notifyDone(t);
       return;
     }
     const dir = p.direction === 'upload' ? '上传' : '下载';
@@ -108,7 +143,9 @@ function ensureSubscribed(): void {
   void onStagingProgress((p: StagingProgress) => {
     const key = `staging:${p.projectId}:${p.sessionId}`;
     if (p.phase === 'done') {
+      const t = tasks.get(key);
       finish(key);
+      if (t) notifyDone(t);
       return;
     }
     const name = p.currentPath.split('/').filter(Boolean).pop() || p.currentPath;
@@ -130,9 +167,20 @@ export function showProgress(title: string, key = 'manual', detail = ''): void {
   upsert(key, title, null, detail);
 }
 
-/** 移除一个手动任务槽（操作失败/完成时兜底；未显示时无操作） */
+/** 移除一个手动任务槽（操作失败/完成时兜底；未显示时无操作）。
+ *  静默收槽：失败/异常兜底路径不发完成通知（成功路径应调 completeProgress）。 */
 export function hideProgress(key = 'manual'): void {
   finish(key);
+}
+
+/** 手动任务槽成功完成（SFTP 压缩/解压/快速备份等 ssh_exec 长命令）：收槽并按耗时门槛
+ *  发完成通知。与 hideProgress 的区别仅在于是否通知；重复调用/槽已不存在时无操作，
+ *  故调用方 finally 里的 hideProgress 兜底保持幂等。 */
+export function completeProgress(key = 'manual'): void {
+  const t = tasks.get(key);
+  if (!t) return;
+  finish(key);
+  notifyDone(t);
 }
 
 /** 工作台挂载完成时补渲染（事件在容器出现前到达时任务已入队列，需刷新展示）；

@@ -38,6 +38,8 @@ interface SysFields {
   mcpPort: string;
   compactServerList: boolean;
   tunnelAutoStart: boolean;
+  notifyAi: boolean;
+  notifyLongTasks: boolean;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -45,7 +47,7 @@ const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '', compactServerList: false,
-  tunnelAutoStart: true,
+  tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true,
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -193,6 +195,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       mcpPort: String(s.mcp?.port ?? 8945),
       compactServerList: s.settings.compactServerList ?? false,
       tunnelAutoStart: s.settings.tunnelAutoStart ?? true,
+      notifyAi: s.settings.notifyAi ?? true,
+      notifyLongTasks: s.settings.notifyLongTasks ?? true,
     });
     void refreshMcpStatus();
   };
@@ -279,6 +283,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       autoBackupRemoteFiles: fields.autoBackup,
       compactServerList: fields.compactServerList,
       tunnelAutoStart: fields.tunnelAutoStart,
+      notifyAi: fields.notifyAi,
+      notifyLongTasks: fields.notifyLongTasks,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -446,6 +452,29 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, tunnelAutoStart: checked })); }}
                 />
                 <div className="hint">开启后，上次处于启用状态的 SSH 隧道随 AIShell 启动自动恢复。关闭后：AIShell 退出时会自动把所有隧道设为禁用（下次启动不再恢复），运行期间手动启动隧道不受影响</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>系统通知</legend>
+              <div className="field">
+                <label>AI 助手通知</label>
+                <input
+                  id="f-notify-ai"
+                  type="checkbox"
+                  checked={fields.notifyAi}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, notifyAi: checked })); }}
+                />
+                <div className="hint">AI 助手等待审批、提出问题（ask/confirm）或任务完成时发送系统通知；AIShell 窗口在前台时不打扰</div>
+              </div>
+              <div className="field">
+                <label>耗时操作通知</label>
+                <input
+                  id="f-notify-long-tasks"
+                  type="checkbox"
+                  checked={fields.notifyLongTasks}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, notifyLongTasks: checked })); }}
+                />
+                <div className="hint">文件上传/下载、压缩/备份、暂存目录等耗时操作（超过 30 秒）完成时发送系统通知；窗口在前台时不打扰</div>
               </div>
             </fieldset>
             <fieldset className="llm-group">

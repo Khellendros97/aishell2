@@ -129,6 +129,15 @@ pub struct Settings {
     /// 旧配置无此字段时按开启处理（默认开启，保持原行为）。
     #[serde(default = "default_true")]
     pub tunnel_auto_start: bool,
+    /// AI 助手系统通知：AI 等待审批、ask/confirm 提问、任务完成时发系统通知
+    /// （仅 AIShell 窗口未聚焦时发送，见前端 shared/notify.ts）。
+    /// 旧配置无此字段时按开启处理（默认开启）。
+    #[serde(default = "default_true")]
+    pub notify_ai: bool,
+    /// 耗时操作系统通知：上传/下载/备份/暂存目录等超过 30 秒的操作完成时发系统通知
+    /// （仅窗口未聚焦时发送，门槛由前端判定）。旧配置无此字段时按开启处理（默认开启）。
+    #[serde(default = "default_true")]
+    pub notify_long_tasks: bool,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -145,6 +154,8 @@ impl Default for Settings {
             auto_backup_remote_files: true,
             compact_server_list: false,
             tunnel_auto_start: true,
+            notify_ai: true,
+            notify_long_tasks: true,
         }
     }
 }
@@ -3544,6 +3555,8 @@ mod tests {
                 auto_backup_remote_files: true,
                 compact_server_list: false,
                 tunnel_auto_start: true,
+                notify_ai: true,
+                notify_long_tasks: true,
             },
             credentials: vec![
                 Credential {
@@ -6569,6 +6582,8 @@ mod tests {
                     auto_backup_remote_files: true,
                     compact_server_list: false,
                     tunnel_auto_start: true,
+                    notify_ai: true,
+                    notify_long_tasks: true,
                 },
                 Some("sk-test-key"),
                 None,
@@ -6763,6 +6778,8 @@ mod tests {
                     auto_backup_remote_files: true,
                     compact_server_list: false,
                     tunnel_auto_start: true,
+                    notify_ai: true,
+                    notify_long_tasks: true,
                 },
                 None,
                 Some("bsk-1"),
@@ -7777,6 +7794,37 @@ mod tests {
         let reloaded = test_store(config);
         assert!(reloaded.settings().tunnel_auto_start, "旧配置无字段默认开启");
         assert!(reloaded.tunnels_all().iter().all(|t| !t.enabled), "禁用态应已落盘");
+    }
+
+    /// 系统通知开关：旧配置 settings 无 notifyAi / notifyLongTasks 字段按开启（默认提醒）。
+    #[test]
+    fn system_notify_flags_default_on_legacy_config() {
+        let config = temp_config_dir("notify-default");
+        let store = test_store(config.clone());
+        // 触发一次设置落盘，状态文件才存在（Store 变更时原子写）
+        store
+            .save_settings(store.settings().clone(), None, None)
+            .unwrap();
+        // 删掉两个通知字段模拟旧配置
+        let state_path = config.join(STATE_FILE);
+        let raw = fs::read(&state_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let settings = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        settings.remove("notifyAi");
+        settings.remove("notifyLongTasks");
+        fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = test_store(config);
+        assert!(reloaded.settings().notify_ai, "旧配置无 notifyAi 字段默认开启");
+        assert!(
+            reloaded.settings().notify_long_tasks,
+            "旧配置无 notifyLongTasks 字段默认开启"
+        );
     }
 
     /// 浏览器历史过滤：URL 与标题均参与、大小写不敏感；空 query 不过滤保持 MRU 序。

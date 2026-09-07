@@ -72,6 +72,7 @@ import { DND_MIME, getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wb
 import { getBrowserPagesForMention, openInActivePage } from '../tabs/browser-engine';
 import { addQuickCommandModal } from '../tabs/useTerminal';
 import { hideProgress } from '../statusbar-progress';
+import { clipBody, notifyAi } from '../../../shared/notify';
 import { confirmDialog, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { openAiDbApprovalModal, type DbRequestDetail } from './AiDbApproval';
 import { openArchiveModal } from './ArchiveModal';
@@ -1506,10 +1507,12 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：弹确认框，
        不进动作卡；其余仍为 Agent 逐调用审批卡 */
     if (ev.action === 'request_agent_mode') {
+      notifyAi('AI 请求切换到工作模式', clipBody(ev.intent || ev.summary));
       void handleModeRequest(eventContext!, sid, ev);
     } else if (ev.action === 'request_db_connection') {
       /* AI 申请数据库连接：插入审批卡片（带 AI 填写的连接信息，只读展示），
          点【审批】打开审批对话框（见 openDbApproval）；关闭对话框不回执、可重开 */
+      notifyAi('AI 申请数据库连接', clipBody(ev.summary || ev.intent));
       const cur = pendingBy.get(sid) ?? null;
       const p = cur ?? emptyPending();
       const existing = p.actions.get(ev.toolCallId);
@@ -1546,6 +1549,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
       pendingBy.set(sid, p);
     } else {
       /* Agent 审批请求：卡片进入审批态（显示意图 + 批准/拒绝按钮） */
+      notifyAi('AI 操作等待审批', clipBody(ev.summary || ev.intent));
       const cur = pendingBy.get(sid) ?? null;
       const p = cur ?? emptyPending();
       const existing = p.actions.get(ev.toolCallId);
@@ -1568,6 +1572,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
   } else if (ev.type === 'ask') {
     /* ask 工具（通用问答）：插入问答卡片（每问候选选项 + 自由输入框），
        提交/取消经 aiRespondAsk 回执（submitAsk/cancelAsk）；卡片终态由前端本地标记 */
+    notifyAi('AI 助手有问题等待回答', clipBody(ev.questions[0]?.question ?? ''));
     const cur = pendingBy.get(sid) ?? null;
     const p = cur ?? emptyPending();
     const existing = p.actions.get(ev.toolCallId);
@@ -1585,6 +1590,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     pendingBy.set(sid, p);
   } else if (ev.type === 'confirm') {
     /* confirm 工具（通用是非确认）：插入确认卡片（确认/取消），经 aiRespondConfirm 回执 */
+    notifyAi('AI 助手请求确认', clipBody(ev.question));
     const cur = pendingBy.get(sid) ?? null;
     const p = cur ?? emptyPending();
     const existing = p.actions.get(ev.toolCallId);
@@ -1681,7 +1687,8 @@ function finalize(sid: string): void {
   if (!s || !p || p.phase !== 'stream') {
     if (s) persistSession(s);
     return;
-  }  const text = p.text.trim() ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
+  }  const hasText = !!p.text.trim();
+  const text = hasText ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
   s.messages.push({
     role: 'assistant',
     content: text,
@@ -1696,6 +1703,8 @@ function finalize(sid: string): void {
     ts: Date.now(),
   });
   persistSession(s);
+  /* 任务完成系统通知（开关与窗口焦点过滤在 shared/notify.ts）；错误/中止与空回复占位不发 */
+  if (hasText) notifyAi('AI 任务完成', clipBody(`${s.title}：${text}`));
   if (sid === activeSessionId) renderSessionBar();
 }
 

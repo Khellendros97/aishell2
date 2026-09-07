@@ -5,7 +5,8 @@
       "resources/pi",
       "resources/git-portable",
       "resources/python-embed",
-      "resources/pysdk"
+      "resources/pysdk",
+      "icons/icon.png"
     ]
   }
 }

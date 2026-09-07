@@ -37,6 +37,10 @@ export interface Settings {
   compactServerList: boolean;
   /** AIShell 启动时自动恢复上次 enabled 的 SSH 隧道；关闭后退出时自动禁用所有隧道；旧配置无此字段按开启 */
   tunnelAutoStart: boolean;
+  /** AI 助手系统通知：等待审批、ask/confirm 提问、任务完成时发系统通知（仅窗口未聚焦时）；旧配置无此字段按开启 */
+  notifyAi: boolean;
+  /** 耗时操作系统通知：上传/下载/备份/暂存目录等超过 30 秒的操作完成时发系统通知（仅窗口未聚焦时）；旧配置无此字段按开启 */
+  notifyLongTasks: boolean;
 }
 
 /** MCP 服务全局配置（AppState 顶层字段）—— 与 store.rs McpServiceConfig serde camelCase 对齐。
@@ -671,4 +675,6 @@ export interface SftpProgress {
   totalBytes: number;
   filesDone: number;
   filesTotal: number;
+  /** done 阶段携带传输是否成功（进度阶段恒为 true）；耗时操作完成通知仅在成功时发送 */
+  ok?: boolean;
 }

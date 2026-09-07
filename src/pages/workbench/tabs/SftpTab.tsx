@@ -51,7 +51,7 @@ import {
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
 import { revealLocalPath } from '../sidebar/ExplorerPanel';
-import { hideProgress, showProgress } from '../statusbar-progress';
+import { completeProgress, hideProgress, showProgress } from '../statusbar-progress';
 
 interface SftpEls {
   body: HTMLElement;
@@ -589,6 +589,8 @@ async function runRemoteCommand(st: SftpTabState, command: string, doneToast: st
       success ? doneToast : `${doneToast}失败，详见 debug 日志`,
       success ? 'success' : 'error',
     );
+    /* 成功完成发耗时通知（≥30 秒才发）；失败静默收槽，finally hideProgress 兜底（幂等） */
+    if (success && jobKey) completeProgress(jobKey);
     st.sel.clear();
     if (success && focusPath) focusAfterRefresh(st, focusPath);
     else void loadDir(st);
