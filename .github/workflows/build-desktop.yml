@@ -1,7 +1,9 @@
 # 桌面端云端构建：macOS（arm64/x64）+ Windows（x64）。
 # 手动触发（Actions → build-desktop → Run workflow）：只产 Artifacts（需登录下载，90 天有效）。
 # 推送 v* tag：额外由 publish-release 汇总安装包挂到同名 GitHub Release（任何人免登录可下载）。
-# 未签名/未公证：
+# 签名/公证（可选）：在仓库 Secrets 配置 APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+# APPLE_API_ISSUER / APPLE_API_KEY / APPLE_API_KEY_P8 后，macOS 构建自动做 Developer ID 签名 +
+# 公证（Tauri bundler 原生识别这些环境变量，无需额外 action）；未配置时保持未签名构建：
 # - macOS 首次打开报「已损坏」：xattr -dr com.apple.quarantine /Applications/AIShell.app
 # - Windows SmartScreen 拦截：点「更多信息 → 仍要运行」
 name: build-desktop
@@ -30,6 +32,10 @@ jobs:
             target: x86_64-apple-darwin
             arch: x64
     runs-on: ${{ matrix.runner }}
+    env:
+      # 签名/公证开关：对应 secret 未配置时为空串，签名步骤整体跳过（保持未签名构建）
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -52,7 +58,61 @@ jobs:
       # 独立成步是为了下载/解压失败时日志定位直接。走 latest/download 重定向，免 API 免鉴权）
       - run: npm run fetch-pi
 
+      # —— Developer ID 签名 + 公证（对应 secrets 未配置时自动跳过）——
+      # 证书导入临时专用 keychain（runner 自带 login keychain 密码未知，专用 keychain 全程可控）；
+      # set-key-partition-list 放行命令行非交互访问，避免本机踩过的 errSecInternalComponent
+      # （SSH/CI 无 GUI，钥匙串授权弹窗点不了）。
+      - name: 导入签名证书
+        if: env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN: ${{ runner.temp }}/build.keychain
+        run: |
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          # 防止长编译期间 keychain 自动锁上导致后续 codesign 找不到身份
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed -e s/\"//g)
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$APPLE_CERTIFICATE_PASSWORD" "$KEYCHAIN"
+          echo "APPLE_SIGNING_IDENTITY=Developer ID Application: Zhang Yu (ETN2Y9FPW2)" >> "$GITHUB_ENV"
+
+      - name: 写入公证 API 密钥
+        if: env.APPLE_CERTIFICATE != '' && env.APPLE_API_KEY_P8 != ''
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          P8="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8" > "$P8"
+          echo "APPLE_API_KEY_PATH=$P8" >> "$GITHUB_ENV"
+
+      # Tauri 不签 resources（踩坑记录），pi 必须在打包前补签；hardened runtime 默认禁 JIT，
+      # pi 内嵌 JS 引擎需要 entitlements 放行，否则签名后的包里 AI 引擎无法启动
+      - name: 补签 pi sidecar
+        if: env.APPLE_CERTIFICATE != ''
+        run: |
+          cat > "$RUNNER_TEMP/pi-entitlements.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key><true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --options runtime --timestamp \
+            --entitlements "$RUNNER_TEMP/pi-entitlements.plist" \
+            --sign "$APPLE_SIGNING_IDENTITY" src-tauri/resources/pi/pi
+
       - run: npm run tauri -- build --target ${{ matrix.target }}
+        env:
+          # 公证走 App Store Connect API 密钥路线（APPLE_API_KEY_PATH 由「写入公证 API 密钥」步导出；
+          # 未配置时 bundler 自动跳过公证，只签名）
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -127,7 +187,7 @@ jobs:
 
             ## macOS 首次打开提示「已损坏」？
 
-            应用未做苹果签名/公证，这是 Gatekeeper 对未签名应用的统一误报。拖进「应用程序」后在终端执行一次即可：
+            未签名/未公证的构建（未配置签名 Secrets 的版本）会被 Gatekeeper 误报。拖进「应用程序」后在终端执行一次即可：
 
             ```bash
             xattr -dr com.apple.quarantine /Applications/AIShell.app
