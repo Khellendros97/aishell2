@@ -9,6 +9,7 @@ pub mod dws;
 pub mod fsops;
 pub mod mcp;
 pub mod notes;
+pub mod notify;
 pub mod redact;
 pub mod session_title;
 pub mod pythoninstall;
@@ -295,6 +296,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             term::term_record_start,
             term::term_record_stop,
             term::debug_export,
+            notify::system_notify,
             fsops::fs_list,
             fsops::fs_is_text,
             fsops::fs_read,

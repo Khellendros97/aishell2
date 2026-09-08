@@ -104,7 +104,7 @@
 .staging-table .st-actions { white-space: nowrap; text-align: right; }
 .staging-table .st-actions .btn { margin-left: 4px; }
 
-/* 暂存/清理进度已迁移至底边栏（statusbar-progress.ts + workbench.css .wb-progress-*） */
+/* 暂存/清理进度已迁移至底边栏（statusbar-progress.ts + components/statusbar.css .wb-progress-*） */
 
 /* ---------- 导出备份对话框（蒙层/骨架复用 design.css .modal-*，以下为内容区） ---------- */
 .staging-export-label {

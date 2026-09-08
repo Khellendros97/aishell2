@@ -218,7 +218,7 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
                     <span className="db-switch-track"></span>
                   </label>
                   <span className="db-conn-ops">
-                    <button className="icon-btn" title="编辑" onClick={() => openForm(c)}><Icon name="pencil" /></button>
+                    <button className="icon-btn" title="编辑" onClick={() => openForm(c)}><Icon name="gear" /></button>
                     <button className="icon-btn" title="删除" onClick={() => deleteConn(c)}><Icon name="trash" /></button>
                   </span>
                 </div>
@@ -847,7 +847,7 @@ function ServersPanelBody(): JSX.Element {
                       <>
                         <button className="icon-btn wbs-edit" title="编辑服务器配置" aria-label="编辑服务器配置"
                           onClick={(e) => { e.stopPropagation(); openEditModal(s); }}>
-                          <Icon name="pencil" />
+                          <Icon name="gear" />
                         </button>
                         <button className={`icon-btn wbs-lock${s.locked ? ' locked' : ''}`} title={lockTitle} aria-label={lockTitle} aria-pressed={s.locked}
                           onClick={(e) => { e.stopPropagation(); toggleLock(s); }}>
@@ -997,7 +997,7 @@ function ServersPanelBody(): JSX.Element {
                         <span className="jump-target-addr mono">{t.server.host}:{t.server.port} · {t.server.username || '未设账号'}</span>
                       </span>
                       <button className="icon-btn" title="编辑目标主机" aria-label="编辑目标主机" onClick={() => openTargetEditModal(t.server)}>
-                        <Icon name="pencil" />
+                        <Icon name="gear" />
                       </button>
                       <button className="icon-btn" title="删除目标主机" aria-label="删除目标主机" onClick={() => deleteJumpTarget(t.server.id)}>
                         <Icon name="trash" />

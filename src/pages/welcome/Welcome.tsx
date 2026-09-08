@@ -10,6 +10,9 @@
  * get_task_project（欢迎页 AI 系统任务上下文）；浏览按钮走 @tauri-apps/plugin-dialog 的 openDialog，
  * 通用 SSH 配置迁移走 AI + python-script skill。
  * 服务器 #tag 筛选与热门标签 chips 复用 src/shared/search.ts 的共享解析器。
+ * 底栏用三页共用的 components/Statusbar（进度区/隧道角标/AI 开关）；右侧 AI 面板
+ * 支持拖宽（shared/panelResize.ts 共享钩子，宽度落 .welcome-content 的 --welcome-ai-w 变量）
+ * 与底栏 AI 开关显隐（会话级，不落盘）。
  *
  * 服务器表单（mini 快捷新建 + 弹层完整模式）由并行迁移的 src/pages/settings/ServerForm.tsx 提供，
  * ref 句柄语义以 legacy/pages/server-form.ts 的 ServerFormHandle 为准
@@ -43,6 +46,8 @@ import { ServerForm, type ServerFormHandle } from '../settings/ServerForm';
 import { saveServerWithCredentialChoice } from '../settings/server-save';
 import { AiPanel } from '../workbench/ai/AiPanel';
 import type { AiPanelController } from '../workbench/ai/ai-engine';
+import { Statusbar } from '../../components/Statusbar';
+import { usePanelResize } from '../../shared/panelResize';
 import '../welcome.css';
 
 const welcomeLogoUrl = new URL('../../assets/logo.svg', import.meta.url).href;
@@ -62,6 +67,8 @@ const EMPTY_STATE: AppState = {
     knowledge: { autoInject: true, injectCount: 5 },
     compactServerList: false,
     tunnelAutoStart: true,
+    notifyAi: true,
+    notifyLongTasks: true,
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
@@ -175,6 +182,21 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
   const [taskError, setTaskError] = useState<string | null>(null);
   const [taskAiReady, setTaskAiReady] = useState(false);
   const taskAiRef = useRef<AiPanelController | null>(null);
+
+  /* ---------- 右侧 AI 面板显隐与拖宽（底栏 AI 开关 + main/aside 之间分隔条） ---------- */
+  const [aiVisible, setAiVisible] = useState(true);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const aiAsideRef = useRef<HTMLElement>(null);
+  const aiResizerRef = useRef<HTMLDivElement>(null);
+  usePanelResize(aiResizerRef, aiAsideRef, 'right', (width) => {
+    const content = contentRef.current;
+    if (!content) return;
+    // 钳制：最小 320；最大不超过 720 且给主列表区留出至少 420px
+    const availableMaximum = Math.max(320, Math.min(720, content.clientWidth - 420));
+    const next = Math.round(Math.max(320, Math.min(width, availableMaximum)));
+    content.style.setProperty('--welcome-ai-w', `${next}px`);
+    aiResizerRef.current?.setAttribute('aria-valuenow', String(next));
+  });
 
   /* ---------- 项目模态框状态（新建 / 编辑） ---------- */
   const [modalOpen, setModalOpen] = useState(false);
@@ -914,7 +936,11 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
             onClick={(e) => { e.stopPropagation(); toggleRow(p.id); }}>
             <Icon name={expanded ? 'chevronDown' : 'chevronRight'} />
           </button>
-          <span className="pr-name ellipsis" title={p.name}>{p.name}</span>
+          {/* 项目名可点击直接进入项目：链接只包住文字本身，名称右侧空白归整行（点击展开子表） */}
+          <span className="pr-name ellipsis">
+            <span className="pr-name-link" title={`${p.name}（点击进入项目）`}
+              onClick={(e) => { e.stopPropagation(); navigate('#/workbench?project=' + p.id); }}>{p.name}</span>
+          </span>
           <span className="pr-path mono ellipsis" title={displayPath}>{displayPath}</span>
           <span className="tag pr-count">{servers.length} 台服务器</span>
           <div className="pr-actions">
@@ -934,9 +960,15 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
                 <span className="ps-host mono">{s.host}:{s.port}</span>
                 <span className="ps-user">{s.username || '-'}</span>
                 {s.authType === 'password' ? <span className="tag blue">密码</span> : <span className="tag yellow">{s.authType === 'publickey' ? 'SSH 公钥' : '密钥'}</span>}
+                {/* 用户自定义标签（与侧栏服务器卡一致的 #hash chips，单行省略不撑高行） */}
+                {s.tags.length ? (
+                  <span className="ps-tags">
+                    {s.tags.map((t) => <span key={t} className="tag blue"><Icon name="hash" />{t}</span>)}
+                  </span>
+                ) : null}
                 <div className="ps-actions">
                   <button className="icon-btn" data-act="srv-edit" data-id={s.id} title="编辑服务器"
-                    onClick={(e) => { e.stopPropagation(); openSrvModal(s, null); }}><Icon name="pencil" /></button>
+                    onClick={(e) => { e.stopPropagation(); openSrvModal(s, null); }}><Icon name="gear" /></button>
                   <button className="icon-btn danger" data-act="srv-del" data-id={s.id} title="删除服务器"
                     onClick={(e) => { e.stopPropagation(); void deleteServerFlow(s); }}><Icon name="trash" /></button>
                 </div>
@@ -1027,7 +1059,7 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
   /* ---------- 页面骨架（DOM 结构 / 类名 / 文案与 legacy welcome.ts 一致） ---------- */
   return (
     <div className="welcome-page" style={PAGE_ROOT_STYLE}>
-      <div className="welcome-content">
+      <div className="welcome-content" ref={contentRef}>
       <main>
         <img className="welcome-logo-watermark" src={welcomeLogoUrl} alt="" aria-hidden="true" />
 
@@ -1138,7 +1170,13 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
           <div>没有匹配的项目，试试其他关键词</div>
         </div>
       </main>
-      <aside className="welcome-ai" aria-label="AI 助手">
+      {/* AI 面板拖宽分隔条（交互语义同工作台 ai-resizer；AI 隐藏时一并收起） */}
+      <div
+        ref={aiResizerRef}
+        className={`wb-resize-handle welcome-ai-resizer${aiVisible ? '' : ' hidden'}`}
+        role="separator" aria-orientation="vertical" aria-label="调整 AI 助手面板宽度" tabIndex={0}
+      ></div>
+      <aside id="welcome-ai" ref={aiAsideRef} className={`welcome-ai${aiVisible ? '' : ' hidden'}`} aria-label="AI 助手">
         <div className="welcome-ai-head"><Icon name="bot" /><span>AI 助手</span><span className="tag">本地任务</span></div>
         <div className="welcome-ai-body">
           {taskProject ? (
@@ -1160,6 +1198,13 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
         </div>
       </aside>
       </div>
+
+      {/* 三页共用底栏：进度区/隧道角标/AI 开关在组件内自持，欢迎页只接 AI 显隐 */}
+      <Statusbar
+        aiVisible={aiVisible}
+        aiControls="welcome-ai"
+        onToggleAi={() => setAiVisible((v) => !v)}
+      />
 
       {/* 新建 / 编辑项目模态框（常驻挂载，.open 控制显隐，同 legacy 骨架） */}
       <div className={`modal-mask${modalOpen ? ' open' : ''}`} id="proj-modal"

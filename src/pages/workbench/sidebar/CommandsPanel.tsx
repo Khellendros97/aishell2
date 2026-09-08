@@ -287,7 +287,7 @@ function QuickCommandCard({ d }: { d: DisplayedCommand }): JSX.Element {
         {qc.global ? <span className="tag blue wbs-commands-global-tag">全局</span> : null}
         <span className="wbs-commands-qc-icons">
           <button className="icon-btn wbs-commands-edit" title="编辑" onClick={() => openQuickCommandModal(d.qc, d.owner)}>
-            <Icon name="pencil" />
+            <Icon name="gear" />
           </button>
           <button className="icon-btn danger wbs-commands-del" title="删除" onClick={() => void deleteQuickCommand(d)}>
             <Icon name="trash" />

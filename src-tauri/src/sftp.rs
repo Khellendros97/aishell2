@@ -36,6 +36,9 @@ pub struct SftpProgress {
     /// files 阶段累计完成文件数（total 未知时为 0）
     pub files_done: u64,
     pub files_total: u64,
+    /// done 阶段携带传输是否成功（前端据此决定是否发「完成」系统通知，失败不发）；
+    /// 进度阶段恒为 true
+    pub ok: bool,
 }
 
 /// upload_one / download_one 的进度回调事件（命令层转译为 `sftp:progress`）；
@@ -198,6 +201,7 @@ pub async fn sftp_upload(
                     total_bytes: total,
                     files_done: 0,
                     files_total: 0,
+                    ok: true,
                 },
                 ProgressEvent::FileDone { current } => SftpProgress {
                     task_id: task_id.clone(),
@@ -209,6 +213,7 @@ pub async fn sftp_upload(
                     total_bytes: 0,
                     files_done: files_done.fetch_add(1, Ordering::SeqCst) + 1,
                     files_total: 0,
+                    ok: true,
                 },
             };
             let _ = app.emit("sftp:progress", p);
@@ -227,6 +232,7 @@ pub async fn sftp_upload(
             total_bytes: 0,
             files_done: 0,
             files_total: 0,
+            ok: result.is_ok(),
         },
     );
     result
@@ -362,6 +368,7 @@ pub async fn sftp_download(
                     total_bytes: total,
                     files_done: 0,
                     files_total: 0,
+                    ok: true,
                 },
                 ProgressEvent::FileDone { current } => SftpProgress {
                     task_id: task_id.clone(),
@@ -373,6 +380,7 @@ pub async fn sftp_download(
                     total_bytes: 0,
                     files_done: files_done.fetch_add(1, Ordering::SeqCst) + 1,
                     files_total: 0,
+                    ok: true,
                 },
             };
             let _ = app.emit("sftp:progress", p);
@@ -391,6 +399,7 @@ pub async fn sftp_download(
             total_bytes: 0,
             files_done: 0,
             files_total: 0,
+            ok: result.is_ok(),
         },
     );
     result

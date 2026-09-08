@@ -1,0 +1,53 @@
+/* ============================================================
+   应用底栏样式（components/Statusbar.tsx 配套；自 workbench.css 迁出，
+   工作台 / 欢迎页 / 设置页三页共用）。
+   ============================================================ */
+
+/* 底部状态栏：左侧页面信息，进度区居中自适应，右侧隧道角标 + AI 开关 */
+.app-statusbar {
+  height: 26px; flex: none; display: flex; align-items: center; justify-content: space-between;
+  padding: 0 8px; background: var(--bg-1); border-top: 1px solid var(--border);
+  color: var(--text-1); font-size: 11px;
+}
+.statusbar-left, .statusbar-right { display: flex; align-items: center; min-width: 0; }
+.statusbar-left, .statusbar-right { gap: 12px; }
+.statusbar-item, .statusbar-ai-toggle { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.statusbar-item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.statusbar-item .ic, .statusbar-ai-toggle .ic { flex: none; }
+.statusbar-active-tab { max-width: 260px; color: var(--text-2); }
+/* 运行中隧道角标：数量醒目，title 列明细 */
+.statusbar-tunnels { color: var(--green); flex: none; }
+.statusbar-tunnels .ic { color: inherit; }
+.statusbar-ai-toggle {
+  height: 22px; padding: 0 8px; border: 1px solid transparent; border-radius: var(--radius-s);
+  background: transparent; color: var(--text-1); cursor: pointer; font: inherit;
+}
+.statusbar-ai-toggle:hover { background: var(--bg-hover); color: var(--text-0); }
+.statusbar-ai-toggle.active { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-dim); }
+
+/* 底边栏进度区（SFTP 传输 / 暂存清理；statusbar-progress.ts 驱动，多容器逐一渲染） */
+.statusbar-progress {
+  display: flex; align-items: center; gap: 8px; margin-left: auto; margin-right: 12px;
+  max-width: 46%; min-width: 0; overflow: hidden; flex: 1 1 auto;
+}
+.statusbar-progress:empty { display: none; }
+.wb-progress-task {
+  position: relative; display: flex; align-items: center; gap: 6px; min-width: 120px; max-width: 260px;
+  height: 18px; padding: 0 8px; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--bg-0); overflow: hidden;
+}
+.wb-progress-fill {
+  position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent-dim);
+  transition: width 0.2s ease; pointer-events: none;
+}
+.wb-progress-task.indeterminate .wb-progress-fill {
+  width: 34% !important; animation: wb-progress-slide 1.2s ease-in-out infinite;
+}
+@keyframes wb-progress-slide {
+  0% { left: -34%; } 100% { left: 100%; }
+}
+.wb-progress-label, .wb-progress-detail {
+  position: relative; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; z-index: 1;
+}
+.wb-progress-label { color: var(--text-0); font-weight: 600; flex: none; }
+.wb-progress-detail { color: var(--text-2); min-width: 0; }

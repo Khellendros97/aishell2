@@ -6,6 +6,7 @@
  * DOM id/class 与旧版一致，settings.css 直接复用；顶栏由 App.tsx 提供，本组件不渲染 Topbar。
  * 2026-08 起按用户要求新增左侧分类导航（功能特性/外观/快捷键/API 接口，SETTINGS_NAV 四页），
  * 字段状态共享一份 SysFields，三个可编辑页的保存按钮等价（整表单提交）；快捷键页只读，此布局无 proto 对照。
+ * 页面底部接入三页共用的 components/Statusbar 底栏（进度区/隧道角标；本页无 AI 面板，不传 AI 开关）。
  * 历史说明：原「服务器配置」面板（服务器卡片/搜索/分组/拖拽/模态/从 Xshell 导入）已随
  * 项目-服务器单维度重构移除；xshell 导入已移至欢迎页按目录自动建项目，服务器在项目语义下管理。
  */
@@ -23,6 +24,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../../theme';
 import { onUpdateStatus } from '../../updates';
 import { useWorkbench } from '../../stores/workbench';
+import { Statusbar } from '../../components/Statusbar';
 import '../settings.css';
 
 /** 表单字段（与旧版 f-* 元素一一对应；apiKey / braveKey 只存本次输入，加载时恒为空串） */
@@ -43,6 +45,8 @@ interface SysFields {
   kbInjectCount: string;
   compactServerList: boolean;
   tunnelAutoStart: boolean;
+  notifyAi: boolean;
+  notifyLongTasks: boolean;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -51,7 +55,7 @@ const EMPTY_FIELDS: SysFields = {
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '',
   kbAutoInject: false, kbInjectCount: '5', compactServerList: false,
-  tunnelAutoStart: true,
+  tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true,
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -225,6 +229,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       kbInjectCount: String(s.settings.knowledge?.injectCount ?? 5),
       compactServerList: s.settings.compactServerList ?? false,
       tunnelAutoStart: s.settings.tunnelAutoStart ?? true,
+      notifyAi: s.settings.notifyAi ?? true,
+      notifyLongTasks: s.settings.notifyLongTasks ?? true,
     });
     void refreshMcpStatus();
   };
@@ -342,6 +348,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       knowledge: { autoInject: fields.kbAutoInject, injectCount: kbInjectCount },
       compactServerList: fields.compactServerList,
       tunnelAutoStart: fields.tunnelAutoStart,
+      notifyAi: fields.notifyAi,
+      notifyLongTasks: fields.notifyLongTasks,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -562,6 +570,29 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, tunnelAutoStart: checked })); }}
                 />
                 <div className="hint">开启后，上次处于启用状态的 SSH 隧道随 AIShell 启动自动恢复。关闭后：AIShell 退出时会自动把所有隧道设为禁用（下次启动不再恢复），运行期间手动启动隧道不受影响</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>系统通知</legend>
+              <div className="field">
+                <label>AI 助手通知</label>
+                <input
+                  id="f-notify-ai"
+                  type="checkbox"
+                  checked={fields.notifyAi}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, notifyAi: checked })); }}
+                />
+                <div className="hint">AI 助手等待审批、提出问题（ask/confirm）或任务完成时发送系统通知；AIShell 窗口在前台时不打扰</div>
+              </div>
+              <div className="field">
+                <label>耗时操作通知</label>
+                <input
+                  id="f-notify-long-tasks"
+                  type="checkbox"
+                  checked={fields.notifyLongTasks}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, notifyLongTasks: checked })); }}
+                />
+                <div className="hint">文件上传/下载、压缩/备份、暂存目录等耗时操作（超过 30 秒）完成时发送系统通知；窗口在前台时不打扰</div>
               </div>
             </fieldset>
             <fieldset className="llm-group">
@@ -828,6 +859,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
           )}
         </main>
       </div>
+      {/* 三页共用底栏（进度区/隧道角标在组件内自持；设置页无 AI 面板，不出 AI 开关） */}
+      <Statusbar />
     </div>
   );
 }

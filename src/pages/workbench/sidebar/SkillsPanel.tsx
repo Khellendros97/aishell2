@@ -283,7 +283,7 @@ function SkillCard({ d, onToggle, onDelete, onUpload, uploading, uploadBusy }: {
           <Icon name={uploading ? 'loader' : 'upload'} />
         </button>
         <button className="icon-btn" title="添加到 AI 对话" onClick={() => addSkillToChat(d)}><Icon name="chatPlus" /></button>
-        <button className="icon-btn" title="编辑" disabled={uploading} onClick={() => openSkillModal(d)}><Icon name="pencil" /></button>
+        <button className="icon-btn" title="编辑" disabled={uploading} onClick={() => openSkillModal(d)}><Icon name="gear" /></button>
         <button className="icon-btn danger" title="删除" disabled={uploading} onClick={() => void onDelete(d)}><Icon name="trash" /></button>
       </div>
     </div>
