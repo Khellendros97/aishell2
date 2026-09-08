@@ -539,6 +539,9 @@ export default function (pi: ExtensionAPI) {
 			case "notes_list":
 				// 只读查询：工作区全局笔记清单（目录 + .md 文件，相对路径）；三档模式可用
 				return undefined;
+			case "timeline_search":
+				// 只读查询：项目时间线检索（无文件副作用）；三档模式可用
+				return undefined;
 			case "db_query": {
 				// 仅工作/全自动模式提供；参数校验（白名单权威裁决在 Rust）
 				if (mode === "suggest") {
@@ -1041,6 +1044,35 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "timeline_search",
+		label: "搜索时间线",
+		description:
+			"搜索当前项目的时间线：SSH 连接/断开、终端与远程命令及结果、文件上传下载、AI 问答与工具调用的历史记录（保留 30 天）。可按关键词（大小写不敏感，匹配摘要与内容；`#标签名` token 按标签过滤——命中直接打标或处于同名标签对选区内的事件，可多个 AND）、类别与时间段过滤，返回倒序（最新在前）的事件列表，条目附标签标注（#名=直接打标，#名（选区）=处于标签对选区内）。",
+		promptSnippet: "搜索项目时间线",
+		promptGuidelines: [
+			"用户问「之前执行过什么命令/连过哪台服务器/上传过什么文件/上次怎么解决的」或需要回顾项目历史时，用 timeline_search 检索，不要凭记忆猜测。",
+			"kinds 过滤类别：ssh_connect / ssh_disconnect / ssh_connect_failed / command / file_upload / file_download / ai_user / ai_assistant / ai_tool；不传则全部类别。",
+			"fromTs/toTs 为 epoch 毫秒（含边界）；不传则搜索全部保留期。结果较多时换更精确的关键词或更窄的时间段分批检索。",
+		],
+		parameters: Type.Object({
+			keyword: Type.Optional(Type.String({ description: "关键词（匹配摘要与内容，大小写不敏感）；支持 #标签名 按标签过滤，可与普通文本混用" })),
+			kinds: Type.Optional(Type.Array(Type.String(), { description: "类别过滤，如 [\"command\", \"file_upload\"]" })),
+			fromTs: Type.Optional(Type.Number({ description: "起始时间（epoch 毫秒，含）" })),
+			toTs: Type.Optional(Type.Number({ description: "截止时间（epoch 毫秒，含）" })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "最多返回条数，默认 200" })),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			const payload: Record<string, unknown> = { action: "timeline_search" };
+			if (params.keyword) payload.keyword = params.keyword;
+			if (params.kinds) payload.kinds = params.kinds;
+			if (params.fromTs !== undefined) payload.fromTs = params.fromTs;
+			if (params.toTs !== undefined) payload.toTs = params.toTs;
+			if (params.limit !== undefined) payload.limit = params.limit;
+			return await rustAction(ctx, toolCallId, payload);
+		},
+	});
+
+	pi.registerTool({
 		name: "run_command",
 		label: "Run Command",
 		description:
@@ -1166,11 +1198,12 @@ export default function (pi: ExtensionAPI) {
 		name: "ask",
 		label: "向用户提问",
 		description:
-			"向用户提出一个或多个问题并等待回答（一次调用可含多个问题，避免多轮往返）。每个问题可附 2–4 个候选选项供点选；界面会为每个问题自动附带自由输入框，用户可点选选项或直接输入自定义回答。适合需要用户决策或补充信息的场景（方案选择、缺失参数、偏好确认）；用户的回答以「问/答」文本形式作为工具结果返回。",
-		promptSnippet: "向用户提问（可一次多问，可带选项）",
+			"向用户提出一个或多个问题并等待回答（一次调用可含多个问题，避免多轮往返）。每个问题可附 2–4 个候选选项供点选；界面会为每个问题自动附带自由输入框，用户可点选选项或直接输入自定义回答。multi=true 时选项变为多选（勾选框），适合「从产物/候选清单中勾选若干项」的场景。适合需要用户决策或补充信息的场景（方案选择、缺失参数、偏好确认）；用户的回答以「问/答」文本形式作为工具结果返回。",
+		promptSnippet: "向用户提问（可一次多问，可带选项/多选）",
 		promptGuidelines: [
 			"需要用户做决定或补充信息时，用 ask 一次性问清，不要只在回复正文里罗列问题等用户打字回复。",
 			"options 只放真实候选答案（2–4 个）；不要放「其他」「由你来指定」之类占位项——界面已为每个问题自动提供自由输入框。",
+			"需要用户从一组候选中勾选若干项保存/执行时（如分析产物清单），用 multi:true + options 列出全部候选；勾选结果以顿号分隔返回。multi 问题的选项数量不受 2–4 个限制。",
 			"只需用户对单一事项做是/否确认时（如执行前最终确认），改用 confirm 工具。",
 		],
 		parameters: Type.Object({
@@ -1178,6 +1211,7 @@ export default function (pi: ExtensionAPI) {
 				Type.Object({
 					question: Type.String({ description: "问题正文（中文，一句话说清要用户决定什么）" }),
 					options: Type.Optional(Type.Array(Type.String(), { description: "供用户点选的候选答案（2–4 个，简洁）；不要包含「其他/由你指定」类占位项——界面已自动提供自由输入" })),
+					multi: Type.Optional(Type.Boolean({ description: "true 时选项为多选（勾选若干项）；省略/false 为单选" })),
 				}),
 				{ minItems: 1, description: "问题列表（一次可提多个）" },
 			),

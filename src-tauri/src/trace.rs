@@ -542,7 +542,8 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Unix 天数转公历 (年, 月, 日)（Howard Hinnant 算法，UTC；无 chrono 依赖）
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// pub(crate)：timeline.rs 按天滚动文件复用同一套日期换算。
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64; // [0, 146096]
@@ -556,7 +557,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// 公历转 Unix 天数（civil_from_days 的逆运算）
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64; // [0, 399]
@@ -567,7 +568,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// 解析日期目录名 "YYYY-MM-DD" 为 Unix 天数；格式非法返回 None。
-fn parse_date_dir(name: &str) -> Option<i64> {
+pub(crate) fn parse_date_dir(name: &str) -> Option<i64> {
     let mut it = name.split('-');
     let y: i64 = it.next()?.parse().ok()?;
     let m: u32 = it.next()?.parse().ok()?;
@@ -579,13 +580,14 @@ fn parse_date_dir(name: &str) -> Option<i64> {
 }
 
 /// 日期目录名（UTC）：YYYY-MM-DD
-fn date_dir_name(ms: u64) -> String {
+pub(crate) fn date_dir_name(ms: u64) -> String {
     let (y, m, d) = civil_from_days((ms / 86_400_000) as i64);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// 导出 .log 行首时间戳（UTC）：YYYY-MM-DD HH:MM:SS.mmmZ
-fn format_ts(ms: u64) -> String {
+/// pub(crate)：timeline.rs 的 AI 工具结果格式化复用。
+pub(crate) fn format_ts(ms: u64) -> String {
     let rem = ms % 86_400_000;
     let (y, mo, d) = civil_from_days((ms / 86_400_000) as i64);
     format!(

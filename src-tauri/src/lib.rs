@@ -20,6 +20,7 @@ pub mod ssh_keys;
 pub mod store;
 pub mod tunnel;
 pub mod term;
+pub mod timeline;
 pub mod trace;
 pub mod xshell;
 
@@ -315,6 +316,13 @@ pub fn run() {
             trace::trace_read,
             trace::trace_export,
             trace::trace_clear,
+            timeline::timeline_report,
+            timeline::timeline_search,
+            timeline::timeline_bind_server,
+            timeline::timeline_tag_add,
+            timeline::timeline_tag_remove,
+            timeline::timeline_tag_reclose,
+            timeline::timeline_tags,
             staging::staging_add,
             staging::staging_list,
             staging::staging_snapshot_read,

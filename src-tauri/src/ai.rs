@@ -136,7 +136,7 @@ const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
 /// ask/confirm 为通用交互工具（execute 内自带前端问答/确认卡片，交互即授权），三档模式可用。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list";
+const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list,timeline_search";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
@@ -696,7 +696,7 @@ impl AiManager {
                                 }
                                 terminal_emitted = true;
                                 settled = true;
-                                trace_flush_output(&key2, &mut output_buf);
+                                trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                                 busy2.store(false, Ordering::SeqCst);
                                 let msg = ae
                                     .get("message")
@@ -712,7 +712,7 @@ impl AiManager {
                     "agent_settled" => {
                         settled = true;
                         text_started = false;
-                        trace_flush_output(&key2, &mut output_buf);
+                        trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                         busy2.store(false, Ordering::SeqCst);
                         if !terminal_emitted {
                             terminal_emitted = true;
@@ -863,6 +863,39 @@ impl AiManager {
                                     "args": args,
                                     "result": result_text,
                                 }));
+                                // 时间线：AI 工具调用（全量，含只读工具；与 trace 同一配对数据）
+                                {
+                                    let label = serde_json::from_str::<serde_json::Value>(&args)
+                                        .ok()
+                                        .and_then(|a| {
+                                            a.get("path")
+                                                .or_else(|| a.get("pattern"))
+                                                .or_else(|| a.get("command"))
+                                                .or_else(|| a.get("query"))
+                                                .or_else(|| a.get("name"))
+                                                .and_then(|v| v.as_str().map(str::to_string))
+                                        })
+                                        .unwrap_or_default();
+                                    let status = if is_err { "失败" } else { "成功" };
+                                    let duration = crate::trace::now_ms().saturating_sub(start);
+                                    let summary = if label.is_empty() {
+                                        format!("AI 工具 {t}（{status}，{duration}ms）")
+                                    } else {
+                                        format!("AI 工具 {t} {label}（{status}，{duration}ms）")
+                                    };
+                                    let detail = if result_text.is_empty() {
+                                        None
+                                    } else {
+                                        Some(crate::ssh::clip_output(&result_text))
+                                    };
+                                    crate::timeline::append(
+                                        &store2,
+                                        &project_id2,
+                                        "ai_tool",
+                                        summary,
+                                        detail,
+                                    );
+                                }
                             }
                         }
                         // AI 写文件成功落盘 → 全局广播，前端刷新已打开的对应编辑器标签
@@ -925,7 +958,7 @@ impl AiManager {
                         if stop == Some("error") {
                             terminal_emitted = true;
                             settled = true;
-                            trace_flush_output(&key2, &mut output_buf);
+                            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let emsg = msg
                                 .and_then(|m| m.get("errorMessage"))
@@ -947,7 +980,7 @@ impl AiManager {
                         if stop == Some("error") {
                             terminal_emitted = true;
                             settled = true;
-                            trace_flush_output(&key2, &mut output_buf);
+                            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let emsg = msg
                                 .and_then(|m| m.get("errorMessage"))
@@ -967,7 +1000,7 @@ impl AiManager {
                         {
                             terminal_emitted = true;
                             settled = true;
-                            trace_flush_output(&key2, &mut output_buf);
+                            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let _ = app2.emit(&event, json!({"type": "error", "message": err_message(&ev)}));
                         }
@@ -998,7 +1031,7 @@ impl AiManager {
                             if ae.get("type").and_then(serde_json::Value::as_str) == Some("error") {
                                 terminal_emitted = true;
                                 settled = true;
-                                trace_flush_output(&key2, &mut output_buf);
+                                trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                                 busy2.store(false, Ordering::SeqCst);
                                 let msg = ae
                                     .get("message")
@@ -1012,7 +1045,7 @@ impl AiManager {
                 }
             }
             // stdout 关闭：进程退出或管道破裂
-            trace_flush_output(&key2, &mut output_buf);
+            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
             busy2.store(false, Ordering::SeqCst);
             if !settled && !killed2.load(Ordering::SeqCst) {
                 let _ = app2.emit(&event, json!({"type": "error", "message": "pi 进程异常退出"}));
@@ -1126,9 +1159,17 @@ impl Drop for AiManager {
 
 /// 处理 pi 发来的 extension_ui_request（审批转发 + 内部动作桥）。
 /// trace：回合终态（done/error/进程退出）落一条聚合的完整助手输出。
-fn trace_flush_output(key: &str, buf: &mut String) {
+fn trace_flush_output(store: &crate::store::Store, project_id: &str, key: &str, buf: &mut String) {
     if !buf.is_empty() {
         crate::trace::log(key, "assistant_output", json!({"text": buf.as_str()}));
+        // 时间线：AI 回答（summary 取首个非空行，detail 为全文——timeline.rs 兜底裁剪）
+        let summary = buf
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("（空回复）")
+            .to_string();
+        crate::timeline::append(store, project_id, "ai_assistant", summary, Some(buf.clone()));
         buf.clear();
     }
 }
@@ -1649,6 +1690,50 @@ fn format_notes_listing(root: &std::path::Path, l: &crate::notes::NotesListing) 
     out
 }
 
+/// timeline_search 工具结果格式化：每条一行 `[时间] [类别] 摘要`，detail 截断附后
+/// （工具结果有体积约束，detail 超 2000 字符截断；全文可按更窄条件再次检索）。
+/// 条目带标签时附「标签:」行：#名 = 直接打标，#名（选区）= 处于同名标签对划定的选区内。
+fn format_timeline_entries(entries: &[crate::timeline::TimelineEntry]) -> String {
+    if entries.is_empty() {
+        return "时间线无匹配记录（可放宽关键词或时间段重试）".to_string();
+    }
+    let mut out = format!("匹配 {} 条（最新在前）：\n", entries.len());
+    for e in entries {
+        out.push_str(&format!(
+            "[{}] [{}] {}\n",
+            crate::trace::format_ts(e.ts),
+            e.kind,
+            e.summary
+        ));
+        if let Some(tags) = &e.tags {
+            if !tags.is_empty() {
+                let s = tags
+                    .iter()
+                    .map(|t| {
+                        if t.direct {
+                            format!("#{}", t.name)
+                        } else {
+                            format!("#{}（选区）", t.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("、");
+                out.push_str(&format!("  标签: {s}\n"));
+            }
+        }
+        if let Some(d) = &e.detail {
+            let clipped = if d.chars().count() > 2000 {
+                let kept: String = d.chars().take(2000).collect();
+                format!("{kept}…(截断)")
+            } else {
+                d.clone()
+            };
+            out.push_str(&format!("  内容: {clipped}\n"));
+        }
+    }
+    out
+}
+
 /// 执行扩展内部动作请求，返回回写扩展的结果 JSON（{ok:true,text}|{ok:false,error}）。
 /// 会话级暂存动作（staging_*）与 run_command/sftp_upload 的自动备份都以 key 推导的
 /// session_id 为准（guard 不暴露任意 project/session 参数）。
@@ -1686,6 +1771,29 @@ async fn run_internal_action(
             (Ok(root), Ok(l)) => json!({"ok": true, "text": format_notes_listing(&root, &l)}),
             (Err(e), _) | (_, Err(e)) => json!({"ok": false, "error": e}),
         }),
+        "timeline_search" => {
+            let query = crate::timeline::TimelineQuery {
+                keyword: payload
+                    .get("keyword")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                kinds: payload.get("kinds").and_then(serde_json::Value::as_array).map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                }),
+                from_ts: payload.get("fromTs").and_then(serde_json::Value::as_u64),
+                to_ts: payload.get("toTs").and_then(serde_json::Value::as_u64),
+                limit: payload
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as usize),
+            };
+            crate::timeline::search(store, project_id, &query).map(|entries| {
+                json!({"ok": true, "text": format_timeline_entries(&entries)})
+            })
+        }
         "run_command" => {
             let intent = str_field("intent");
             let command = str_field("command");
@@ -2233,6 +2341,22 @@ pub async fn ai_chat(
             "bytes": img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0),
         })).collect::<Vec<_>>(),
     }));
+    // 时间线：用户提问（与 trace 同一脱敏后文本；summary 取首行、detail 保留全文）
+    {
+        let summary = prompt
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("（空输入）")
+            .to_string();
+        crate::timeline::append(
+            &mgr.store,
+            &project_id,
+            "ai_user",
+            summary,
+            Some(prompt.clone()),
+        );
+    }
     // 用 JSON 序列化生成，勿手拼。刚 abort 过时带 streamingBehavior=followUp：
     // abort 清理流式状态可能未即时生效，agent 仍在流式期间时裸发 prompt 会被 RPC
     // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同。
@@ -2798,6 +2922,39 @@ mod tests {
         // 初始 --tools 集（suggest/agent/yolo 一致）应含 notes_list
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
         assert!(tools_suggest.contains("notes_list"), "suggest 工具集应含 notes_list");
+    }
+
+    #[test]
+    fn guard_extension_registers_timeline_search_as_readonly() {
+        // timeline_search 工具探针：guard 注册 + 动作桥 + 只读（不进 AI_ONLY_TOOLS/CONTROLLED_TOOLS），
+        // 三档模式可用（BASE_TOOLS）；ask 的 multi 多选字段经 guard schema 透传
+        assert!(
+            GUARD_EXT.contains("name: \"timeline_search\""),
+            "guard 应注册 timeline_search 工具"
+        );
+        assert!(
+            GUARD_EXT.contains("action: \"timeline_search\""),
+            "timeline_search 应走动作桥"
+        );
+        let ai_only_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const AI_ONLY_TOOLS"))
+            .unwrap_or_default();
+        assert!(
+            !ai_only_line.contains("timeline_search"),
+            "timeline_search 应三档模式可用（不限于 agent/yolo）"
+        );
+        let controlled_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const CONTROLLED_TOOLS"))
+            .unwrap_or_default();
+        assert!(
+            !controlled_line.contains("timeline_search"),
+            "timeline_search 是只读查询，不应受控审批"
+        );
+        assert!(BASE_TOOLS.contains("timeline_search"), "BASE_TOOLS 应含 timeline_search");
+        // ask 多选：schema 携带 multi 字段（时间线分析产物勾选依赖）
+        assert!(GUARD_EXT.contains("multi: Type.Optional(Type.Boolean"), "ask 应支持 multi 多选");
     }
 
     #[test]

@@ -115,6 +115,9 @@ impl client::Handler for CliHandler {
 pub struct SshManager {
     store: Arc<store::Store>,
     sessions: Mutex<HashMap<String, Arc<client::Handle<CliHandler>>>>,
+    /// serverId → 项目归属（时间线埋点用）：连接池按 serverId 复用、跨项目共享，
+    /// 归属取「最近触发方」（终端/SFTP 打开或 AI 动作发起时 bind_project 登记）。
+    projects: Mutex<HashMap<String, String>>,
 }
 
 /// 转发通道失败的可能原因提示（错误信息追加用；纯函数便于单测）。
@@ -133,6 +136,36 @@ impl SshManager {
         SshManager {
             store,
             sessions: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 登记 serverId 的项目归属（时间线 connect/disconnect/exec 事件按项目落盘）。
+    /// 前端打开 SSH 终端/SFTP 标签（timeline_bind_server 命令）与 AI 远程动作入口调用。
+    pub async fn bind_project(&self, server_id: &str, project_id: &str) {
+        self.projects
+            .lock()
+            .await
+            .insert(server_id.to_string(), project_id.to_string());
+    }
+
+    /// 服务器显示名（时间线/日志标签用）：未找到返回 None。
+    pub(crate) fn server_label(&self, server_id: &str) -> Option<String> {
+        self.store.server(server_id).map(|s| s.name)
+    }
+
+    /// 时间线事件写入：仅当该 server 已登记项目归属时记录（未登记说明与工作台项目无关，
+    /// 如公钥部署等旁路连接）。失败静默，绝不影响主路径。
+    pub(crate) async fn timeline_event(
+        &self,
+        server_id: &str,
+        kind: &str,
+        summary: impl Into<String>,
+        detail: Option<String>,
+    ) {
+        let project_id = self.projects.lock().await.get(server_id).cloned();
+        if let Some(pid) = project_id {
+            crate::timeline::append(&self.store, &pid, kind, summary, detail);
         }
     }
 
@@ -144,7 +177,18 @@ impl SshManager {
         self: &Arc<Self>,
         server_id: &str,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
-        self.get_or_connect_inner(server_id, None).await
+        let result = self.get_or_connect_inner(server_id, None).await;
+        // 连接失败也入时间线（排查「连不上」类问题正好需要）；成功事件在 insert_and_watch
+        if let Err(e) = &result {
+            self.timeline_event(
+                server_id,
+                "ssh_connect_failed",
+                format!("连接服务器失败：{e}"),
+                None,
+            )
+            .await;
+        }
+        result
     }
 
     /// 测试专用（doc hidden）：与 `get_or_connect` 相同，但直连与跳板两段认证都用给定密码
@@ -333,6 +377,15 @@ impl SshManager {
     pub async fn disconnect(&self, server_id: &str) {
         let handle = self.sessions.lock().await.remove(server_id);
         if let Some(handle) = handle {
+            if let Some(s) = self.store.server(server_id) {
+                self.timeline_event(
+                    server_id,
+                    "ssh_disconnect",
+                    format!("与服务器「{}」的连接已断开（手动）", s.name),
+                    None,
+                )
+                .await;
+            }
             let _ = handle
                 .disconnect(russh::Disconnect::ByApplication, "client disconnect", "en")
                 .await;
@@ -657,6 +710,20 @@ impl SshManager {
             }
             map.insert(server_id.to_string(), Arc::clone(&handle));
         }
+        if let Some(s) = self.store.server(server_id) {
+            let via = if s.bastion_id.is_some() {
+                "（经堡垒机）"
+            } else {
+                ""
+            };
+            self.timeline_event(
+                server_id,
+                "ssh_connect",
+                format!("连接服务器「{}」（{}:{}）{via}", s.name, s.host, s.port),
+                None,
+            )
+            .await;
+        }
         self.spawn_watcher(server_id.to_string(), Arc::clone(&handle));
         Ok(handle)
     }
@@ -669,9 +736,21 @@ impl SshManager {
                 interval.tick().await;
                 if handle.is_closed() {
                     let mut map = manager.sessions.lock().await;
-                    // 仅摘除仍指向同一连接的表项（避免误删并发重建的新连接）
+                    // 仅摘除仍指向同一连接的表项（避免误删并发重建的新连接）；
+                    // 断开时间线事件也只在真正摘除时记录（与 disconnect() 的手动事件不重复）
                     if matches!(map.get(&server_id), Some(h) if Arc::ptr_eq(h, &handle)) {
                         map.remove(&server_id);
+                        drop(map);
+                        if let Some(s) = manager.store.server(&server_id) {
+                            manager
+                                .timeline_event(
+                                    &server_id,
+                                    "ssh_disconnect",
+                                    format!("与服务器「{}」的连接已断开", s.name),
+                                    None,
+                                )
+                                .await;
+                        }
                     }
                     break;
                 }
@@ -716,7 +795,8 @@ pub struct SshExecResult {
 
 /// SFTP 直执命令（待优化 5）：复用 SshManager 既有连接（每 serverId 一条），
 /// 新建 channel 执行单条命令并收集 stdout/stderr/退出码；不依赖前端迷你终端的
-/// 登录时序。命令与结果由前端写入 debug 日志（见 sftp.ts runRemoteCommand）。
+/// 登录时序。命令与结果由前端写入 debug 日志（见 sftp.ts runRemoteCommand），
+/// 同时记入项目时间线（command 事件，detail 为裁剪输出，需前端已 bind_project）。
 #[tauri::command]
 pub async fn ssh_exec(
     ssh: State<'_, Arc<SshManager>>,
@@ -725,12 +805,55 @@ pub async fn ssh_exec(
 ) -> Result<SshExecResult, String> {
     let res = ssh
         .exec_with_timeout(&server_id, &command, SSH_EXEC_TIMEOUT)
-        .await?;
+        .await;
+    let label = ssh
+        .server_label(&server_id)
+        .map(|n| format!("「{n}」"))
+        .unwrap_or_default();
+    match &res {
+        Ok(r) => {
+            let mut detail = format!(
+                "退出码: {}",
+                r.exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "超时/未知".into())
+            );
+            if !r.stdout.trim().is_empty() {
+                detail.push_str(&format!("\n{}", clip_output(&r.stdout)));
+            }
+            if !r.stderr.trim().is_empty() {
+                detail.push_str(&format!("\n[stderr] {}", clip_output(&r.stderr)));
+            }
+            ssh.timeline_event(&server_id, "command", format!("{label}$ {command}"), Some(detail))
+                .await;
+        }
+        Err(e) => {
+            ssh.timeline_event(
+                &server_id,
+                "command",
+                format!("{label}$ {command}（执行失败）"),
+                Some(e.clone()),
+            )
+            .await;
+        }
+    }
+    let res = res?;
     Ok(SshExecResult {
         code: res.exit_code,
         stdout: res.stdout,
         stderr: res.stderr,
     })
+}
+
+/// 命令输出裁剪（时间线 detail 用）：按字符数截断，防海量输出撑爆时间线文件。
+pub(crate) fn clip_output(s: &str) -> String {
+    const MAX: usize = 4096;
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= MAX {
+        return trimmed.to_string();
+    }
+    let kept: String = trimmed.chars().take(MAX).collect();
+    format!("{kept}…(输出过长已裁剪)")
 }
 
 /// 部署公钥(密钥对)凭据的公钥到服务器 authorized_keys（ssh-copy-id 等价）。

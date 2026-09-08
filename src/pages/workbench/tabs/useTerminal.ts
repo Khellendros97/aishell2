@@ -30,6 +30,7 @@ import '@xterm/xterm/css/xterm.css';
 import {
   SSH_AUTH_FAILED_PREFIX, SSH_NEED_DEPLOY_KEY_PREFIX, getState, onTermData, onTermExit, openDialog,
   sshDeployPublicKey, termClose, termCreate, termInput, termRecordStart, termRecordStop, termResize,
+  timelineBindServer, timelineReport,
   upsertProject,
 } from '../../../api';
 import type { TermKind } from '../../../api';
@@ -87,6 +88,8 @@ interface TermBlock {
   echoPending: boolean;
   /** 待匹配的命令回显（去空白归一化）；空串 = 已进入「跳到首个 \n」阶段。 */
   echoRemain: string;
+  /** 时间线已上报标记：区块在「下一条命令入块 / 进程退出 / 标签关闭」定稿时上报一次。 */
+  reported: boolean;
 }
 
 /** 单块 output 行数上限（计划：每块上限 2000 行）。 */
@@ -356,6 +359,14 @@ class TermSession {
     try {
       this.unlisteners.push(await onTermData(this.tab.id, (d) => this.onBackendData(d)));
       this.unlisteners.push(await onTermExit(this.tab.id, (code) => this.onExit(code)));
+      // SSH 终端：登记 serverId 的项目归属（后端连接池 connect/disconnect/exec 事件
+      // 据此计入本项目时间线；fire-and-forget，登记失败不影响终端建立）
+      if (kind === 'ssh' && data.serverId) {
+        const projectId = useWorkbench.getState().project?.id;
+        if (projectId) {
+          void timelineBindServer(projectId, data.serverId).catch(() => { /* 静默 */ });
+        }
+      }
       await termCreate(this.tab.id, kind, data.serverId ?? null, data.cwd ?? null);
       this.ready = true;
       dbg(`${this.sid} ready`);
@@ -507,16 +518,40 @@ class TermSession {
   }
 
   private pushBlock(name: string): void {
+    // 新命令入块 = 上一块输出已定稿：上报项目时间线（命令 + 裁剪输出）
+    const prev = this.blocks[this.blocks.length - 1];
+    if (prev) this.reportBlock(prev, name);
     this.blocks.push({
       command: name,
       output: [],
       pending: '',
       echoPending: true,
       echoRemain: name.replace(/\s/g, ''),
+      reported: false,
     });
     this.lastCommand = name;
     this.updateInfo();
     this.renderDrawer();
+  }
+
+  /**
+   * 时间线命令上报：区块定稿（下一命令入块/退出/关闭）时把命令与清洗后输出
+   * 发给后端 timeline_report（<项目>/.aishell/timeline/ 按天落盘）。输出超 4000 字符裁剪；
+   * 上报失败静默（绝不影响终端主路径）。backend 只存近似文本（无 OSC 133，见 cleanBlockLines）。
+   */
+  private reportBlock(block: TermBlock, nextCmd?: string): void {
+    if (block.reported) return;
+    block.reported = true;
+    const cmd = block.command.trim();
+    if (!cmd) return;
+    const projectId = useWorkbench.getState().project?.id;
+    if (!projectId) return;
+    let detail = this.cleanBlockLines(block, nextCmd).join('\n').trim();
+    if (detail.length > 4000) detail = `${detail.slice(0, 4000)}…(输出过长已裁剪)`;
+    const data = this.tab.data as { kind?: string };
+    const label = data.kind === 'ssh' ? `「${this.tabTitle}」` : '本地';
+    void timelineReport(projectId, 'command', `${label}$ ${cmd}`, detail || undefined)
+      .catch(() => { /* 时间线上报失败静默 */ });
   }
 
   /** 从 xterm buffer 提取光标所在输入行的命令文本（实现见模块级纯函数 extractCommandFromBuffer） */
@@ -621,6 +656,9 @@ class TermSession {
     if (this.exited) return;
     this.exited = true;
     dbg(`${this.sid} fe-exit code=${code}`);
+    // 进程退出 = 会话终结：末块定稿上报时间线
+    const last = this.blocks[this.blocks.length - 1];
+    if (last) this.reportBlock(last);
     this.resizer?.disconnect();
     setTabBarExited(this.tab.id, true);
     const hint = code === null ? '[进程已退出]' : `[进程已退出 code=${code}]`;
@@ -947,6 +985,9 @@ class TermSession {
 
   /* ---------- 关闭清理（React 卸载时由 useTerminal 的 effect cleanup 调起） ---------- */
   destroy(): void {
+    // 关标签 = 会话终结：末块定稿上报时间线（已上报区块幂等跳过）
+    const last = this.blocks[this.blocks.length - 1];
+    if (last) this.reportBlock(last);
     liveTerms.delete(this);
     this.resizer?.disconnect();
     if (this.recording) void this.stopRecording(true);

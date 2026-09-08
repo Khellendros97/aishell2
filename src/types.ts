@@ -418,6 +418,50 @@ export interface TraceEntry {
   text: string;
 }
 
+/** 条目的标签标注（timeline.rs TimelineTagInfo）：direct=true 直接打标，false 仅处于标签对选区内 */
+export interface TimelineTagInfo {
+  name: string;
+  /** #rrggbb */
+  color: string;
+  direct: boolean;
+}
+
+/** 项目时间线条目（timeline.rs TimelineEntry serde camelCase 对齐） */
+export interface TimelineEntry {
+  ts: number;
+  /** ssh_connect/ssh_disconnect/ssh_connect_failed/command/file_upload/file_download/ai_user/ai_assistant/ai_tool */
+  kind: string;
+  summary: string;
+  detail?: string;
+  /** 搜索时回填的标签标注（直接打标/选区命中） */
+  tags?: TimelineTagInfo[];
+}
+
+/** 一条时间线标签记录（timeline.rs TimelineTag；tags.jsonl 行格式） */
+export interface TimelineTag {
+  /** 打标时间（epoch millis） */
+  ts: number;
+  name: string;
+  /** #rrggbb */
+  color: string;
+  /** 被打标事件的定位锚点 */
+  anchorTs: number;
+  anchorKind: string;
+}
+
+/** 时间线搜索条件（timeline.rs TimelineQuery serde camelCase 对齐；字段全可选） */
+export interface TimelineQuery {
+  /** 关键词：大小写不敏感子串匹配 summary+detail；`#标签名` token 按标签过滤（可多个，AND） */
+  keyword?: string;
+  /** 类别过滤；空/缺省 = 全部 */
+  kinds?: string[];
+  /** 时间段起止（epoch millis，含边界）；缺省 = 不限（全部保留期 30 天） */
+  fromTs?: number;
+  toTs?: number;
+  /** 最多返回条数（默认 200，上限 1000） */
+  limit?: number;
+}
+
 export interface FsEntry {
   name: string;
   isDir: boolean;

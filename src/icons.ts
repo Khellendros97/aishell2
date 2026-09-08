@@ -72,6 +72,8 @@ export const PATHS = {  folder:
     '<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
   history:
     '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 3"/>',
+  /** 项目时间线（lucide git-commit-horizontal 风格：横向轴 + 节点） */
+  timeline: '<circle cx="6" cy="12" r="2"/><circle cx="18" cy="12" r="2"/><path d="M8 12h8"/><path d="M2 12h2"/><path d="M20 12h2"/>',
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
   home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/>',
   arrowUp: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>',
