@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -257,7 +257,7 @@ export type AiEvent =
       connection?: { serverId: string; name: string; kind: DbKind; host: string; port?: number; user?: string; database?: string } }
   /** ask 工具（通用问答）：AI 一次提出多个问题，前端渲染问答卡片（每问候选选项 + 自由输入框），
    *  用户提交后经 aiRespondAsk 回执拼装好的问答文本 */
-  | { type: 'ask'; requestId: string; toolCallId: string; questions: Array<{ question: string; options?: string[] }> }
+  | { type: 'ask'; requestId: string; toolCallId: string; questions: Array<{ question: string; options?: string[]; multi?: boolean }> }
   /** confirm 工具（通用是非确认）：单一问题 + 确认/取消，经 aiRespondConfirm 回执布尔 */
   | { type: 'confirm'; requestId: string; toolCallId: string; question: string }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
@@ -321,6 +321,20 @@ export const traceRead = (key: string) => call<TraceEntry[]>('trace_read', { key
 export const traceExport = (path: string, key: string) => call<number>('trace_export', { path, key });
 /** 清空当前会话 trace（全部日期文件） */
 export const traceClear = (key: string) => call<void>('trace_clear', { key });
+
+/* ---------------- 项目时间线（Rust timeline.rs） ----------------
+   按天滚动落盘 <项目>/.aishell/timeline/YYYY-MM-DD.jsonl，保留 30 天（后端写线程每天
+   首次写入时清理）；无开关、默认常开。事件源：SSH 连接池（connect/disconnect）、
+   终端命令区块（前端上报）、ssh_exec / SFTP 传输、AI 会话（提问/回答/工具调用）。 */
+/** 前端事件上报（终端命令区块定稿）：fire-and-forget，失败静默 */
+export const timelineReport = (projectId: string, kind: string, summary: string, detail?: string) =>
+  call<void>('timeline_report', { projectId, kind, summary, detail: detail ?? null });
+/** 时间线搜索（关键词/类别/时间段过滤，倒序返回） */
+export const timelineSearch = (projectId: string, query: TimelineQuery) =>
+  call<TimelineEntry[]>('timeline_search', { projectId, query });
+/** 登记 serverId 的项目归属（打开 SSH 终端/SFTP 标签时调用，连接事件按归属项目落盘） */
+export const timelineBindServer = (projectId: string, serverId: string) =>
+  call<void>('timeline_bind_server', { projectId, serverId });
 
 /* ---------------- browser（内置浏览器多页面子 webview，Rust browser.rs） ----------------
    每个「页面」一个子 webview（viewId 由前端生成 p1/p2/…）；占位 div 经 ResizeObserver

@@ -66,6 +66,9 @@ export interface AiHandle {
   addNoteRef?(ref: NoteRef): void;
   /** 把一篇笔记转换为 Skill:新建 AI 会话并发送「笔记引用 + skill-management 技能引用 + 指令文本」 */
   convertNoteToSkill?(ref: NoteRef): void;
+  /** 项目时间线分析:新建 AI 会话并发送时间线分析指令(timeline_search 检索 → 产出笔记/skill →
+   *  ask 多选让用户勾选保存);时间线标签页「AI 分析」按钮入口 */
+  analyzeTimeline?(): void;
   /** 图片附件(explorer/SFTP 右键「添加到对话」对图片文件的入口;物化与上限校验在引擎内) */
   addImageRef?(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void;
   /** 当前 AI 会话 ID;会话尚未加载时返回 null。 */
@@ -74,7 +77,7 @@ export interface AiHandle {
 
 const TYPE_ICONS: Record<string, IconName> = {
   editor: 'file', sftp: 'folderOpen', terminal: 'terminal', 'remote-staging': 'history', 'staging-diff': 'diff',
-  browser: 'globe', trace: 'history', note: 'note', tunnel: 'tunnel',
+  browser: 'globe', trace: 'history', note: 'note', tunnel: 'tunnel', timeline: 'timeline',
 };
 
 export type PanelKey = 'explorer' | 'servers' | 'commands' | 'skills' | 'notes';

@@ -200,6 +200,11 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
       s.openTab({ id: 'browser', type: 'browser', title: '浏览器' });
       return;
     }
+    if (p === 'timeline') {
+      // 时间线同为中央标签页:固定 id 单实例
+      s.openTab({ id: 'timeline', type: 'timeline', title: '时间线' });
+      return;
+    }
     if (!p) return;
     // 侧栏折叠时点击任意面板图标:先展开侧栏再切换面板
     if (s.sidebarCollapsed) s.setSidebarCollapsed(false);
@@ -256,6 +261,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
             <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
             <div className={`activity-icon${panel === 'skills' ? ' active' : ''}`} data-panel="skills" title="Skill"><Icon name="sparkles" /></div>
             <div className={`activity-icon${panel === 'notes' ? ' active' : ''}`} data-panel="notes" title="笔记"><Icon name="pencil" /></div>
+            <div className="activity-icon" data-panel="timeline" title="项目时间线(在标签页中打开)"><Icon name="timeline" /></div>
             <div className="activity-icon" data-panel="browser" title="浏览器(在标签页中打开)"><Icon name="globe" /></div>
           </div>
         <div id="sidebar" ref={sidebarRef}>

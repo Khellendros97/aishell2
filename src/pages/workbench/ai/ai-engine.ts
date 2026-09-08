@@ -477,10 +477,10 @@ interface ActionCard {
   requestId?: string;
   /** 数据库连接申请（request_db_connection）：AI 填写的连接信息，卡片只读展示、审批对话框复用 */
   dbRequest?: DbRequestDetail;
-  /** ask 工具问答卡：问题列表（每问可有候选选项；界面自动为每问附自由输入框） */
-  askRequest?: { questions: Array<{ question: string; options?: string[] }> };
-  /** ask 提交后的逐问回答（picked = 点选的选项，free = 自由输入）：卡片终态渲染时还原选中态/自定义回答 */
-  askAnswers?: Array<{ picked: string; free: string }>;
+  /** ask 工具问答卡：问题列表（每问可有候选选项；界面自动为每问附自由输入框；multi=true 时选项为多选勾选框） */
+  askRequest?: { questions: Array<{ question: string; options?: string[]; multi?: boolean }> };
+  /** ask 提交后的逐问回答（picked = 点选的选项，free = 自由输入，pickedList = 多选勾选的全部选项）：卡片终态渲染时还原选中态/自定义回答 */
+  askAnswers?: Array<{ picked: string; free: string; pickedList?: string[] }>;
   /** confirm 工具确认卡：单一是非问题 */
   confirmRequest?: { question: string };
   /** 智能审批自动放行：status='smart' 时展示判定理由 */
@@ -1189,6 +1189,10 @@ function createAiHandle() {
     if (!noteRef || typeof noteRef.path !== 'string' || !noteRef.path.trim()) return;
     void convertNoteToSkill(noteRef);
   },
+  /** 项目时间线分析（时间线标签页「AI 分析」入口）：新建会话注入分析指令，走标准 send() */
+  analyzeTimeline(): void {
+    void analyzeTimeline();
+  },
   /** 图片附件（explorer/SFTP 右键「添加到对话」对图片文件的入口）：
    *  物化由 attachImages 统一完成（vision 门槛 / 数量上限 / 后端嗅探都在那里） */
   addImageRef(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void {
@@ -1270,8 +1274,42 @@ async function convertNoteToSkill(noteRef: NoteRef): Promise<void> {
   await send();
 }
 
-function openCurrentStaging(): void {
-  const pid = project?.id;
+/** 时间线分析任务指令（analyzeTimeline 注入输入区；产物保存流程：ask 多选勾选 → write 落盘）。
+ *  保存路径发现：笔记根经 notes_list 工具；技能根规则由 skill-management 技能承载（AI 已挂载时可查）。 */
+const TIMELINE_ANALYSIS_PROMPT = [
+  '请分析本项目的项目时间线，生成项目日志与可重用 Skill。项目时间线记录了本项目近期的 SSH 连接、终端与远程命令及结果、文件上传下载、以及 AI 问答与工具调用历史（保留 30 天），用 timeline_search 工具检索。',
+  '',
+  '步骤：',
+  '1. 用 timeline_search 分批检索：先按类别总览（kinds 分别为 ["ssh_connect","ssh_disconnect","ssh_connect_failed"]、["command"]、["file_upload","file_download"]、["ai_user"]），再对关键主题用关键词/时间段细化；梳理出本项目近期的主要工作、关键命令与操作结果。',
+  '2. 产出两类产物：',
+  '   a. 项目日志（笔记）：markdown，按主题归纳做了什么、结果如何、遗留问题与待办；',
+  '   b. 可重用 Skill（仅当存在可沉淀的重复性操作流程时）：markdown，frontmatter 遵循 skill-management 技能规范（name 小写字母/数字/连字符、description、scope、enabled）。',
+  '3. 产出完成后必须调用 ask 工具（该问题设 multi=true），把全部产物列为选项让用户勾选保存哪些，选项格式：「[笔记] 标题」或「[skill] 名称：简介」；不要在 ask 之前擅自保存。',
+  '4. 只对用户勾选的产物逐个保存：笔记用 write 写入笔记根目录（先调 notes_list 拿到绝对根目录，保存为 <根>/<主题>.md）；Skill 用 write 写入技能根目录 <根>/<名称>/SKILL.md（全局/项目技能根的路径规则见 skill-management 技能）。未勾选的产物不要保存。保存完成后在回复中列出已保存的文件路径。',
+].join('\n');
+
+/** 项目时间线分析（时间线标签页「AI 分析」按钮入口，仿 convertNoteToSkill 流程）：
+ *  新建 AI 会话 → 输入区注入 TIMELINE_ANALYSIS_PROMPT → 标准 send()（含审批/标题等既有路径）。 */
+async function analyzeTimeline(): Promise<void> {
+  const ctx = viewContext;
+  if (!ctx || unmounted) { toast('AI 面板尚未就绪'); return; }
+  await loadSessions();
+  if (viewContext !== ctx || unmounted) { toast('AI 面板已离开当前页面'); return; }
+  useWorkbench.getState().setAiVisible(true); // 展示 AI 面板让用户看到分析进度
+  const created = newSession();
+  ctx.activeSessionId = created.id;
+  activeSessionId = created.id;
+  await ensureSessionSubscription(ctx, created.id);
+  renderSessionBar();
+  renderHistory();
+  updateSendBtn();
+  clearChips();
+  input.appendChild(document.createTextNode(TIMELINE_ANALYSIS_PROMPT));
+  input.focus();
+  await send();
+}
+
+function openCurrentStaging(): void {  const pid = project?.id;
   const sid = activeSessionId;
   if (!pid || !sid) return;
   useWorkbench.getState().openTab({
@@ -2256,7 +2294,12 @@ function renderAskCard(a: ActionCard): string {
   const interactive = a.status === 'approving' && a.requestId;
   const body = questions.map((q, i) => {
     const ans = a.askAnswers?.[i];
-    const opts = (q.options ?? []).map((opt) => `
+    /* multi=true：选项渲染为 checkbox（可勾选多项，终态按 pickedList 还原）；默认单选 radio */
+    const opts = (q.options ?? []).map((opt) => q.multi ? `
+      <label class="ai-ask-option">
+        <input type="checkbox" name="ask-${escapeHtml(a.toolCallId)}-${i}" value="${escapeHtml(opt)}"${interactive ? '' : ' disabled'}${ans?.pickedList?.includes(opt) ? ' checked' : ''} />
+        <span>${escapeHtml(opt)}</span>
+      </label>` : `
       <label class="ai-ask-option">
         <input type="radio" name="ask-${escapeHtml(a.toolCallId)}-${i}" value="${escapeHtml(opt)}"${interactive ? '' : ' disabled'}${ans && ans.picked === opt ? ' checked' : ''} />
         <span>${escapeHtml(opt)}</span>
@@ -2268,7 +2311,7 @@ function renderAskCard(a: ActionCard): string {
     return `<div class="ai-ask-question" data-ask-idx="${i}">
       <div class="ai-ask-qtext">${questions.length > 1 ? `${i + 1}. ` : ''}${escapeHtml(q.question)}</div>
       ${opts ? `<div class="ai-ask-options">${opts}</div>` : ''}
-      ${interactive ? `<input class="ai-ask-input" type="text" placeholder="${q.options?.length ? '点选上方选项，或在此输入自定义回答' : '输入你的回答'}" />` : answeredInput}
+      ${interactive ? `<input class="ai-ask-input" type="text" placeholder="${q.options?.length ? (q.multi ? '勾选上方选项（可多选），或在此输入补充说明' : '点选上方选项，或在此输入自定义回答') : '输入你的回答'}" />` : answeredInput}
     </div>`;
   }).join('');
   const buttons = interactive
@@ -2787,15 +2830,24 @@ async function submitAsk(sid: string, toolCallId: string): Promise<void> {
     return;
   }
   const cardEl = chat.querySelector(`[data-ask-card="${CSS.escape(toolCallId)}"]`);
-  /* 自由输入优先于点选：free 非空时清空 picked，避免终态卡片同时回显两个答案 */
+  /* 自由输入优先于点选：free 非空时清空 picked/pickedList，避免终态卡片同时回显两个答案；
+     multi 问题收集全部勾选项（pickedList），answer 文本以顿号拼接 */
   const answers = card.askRequest.questions.map((q, i) => {
     const scope = cardEl?.querySelector(`[data-ask-idx="${i}"]`);
     const free = (scope?.querySelector('.ai-ask-input') as HTMLInputElement | null)?.value.trim() ?? '';
+    if (q.multi) {
+      const pickedList = free ? [] : Array.from(scope?.querySelectorAll('input[type="checkbox"]:checked') ?? [])
+        .map((el) => (el as HTMLInputElement).value);
+      return { q, picked: '', free, pickedList };
+    }
     const picked = free ? '' : ((scope?.querySelector('input[type="radio"]:checked') as HTMLInputElement | null)?.value ?? '');
-    return { q, picked, free };
+    return { q, picked, free, pickedList: undefined as string[] | undefined };
   });
   const response = answers
-    .map(({ q, picked, free }) => `问：${q.question}\n答：${free || picked || '（未作答）'}`)
+    .map(({ q, picked, free, pickedList }) => {
+      const answer = free || (pickedList?.length ? pickedList.join('、') : picked) || (q.multi ? '（均未勾选）' : '（未作答）');
+      return `问：${q.question}\n答：${answer}`;
+    })
     .join('\n');
   const requestId = card.requestId;
   try {
@@ -2806,7 +2858,7 @@ async function submitAsk(sid: string, toolCallId: string): Promise<void> {
   }
   card.status = 'succeeded';
   card.requestId = undefined;
-  card.askAnswers = answers.map(({ picked, free }) => ({ picked, free }));
+  card.askAnswers = answers.map(({ picked, free, pickedList }) => ({ picked, free, pickedList }));
   card.result = response;
   card.summary = response;
   if (sid === activeSessionId) {

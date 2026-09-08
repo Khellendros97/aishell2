@@ -418,6 +418,28 @@ export interface TraceEntry {
   text: string;
 }
 
+/** 项目时间线条目（timeline.rs TimelineEntry serde camelCase 对齐） */
+export interface TimelineEntry {
+  ts: number;
+  /** ssh_connect/ssh_disconnect/ssh_connect_failed/command/file_upload/file_download/ai_user/ai_assistant/ai_tool */
+  kind: string;
+  summary: string;
+  detail?: string;
+}
+
+/** 时间线搜索条件（timeline.rs TimelineQuery serde camelCase 对齐；字段全可选） */
+export interface TimelineQuery {
+  /** 关键词：大小写不敏感子串匹配 summary+detail */
+  keyword?: string;
+  /** 类别过滤；空/缺省 = 全部 */
+  kinds?: string[];
+  /** 时间段起止（epoch millis，含边界）；缺省 = 不限（全部保留期 30 天） */
+  fromTs?: number;
+  toTs?: number;
+  /** 最多返回条数（默认 200，上限 1000） */
+  limit?: number;
+}
+
 export interface FsEntry {
   name: string;
   isDir: boolean;
