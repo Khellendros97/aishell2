@@ -436,7 +436,7 @@ fn path_depth(path: &str) -> usize {
     path.split('/').count()
 }
 
-fn directory_hash(path: &str) -> String {
+pub(crate) fn directory_hash(path: &str) -> String {
     let mut value = EMPTY_DIRECTORY_DOMAIN.to_vec();
     value.extend_from_slice(path.as_bytes());
     sha256_hex(&value)
@@ -444,7 +444,8 @@ fn directory_hash(path: &str) -> String {
 
 /// 复用 crypto 的 NFC/path 规则，并补上 Windows 驱动器、ADS 和设备名规则。
 /// 后三项即使在非 Windows 测试机也执行，保证同步数据跨平台可还原。
-fn normalized_sync_path(path: &str) -> NoteSyncResult<String> {
+/// （技能同步等其它文件树域共用本函数。）
+pub(crate) fn normalized_sync_path(path: &str) -> NoteSyncResult<String> {
     let normalized = normalize_note_path(path)?;
     for component in normalized.split('/') {
         if component.is_empty()
@@ -513,7 +514,9 @@ fn validated_root(root: &Path) -> NoteSyncResult<PathBuf> {
 }
 
 /// 在 root 下解析路径。逐组件检查 symlink，并用最近存在的祖先做 canonical 边界校验。
-fn safe_target(root: &Path, relative: &str) -> NoteSyncResult<(PathBuf, String)> {
+/// 在 root 下解析路径。逐组件检查 symlink，并用最近存在的祖先做 canonical 边界校验。
+/// （技能同步等其它文件树域共用本函数。）
+pub(crate) fn safe_target(root: &Path, relative: &str) -> NoteSyncResult<(PathBuf, String)> {
     let root = validated_root(root)?;
     let relative = normalized_sync_path(relative)?;
     let mut target = root.clone();
@@ -542,7 +545,8 @@ fn safe_target(root: &Path, relative: &str) -> NoteSyncResult<(PathBuf, String)>
     Ok((target, relative))
 }
 
-fn ensure_safe_parent(root: &Path, target: &Path) -> NoteSyncResult<()> {
+/// （技能同步等其它文件树域共用本函数。）
+pub(crate) fn ensure_safe_parent(root: &Path, target: &Path) -> NoteSyncResult<()> {
     let root = validated_root(root)?;
     let parent = target
         .parent()
@@ -583,7 +587,8 @@ fn temporary_path(parent: &Path, name: &str) -> PathBuf {
 
 /// 同目录 tmp + flush + rename。Unix rename 可原子替换；Windows 的 rename 不覆盖已有
 /// 文件，因此只在确认目标是普通文件后删除，再完成替换，绝不覆盖符号链接或目录。
-fn atomic_write(target: &Path, bytes: &[u8], replace_existing: bool) -> NoteSyncResult<()> {
+/// （技能同步等其它文件树域共用本函数。）
+pub(crate) fn atomic_write(target: &Path, bytes: &[u8], replace_existing: bool) -> NoteSyncResult<()> {
     let parent = target
         .parent()
         .ok_or_else(|| NoteSyncError::InvalidPath(target.display().to_string()))?;
@@ -751,7 +756,8 @@ pub fn apply_remote_tombstone(root: &Path, tombstone: &NoteTombstone) -> NoteSyn
     Ok(())
 }
 
-fn remove_tree_no_symlinks(path: &Path) -> NoteSyncResult<()> {
+/// （技能同步等其它文件树域共用本函数。）
+pub(crate) fn remove_tree_no_symlinks(path: &Path) -> NoteSyncResult<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(NoteSyncError::Symlink(path.display().to_string()));

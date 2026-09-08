@@ -413,6 +413,22 @@ pub fn note_entity_id(
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
+/// 技能同步实体的不透明标识，派生方式与 note_entity_id 相同但用途域隔离：
+/// `base64url(HMAC-SHA256(skillIndexKey, "skill:" + NFC(path)))`。
+/// 路径形如 `global/<技能名>/<相对路径>` 或 `project/<projectId>/<技能名>/<相对路径>`。
+pub fn skill_entity_id(
+    vault_key: &[u8; KEY_BYTES],
+    relative_path: &str,
+) -> Result<String, CryptoError> {
+    let path = normalize_note_path(relative_path)?;
+    let index_key = derive_purpose_key(vault_key, "skill-index")?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(index_key.as_ref())
+        .map_err(|_| CryptoError::Derivation)?;
+    mac.update(b"skill:");
+    mac.update(path.as_bytes());
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
 /// 让测试和调用方安全清理临时秘密缓冲区。
 pub fn clear_secret(buffer: &mut [u8]) {
     buffer.zeroize();

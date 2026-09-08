@@ -162,6 +162,8 @@ export interface SyncStatus {
     sftpFavorites: number;
     browserFavorites: number;
   } | null;
+  /** 本机扫描到的同步技能个数（全局 + 各项目技能根）；尚未扫描过为 null */
+  skillCount?: number | null;
 }
 
 /** 云端文件备份条目；锁定时 name/rootMeta 可为空，避免泄露本地路径 */

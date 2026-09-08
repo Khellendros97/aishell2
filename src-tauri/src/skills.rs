@@ -183,7 +183,7 @@ fn trusted_root(root: &Path) -> Result<PathBuf, String> {
 }
 
 /// 校验技能名称（frontmatter name / 目录名共用）：小写字母数字与连字符、最长 64。
-fn validate_skill_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("技能名称不能为空".to_string());
     }
@@ -1183,6 +1183,22 @@ pub(crate) fn skill_scope_of(content: &str) -> Result<Vec<String>, String> {
     Ok(validate_fm(&v)?.1)
 }
 
+/// 云同步扫描用：校验目录是一个合法技能（SKILL.md frontmatter 合法且 name 与目录名一致）。
+/// 只读校验，不做任何文件系统变更。
+pub(crate) fn validate_skill_content(dir_name: &str, content: &str) -> Result<(), String> {
+    validate_skill_name(dir_name)?;
+    let split = split_frontmatter(content)?;
+    let v = parse_fm_value(split.fm)?;
+    let common = validate_fm_common(&v)?;
+    if common.name != dir_name {
+        return Err(format!(
+            "技能目录名与 frontmatter name 不一致（目录「{dir_name}」≠「{}」）",
+            common.name
+        ));
+    }
+    Ok(())
+}
+
 /// 指定技能是否已存在于对应根（SDK 导入判断覆盖语义用）。
 pub(crate) fn skill_exists(store: &Store, project_id: &str, origin: SkillOrigin, name: &str) -> bool {
     let Ok(root) = skills_root(store, project_id, origin) else {
@@ -1244,6 +1260,19 @@ pub fn seed_builtin_skill_files(workspace: &str) -> Result<(), String> {
 /// 内置技能内容哈希侧车文件名（与 SKILL.md 同目录），用于区分「上次播种的原样文件」
 /// 与「用户改过的文件」——只有前者才允许推送内置内容更新。
 const BUILTIN_HASH_FILE: &str = ".builtin-sha256";
+
+/// 云同步扫描用：判定内置播种副本是否未被用户改过（SKILL.md 内容哈希 == 侧车记录）。
+/// 未改过的内置技能每台设备都会自动播种，无需经云同步传播。
+pub(crate) fn builtin_seed_untouched(skill_dir: &Path) -> bool {
+    let file = skill_dir.join(SKILL_FILE);
+    let Ok(current) = std::fs::read(&file) else {
+        return false;
+    };
+    match std::fs::read_to_string(skill_dir.join(BUILTIN_HASH_FILE)) {
+        Ok(recorded) => recorded.trim() == sha256_hex(&current),
+        Err(_) => false,
+    }
+}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};

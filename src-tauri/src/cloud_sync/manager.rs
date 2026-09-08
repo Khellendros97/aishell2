@@ -4,7 +4,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
@@ -26,6 +26,12 @@ use super::notes_sync::{
     apply_remote_directory, apply_remote_file, apply_remote_tombstone, diff, scan_notes,
     NoteDirectoryPayloadV1, NoteEntryType, NoteIndex, NotePayloadV1, NoteTombstone,
     NOTE_DIRECTORY_ENTITY_TYPE, NOTE_ENTITY_TYPE, NOTE_PAYLOAD_SCHEMA_VERSION,
+};
+use super::skills_sync::{
+    diff_skill_indexes, scan_skill_roots, skill_path_prefix, split_skill_path, SkillEntryType,
+    SkillFilePayloadV1, SkillIndexRecord, SkillRootSpec, SkillSyncScope,
+    SKILL_DIRECTORY_ENTITY_TYPE, SKILL_ENTITY_TYPE, SKILL_INDEX_BASELINE_ID,
+    SKILL_INDEX_BASELINE_TYPE, SKILL_PAYLOAD_SCHEMA_VERSION,
 };
 use super::protocol::{
     CompleteUploadRequest, CreateUploadRequest, Device, KeyEnvelope, MutationRequest,
@@ -122,6 +128,8 @@ pub struct ClientSyncStatus {
     pub device: Option<ClientDevice>,
     /// 云端核心配置（core_config）里各实体的数量，反映已备份到云端的配置规模。
     pub config_counts: Option<ClientConfigCounts>,
+    /// 本轮扫描到的技能个数（全局 + 各项目技能根）；尚未扫描过为 None。
+    pub skill_count: Option<usize>,
 }
 
 impl Default for ClientSyncStatus {
@@ -140,6 +148,7 @@ impl Default for ClientSyncStatus {
             limits: ClientLimits::default(),
             device: None,
             config_counts: None,
+            skill_count: None,
         }
     }
 }
@@ -256,6 +265,50 @@ impl CloudSyncManager {
     fn record_config_counts(&self, payload: &CoreConfigPayloadV1) {
         if let Ok(mut runtime) = self.runtime.lock() {
             runtime.status.config_counts = Some(config_counts(payload));
+        }
+    }
+
+    /// 记录本轮扫描到的技能个数，供前端展示同步规模。
+    fn record_skill_count(&self, count: usize) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.status.skill_count = Some(count);
+        }
+    }
+
+    /// 技能根清单：全局根 + 每个项目的技能根（根推导复用 skills.rs 的权威规则；
+    /// workspace 未配置时根推导失败，技能同步整体跳过——sync_now 已先行门禁）。
+    fn skill_scan_specs(&self, projects: &[crate::store::Project]) -> Vec<SkillRootSpec> {
+        let mut specs = Vec::new();
+        if let Ok(root) = crate::skills::global_skills_root(&self.store) {
+            specs.push(SkillRootSpec {
+                prefix: "global".into(),
+                root,
+            });
+        }
+        for project in projects {
+            if let Ok(root) = crate::skills::project_skills_root(&self.store, &project.id) {
+                specs.push(SkillRootSpec {
+                    prefix: format!("project/{}", project.id),
+                    root,
+                });
+            }
+        }
+        specs
+    }
+
+    /// 同步路径 scope → 本机技能根。项目不存在返回 None（悬空云端数据，宽松跳过）。
+    fn skill_root_for_scope(&self, scope: &SkillSyncScope) -> Result<Option<PathBuf>, String> {
+        match scope {
+            SkillSyncScope::Global => {
+                Ok(Some(crate::skills::global_skills_root(&self.store)?))
+            }
+            SkillSyncScope::Project(project_id) => match self.store.project(project_id) {
+                Some(_) => Ok(Some(crate::skills::project_skills_root(
+                    &self.store,
+                    project_id,
+                )?)),
+                None => Ok(None),
+            },
         }
     }
 
@@ -539,13 +592,17 @@ impl CloudSyncManager {
             };
             let plaintext = decrypt_sync_item(vault, user_id, &item.entity_type, &item.entity_id, item.payload_schema_version as u32, &encrypted).map_err(|error| error.to_string())?;
             let local_hash = sha256_hex(&plaintext);
-            self.apply_plain_item(user_id, item, &plaintext)?;
-            state.entities.insert(key, EntityState { version: item.version, tombstone: false, ciphertext_sha256: item.ciphertext_sha256.clone(), local_hash: Some(local_hash) });
+            // 返回 false 表示宽松跳过（项目技能根缺失等悬空云端数据）：不落盘、不记入
+            // 实体状态；游标照常推进，等对端把残缺数据补全后自然不再出现。
+            if self.apply_plain_item(user_id, item, &plaintext)? {
+                state.entities.insert(key, EntityState { version: item.version, tombstone: false, ciphertext_sha256: item.ciphertext_sha256.clone(), local_hash: Some(local_hash) });
+            }
         }
         Ok(())
     }
 
-    fn apply_plain_item(&self, user_id: &str, item: &SyncItem, plaintext: &[u8]) -> Result<(), String> {
+    /// 返回 false 表示该实体被宽松跳过（未落盘、不记入实体状态）。
+    fn apply_plain_item(&self, user_id: &str, item: &SyncItem, plaintext: &[u8]) -> Result<bool, String> {
         match item.entity_type.as_str() {
             CORE_ENTITY_TYPE => {
                 let remote: CoreConfigPayloadV1 = serde_json::from_slice(plaintext).map_err(|error| format!("云端核心配置格式损坏: {error}"))?;
@@ -586,9 +643,28 @@ impl CloudSyncManager {
                 let root = self.store.notes_root()?;
                 apply_remote_directory(&root, &payload).map_err(|error| error.to_string())?;
             }
+            SKILL_ENTITY_TYPE => {
+                let payload: SkillFilePayloadV1 = serde_json::from_slice(plaintext).map_err(|error| format!("云端技能文件格式损坏: {error}"))?;
+                let (scope, within_root) = split_skill_path(&payload.path)?;
+                match self.skill_root_for_scope(&scope)? {
+                    Some(root) => {
+                        super::skills_sync::apply_remote_file(&root, &within_root, &payload)?;
+                        let _ = self.app.emit("fs:changed", json!({"path": root.join(&within_root).to_string_lossy()}));
+                    }
+                    None => return Ok(false),
+                }
+            }
+            SKILL_DIRECTORY_ENTITY_TYPE => {
+                let payload: super::skills_sync::SkillDirectoryPayloadV1 = serde_json::from_slice(plaintext).map_err(|error| format!("云端技能目录格式损坏: {error}"))?;
+                let (scope, within_root) = split_skill_path(&payload.path)?;
+                match self.skill_root_for_scope(&scope)? {
+                    Some(root) => super::skills_sync::apply_remote_directory(&root, &within_root, &payload)?,
+                    None => return Ok(false),
+                }
+            }
             _ => return Err(format!("当前客户端不支持同步实体类型 {}，请升级 AIShell", item.entity_type)),
         }
-        Ok(())
+        Ok(true)
     }
 
     fn apply_tombstone(&self, user_id: &str, item: &SyncItem) -> Result<(), String> {
@@ -603,6 +679,16 @@ impl CloudSyncManager {
                 if let Some(record) = baseline {
                     let tombstone = NoteTombstone { entity_id: item.entity_id.clone(), entry_type: record.entry_type, path: record.path, tombstone: true };
                     apply_remote_tombstone(&self.store.notes_root()?, &tombstone).map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            }
+            SKILL_ENTITY_TYPE | SKILL_DIRECTORY_ENTITY_TYPE => {
+                let baseline: Option<super::skills_sync::SkillIndexRecordBaseline> = self.local.load_baseline(user_id, &item.entity_type, &item.entity_id).map_err(|error| error.to_string())?;
+                if let Some(record) = baseline {
+                    let (scope, within_root) = split_skill_path(&record.path)?;
+                    if let Some(root) = self.skill_root_for_scope(&scope)? {
+                        super::skills_sync::apply_remote_tombstone(&root, &within_root, record.entry_type)?;
+                    }
                 }
                 Ok(())
             }
@@ -720,6 +806,44 @@ impl CloudSyncManager {
         } else if !pending.is_empty() {
             self.submit_pending(api, user_id, state, &pending, remote_status.limits.max_batch_items.max(1) as usize).await?;
         }
+
+        // ---- 技能文件同步（全局根 + 各项目根） ----
+        // 只有扫描完整才允许保存索引基线；tombstone 只对「本轮确认过状态」的前缀生效
+        // （实际扫描过的根 + 已从配置删除的项目级联清理），项目还在但技能根目录暂时缺失
+        // （移动/还原中）保守保留云端，绝不误删。
+        let skill_specs = self.skill_scan_specs(&snapshot.projects);
+        if !skill_specs.is_empty() {
+            let scan = scan_skill_roots(&skill_specs, vault);
+            let old_index: Vec<SkillIndexRecord> = self.local.load_baseline(user_id, SKILL_INDEX_BASELINE_TYPE, SKILL_INDEX_BASELINE_ID).map_err(|error| error.to_string())?.unwrap_or_default();
+            let mut skill_plan = diff_skill_indexes(&old_index, &scan.index);
+            let mut considered = scan.scanned_prefixes.clone();
+            let active_project_ids: HashSet<&str> = snapshot.projects.iter().map(|project| project.id.as_str()).collect();
+            for prefix in old_index.iter().filter_map(|record| skill_path_prefix(&record.path)) {
+                if let Some(project_id) = prefix.strip_prefix("project/") {
+                    if !active_project_ids.contains(project_id) { considered.insert(prefix.to_string()); }
+                }
+            }
+            skill_plan.tombstones.retain(|tombstone| skill_path_prefix(&tombstone.path).is_some_and(|prefix| considered.contains(prefix)));
+            let mut skill_pending = Vec::new();
+            for upsert in &skill_plan.upserts {
+                let bytes = match upsert.entry_type {
+                    SkillEntryType::File => serde_json::to_vec(scan.file_payload(&upsert.path).ok_or_else(|| "技能同步计划缺少文件 payload".to_string())?),
+                    SkillEntryType::Directory => serde_json::to_vec(scan.directory_payload(&upsert.path).ok_or_else(|| "技能同步计划缺少目录 payload".to_string())?),
+                }.map_err(|error| format!("序列化技能失败: {error}"))?;
+                skill_pending.push(self.prepare_upsert(api, user_id, vault, state, upsert.entry_type.entity_type(), &upsert.entity_id, SKILL_PAYLOAD_SCHEMA_VERSION as i64, &bytes, remote_status.limits.inline_payload_bytes).await?);
+                self.local.save_baseline(user_id, upsert.entry_type.entity_type(), &upsert.entity_id, &super::skills_sync::SkillIndexRecordBaseline { path: upsert.path.clone(), entry_type: upsert.entry_type }).map_err(|error| error.to_string())?;
+            }
+            for tombstone in &skill_plan.tombstones {
+                let version = state.entities.get(&entity_key(tombstone.entry_type.entity_type(), &tombstone.entity_id)).map(|entity| entity.version).unwrap_or(0);
+                skill_pending.push(prepared_delete(tombstone.entry_type.entity_type(), &tombstone.entity_id, version));
+            }
+            if !skill_pending.is_empty() {
+                self.submit_pending(api, user_id, state, &skill_pending, remote_status.limits.max_batch_items.max(1) as usize).await?;
+            }
+            self.local.save_baseline(user_id, SKILL_INDEX_BASELINE_TYPE, SKILL_INDEX_BASELINE_ID, &scan.index).map_err(|error| error.to_string())?;
+            self.record_skill_count(scan.skill_count);
+        }
+
         self.local.save_baseline(user_id, CORE_ENTITY_TYPE, CORE_ENTITY_ID, &core).map_err(|error| error.to_string())?;
         // 推送后记录本机核心配置规模（本机已与云端就这些配置达成一致）。
         self.record_config_counts(&core);
