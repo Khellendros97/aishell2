@@ -6,6 +6,7 @@
  * DOM id/class 与旧版一致，settings.css 直接复用；顶栏由 App.tsx 提供，本组件不渲染 Topbar。
  * 2026-08 起按用户要求新增左侧分类导航（功能特性/外观/快捷键/API 接口，SETTINGS_NAV 四页），
  * 字段状态共享一份 SysFields，三个可编辑页的保存按钮等价（整表单提交）；快捷键页只读，此布局无 proto 对照。
+ * 页面底部接入三页共用的 components/Statusbar 底栏（进度区/隧道角标；本页无 AI 面板，不传 AI 开关）。
  * 历史说明：原「服务器配置」面板（服务器卡片/搜索/分组/拖拽/模态/从 Xshell 导入）已随
  * 项目-服务器单维度重构移除；xshell 导入已移至欢迎页按目录自动建项目，服务器在项目语义下管理。
  */
@@ -20,6 +21,7 @@ import { Icon } from '../../shared/Icon';
 import type { IconName } from '../../icons';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { applyTheme, currentTheme, onThemeChange } from '../../theme';
+import { Statusbar } from '../../components/Statusbar';
 import '../settings.css';
 
 /** 表单字段（与旧版 f-* 元素一一对应；apiKey / braveKey 只存本次输入，加载时恒为空串） */
@@ -611,6 +613,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
           )}
         </main>
       </div>
+      {/* 三页共用底栏（进度区/隧道角标在组件内自持；设置页无 AI 面板，不出 AI 开关） */}
+      <Statusbar />
     </div>
   );
 }

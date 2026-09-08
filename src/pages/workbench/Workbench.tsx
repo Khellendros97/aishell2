@@ -5,19 +5,22 @@
  *   底部 AI 面板开关;浏览器是主工作区标签页而非侧栏面板(用户要求窗口大),固定 id 'browser'
  *   单实例,openTab 同 id 去重激活;
  * - commands 准入在 store.setPanel(活跃标签须为终端);活跃标签变为非终端时自动切回 explorer;
- * - 侧栏/ AI 面板可拖宽(语义同旧版 bindPanelResize:指针拖拽 + 键盘方向键 + 出屏钳制);
+ * - 侧栏/ AI 面板可拖宽(语义同旧版 bindPanelResize:指针拖拽 + 键盘方向键 + 出屏钳制,
+ *   交互逻辑在 shared/panelResize.ts 共享钩子,本组件只负责钳制与落地);
  * - 标签栏:同 id 去重激活、终端同名自动编号、终端右键菜单(添加到对话/重命名/复制 SSH 渠道/关闭);
  * - panes 常驻挂载(keep-alive),active 仅切显隐 —— 终端/SSH/AI 会话不随标签切换销毁。
  * 项目装载失败自行导航回欢迎页并 onFail();实例销毁(换项目)时关闭全部标签并复位 store。
  */
-import { useEffect, useRef, useState } from 'react';
-import type { MouseEvent as ReactMouseEvent, RefObject } from 'react';
-import { getState, onTunnelsChanged, tunnelList } from '../../api';
+import { useEffect, useRef } from 'react';
+import type { MouseEvent as ReactMouseEvent } from 'react';
+import { getState } from '../../api';
 import { navigate } from '../../router';
 import { toast, promptDialog, showContextMenu, uid, type CtxMenuItems } from '../../ui';
-import type { Project, ServerRef, TunnelState } from '../../types';
+import type { Project, ServerRef } from '../../types';
 import { Topbar } from '../../components/Topbar';
+import { Statusbar } from '../../components/Statusbar';
 import { Icon } from '../../shared/Icon';
+import { usePanelResize } from '../../shared/panelResize';
 import {
   useWorkbench, wbEvents, wbHandles, type PanelKey, type Tab,
 } from '../../stores/workbench';
@@ -25,88 +28,22 @@ import { PANELS } from './sidebar/panels';
 import { TAB_TYPES } from './tabs/registry';
 import { setWorkbenchActive } from './tabs/browser-engine';
 import { AiPanel } from './ai/AiPanel';
-import { refreshProgress } from './statusbar-progress';
 import './workbench.css';
 
-/* ---------- 面板拖宽(指针 + 键盘,出屏钳制;对照旧版 bindPanelResize) ---------- */
-function usePanelResize(
-  handleRef: RefObject<HTMLDivElement>,
-  panelRef: RefObject<HTMLDivElement>,
+/* ---------- 面板宽度钳制与应用(语义同旧版 bindPanelResize;交互在共享钩子) ---------- */
+function applyPanelWidth(
+  workbench: HTMLDivElement,
+  handle: HTMLElement | null,
   side: 'left' | 'right',
-  workbenchRef: RefObject<HTMLDivElement>,
-  activityBarRef: RefObject<HTMLDivElement>,
-  sidebarRef: RefObject<HTMLDivElement>,
-  aiPanelRef: RefObject<HTMLDivElement>,
-  sidebarResizerRef: RefObject<HTMLDivElement>,
-  aiResizerRef: RefObject<HTMLDivElement>,
+  width: number,
+  occupiedByOther: number,
 ): void {
-  useEffect(() => {
-    const handle = handleRef.current;
-    const panel = panelRef.current;
-    const workbench = workbenchRef.current;
-    if (!handle || !panel || !workbench) return;
-    const minimum = side === 'left' ? 180 : 280;
-    const maximum = side === 'left' ? 520 : 560;
-    const property = side === 'left' ? '--sidebar-w' : '--ai-panel-w';
-
-    const clampWidth = (width: number): number => {
-      const occupiedByOther = (activityBarRef.current?.offsetWidth ?? 0)
-        + (side === 'left' ? (aiPanelRef.current?.offsetWidth ?? 0) : (sidebarRef.current?.offsetWidth ?? 0))
-        + (sidebarResizerRef.current?.offsetWidth ?? 0) + (aiResizerRef.current?.offsetWidth ?? 0);
-      const availableMaximum = Math.max(minimum, workbench.clientWidth - occupiedByOther - 360);
-      return Math.round(Math.max(minimum, Math.min(maximum, Math.min(width, availableMaximum))));
-    };
-
-    const applyWidth = (width: number): void => {
-      const next = clampWidth(width);
-      workbench.style.setProperty(property, `${next}px`);
-      handle.setAttribute('aria-valuenow', String(next));
-    };
-
-    let dragging = false;
-    let startX = 0;
-    let startWidth = 0;
-
-    const onPointerMove = (event: PointerEvent): void => {
-      if (!dragging) return;
-      const delta = event.clientX - startX;
-      applyWidth(startWidth + (side === 'left' ? delta : -delta));
-    };
-    const onPointerUp = (): void => {
-      if (!dragging) return;
-      dragging = false;
-      handle.classList.remove('active');
-      document.body.classList.remove('wb-resizing');
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
-    };
-    const onPointerDown = (event: PointerEvent): void => {
-      if (event.button !== 0) return;
-      event.preventDefault();
-      dragging = true;
-      startX = event.clientX;
-      startWidth = panel.getBoundingClientRect().width;
-      handle.classList.add('active');
-      document.body.classList.add('wb-resizing');
-      window.addEventListener('pointermove', onPointerMove);
-      window.addEventListener('pointerup', onPointerUp);
-    };
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-      event.preventDefault();
-      const direction = event.key === 'ArrowRight' ? 1 : -1;
-      applyWidth(panel.getBoundingClientRect().width + direction * (side === 'left' ? 16 : -16));
-    };
-
-    handle.addEventListener('pointerdown', onPointerDown);
-    handle.addEventListener('keydown', onKeyDown);
-    applyWidth(panel.getBoundingClientRect().width);
-    return () => {
-      onPointerUp();
-      handle.removeEventListener('pointerdown', onPointerDown);
-      handle.removeEventListener('keydown', onKeyDown);
-    };
-  }, [handleRef, panelRef, side, workbenchRef, activityBarRef, sidebarRef, aiPanelRef, sidebarResizerRef, aiResizerRef]);
+  const minimum = side === 'left' ? 180 : 280;
+  const maximum = side === 'left' ? 520 : 560;
+  const availableMaximum = Math.max(minimum, workbench.clientWidth - occupiedByOther - 360);
+  const next = Math.round(Math.max(minimum, Math.min(maximum, Math.min(width, availableMaximum))));
+  workbench.style.setProperty(side === 'left' ? '--sidebar-w' : '--ai-panel-w', `${next}px`);
+  handle?.setAttribute('aria-valuenow', String(next));
 }
 
 /** 终端标签重命名:promptDialog 输入新名,空串/路径分隔符由弹窗校验拦截 */
@@ -150,8 +87,20 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
   const aiPanelRef = useRef<HTMLDivElement>(null);
   const aiResizerRef = useRef<HTMLDivElement>(null);
 
-  usePanelResize(sidebarResizerRef, sidebarRef, 'left', workbenchRef, activityBarRef, sidebarRef, aiPanelRef, sidebarResizerRef, aiResizerRef);
-  usePanelResize(aiResizerRef, aiPanelRef, 'right', workbenchRef, activityBarRef, sidebarRef, aiPanelRef, sidebarResizerRef, aiResizerRef);
+  usePanelResize(sidebarResizerRef, sidebarRef, 'left', (width) => {
+    const workbench = workbenchRef.current;
+    if (!workbench) return;
+    applyPanelWidth(workbench, sidebarResizerRef.current, 'left', width,
+      (activityBarRef.current?.offsetWidth ?? 0) + (aiPanelRef.current?.offsetWidth ?? 0)
+        + (sidebarResizerRef.current?.offsetWidth ?? 0) + (aiResizerRef.current?.offsetWidth ?? 0));
+  });
+  usePanelResize(aiResizerRef, aiPanelRef, 'right', (width) => {
+    const workbench = workbenchRef.current;
+    if (!workbench) return;
+    applyPanelWidth(workbench, aiResizerRef.current, 'right', width,
+      (activityBarRef.current?.offsetWidth ?? 0) + (sidebarRef.current?.offsetWidth ?? 0)
+        + (sidebarResizerRef.current?.offsetWidth ?? 0) + (aiResizerRef.current?.offsetWidth ?? 0));
+  });
 
   /* ---------- 项目装载(异步;对照旧版 workbench.ts 装载段) ---------- */
   useEffect(() => {
@@ -230,26 +179,6 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
   useEffect(() => {
     setWorkbenchActive(active);
   }, [active]);
-
-  /* ---------- 底边栏进度区:挂载后刷新一次(传输/暂存事件先于容器出现时任务已入队) ---------- */
-  useEffect(() => {
-    refreshProgress();
-  }, []);
-
-  /* ---------- 底边栏运行中隧道角标:挂载拉一次 + tunnels:changed 驱动刷新(全服务器,不过滤) ---------- */
-  const [runningTunnels, setRunningTunnels] = useState<TunnelState[]>([]);
-  useEffect(() => {
-    let alive = true;
-    const refresh = (): void => {
-      void tunnelList()
-        .then((list) => { if (alive) setRunningTunnels(list.filter((t) => t.running)); })
-        .catch(() => { /* 后端未就绪静默,下次 tunnels:changed 再刷 */ });
-    };
-    refresh();
-    let unlisten: (() => void) | null = null;
-    void onTunnelsChanged(refresh).then((u) => { unlisten = u; });
-    return () => { alive = false; unlisten?.(); };
-  }, []);
 
   /* ---------- 正在显示 commands 时活跃标签变为非终端(或 null)→ 自动切回 explorer ---------- */
   useEffect(() => {
@@ -378,36 +307,21 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
             导致发送消息恒报「项目未加载」。project 门控恢复旧版时序;换项目时整树经 key 重建,AiPanel 随之重挂。 */}
         <div id="ai-panel" ref={aiPanelRef} className={aiVisible ? '' : 'hidden'}>{project && active ? <AiPanel /> : null}</div>
         </div>
-        <div id="workbench-statusbar" role="status" aria-label="工作台状态栏">
-          <div className="statusbar-left">
-            {project && <span className="statusbar-item" title={`当前项目：${project.name}`}><Icon name="folder" />{project.name}</span>}
-            <span className="statusbar-item statusbar-active-tab" title={activeTab ? `当前标签页：${activeTab.title}` : '当前没有活跃标签页'}>
-              {activeTab ? <><Icon name={activeTab.icon} />{activeTab.title}</> : '无活动标签页'}
-            </span>
-          </div>
-          <div className="statusbar-progress" id="workbench-progress" aria-live="polite"></div>
-          <div className="statusbar-right">
-            {runningTunnels.length > 0 && (
-              <span
-                className="statusbar-item statusbar-tunnels"
-                title={`运行中的 SSH 隧道（${runningTunnels.length}）：${runningTunnels.map((t) => `${t.name}（${t.bindAddr}:${t.localPort}）`).join('、')}`}
-              >
-                <Icon name="tunnel" />{runningTunnels.length}
+        {/* 底栏为三页共用组件(components/Statusbar):进度区/隧道角标在组件内自持,
+            这里只传工作台特有的左信息区与 AI 面板开关 */}
+        <Statusbar
+          left={
+            <>
+              {project && <span className="statusbar-item" title={`当前项目：${project.name}`}><Icon name="folder" />{project.name}</span>}
+              <span className="statusbar-item statusbar-active-tab" title={activeTab ? `当前标签页：${activeTab.title}` : '当前没有活跃标签页'}>
+                {activeTab ? <><Icon name={activeTab.icon} />{activeTab.title}</> : '无活动标签页'}
               </span>
-            )}
-            <button
-              type="button"
-              className={`statusbar-ai-toggle${aiVisible ? ' active' : ''}`}
-              title={aiVisible ? '隐藏 AI 助手' : '显示 AI 助手'}
-              aria-controls="ai-panel"
-              aria-expanded={aiVisible}
-              onClick={() => useWorkbench.getState().setAiVisible(!aiVisible)}
-            >
-              <Icon name="bot" />
-              <span>AI 助手</span>
-            </button>
-          </div>
-        </div>
+            </>
+          }
+          aiVisible={aiVisible}
+          aiControls="ai-panel"
+          onToggleAi={() => useWorkbench.getState().setAiVisible(!aiVisible)}
+        />
       </div>
     </>
   );

@@ -5,8 +5,9 @@
 
 .welcome-page .welcome-content { flex: 1; min-height: 0; display: flex; }
 .welcome-page main { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 20px 24px 32px; }
+/* AI 面板可拖宽：宽度由 Welcome.tsx 拖拽落在 .welcome-content 的 --welcome-ai-w（缺省用 clamp 默认值） */
 .welcome-page .welcome-ai {
-  width: clamp(360px, 34vw, 520px); flex: none; min-height: 0;
+  width: var(--welcome-ai-w, clamp(360px, 34vw, 520px)); flex: none; min-height: 0;
   display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--bg-1);
 }
 .welcome-page .welcome-ai-head {

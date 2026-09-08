@@ -1,5 +1,6 @@
 /**
- * 工作台底边栏进度区（命令式单例，挂载到 #workbench-statusbar 的 #workbench-progress 容器）。
+ * 应用底栏进度区（命令式单例，渲染到页面上全部 .statusbar-progress 容器——
+ * 工作台保活隐藏期间其容器与当前页（欢迎/设置）容器并存，逐一同步）。
  * 无 .proto 对照，全新功能；取代旧右下角弹窗 staging-progress.ts。
  *
  * 数据源：
@@ -37,31 +38,34 @@ interface Task {
 const tasks = new Map<string, Task>();
 let subscribed = false;
 
-function rootEl(): HTMLElement | null {
-  const el = document.getElementById('workbench-progress');
-  return el && el.isConnected ? el : null;
+function rootEls(): HTMLElement[] {
+  /* 多页面底栏并存（工作台保活隐藏的容器 + 当前页容器），全部连接的容器同步渲染 */
+  return Array.from(document.querySelectorAll<HTMLElement>('.statusbar-progress'))
+    .filter((el) => el.isConnected);
 }
 
 function render(): void {
-  const el = rootEl();
-  if (!el) return;
-  el.innerHTML = '';
-  for (const t of tasks.values()) {
-    const bar = document.createElement('div');
-    bar.className = 'wb-progress-task';
-    if (t.pct == null) bar.classList.add('indeterminate');
-    bar.title = t.detail;
-    const fill = document.createElement('div');
-    fill.className = 'wb-progress-fill';
-    if (t.pct != null) fill.style.width = `${t.pct}%`;
-    const label = document.createElement('span');
-    label.className = 'wb-progress-label';
-    label.textContent = `${t.title}${t.pct != null ? ` ${t.pct}%` : ''}`;
-    const detail = document.createElement('span');
-    detail.className = 'wb-progress-detail';
-    detail.textContent = t.detail;
-    bar.append(fill, label, detail);
-    el.appendChild(bar);
+  const els = rootEls();
+  if (!els.length) return;
+  for (const el of els) {
+    el.innerHTML = '';
+    for (const t of tasks.values()) {
+      const bar = document.createElement('div');
+      bar.className = 'wb-progress-task';
+      if (t.pct == null) bar.classList.add('indeterminate');
+      bar.title = t.detail;
+      const fill = document.createElement('div');
+      fill.className = 'wb-progress-fill';
+      if (t.pct != null) fill.style.width = `${t.pct}%`;
+      const label = document.createElement('span');
+      label.className = 'wb-progress-label';
+      label.textContent = `${t.title}${t.pct != null ? ` ${t.pct}%` : ''}`;
+      const detail = document.createElement('span');
+      detail.className = 'wb-progress-detail';
+      detail.textContent = t.detail;
+      bar.append(fill, label, detail);
+      el.appendChild(bar);
+    }
   }
 }
 
@@ -76,7 +80,7 @@ function formatBytes(n: number): string {
 function upsert(key: string, title: string, pct: number | null, detail: string): void {
   const prev = tasks.get(key);
   tasks.set(key, { key, title, pct, detail, startedAt: prev?.startedAt ?? Date.now() });
-  if (prev || rootEl()) render();
+  if (prev || rootEls().length) render();
 }
 
 function finish(key: string): void {
@@ -107,7 +111,7 @@ function notifyDone(t: Task): void {
   notifyLongTask(title, `${name ? `${name} · ` : ''}耗时 ${formatDuration(dur)}`);
 }
 
-/** 底边栏进度注册（幂等；工作台挂载后 #workbench-progress 容器出现，事件到达即显示） */
+/** 底栏进度注册（幂等；页面挂载后 .statusbar-progress 容器出现，事件到达即显示） */
 function ensureSubscribed(): void {
   if (subscribed) return;
   subscribed = true;
@@ -183,7 +187,7 @@ export function completeProgress(key = 'manual'): void {
   notifyDone(t);
 }
 
-/** 工作台挂载完成时补渲染（事件在容器出现前到达时任务已入队列，需刷新展示）；
+/** 页面底栏挂载完成时补渲染（事件在容器出现前到达时任务已入队列，需刷新展示）；
  *  同时确保事件订阅已建立——SFTP 传输为纯事件驱动，若惰性只在 showProgress 时注册，
  *  用户直接上传/下载将收不到进度（曾因此不显示）。 */
 export function refreshProgress(): void {

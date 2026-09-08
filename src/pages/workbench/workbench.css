@@ -39,19 +39,7 @@
 #workbench.sidebar-collapsed #sidebar,
 #workbench.sidebar-collapsed #sidebar-resizer { display: none; }
 
-/* 左右面板可调宽分隔条；支持鼠标拖拽与键盘方向键微调 */
-.wb-resize-handle {
-  position: relative; z-index: 4; flex: none; width: 6px; height: 100%;
-  cursor: col-resize; touch-action: none; background: transparent;
-  transition: background 0.12s;
-}
-.wb-resize-handle::after {
-  content: ''; position: absolute; inset: 0 2px; background: var(--border-strong); opacity: 0;
-  transition: opacity 0.12s;
-}
-.wb-resize-handle:hover, .wb-resize-handle.active { background: var(--bg-hover); }
-.wb-resize-handle:hover::after, .wb-resize-handle.active::after { opacity: 1; }
-body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-select: none !important; }
+/* 面板可调宽分隔条 .wb-resize-handle / body.wb-resizing 样式已迁至 shared/panel-resize.css（三页共用） */
 
 /* 中央工作区 */
 #center { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg-0); }
@@ -77,54 +65,7 @@ body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-selec
 /* 右侧 AI 面板 */
 #ai-panel { width: var(--ai-panel-w); flex: none; background: var(--bg-1); border-left: 1px solid var(--border); display: flex; flex-direction: column; }
 
-/* 底部状态栏：AI 开关固定在右侧，不占用左侧活动栏空间 */
-#workbench-statusbar {
-  height: 26px; flex: none; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 8px; background: var(--bg-1); border-top: 1px solid var(--border);
-  color: var(--text-1); font-size: 11px;
-}
-.statusbar-left, .statusbar-right { display: flex; align-items: center; min-width: 0; }
-.statusbar-left, .statusbar-right { gap: 12px; }
-.statusbar-item, .statusbar-ai-toggle { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
-.statusbar-item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.statusbar-item .ic, .statusbar-ai-toggle .ic { flex: none; }
-.statusbar-active-tab { max-width: 260px; color: var(--text-2); }
-/* 运行中隧道角标：数量醒目，title 列明细 */
-.statusbar-tunnels { color: var(--green); flex: none; }
-.statusbar-tunnels .ic { color: inherit; }
-.statusbar-ai-toggle {
-  height: 22px; padding: 0 8px; border: 1px solid transparent; border-radius: var(--radius-s);
-  background: transparent; color: var(--text-1); cursor: pointer; font: inherit;
-}
-.statusbar-ai-toggle:hover { background: var(--bg-hover); color: var(--text-0); }
-.statusbar-ai-toggle.active { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-dim); }
-
-/* 底边栏进度区（SFTP 传输 / 暂存清理；statusbar-progress.ts 驱动） */
-.statusbar-progress {
-  display: flex; align-items: center; gap: 8px; margin-left: auto; margin-right: 12px;
-  max-width: 46%; min-width: 0; overflow: hidden; flex: 1 1 auto;
-}
-.statusbar-progress:empty { display: none; }
-.wb-progress-task {
-  position: relative; display: flex; align-items: center; gap: 6px; min-width: 120px; max-width: 260px;
-  height: 18px; padding: 0 8px; border: 1px solid var(--border); border-radius: 9px;
-  background: var(--bg-0); overflow: hidden;
-}
-.wb-progress-fill {
-  position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent-dim);
-  transition: width 0.2s ease; pointer-events: none;
-}
-.wb-progress-task.indeterminate .wb-progress-fill {
-  width: 34% !important; animation: wb-progress-slide 1.2s ease-in-out infinite;
-}
-@keyframes wb-progress-slide {
-  0% { left: -34%; } 100% { left: 100%; }
-}
-.wb-progress-label, .wb-progress-detail {
-  position: relative; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; z-index: 1;
-}
-.wb-progress-label { color: var(--text-0); font-weight: 600; flex: none; }
-.wb-progress-detail { color: var(--text-2); min-width: 0; }
+/* 底部状态栏样式已迁至 components/statusbar.css（三页共用，工作台由 components/Statusbar 渲染） */
 
 /* ===== 终端标签页（类名沿用 .proto/workbench-terminal.js） ===== */
 .term-root { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--bg-0); }
