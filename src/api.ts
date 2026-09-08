@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -335,6 +335,18 @@ export const timelineSearch = (projectId: string, query: TimelineQuery) =>
 /** 登记 serverId 的项目归属（打开 SSH 终端/SFTP 标签时调用，连接事件按归属项目落盘） */
 export const timelineBindServer = (projectId: string, serverId: string) =>
   call<void>('timeline_bind_server', { projectId, serverId });
+/** 给事件打标签（anchorTs/anchorKind 定位事件；两个同名标签构成标签对划定选区） */
+export const timelineTagAdd = (projectId: string, name: string, color: string, anchorTs: number, anchorKind: string) =>
+  call<TimelineTag>('timeline_tag_add', { projectId, name, color, anchorTs, anchorKind });
+/** 删除标签（按 名称+锚点 匹配，同名同锚点多条一并删） */
+export const timelineTagRemove = (projectId: string, name: string, anchorTs: number, anchorKind: string) =>
+  call<number>('timeline_tag_remove', { projectId, name, anchorTs, anchorKind });
+/** 更新闭合位置：该名称最近一个闭合选区的结束锚点移到目标事件，沿用原颜色 */
+export const timelineTagReclose = (projectId: string, name: string, anchorTs: number, anchorKind: string) =>
+  call<TimelineTag>('timeline_tag_reclose', { projectId, name, anchorTs, anchorKind });
+/** 列出项目全部标签记录（按打标时间倒序；按名去重取最新颜色由调用方做） */
+export const timelineTags = (projectId: string) =>
+  call<TimelineTag[]>('timeline_tags', { projectId });
 
 /* ---------------- browser（内置浏览器多页面子 webview，Rust browser.rs） ----------------
    每个「页面」一个子 webview（viewId 由前端生成 p1/p2/…）；占位 div 经 ResizeObserver

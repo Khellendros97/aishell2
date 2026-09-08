@@ -1047,7 +1047,7 @@ export default function (pi: ExtensionAPI) {
 		name: "timeline_search",
 		label: "搜索时间线",
 		description:
-			"搜索当前项目的时间线：SSH 连接/断开、终端与远程命令及结果、文件上传下载、AI 问答与工具调用的历史记录（保留 30 天）。可按关键词（大小写不敏感，匹配摘要与内容）、类别与时间段过滤，返回倒序（最新在前）的事件列表。",
+			"搜索当前项目的时间线：SSH 连接/断开、终端与远程命令及结果、文件上传下载、AI 问答与工具调用的历史记录（保留 30 天）。可按关键词（大小写不敏感，匹配摘要与内容；`#标签名` token 按标签过滤——命中直接打标或处于同名标签对选区内的事件，可多个 AND）、类别与时间段过滤，返回倒序（最新在前）的事件列表，条目附标签标注（#名=直接打标，#名（选区）=处于标签对选区内）。",
 		promptSnippet: "搜索项目时间线",
 		promptGuidelines: [
 			"用户问「之前执行过什么命令/连过哪台服务器/上传过什么文件/上次怎么解决的」或需要回顾项目历史时，用 timeline_search 检索，不要凭记忆猜测。",
@@ -1055,7 +1055,7 @@ export default function (pi: ExtensionAPI) {
 			"fromTs/toTs 为 epoch 毫秒（含边界）；不传则搜索全部保留期。结果较多时换更精确的关键词或更窄的时间段分批检索。",
 		],
 		parameters: Type.Object({
-			keyword: Type.Optional(Type.String({ description: "关键词（匹配摘要与内容，大小写不敏感）" })),
+			keyword: Type.Optional(Type.String({ description: "关键词（匹配摘要与内容，大小写不敏感）；支持 #标签名 按标签过滤，可与普通文本混用" })),
 			kinds: Type.Optional(Type.Array(Type.String(), { description: "类别过滤，如 [\"command\", \"file_upload\"]" })),
 			fromTs: Type.Optional(Type.Number({ description: "起始时间（epoch 毫秒，含）" })),
 			toTs: Type.Optional(Type.Number({ description: "截止时间（epoch 毫秒，含）" })),

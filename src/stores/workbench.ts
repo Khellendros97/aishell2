@@ -50,6 +50,13 @@ export interface TerminalApi {
   ctrlC(): void;
 }
 
+/** 时间线分析范围项：一个标签名 + 其锚点覆盖的时间段（epoch millis，含边界） */
+export interface TimelineAnalysisScopeItem {
+  name: string;
+  fromTs: number;
+  toTs: number;
+}
+
 export interface AiHandle {
   addSnapshot(snap: TermSnapshot): void;
   /** 编辑器选区引用(@文件名_起始行_结束行号) */
@@ -67,8 +74,10 @@ export interface AiHandle {
   /** 把一篇笔记转换为 Skill:新建 AI 会话并发送「笔记引用 + skill-management 技能引用 + 指令文本」 */
   convertNoteToSkill?(ref: NoteRef): void;
   /** 项目时间线分析:新建 AI 会话并发送时间线分析指令(timeline_search 检索 → 产出笔记/skill →
-   *  ask 多选让用户勾选保存);时间线标签页「AI 分析」按钮入口 */
-  analyzeTimeline?(): void;
+   *  ask 多选让用户勾选保存);时间线标签页「AI 分析」按钮入口。
+   *  scope 为用户勾选的标签范围（名称+锚点时间段）;传入后指令限定只检索这些标签
+   *  （keyword `#标签名` + fromTs/toTs）,缺省/空 = 全量分析 */
+  analyzeTimeline?(scope?: TimelineAnalysisScopeItem[]): void;
   /** 图片附件(explorer/SFTP 右键「添加到对话」对图片文件的入口;物化与上限校验在引擎内) */
   addImageRef?(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void;
   /** 当前 AI 会话 ID;会话尚未加载时返回 null。 */

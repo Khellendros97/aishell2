@@ -1692,6 +1692,7 @@ fn format_notes_listing(root: &std::path::Path, l: &crate::notes::NotesListing) 
 
 /// timeline_search 工具结果格式化：每条一行 `[时间] [类别] 摘要`，detail 截断附后
 /// （工具结果有体积约束，detail 超 2000 字符截断；全文可按更窄条件再次检索）。
+/// 条目带标签时附「标签:」行：#名 = 直接打标，#名（选区）= 处于同名标签对划定的选区内。
 fn format_timeline_entries(entries: &[crate::timeline::TimelineEntry]) -> String {
     if entries.is_empty() {
         return "时间线无匹配记录（可放宽关键词或时间段重试）".to_string();
@@ -1704,6 +1705,22 @@ fn format_timeline_entries(entries: &[crate::timeline::TimelineEntry]) -> String
             e.kind,
             e.summary
         ));
+        if let Some(tags) = &e.tags {
+            if !tags.is_empty() {
+                let s = tags
+                    .iter()
+                    .map(|t| {
+                        if t.direct {
+                            format!("#{}", t.name)
+                        } else {
+                            format!("#{}（选区）", t.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("、");
+                out.push_str(&format!("  标签: {s}\n"));
+            }
+        }
         if let Some(d) = &e.detail {
             let clipped = if d.chars().count() > 2000 {
                 let kept: String = d.chars().take(2000).collect();
