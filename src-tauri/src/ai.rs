@@ -23,7 +23,10 @@
 //!
 //! - suggest：read/grep/find/ls/write/edit(+web_search)+request_agent_mode（申请切换工作模式），写仅限 .aishell/；
 //! - agent/yolo：读写限项目根 + delete_path/run_command/sftp_upload/sftp_download；
-//! - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；yolo 跳过；suggest 直接阻止。
+//! - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；suggest 直接阻止；
+//! - yolo 简化审批：默认全自动执行（影响范围不明不拦截），仅 guard 识别的极高风险操作
+//!   （递归删除目录/格式化/裸设备写入/关机重启/find 批量删除/本地删目录）经同一审批
+//!   通道转人工确认，确认后照常执行；yolo 不做 LLM 智能审批判定。
 //!
 //! 模式切换（set_ai_mode）：agent ↔ yolo 热推 `/aishell-mode`（guard 模式变量即时生效）；
 //! suggest ↔ agent/yolo 因工具集/系统提示在 spawn 时固定而静默重启该项目全部 pi 进程，
@@ -94,7 +97,7 @@ const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用�
 
 /// agent / yolo 模式的系统提示（有执行权限；Agent 逐调用审批，YOLO 已获用户显式授权）。
 const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
-你有执行权限（Agent 模式每次操作需用户批准；YOLO 模式自动执行，用户已显式授权）：
+你有执行权限（Agent 模式每次操作需用户批准；YOLO 全自动模式自动执行，影响范围无法完整确定的命令也照常执行，但递归删除目录、格式化磁盘、裸设备写入、关机重启等极高风险操作会转给用户确认——确认被拒时不要重试同一操作，向用户说明后改换方案）：
 - run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。默认 10 秒超时，可用 timeoutSeconds（1–3600 秒）覆盖；预计超过 10 秒的命令应主动设置合理超时。
 - list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。每个工具既支持单项字段，也支持 `items` 数组一次串行处理最多 32 项；批量结果会逐项汇总，部分失败时必须如实说明，不得声称全部成功。
@@ -141,7 +144,7 @@ const KB_EXT: &str = include_str!("pi_ext/aishell-kb.ts");
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
 /// ask/confirm 为通用交互工具（execute 内自带前端问答/确认卡片，交互即授权），三档模式可用。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list";
+const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list,timeline_search";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
@@ -857,7 +860,7 @@ impl AiManager {
                                 }
                                 terminal_emitted = true;
                                 settled = true;
-                                trace_flush_output(&key2, &mut output_buf);
+                                trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                                 busy2.store(false, Ordering::SeqCst);
                                 let msg = ae
                                     .get("message")
@@ -873,7 +876,7 @@ impl AiManager {
                     "agent_settled" => {
                         settled = true;
                         text_started = false;
-                        trace_flush_output(&key2, &mut output_buf);
+                        trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                         busy2.store(false, Ordering::SeqCst);
                         if !terminal_emitted {
                             terminal_emitted = true;
@@ -973,7 +976,8 @@ impl AiManager {
                             if let Some(obj) = args.as_object_mut() {
                                 obj.remove("content");
                             }
-                            // 影响计划登记（yolo 也走：执行时按确定性计划快照/拒绝 unbounded）：
+                            // 影响计划登记（yolo 也走：执行时按确定性计划快照；unbounded 不拦截，
+                            // 极高风险在 guard 层转人工）：
                             // run_command（仅远程）与 SFTP 传输在 AISHELL_ACTION 前需要
                             // 会话级参数绑定；上传还需要暂存信息，下载虽不改远端，仍需
                             // 防止审批后替换本地/远端路径。
@@ -1051,6 +1055,39 @@ impl AiManager {
                                     "args": args,
                                     "result": result_text,
                                 }));
+                                // 时间线：AI 工具调用（全量，含只读工具；与 trace 同一配对数据）
+                                {
+                                    let label = serde_json::from_str::<serde_json::Value>(&args)
+                                        .ok()
+                                        .and_then(|a| {
+                                            a.get("path")
+                                                .or_else(|| a.get("pattern"))
+                                                .or_else(|| a.get("command"))
+                                                .or_else(|| a.get("query"))
+                                                .or_else(|| a.get("name"))
+                                                .and_then(|v| v.as_str().map(str::to_string))
+                                        })
+                                        .unwrap_or_default();
+                                    let status = if is_err { "失败" } else { "成功" };
+                                    let duration = crate::trace::now_ms().saturating_sub(start);
+                                    let summary = if label.is_empty() {
+                                        format!("AI 工具 {t}（{status}，{duration}ms）")
+                                    } else {
+                                        format!("AI 工具 {t} {label}（{status}，{duration}ms）")
+                                    };
+                                    let detail = if result_text.is_empty() {
+                                        None
+                                    } else {
+                                        Some(crate::ssh::clip_output(&result_text))
+                                    };
+                                    crate::timeline::append(
+                                        &store2,
+                                        &project_id2,
+                                        "ai_tool",
+                                        summary,
+                                        detail,
+                                    );
+                                }
                             }
                         }
                         // AI 写文件成功落盘 → 全局广播，前端刷新已打开的对应编辑器标签
@@ -1121,7 +1158,7 @@ impl AiManager {
                         if stop == Some("error") {
                             terminal_emitted = true;
                             settled = true;
-                            trace_flush_output(&key2, &mut output_buf);
+                            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let emsg = msg
                                 .and_then(|m| m.get("errorMessage"))
@@ -1143,7 +1180,7 @@ impl AiManager {
                         if stop == Some("error") {
                             terminal_emitted = true;
                             settled = true;
-                            trace_flush_output(&key2, &mut output_buf);
+                            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let emsg = msg
                                 .and_then(|m| m.get("errorMessage"))
@@ -1163,7 +1200,7 @@ impl AiManager {
                         {
                             terminal_emitted = true;
                             settled = true;
-                            trace_flush_output(&key2, &mut output_buf);
+                            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                             busy2.store(false, Ordering::SeqCst);
                             let _ = app2.emit(
                                 &event,
@@ -1198,7 +1235,7 @@ impl AiManager {
                             if ae.get("type").and_then(serde_json::Value::as_str) == Some("error") {
                                 terminal_emitted = true;
                                 settled = true;
-                                trace_flush_output(&key2, &mut output_buf);
+                                trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
                                 busy2.store(false, Ordering::SeqCst);
                                 let msg = ae
                                     .get("message")
@@ -1212,7 +1249,7 @@ impl AiManager {
                 }
             }
             // stdout 关闭：进程退出或管道破裂
-            trace_flush_output(&key2, &mut output_buf);
+            trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
             busy2.store(false, Ordering::SeqCst);
             if !settled && !killed2.load(Ordering::SeqCst) {
                 let _ = app2.emit(
@@ -1328,9 +1365,17 @@ impl Drop for AiManager {
 
 /// 处理 pi 发来的 extension_ui_request（审批转发 + 内部动作桥）。
 /// trace：回合终态（done/error/进程退出）落一条聚合的完整助手输出。
-fn trace_flush_output(key: &str, buf: &mut String) {
+fn trace_flush_output(store: &crate::store::Store, project_id: &str, key: &str, buf: &mut String) {
     if !buf.is_empty() {
         crate::trace::log(key, "assistant_output", json!({"text": buf.as_str()}));
+        // 时间线：AI 回答（summary 取首个非空行，detail 为全文——timeline.rs 兜底裁剪）
+        let summary = buf
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("（空回复）")
+            .to_string();
+        crate::timeline::append(store, project_id, "ai_assistant", summary, Some(buf.clone()));
         buf.clear();
     }
 }
@@ -1653,8 +1698,14 @@ fn handle_extension_ui_request(
             }
         }
 
-        // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）
-        if store2.approval_mode() == ApprovalMode::Smart {
+        // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）。
+        // 系统任务上下文是受控迁移任务，必须逐调用人工确认，不能被全局 smart 自动放行。
+        // yolo（全自动）简化审批：跳过 LLM 判定（guard 只对极高风险请求审批），直接转人工卡。
+        if should_use_smart_approval(
+            project_id,
+            store2.approval_mode(),
+            store2.ai_mode(project_id).unwrap_or(AiMode::Suggest),
+        ) {
             let runtime = rt.get_or_insert_with(|| {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1746,12 +1797,18 @@ fn handle_extension_ui_request(
                 }
             }
         } else {
-            // agent + 全部审批：确定性计划直接落盘（卡片展示影响，执行时消费）
+            // 非 LLM 判定路径（全部审批 / yolo 极高风险转人工）：确定性计划直接落盘
+            // （卡片展示影响，执行时消费）
             if let Some(p) = &deterministic_plan {
                 if let Some(e) = impact_tracker.get_mut(&tool_call_id) {
                     e.plan = Some(p.clone());
                 }
             }
+        }
+
+        // yolo（全自动）：guard 只对极高风险操作请求审批（已跳过 LLM 判定），卡片标注转人工原因
+        if store2.ai_mode(project_id) == Some(AiMode::Yolo) && flagged_reason.is_none() {
+            flagged_reason = Some("全自动模式检测到极高风险操作，需人工确认后执行".to_string());
         }
 
         // 智能审批判危险/影响不可控的拦截理由（全部审批模式 None，不重复记日志）
@@ -1779,6 +1836,14 @@ fn handle_extension_ui_request(
         let _ = app2.emit(event, ev_json);
     }
     // 其余 UI 请求（notify/setStatus 等）不转发也不响应（fire-and-forget）
+}
+
+/// 任务上下文必须人工审批；普通项目才允许按全局设置进入智能审批。
+/// yolo（全自动）简化审批：guard 只对极高风险操作请求审批，不经 LLM 判定直接转人工卡。
+fn should_use_smart_approval(project_id: &str, mode: ApprovalMode, ai_mode: AiMode) -> bool {
+    project_id != crate::store::TASK_PROJECT_ID
+        && mode == ApprovalMode::Smart
+        && ai_mode != AiMode::Yolo
 }
 
 /// 审批上下文：run_command 取命令/目标/服务器/工作目录（LLM 判定输入）；其余动作空串。
@@ -1885,6 +1950,50 @@ fn format_notes_listing(root: &std::path::Path, l: &crate::notes::NotesListing) 
     out
 }
 
+/// timeline_search 工具结果格式化：每条一行 `[时间] [类别] 摘要`，detail 截断附后
+/// （工具结果有体积约束，detail 超 2000 字符截断；全文可按更窄条件再次检索）。
+/// 条目带标签时附「标签:」行：#名 = 直接打标，#名（选区）= 处于同名标签对划定的选区内。
+fn format_timeline_entries(entries: &[crate::timeline::TimelineEntry]) -> String {
+    if entries.is_empty() {
+        return "时间线无匹配记录（可放宽关键词或时间段重试）".to_string();
+    }
+    let mut out = format!("匹配 {} 条（最新在前）：\n", entries.len());
+    for e in entries {
+        out.push_str(&format!(
+            "[{}] [{}] {}\n",
+            crate::trace::format_ts(e.ts),
+            e.kind,
+            e.summary
+        ));
+        if let Some(tags) = &e.tags {
+            if !tags.is_empty() {
+                let s = tags
+                    .iter()
+                    .map(|t| {
+                        if t.direct {
+                            format!("#{}", t.name)
+                        } else {
+                            format!("#{}（选区）", t.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("、");
+                out.push_str(&format!("  标签: {s}\n"));
+            }
+        }
+        if let Some(d) = &e.detail {
+            let clipped = if d.chars().count() > 2000 {
+                let kept: String = d.chars().take(2000).collect();
+                format!("{kept}…(截断)")
+            } else {
+                d.clone()
+            };
+            out.push_str(&format!("  内容: {clipped}\n"));
+        }
+    }
+    out
+}
+
 /// 执行扩展内部动作请求，返回回写扩展的结果 JSON（{ok:true,text}|{ok:false,error}）。
 /// 会话级暂存动作（staging_*）与 run_command/sftp_upload 的自动备份都以 key 推导的
 /// session_id 为准（guard 不暴露任意 project/session 参数）。
@@ -1926,6 +2035,29 @@ async fn run_internal_action(
             (Ok(root), Ok(l)) => json!({"ok": true, "text": format_notes_listing(&root, &l)}),
             (Err(e), _) | (_, Err(e)) => json!({"ok": false, "error": e}),
         }),
+        "timeline_search" => {
+            let query = crate::timeline::TimelineQuery {
+                keyword: payload
+                    .get("keyword")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                kinds: payload.get("kinds").and_then(serde_json::Value::as_array).map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                }),
+                from_ts: payload.get("fromTs").and_then(serde_json::Value::as_u64),
+                to_ts: payload.get("toTs").and_then(serde_json::Value::as_u64),
+                limit: payload
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as usize),
+            };
+            crate::timeline::search(store, project_id, &query).map(|entries| {
+                json!({"ok": true, "text": format_timeline_entries(&entries)})
+            })
+        }
         "run_command" => {
             let intent = str_field("intent");
             let command = str_field("command");
@@ -1973,16 +2105,9 @@ async fn run_internal_action(
                     }
                 }
             }
-            // yolo + 自动备份 + unbounded：直接拒绝，避免绕过保护（agent 已在审批卡确认放行）
-            if auto_backup
-                && plan.effect == Effect::Unbounded
-                && store.ai_mode(project_id) == Some(AiMode::Yolo)
-            {
-                return json!({
-                    "ok": false,
-                    "error": "该命令的影响范围无法完整确定（不保证完整备份），已拒绝自动执行。请改用受管文件操作（sftp_upload 等），或切换到工作模式由用户确认后执行"
-                });
-            }
+            // 影响范围不明（unbounded）不再拒绝：yolo 原则=仅极高风险拦截（guard 层已转人工
+            // 确认，其余自动执行），此处照常执行；自动备份按可枚举部分尽力而为
+            // （ai_actions::run_command 只对 bounded 计划做执行前快照）
             actions
                 .run_command(
                     project_id,
@@ -2622,6 +2747,22 @@ pub async fn ai_chat(
             "bytes": img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0),
         })).collect::<Vec<_>>(),
     }));
+    // 时间线：用户提问（与 trace 同一脱敏后文本；summary 取首行、detail 保留全文）
+    {
+        let summary = prompt
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("（空输入）")
+            .to_string();
+        crate::timeline::append(
+            &mgr.store,
+            &project_id,
+            "ai_user",
+            summary,
+            Some(prompt.clone()),
+        );
+    }
     // 用 JSON 序列化生成，勿手拼。刚 abort 过时带 streamingBehavior=followUp：
     // abort 清理流式状态可能未即时生效，agent 仍在流式期间时裸发 prompt 会被 RPC
     // 协议拒绝；followUp 在 agent 停止后送达，空闲时语义与直接 prompt 相同。
@@ -3125,6 +3266,37 @@ mod tests {
     }
 
     #[test]
+    fn task_project_never_uses_smart_approval() {
+        // 系统任务上下文必须逐调用人工审批；全部审批模式不用智能审批
+        assert!(!should_use_smart_approval(
+            crate::store::TASK_PROJECT_ID,
+            ApprovalMode::Smart,
+            AiMode::Agent
+        ));
+        assert!(!should_use_smart_approval(
+            crate::store::TASK_PROJECT_ID,
+            ApprovalMode::All,
+            AiMode::Agent
+        ));
+        assert!(should_use_smart_approval(
+            "proj-1",
+            ApprovalMode::Smart,
+            AiMode::Agent
+        ));
+        assert!(!should_use_smart_approval(
+            "proj-1",
+            ApprovalMode::All,
+            AiMode::Agent
+        ));
+        // yolo（全自动）简化审批：不经 LLM 判定，极高风险由 guard 直接转人工
+        assert!(!should_use_smart_approval(
+            "proj-1",
+            ApprovalMode::Smart,
+            AiMode::Yolo
+        ));
+    }
+
+    #[test]
     fn impact_fingerprint_is_stable_and_input_sensitive() {
         let fp1 = impact_fingerprint("echo x > f", "remote", "srv-a", "/root");
         // 稳定：同输入同指纹
@@ -3370,6 +3542,39 @@ mod tests {
         // 初始 --tools 集（suggest/agent/yolo 一致）应含 notes_list
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
         assert!(tools_suggest.contains("notes_list"), "suggest 工具集应含 notes_list");
+    }
+
+    #[test]
+    fn guard_extension_registers_timeline_search_as_readonly() {
+        // timeline_search 工具探针：guard 注册 + 动作桥 + 只读（不进 AI_ONLY_TOOLS/CONTROLLED_TOOLS），
+        // 三档模式可用（BASE_TOOLS）；ask 的 multi 多选字段经 guard schema 透传
+        assert!(
+            GUARD_EXT.contains("name: \"timeline_search\""),
+            "guard 应注册 timeline_search 工具"
+        );
+        assert!(
+            GUARD_EXT.contains("action: \"timeline_search\""),
+            "timeline_search 应走动作桥"
+        );
+        let ai_only_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const AI_ONLY_TOOLS"))
+            .unwrap_or_default();
+        assert!(
+            !ai_only_line.contains("timeline_search"),
+            "timeline_search 应三档模式可用（不限于 agent/yolo）"
+        );
+        let controlled_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const CONTROLLED_TOOLS"))
+            .unwrap_or_default();
+        assert!(
+            !controlled_line.contains("timeline_search"),
+            "timeline_search 是只读查询，不应受控审批"
+        );
+        assert!(BASE_TOOLS.contains("timeline_search"), "BASE_TOOLS 应含 timeline_search");
+        // ask 多选：schema 携带 multi 字段（时间线分析产物勾选依赖）
+        assert!(GUARD_EXT.contains("multi: Type.Optional(Type.Boolean"), "ask 应支持 multi 多选");
     }
 
     #[test]

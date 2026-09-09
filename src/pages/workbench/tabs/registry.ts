@@ -15,6 +15,7 @@ import { DiffTab } from './DiffTab';
 import BrowserTab from './BrowserTab';
 import SkillHubTab from './SkillHubTab';
 import { TraceTab } from './TraceTab';
+import { TimelineTab } from './TimelineTab';
 import { NoteTab } from './NoteTab';
 import { TunnelTab } from './TunnelTab';
 
@@ -27,6 +28,7 @@ export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   browser: BrowserTab,
   'skill-hub': SkillHubTab,
   trace: TraceTab,
+  timeline: TimelineTab,
   note: NoteTab,
   tunnel: TunnelTab,
 };

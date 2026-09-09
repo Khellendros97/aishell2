@@ -40,6 +40,7 @@ import type { FsEntry, FsStat, SftpFavorite, SshExecResult } from '../../../type
 import {
   fsDelete, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
   sftpHome, sftpList, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec, stagingAdd,
+  timelineBindServer,
 } from '../../../api';
 import { confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../../ui';
 import { dbg } from '../../../debug';
@@ -1719,6 +1720,14 @@ export function SftpTab({ tab, active: _active }: TabProps): JSX.Element {
       historyDocHandler: null,
     };
     sftpTabs.set(tab.id, st);
+
+    // 登记 serverId 的项目归属（后端 SFTP 传输/ssh_exec/连接事件据此计入本项目时间线）
+    {
+      const projectId = useWorkbench.getState().project?.id;
+      if (projectId && st.serverId) {
+        void timelineBindServer(projectId, st.serverId).catch(() => { /* 静默 */ });
+      }
+    }
 
     wireToolbar(st);
     // 侧边栏右键不冒泡到容器菜单(新建/粘贴等动作只对目录区有意义)

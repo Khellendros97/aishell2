@@ -5,6 +5,8 @@
  * 编辑/删除仍归属原项目)。分类展开状态经 setUiExpanded('commands:folders') 300ms 防抖落盘,
  * 每会话只从后端播种一次;搜索只过滤不持久化(搜索中命中组自动展开)。
  * 新增/编辑模态为 body 级浮层(createRoot 挂载),所属目录走 attachCombo 组合框。
+ * 拖拽命令卡片到分组标题 = 改所属目录(交互照欢迎页项目卡片拖拽,HTML5 DnD;
+ * 窗口 dragDropEnabled:false 不截页面内拖拽)。
  * 契约:commandsPanel 导出(标题 + HeadActions「+ 新增」);commands 准入(活跃标签须为终端)
  * 与 tab-activated 自动切回 explorer 由 Workbench 外壳负责。
  * 接口点:src/api.ts store 段(upsert_project / create|rename|delete_command_folder / set_ui_expanded);
@@ -121,6 +123,9 @@ function runOnTerminal(action: 'paste' | 'execute', cmd: string): void {
   else api.execute(cmd);
 }
 
+/** 拖拽载荷 MIME(独立于文件拖拽的 DND_MIME,载荷 = {ownerId, id}) */
+const QC_DND_MIME = 'application/x-aishell-qc';
+
 /** upsert 成功后同步 store 持有的当前项目对象(克隆新引用,触发订阅者重渲染) */
 function syncProjectStore(owner: Project): void {
   const s = useWorkbench.getState();
@@ -141,6 +146,20 @@ async function deleteQuickCommand(d: DisplayedCommand): Promise<void> {
     await upsertProject(d.owner);
     syncProjectStore(d.owner);
     wbEvents.emit('project-changed');
+  } catch (err) {
+    toast(String(err), 'error');
+  }
+}
+
+/** 拖拽移动命令到目标分组 = 改 folder 后整体落盘(编辑模态保存同语义;跨项目全局命令写回原项目) */
+async function moveCommandToFolder(d: DisplayedCommand, folder: string): Promise<void> {
+  if ((d.qc.folder || '') === folder) return;
+  d.qc.folder = folder;
+  try {
+    await upsertProject(d.owner);
+    syncProjectStore(d.owner);
+    wbEvents.emit('project-changed');
+    toast(`已移动到「${folder || '未分类'}」`, 'success');
   } catch (err) {
     toast(String(err), 'error');
   }
@@ -278,10 +297,18 @@ function openQuickCommandModal(qc: QuickCommand | null, owner: Project | null): 
 }
 
 /* ---------- 卡片 ---------- */
-function QuickCommandCard({ d }: { d: DisplayedCommand }): JSX.Element {
+function QuickCommandCard({ d, dragging, onDragStart, onDragEnd }: {
+  d: DisplayedCommand;
+  dragging: boolean;
+  onDragStart: (e: React.DragEvent<HTMLDivElement>, d: DisplayedCommand) => void;
+  onDragEnd: () => void;
+}): JSX.Element {
   const { qc } = d;
   return (
-    <div className="card wbs-commands-qc-card">
+    <div
+      className={`card wbs-commands-qc-card${dragging ? ' dragging' : ''}`} draggable
+      onDragStart={(e) => onDragStart(e, d)} onDragEnd={onDragEnd}
+    >
       <div className="wbs-commands-qc-head">
         <div className="wbs-commands-qc-title ellipsis" title={qc.title}>{qc.title}</div>
         {qc.global ? <span className="tag blue wbs-commands-global-tag">全局</span> : null}
@@ -321,6 +348,10 @@ function CommandsPanelBody(): JSX.Element {
   const [folders, setFolders] = useState<string[]>([]);
   const [searchText, setSearchText] = useState('');
   const [reloadKey, setReloadKey] = useState(0);
+  /** 拖拽中卡片标识(ownerId:qcId,.dragging 视觉态) */
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  /** 当前拖拽放置目标分组(.drop-target 高亮) */
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
 
   /* 数据源:当前项目 quickCommands + 其他项目 global=true 命令(全局命令编辑/删除仍归属原项目) */
   useEffect(() => {
@@ -396,6 +427,48 @@ function CommandsPanelBody(): JSX.Element {
     setReloadKey((k) => k + 1);
   };
 
+  /* ---------- 拖拽移动:卡片拖到分组标题 = 改所属目录(交互照欢迎页项目卡片拖拽) ---------- */
+  const cardKey = (d: DisplayedCommand): string => `${d.owner.id}:${d.qc.id}`;
+  const onCardDragStart = (e: React.DragEvent<HTMLDivElement>, d: DisplayedCommand): void => {
+    if (!e.dataTransfer) return;
+    e.dataTransfer.setData(QC_DND_MIME, JSON.stringify({ ownerId: d.owner.id, id: d.qc.id }));
+    setDraggingId(cardKey(d));
+  };
+  const onCardDragEnd = (): void => {
+    setDraggingId(null);
+    setDropTarget(null); // 拖出窗口 / 中途取消时清理残留的放置高亮
+  };
+  const onListDragOver = (e: React.DragEvent<HTMLDivElement>): void => {
+    const title = (e.target as HTMLElement).closest<HTMLElement>('.wbs-commands-group-title');
+    if (!e.dataTransfer || !title) return;
+    if (!Array.from(e.dataTransfer.types).includes(QC_DND_MIME)) return;
+    e.preventDefault(); // 声明可放置,drop 才会触发
+    const folder = title.dataset.folder ?? '';
+    setDropTarget((prev) => (prev === folder ? prev : folder)); // 相同值跳过,避免拖过时反复重渲染
+  };
+  const onGroupTitleDragLeave = (e: React.DragEvent<HTMLDivElement>): void => {
+    if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return; // 标题内子元素间移动不取消
+    setDropTarget(null);
+  };
+  const onListDrop = (e: React.DragEvent<HTMLDivElement>): void => {
+    const title = (e.target as HTMLElement).closest<HTMLElement>('.wbs-commands-group-title');
+    if (!e.dataTransfer || !title) return;
+    e.preventDefault();
+    setDropTarget(null);
+    setDraggingId(null);
+    let payload: { ownerId?: string; id?: string };
+    try {
+      payload = JSON.parse(e.dataTransfer.getData(QC_DND_MIME));
+    } catch {
+      return;
+    }
+    const d = displayed.find((x) => x.owner.id === payload.ownerId && x.qc.id === payload.id);
+    if (!d) return;
+    const folderKey = title.dataset.folder ?? '';
+    if ((d.qc.folder || '') === folderKey) return; // 已在目标组,跳过
+    void moveCommandToFolder(d, folderKey);
+  };
+
   return (
     <div className="wbs-content">
       {/* 搜索行:搜索框 + 新建分类目录 + 全部展开/折叠(持久元素,不随列表重建) */}
@@ -409,7 +482,7 @@ function CommandsPanelBody(): JSX.Element {
           <Icon name={allExpanded ? 'folder' : 'folderOpen'} />
         </button>
       </div>
-      <div className="wbs-commands-list">
+      <div className="wbs-commands-list" onDragOver={onListDragOver} onDrop={onListDrop}>
         {displayed.length === 0 ? (
           <div className="empty-state">
             <div className="icon"><Icon name="star" /></div>
@@ -424,8 +497,10 @@ function CommandsPanelBody(): JSX.Element {
             return (
               <div key={folderKey}>
                 <div
-                  className={`wbs-commands-group-title${expanded ? ' expanded' : ''}`}
+                  className={`wbs-commands-group-title${expanded ? ' expanded' : ''}${dropTarget === folderKey ? ' drop-target' : ''}`}
+                  data-folder={folderKey}
                   onClick={searching ? undefined : () => toggleFolder(folderKey)}
+                  onDragLeave={onGroupTitleDragLeave}
                 >
                   <span className="wbs-commands-group-ic"><Icon name={expanded ? 'folderOpen' : 'folder'} /></span>
                   <span className="wbs-commands-group-name">{folderKey || '未分类'}</span>
@@ -447,7 +522,13 @@ function CommandsPanelBody(): JSX.Element {
                   ) : null}
                 </div>
                 <div className={`wbs-commands-group-list${expanded ? '' : ' hidden'}`}>
-                  {items.map((d) => <QuickCommandCard key={d.qc.id} d={d} />)}
+                  {items.map((d) => (
+                    <QuickCommandCard
+                      key={d.qc.id} d={d}
+                      dragging={draggingId === cardKey(d)}
+                      onDragStart={onCardDragStart} onDragEnd={onCardDragEnd}
+                    />
+                  ))}
                 </div>
               </div>
             );

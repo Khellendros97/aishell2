@@ -42,3 +42,7 @@
 /* 组内命令列表容器：收起时整体隐藏 */
 .wbs-commands-group-list { display: flex; flex-direction: column; gap: 8px; }
 .wbs-commands-group-list.hidden { display: none; }
+
+/* 拖拽移动：卡片拖到分组标题 = 改所属目录（视觉态照欢迎页项目卡片拖拽） */
+.wbs-commands-qc-card.dragging { opacity: 0.45; }
+.wbs-commands-group-title.drop-target { outline: 1px dashed var(--accent); background: var(--accent-dim); }

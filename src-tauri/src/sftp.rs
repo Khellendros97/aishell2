@@ -220,6 +220,22 @@ pub async fn sftp_upload(
         }
     };
     let result = upload_one(&sftp, Path::new(&local_path), &target, false, Some(&cb)).await;
+    // 时间线：文件上传完成/失败（files_done 计数含目录递归的每个文件）
+    {
+        let label = ssh
+            .server_label(&server_id)
+            .map(|n| format!("「{n}」"))
+            .unwrap_or_default();
+        let summary = match &result {
+            Ok(name) => format!(
+                "上传 {local_path} → {label}:{target}/（落地 {name}，{} 个文件）",
+                files_done.load(Ordering::SeqCst)
+            ),
+            Err(e) => format!("上传 {local_path} → {label}:{target}/ 失败：{e}"),
+        };
+        ssh.timeline_event(&server_id, "file_upload", summary, None)
+            .await;
+    }
     let _ = app.emit(
         "sftp:progress",
         SftpProgress {
@@ -387,6 +403,22 @@ pub async fn sftp_download(
         }
     };
     let result = download_one(&sftp, &remote_path, &local, Some(&cb)).await;
+    // 时间线：文件下载完成/失败
+    {
+        let label = ssh
+            .server_label(&server_id)
+            .map(|n| format!("「{n}」"))
+            .unwrap_or_default();
+        let summary = match &result {
+            Ok(path) => format!(
+                "下载 {label}:{remote_path} → {path}（{} 个文件）",
+                files_done.load(Ordering::SeqCst)
+            ),
+            Err(e) => format!("下载 {label}:{remote_path} 失败：{e}"),
+        };
+        ssh.timeline_event(&server_id, "file_download", summary, None)
+            .await;
+    }
     let _ = app.emit(
         "sftp:progress",
         SftpProgress {

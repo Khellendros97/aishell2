@@ -26,7 +26,7 @@ use crate::ai_impact::{analyze_remote_command, Effect, ImpactPlan};
 use crate::skills::SkillOrigin;
 use crate::ssh::SshManager;
 use crate::staging::{DiffLine, RemoteStaging, StagedState};
-use crate::store::{AuthType, DbKind, Project, QuickCommand, Server, Store};
+use crate::store::{AiMode, AuthType, DbKind, Project, QuickCommand, Server, Store};
 
 const DEFAULT_RUN_COMMAND_TIMEOUT_SECS: u64 = 10;
 const MAX_RUN_COMMAND_TIMEOUT_SECS: u64 = 3600;
@@ -152,8 +152,8 @@ impl AiActions {
     /// - `impact` 为审批阶段确定的影响计划（None = 执行时按 command+cwd 现算，yolo 路径）。
     ///
     /// 自动备份开启时：bounded → 执行前逐项 ensure_snapshot（全部成功才执行，失败阻止写入）；
-    /// 执行后逐项刷新 current 状态。none/unbounded 不在此处拦截（unbounded 的拒绝/人工确认在
-    /// 审批与动作桥层处理）。
+    /// 执行后逐项刷新 current 状态。none/unbounded 不在此处拦截：unbounded 的极高风险转人工
+    /// 在 guard 层完成（yolo 仅极高风险确认，其余自动执行），此处照常执行、备份尽力而为。
     #[allow(clippy::too_many_arguments)]
     pub async fn run_command(
         &self,
@@ -181,11 +181,14 @@ impl AiActions {
                     return Err("本地目标不得使用 serverId".to_string());
                 }
                 let root = self.project_root(project_id)?;
-                self.run_local(&root, &command, timeout).await
+                let result = self.run_local(&root, &command, timeout).await;
+                self.timeline_command(project_id, format!("AI 执行（本地）：{command}"), &result);
+                result
             }
             "remote" => {
                 let sid = server_id.ok_or_else(|| "远程目标必须提供 serverId".to_string())?;
                 self.ensure_ai_allowed(&sid)?;
+                self.ssh.bind_project(&sid, project_id).await;
                 // 有效工作目录：调用方解析结果优先（与审批分析同源），否则现取
                 let effective_cwd = match &working_directory {
                     Some(c) if c.starts_with('/') => c.clone(),
@@ -218,32 +221,73 @@ impl AiActions {
                 }
                 // 用同一绝对 cwd 包装命令（保证分析路径与实际执行环境一致）
                 let wrapped = format!("cd {} && {}", shell_quote(&effective_cwd), command);
-                let result = self.ssh.exec_with_timeout(&sid, &wrapped, timeout).await?;
-                if result.timed_out {
-                    return Err(format!(
+                // 时间线：exec 失败与超时也记录（先收集成 Result，统一在末尾落时间线）
+                let result = match self.ssh.exec_with_timeout(&sid, &wrapped, timeout).await {
+                    Ok(r) if r.timed_out => Err(format!(
                         "命令执行超时（{} 秒），已尝试终止远端命令",
                         timeout.as_secs()
-                    ));
-                }
+                    )),
+                    other => other,
+                };
                 // 执行后刷新 current 状态（best-effort：刷新失败不掩盖命令结果）
-                if auto_backup && plan.effect == Effect::Bounded {
-                    for c in &plan.changes {
-                        let _ = self
-                            .staging
-                            .refresh_current(project_id, session_id, &sid, &c.path)
-                            .await;
-                        if let Some(d) = &c.destination {
+                if let Ok(_result) = &result {
+                    if auto_backup && plan.effect == Effect::Bounded {
+                        for c in &plan.changes {
                             let _ = self
                                 .staging
-                                .refresh_current(project_id, session_id, &sid, d)
+                                .refresh_current(project_id, session_id, &sid, &c.path)
                                 .await;
+                            if let Some(d) = &c.destination {
+                                let _ = self
+                                    .staging
+                                    .refresh_current(project_id, session_id, &sid, d)
+                                    .await;
+                            }
                         }
                     }
                 }
-                Ok(result)
+                let label = self
+                    .ssh
+                    .server_label(&sid)
+                    .map(|n| format!("「{n}」"))
+                    .unwrap_or_default();
+                self.timeline_command(
+                    project_id,
+                    format!("AI 执行（{label}）：{command}"),
+                    &result,
+                );
+                result
             }
             other => Err(format!("未知命令目标：{other}")),
         }
+    }
+
+    /// 时间线命令事件：AI run_command 的成功（退出码+裁剪输出）与失败都记录。
+    fn timeline_command(
+        &self,
+        project_id: &str,
+        summary: String,
+        result: &Result<CommandResult, String>,
+    ) {
+        let detail = match result {
+            Ok(r) => {
+                let mut d = format!(
+                    "退出码: {}",
+                    r.exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "超时/未知".into())
+                );
+                if !r.stdout.trim().is_empty() {
+                    d.push_str(&format!("\n{}", crate::ssh::clip_output(&r.stdout)));
+                }
+                if !r.stderr.trim().is_empty() {
+                    d.push_str(&format!("\n[stderr] {}", crate::ssh::clip_output(&r.stderr)));
+                }
+                Some(d)
+            }
+            Err(e) => Some(format!("执行失败：{e}")),
+        };
+        crate::timeline::append(&self.store, project_id, "command", summary, detail);
     }
 
     /// SFTP 上传：本地源必须在项目根内且已存在（文件或目录），远端目录必填。
@@ -252,8 +296,8 @@ impl AiActions {
     ///
     /// 自动备份：overwrite=true 时在 `upload_one` 前快照最终远程目标；目录覆盖时枚举本地
     /// 每个文件逐一快照，无法枚举（权限等）返回错误拒绝（已获「不保证完整备份」人工确认的
-    /// agent 场景除外——`impact` 为审批阶段 unbounded 计划时按用户确认放行）。overwrite=false
-    /// 创建新副本，不备份原同名文件。
+    /// agent 场景与 yolo 全自动模式除外——`impact` 为审批阶段 unbounded 计划，或当前项目
+    /// 为 yolo 时按「影响范围不明不拦截」原则放行）。overwrite=false 创建新副本，不备份原同名文件。
     #[allow(clippy::too_many_arguments)]
     pub async fn sftp_upload(
         &self,
@@ -353,6 +397,7 @@ impl AiActions {
         }
         let root = self.project_root(project_id)?;
         self.ensure_ai_allowed(server_id)?;
+        self.ssh.bind_project(server_id, project_id).await;
         let mut resolved = Vec::with_capacity(items.len());
         let mut remote_dirs = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
@@ -378,7 +423,11 @@ impl AiActions {
                         }
                     }
                     Err(reason) => {
-                        let approved_unbounded = matches!(impact.as_ref().map(|p| p.effect), Some(Effect::Unbounded));
+                        // agent：审批阶段 unbounded 计划 = 用户已确认「不保证完整备份」放行；
+                        // yolo：全自动模式影响范围不明不拦截（仅 guard 识别的极高风险转人工），
+                        // 视同已确认——放弃该部分快照继续执行。
+                        let approved_unbounded = matches!(impact.as_ref().map(|p| p.effect), Some(Effect::Unbounded))
+                            || self.store.ai_mode(project_id) == Some(AiMode::Yolo);
                         if !approved_unbounded {
                             return Err(format!("批量上传覆盖范围无法完整枚举：{reason}，已拒绝写入"));
                         }
@@ -394,10 +443,37 @@ impl AiActions {
             }
         }
         let succeeded = items.len() - failures.len();
+        let label = self
+            .ssh
+            .server_label(server_id)
+            .map(|n| format!("「{n}」"))
+            .unwrap_or_default();
         if failures.is_empty() {
+            crate::timeline::append(
+                &self.store,
+                project_id,
+                "file_upload",
+                format!(
+                    "AI 上传 {succeeded} 项到 {label}：{}",
+                    items
+                        .iter()
+                        .map(|i| i.local_path.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                ),
+                None,
+            );
             Ok(format!("批量上传完成：成功 {succeeded} 项（服务器 {server_id}）"))
         } else {
-            Err(format!("批量上传部分成功：成功 {succeeded} 项，失败 {} 项\n{}", failures.len(), failures.join("\n")))
+            let msg = format!("批量上传部分成功：成功 {succeeded} 项，失败 {} 项\n{}", failures.len(), failures.join("\n"));
+            crate::timeline::append(
+                &self.store,
+                project_id,
+                "file_upload",
+                format!("AI 上传到 {label} 部分失败（成功 {succeeded}/{} 项）", items.len()),
+                Some(msg.clone()),
+            );
+            Err(msg)
         }
     }
 
@@ -413,6 +489,7 @@ impl AiActions {
         }
         let root = self.project_root(project_id)?;
         self.ensure_ai_allowed(server_id)?;
+        self.ssh.bind_project(server_id, project_id).await;
         let mut dirs = Vec::with_capacity(items.len());
         let mut remote_paths = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
@@ -436,10 +513,37 @@ impl AiActions {
             }
         }
         let succeeded = items.len() - failures.len();
+        let label = self
+            .ssh
+            .server_label(server_id)
+            .map(|n| format!("「{n}」"))
+            .unwrap_or_default();
         if failures.is_empty() {
+            crate::timeline::append(
+                &self.store,
+                project_id,
+                "file_download",
+                format!(
+                    "AI 从 {label} 下载 {succeeded} 项：{}",
+                    items
+                        .iter()
+                        .map(|i| i.remote_path.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                ),
+                None,
+            );
             Ok(format!("批量下载完成：成功 {succeeded} 项（服务器 {server_id}）"))
         } else {
-            Err(format!("批量下载部分成功：成功 {succeeded} 项，失败 {} 项\n{}", failures.len(), failures.join("\n")))
+            let msg = format!("批量下载部分成功：成功 {succeeded} 项，失败 {} 项\n{}", failures.len(), failures.join("\n"));
+            crate::timeline::append(
+                &self.store,
+                project_id,
+                "file_download",
+                format!("AI 从 {label} 下载部分失败（成功 {succeeded}/{} 项）", items.len()),
+                Some(msg.clone()),
+            );
+            Err(msg)
         }
     }
 

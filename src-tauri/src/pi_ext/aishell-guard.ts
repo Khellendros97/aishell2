@@ -22,7 +22,11 @@
  * 覆盖而扩大到其它路径。
  * 审批：agent 对受控工具（write/edit/delete_path/run_command/sftp_upload/sftp_download）
  * 每次调用单独 ctx.ui.confirm（title 固定 `AISHELL_APPROVAL:<toolCallId>`，message 为
- * `{action,intent,summary}`）；yolo 跳过；suggest 即使异常收到变更工具调用也直接阻止。
+ * `{action,intent,summary}`）；suggest 即使异常收到变更工具调用也直接阻止。
+ * yolo 简化审批：默认全自动执行（影响范围不明不再拦截），仅极高风险操作经同一
+ * `AISHELL_APPROVAL` 通道转人工确认——确认后照常执行，拒绝才阻止。极高风险 =
+ * run_command 命中递归删除目录树/格式化/裸设备写入/关机重启/find 批量删除（见
+ * highRiskReason，极窄覆盖宁缺勿滥）、本地 delete_path 目标为目录（远程删除仅支持文件）。
  * 申请数据库连接（request_db_connection）：工具 execute 内自带 ctx.ui.input
  * （`AISHELL_DB_REQUEST:<toolCallId>`，消息为 `{action,intent,summary,connection}`），
  * 经 Rust 转发前端审批对话框，用户补密码并授权后回执 `{approved,connectionId}`；
@@ -555,6 +559,9 @@ export default function (pi: ExtensionAPI) {
 			case "notes_list":
 				// 只读查询：工作区全局笔记清单（目录 + .md 文件，相对路径）；三档模式可用
 				return undefined;
+			case "timeline_search":
+				// 只读查询：项目时间线检索（无文件副作用）；三档模式可用
+				return undefined;
 			case "db_query": {
 				// 仅工作/全自动模式提供；参数校验（白名单权威裁决在 Rust）
 				if (mode === "suggest") {
@@ -729,13 +736,61 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/* ---------- yolo 极高风险识别（全自动模式的唯一拦截依据，宁缺勿滥防审批疲劳） ---------- */
+	/** 关机/重启类命令词。 */
+	const SHUTDOWN_WORDS = new Set(["shutdown", "reboot", "poweroff", "halt"]);
+	/**
+	 * 识别极高风险命令，返回风险描述（null = 不属于极高风险，yolo 照常自动执行）。
+	 * 覆盖：递归删除目录树（rm -r/-R/--recursive，含 -rf 组合旗标）、格式化文件系统（mkfs*）、
+	 * 裸设备写入（dd of=/dev/…）、关机/重启（shutdown/reboot/poweroff/halt/init 0|6）、
+	 * find … -delete 批量删除。词法近似扫描：按空白与 bash 串联符（| & ;）切词，
+	 * 命中 sudo/timeout 前缀、/bin/rm 全路径形态；普通 grep -r / cp -r / tar 等不命中。
+	 * 已知盲区（引号包裹、$() 命令替换内的命令）不误报也不补查——误报只多一次人工确认，
+	 * 漏报水位与 agent 的确定性影响分析一致。
+	 */
+	function highRiskReason(command: string): string | null {
+		const words = command.split(/[\s;&|]+/).filter(Boolean);
+		let findSeen = false;
+		for (let i = 0; i < words.length; i++) {
+			const bare = (words[i].replace(/^["']+/, "").split("/").pop() ?? "").replace(/["')]+$/, "");
+			if (bare === "rm") {
+				// 只扫选项区（首个非旗标操作数即止）：-r/-R/--recursive，含组合旗标（-rf/-FR）
+				for (let j = i + 1; j < words.length; j++) {
+					const f = words[j];
+					if (!f.startsWith("-") || f === "--") break;
+					if (f === "--recursive" || (!f.startsWith("--") && /[rR]/.test(f.slice(1)))) {
+						return "递归删除目录树（rm -r）";
+					}
+				}
+			} else if (bare.startsWith("mkfs")) {
+				return "格式化文件系统";
+			} else if (bare === "dd") {
+				// 紧邻参数区 of= 指向 /dev/（容忍引号）
+				for (let j = i + 1; j < Math.min(i + 9, words.length); j++) {
+					if (/^of="?\/dev\//.test(words[j])) return "写入裸设备（dd of=/dev/…）";
+				}
+			} else if (SHUTDOWN_WORDS.has(bare)) {
+				return "关机/重启";
+			} else if (bare === "init" && (words[i + 1] === "0" || words[i + 1] === "6")) {
+				return "关机/重启";
+			} else if (bare === "find") {
+				findSeen = true;
+			} else if (findSeen && bare === "-delete") {
+				return "find 批量删除";
+			}
+		}
+		return null;
+	}
+
 	/* ---------- 工具调用钩子：路径/参数校验 + Agent 逐调用审批 ---------- */
 	/** trace 上报（validate 门禁拒绝等 Rust 侧不可见事件）：经 AISHELL_TRACE 桥落日志，失败静默。 */
 	function traceReport(ctx: Parameters<typeof pi.on>[1], toolCallId: string, kind: string, detail: string): void {
 		void ctx.ui.input("AISHELL_TRACE:" + toolCallId, JSON.stringify({ kind, detail: detail.slice(0, 2000) })).catch(() => {});
 	}
-	async function approve(ctx: Parameters<typeof pi.on>[1], tool: string, input: Record<string, unknown>, toolCallId: string): Promise<boolean> {
+	async function approve(ctx: Parameters<typeof pi.on>[1], tool: string, input: Record<string, unknown>, toolCallId: string, note?: string): Promise<boolean> {
 		const info = approvalInfo(tool, input);
+		// yolo 极高风险转人工：把识别到的风险类别放进卡片摘要，用户能看出「为什么弹确认」
+		if (note) info.summary = `【${note}】${info.summary}`;
 		let ok = false;
 		try {
 			ok = await ctx.ui.confirm("AISHELL_APPROVAL:" + toolCallId, JSON.stringify(info));
@@ -764,6 +819,27 @@ export default function (pi: ExtensionAPI) {
 			} else if (tool === "db_query" && !isDbReadCommand(String(input.command || ""))) {
 				// 数据库写命令（用户加入白名单的 UPDATE/DELETE 等）：agent 模式人工审批
 				if (!(await approve(ctx, tool, input, event.toolCallId))) {
+					return { block: true, reason: "用户拒绝了该操作" };
+				}
+			}
+		} else if (mode === "yolo") {
+			// 全自动简化审批：仅极高风险操作转人工确认（用户确认后照常执行，拒绝才阻止）；
+			// 影响范围不明不再拦截（执行层自动备份按可枚举部分尽力而为，见 ai_actions.rs）
+			if (tool === "run_command") {
+				const risk = highRiskReason(String(input.command || ""));
+				if (risk && !(await approve(ctx, tool, input, event.toolCallId, `极高风险：${risk}`))) {
+					return { block: true, reason: "用户拒绝了该操作" };
+				}
+			} else if (tool === "delete_path" && !(typeof input.serverId === "string" && input.serverId.trim())) {
+				// 本地删除目录转人工确认（文件删除自动执行；stat 失败按非目录放行，执行时自然报错）；
+				// 远程删除仅支持文件（目录由后端拒绝并提示改用 run_command），无需确认
+				let isDir = false;
+				try {
+					isDir = (await fs.stat(path.resolve(cwd, String(input.path || ".")))).isDirectory();
+				} catch {
+					// 不存在/不可读：按非目录处理
+				}
+				if (isDir && !(await approve(ctx, tool, input, event.toolCallId, "极高风险：删除目录"))) {
 					return { block: true, reason: "用户拒绝了该操作" };
 				}
 			}
@@ -1073,6 +1149,35 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "timeline_search",
+		label: "搜索时间线",
+		description:
+			"搜索当前项目的时间线：SSH 连接/断开、终端与远程命令及结果、文件上传下载、AI 问答与工具调用的历史记录（保留 30 天）。可按关键词（大小写不敏感，匹配摘要与内容；`#标签名` token 按标签过滤——命中直接打标或处于同名标签对选区内的事件，可多个 AND）、类别与时间段过滤，返回倒序（最新在前）的事件列表，条目附标签标注（#名=直接打标，#名（选区）=处于标签对选区内）。",
+		promptSnippet: "搜索项目时间线",
+		promptGuidelines: [
+			"用户问「之前执行过什么命令/连过哪台服务器/上传过什么文件/上次怎么解决的」或需要回顾项目历史时，用 timeline_search 检索，不要凭记忆猜测。",
+			"kinds 过滤类别：ssh_connect / ssh_disconnect / ssh_connect_failed / command / file_upload / file_download / ai_user / ai_assistant / ai_tool；不传则全部类别。",
+			"fromTs/toTs 为 epoch 毫秒（含边界）；不传则搜索全部保留期。结果较多时换更精确的关键词或更窄的时间段分批检索。",
+		],
+		parameters: Type.Object({
+			keyword: Type.Optional(Type.String({ description: "关键词（匹配摘要与内容，大小写不敏感）；支持 #标签名 按标签过滤，可与普通文本混用" })),
+			kinds: Type.Optional(Type.Array(Type.String(), { description: "类别过滤，如 [\"command\", \"file_upload\"]" })),
+			fromTs: Type.Optional(Type.Number({ description: "起始时间（epoch 毫秒，含）" })),
+			toTs: Type.Optional(Type.Number({ description: "截止时间（epoch 毫秒，含）" })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000, description: "最多返回条数，默认 200" })),
+		}),
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			const payload: Record<string, unknown> = { action: "timeline_search" };
+			if (params.keyword) payload.keyword = params.keyword;
+			if (params.kinds) payload.kinds = params.kinds;
+			if (params.fromTs !== undefined) payload.fromTs = params.fromTs;
+			if (params.toTs !== undefined) payload.toTs = params.toTs;
+			if (params.limit !== undefined) payload.limit = params.limit;
+			return await rustAction(ctx, toolCallId, payload);
+		},
+	});
+
+	pi.registerTool({
 		name: "run_command",
 		label: "Run Command",
 		description:
@@ -1198,11 +1303,12 @@ export default function (pi: ExtensionAPI) {
 		name: "ask",
 		label: "向用户提问",
 		description:
-			"向用户提出一个或多个问题并等待回答（一次调用可含多个问题，避免多轮往返）。每个问题可附 2–4 个候选选项供点选；界面会为每个问题自动附带自由输入框，用户可点选选项或直接输入自定义回答。适合需要用户决策或补充信息的场景（方案选择、缺失参数、偏好确认）；用户的回答以「问/答」文本形式作为工具结果返回。",
-		promptSnippet: "向用户提问（可一次多问，可带选项）",
+			"向用户提出一个或多个问题并等待回答（一次调用可含多个问题，避免多轮往返）。每个问题可附 2–4 个候选选项供点选；界面会为每个问题自动附带自由输入框，用户可点选选项或直接输入自定义回答。multi=true 时选项变为多选（勾选框），适合「从产物/候选清单中勾选若干项」的场景。适合需要用户决策或补充信息的场景（方案选择、缺失参数、偏好确认）；用户的回答以「问/答」文本形式作为工具结果返回。",
+		promptSnippet: "向用户提问（可一次多问，可带选项/多选）",
 		promptGuidelines: [
 			"需要用户做决定或补充信息时，用 ask 一次性问清，不要只在回复正文里罗列问题等用户打字回复。",
 			"options 只放真实候选答案（2–4 个）；不要放「其他」「由你来指定」之类占位项——界面已为每个问题自动提供自由输入框。",
+			"需要用户从一组候选中勾选若干项保存/执行时（如分析产物清单），用 multi:true + options 列出全部候选；勾选结果以顿号分隔返回。multi 问题的选项数量不受 2–4 个限制。",
 			"只需用户对单一事项做是/否确认时（如执行前最终确认），改用 confirm 工具。",
 		],
 		parameters: Type.Object({
@@ -1210,6 +1316,7 @@ export default function (pi: ExtensionAPI) {
 				Type.Object({
 					question: Type.String({ description: "问题正文（中文，一句话说清要用户决定什么）" }),
 					options: Type.Optional(Type.Array(Type.String(), { description: "供用户点选的候选答案（2–4 个，简洁）；不要包含「其他/由你指定」类占位项——界面已自动提供自由输入" })),
+					multi: Type.Optional(Type.Boolean({ description: "true 时选项为多选（勾选若干项）；省略/false 为单选" })),
 				}),
 				{ minItems: 1, description: "问题列表（一次可提多个）" },
 			),
