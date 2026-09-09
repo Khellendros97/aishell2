@@ -274,7 +274,12 @@ export function attachCombo(input: HTMLInputElement, getOptions: () => string[])
   }
 
   const pick = (value: string) => {
-    input.value = value;
+    // React 受控 input 会覆写实例 value 属性并维护 value tracker：直接赋值会让 tracker 同步更新，
+    // 随后派发的 input 事件被判定「值未变化」，onChange 不触发（命令收藏编辑模态所属目录不生效的根因）。
+    // 改走原型链上的原生 setter 绕开实例覆写，保证 React onChange 正常触发；纯 DOM 场景行为不变。
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, value);
+    else input.value = value;
     input.dispatchEvent(new Event('input', { bubbles: true }));
     close();
     input.focus();
