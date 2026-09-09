@@ -3,7 +3,8 @@
 //! 验证 aishell-guard.ts 三模式权限边界（计划验证项 3）：
 //! - suggest：越界写（含 `../`）被拒且项目外文件不变，.aishell/ 内放行，全程无审批请求；
 //! - agent：受控工具逐调用产生 `extension_ui_request(method=confirm)`，拒绝无副作用，批准才落盘；
-//! - yolo：不发 confirm 自动执行；`../` 越界仍拒绝；delete_path 在扩展内执行（无动作桥请求）；
+//! - yolo：默认不发 confirm 自动执行；仅极高风险（删除目录）转人工确认；
+//!   `../` 越界仍拒绝；delete_path 在扩展内执行（无动作桥请求）；
 //! - `/aishell-mode` 热切换：非法值保持原模式，合法值立即生效（后续工具调用按新模式审批）。
 //!
 //! mock 服务行为：请求末条消息 role=tool → 回最终文本；否则按脚本队列依次下发工具调用。
@@ -627,7 +628,7 @@ async fn agent_mode_asks_approval_per_tool_call() {
     assert_eq!(pi.confirm_count(), 2, "agent 每次受控调用都应产生一次审批");
 }
 
-/// yolo：不发 confirm 自动执行；`../` 越界仍拒绝；delete_path 在扩展内执行。
+/// yolo：写/删文件自动执行不发 confirm；`../` 越界仍拒绝；delete_path 在扩展内执行。
 #[tokio::test(flavor = "multi_thread")]
 async fn yolo_mode_auto_executes_without_approval_and_blocks_escape() {
     let (env, pi) = setup("yolo", &[WRITE_AUTO_TXT, DELETE_OUTSIDE2, DELETE_AUTO]).await;
@@ -649,10 +650,10 @@ async fn yolo_mode_auto_executes_without_approval_and_blocks_escape() {
     pi.wait_settled();
     assert!(
         !env.project_dir.join("auto.txt").exists(),
-        "yolo 应自动执行删除"
+        "yolo 应自动执行删除（文件删除非极高风险，无需确认）"
     );
 
-    assert_eq!(pi.confirm_count(), 0, "yolo 不应产生任何审批请求");
+    assert_eq!(pi.confirm_count(), 0, "yolo 写/删文件不应产生审批请求");
     assert_eq!(pi.action_count(), 0, "delete_path 在扩展内执行，不应有动作桥请求");
 }
 
@@ -886,15 +887,18 @@ async fn yolo_delete_global_skill_allowed_escape_rejected() {
         let mut s = env.mock_state.script.lock().unwrap();
         *s = script.iter().map(|x| x.to_string()).collect();
     }
+    // yolo 简化审批：删除目录属极高风险，转人工确认；批准后照常执行
     pi.prompt("删除全局技能 to-delete");
+    let req = pi.wait_confirm_request();
+    pi.respond_confirm(req["id"].as_str().unwrap(), true);
     pi.wait_settled();
-    assert!(!delete_dir.exists(), "yolo 删除全局技能目录应放行");
+    assert!(!delete_dir.exists(), "yolo 删除目录经人工确认后应执行");
     assert!(!env.project_dir.join("to-delete").exists());
     pi.prompt("删除 workspace 邻居文件");
     pi.wait_settled();
     assert!(escape.exists(), "workspace 邻居文件越界必须保留");
     assert_tool_error(&env, "权限边界");
-    assert_eq!(pi.confirm_count(), 0, "yolo 不应产生审批");
+    assert_eq!(pi.confirm_count(), 1, "yolo 仅删除目录产生一次审批；越界删除在权限边界被拒");
 }
 
 /// 非法环境变量（fail-closed）：技能目录读被拒，只保留项目根权限。

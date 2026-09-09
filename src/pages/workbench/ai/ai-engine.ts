@@ -1542,7 +1542,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     }
     pendingBy.set(sid, p);
   } else if (ev.type === 'actionStart') {
-    /* 受控工具开始：Agent 模式进入等待批准（审批事件随后到达），YOLO 直接执行中 */
+    /* 受控工具开始：Agent 模式进入等待批准（审批事件随后到达）；YOLO 直接执行中，
+       极高风险转人工时由后续 approval 事件翻转为 approving */
     const cur = pendingBy.get(sid) ?? null;
     const p = cur ?? emptyPending();
     const existing = p.actions.get(ev.toolCallId);
@@ -1609,7 +1610,9 @@ function handleEventBody(sid: string, ev: AiEvent): void {
       });
       pendingBy.set(sid, p);
     } else {
-      /* Agent 审批请求：卡片进入审批态（显示意图 + 批准/拒绝按钮） */
+      /* 审批请求（Agent 逐调用 / YOLO 极高风险转人工）：卡片进入审批态（显示意图 + 批准/拒绝按钮）。
+         无条件置 approving——actionStart 已先行把卡片置为 running（YOLO）或 approving（Agent），
+         审批事件本身即「等待人工决策」，保留 running 态会丢按钮 */
       notifyAi('AI 操作等待审批', clipBody(ev.summary || ev.intent));
       const cur = pendingBy.get(sid) ?? null;
       const p = cur ?? emptyPending();
@@ -1623,7 +1626,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
         timeoutSeconds: existing?.timeoutSeconds,
         requestId: ev.requestId,
         impact: ev.impact,
-        status: existing?.status === 'running' ? 'running' : 'approving',
+        status: 'approving',
         smartReason: ev.smartReason,
         textLen: existing?.textLen ?? p.text.length,
         seq: existing?.seq ?? ++toolSeq,

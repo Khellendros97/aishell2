@@ -23,7 +23,10 @@
 //!
 //! - suggest：read/grep/find/ls/write/edit(+web_search)+request_agent_mode（申请切换工作模式），写仅限 .aishell/；
 //! - agent/yolo：读写限项目根 + delete_path/run_command/sftp_upload/sftp_download；
-//! - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；yolo 跳过；suggest 直接阻止。
+//! - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；suggest 直接阻止；
+//! - yolo 简化审批：默认全自动执行（影响范围不明不拦截），仅 guard 识别的极高风险操作
+//!   （递归删除目录/格式化/裸设备写入/关机重启/find 批量删除/本地删目录）经同一审批
+//!   通道转人工确认，确认后照常执行；yolo 不做 LLM 智能审批判定。
 //!
 //! 模式切换（set_ai_mode）：agent ↔ yolo 热推 `/aishell-mode`（guard 模式变量即时生效）；
 //! suggest ↔ agent/yolo 因工具集/系统提示在 spawn 时固定而静默重启该项目全部 pi 进程，
@@ -92,7 +95,7 @@ const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用�
 
 /// agent / yolo 模式的系统提示（有执行权限；Agent 逐调用审批，YOLO 已获用户显式授权）。
 const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户围绕本地/远程终端工作流提问，消息中可能附带终端快照（形如 [终端快照 命令: <cmd>] 加输出内容）。
-你有执行权限（Agent 模式每次操作需用户批准；YOLO 模式自动执行，用户已显式授权）：
+你有执行权限（Agent 模式每次操作需用户批准；YOLO 全自动模式自动执行，影响范围无法完整确定的命令也照常执行，但递归删除目录、格式化磁盘、裸设备写入、关机重启等极高风险操作会转给用户确认——确认被拒时不要重试同一操作，向用户说明后改换方案）：
 - run_command：在本地 shell（项目根目录）或远程服务器执行命令；调用时必须提供 intent（一句中文说明命令意图，会展示给用户审批）。默认 10 秒超时，可用 timeoutSeconds（1–3600 秒）覆盖；预计超过 10 秒的命令应主动设置合理超时。
 - list_servers：查询当前项目绑定的可操作服务器（serverId、地址、锁定状态）；远程操作前先调用它确认 serverId，不要凭空编造服务器 ID。
 - sftp_upload/sftp_download：向项目绑定的服务器上传/下载文件（本地路径必须在项目目录内）。每个工具既支持单项字段，也支持 `items` 数组一次串行处理最多 32 项；批量结果会逐项汇总，部分失败时必须如实说明，不得声称全部成功。
@@ -791,7 +794,8 @@ impl AiManager {
                             if let Some(obj) = args.as_object_mut() {
                                 obj.remove("content");
                             }
-                            // 影响计划登记（yolo 也走：执行时按确定性计划快照/拒绝 unbounded）：
+                            // 影响计划登记（yolo 也走：执行时按确定性计划快照；unbounded 不拦截，
+                            // 极高风险在 guard 层转人工）：
                             // run_command（仅远程）与 SFTP 传输在 AISHELL_ACTION 前需要
                             // 会话级参数绑定；上传还需要暂存信息，下载虽不改远端，仍需
                             // 防止审批后替换本地/远端路径。
@@ -1463,7 +1467,12 @@ fn handle_extension_ui_request(
 
         // 智能审批判定（影响 unbounded 时即使 LLM 判安全也转人工——「不保证完整备份」）。
         // 系统任务上下文是受控迁移任务，必须逐调用人工确认，不能被全局 smart 自动放行。
-        if should_use_smart_approval(project_id, store2.approval_mode()) {
+        // yolo（全自动）简化审批：跳过 LLM 判定（guard 只对极高风险请求审批），直接转人工卡。
+        if should_use_smart_approval(
+            project_id,
+            store2.approval_mode(),
+            store2.ai_mode(project_id).unwrap_or(AiMode::Suggest),
+        ) {
             let runtime = rt.get_or_insert_with(|| {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1551,12 +1560,18 @@ fn handle_extension_ui_request(
                 }
             }
         } else {
-            // agent + 全部审批：确定性计划直接落盘（卡片展示影响，执行时消费）
+            // 非 LLM 判定路径（全部审批 / yolo 极高风险转人工）：确定性计划直接落盘
+            // （卡片展示影响，执行时消费）
             if let Some(p) = &deterministic_plan {
                 if let Some(e) = impact_tracker.get_mut(&tool_call_id) {
                     e.plan = Some(p.clone());
                 }
             }
+        }
+
+        // yolo（全自动）：guard 只对极高风险操作请求审批（已跳过 LLM 判定），卡片标注转人工原因
+        if store2.ai_mode(project_id) == Some(AiMode::Yolo) && flagged_reason.is_none() {
+            flagged_reason = Some("全自动模式检测到极高风险操作，需人工确认后执行".to_string());
         }
 
         // 智能审批判危险/影响不可控的拦截理由（全部审批模式 None，不重复记日志）
@@ -1587,8 +1602,11 @@ fn handle_extension_ui_request(
 }
 
 /// 任务上下文必须人工审批；普通项目才允许按全局设置进入智能审批。
-fn should_use_smart_approval(project_id: &str, mode: ApprovalMode) -> bool {
-    project_id != crate::store::TASK_PROJECT_ID && mode == ApprovalMode::Smart
+/// yolo（全自动）简化审批：guard 只对极高风险操作请求审批，不经 LLM 判定直接转人工卡。
+fn should_use_smart_approval(project_id: &str, mode: ApprovalMode, ai_mode: AiMode) -> bool {
+    project_id != crate::store::TASK_PROJECT_ID
+        && mode == ApprovalMode::Smart
+        && ai_mode != AiMode::Yolo
 }
 
 /// 审批上下文：run_command 取命令/目标/服务器/工作目录（LLM 判定输入）；其余动作空串。
@@ -1832,13 +1850,9 @@ async fn run_internal_action(
                     }
                 }
             }
-            // yolo + 自动备份 + unbounded：直接拒绝，避免绕过保护（agent 已在审批卡确认放行）
-            if auto_backup && plan.effect == Effect::Unbounded && store.ai_mode(project_id) == Some(AiMode::Yolo) {
-                return json!({
-                    "ok": false,
-                    "error": "该命令的影响范围无法完整确定（不保证完整备份），已拒绝自动执行。请改用受管文件操作（sftp_upload 等），或切换到工作模式由用户确认后执行"
-                });
-            }
+            // 影响范围不明（unbounded）不再拒绝：yolo 原则=仅极高风险拦截（guard 层已转人工
+            // 确认，其余自动执行），此处照常执行；自动备份按可枚举部分尽力而为
+            // （ai_actions::run_command 只对 bounded 计划做执行前快照）
             actions
                 .run_command(
                     project_id,
@@ -2714,10 +2728,13 @@ mod tests {
 
     #[test]
     fn task_project_never_uses_smart_approval() {
-        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::Smart));
-        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::All));
-        assert!(should_use_smart_approval("proj-1", ApprovalMode::Smart));
-        assert!(!should_use_smart_approval("proj-1", ApprovalMode::All));
+        // 系统任务上下文必须逐调用人工审批；全部审批模式不用智能审批
+        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::Smart, AiMode::Agent));
+        assert!(!should_use_smart_approval(crate::store::TASK_PROJECT_ID, ApprovalMode::All, AiMode::Agent));
+        assert!(should_use_smart_approval("proj-1", ApprovalMode::Smart, AiMode::Agent));
+        assert!(!should_use_smart_approval("proj-1", ApprovalMode::All, AiMode::Agent));
+        // yolo（全自动）简化审批：不经 LLM 判定，极高风险由 guard 直接转人工
+        assert!(!should_use_smart_approval("proj-1", ApprovalMode::Smart, AiMode::Yolo));
     }
 
     #[test]

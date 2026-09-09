@@ -26,7 +26,7 @@ use crate::ai_impact::{analyze_remote_command, Effect, ImpactPlan};
 use crate::skills::SkillOrigin;
 use crate::ssh::SshManager;
 use crate::staging::{DiffLine, RemoteStaging, StagedState};
-use crate::store::{AuthType, DbKind, Project, QuickCommand, Server, Store};
+use crate::store::{AiMode, AuthType, DbKind, Project, QuickCommand, Server, Store};
 
 const DEFAULT_RUN_COMMAND_TIMEOUT_SECS: u64 = 10;
 const MAX_RUN_COMMAND_TIMEOUT_SECS: u64 = 3600;
@@ -152,8 +152,8 @@ impl AiActions {
     /// - `impact` 为审批阶段确定的影响计划（None = 执行时按 command+cwd 现算，yolo 路径）。
     ///
     /// 自动备份开启时：bounded → 执行前逐项 ensure_snapshot（全部成功才执行，失败阻止写入）；
-    /// 执行后逐项刷新 current 状态。none/unbounded 不在此处拦截（unbounded 的拒绝/人工确认在
-    /// 审批与动作桥层处理）。
+    /// 执行后逐项刷新 current 状态。none/unbounded 不在此处拦截：unbounded 的极高风险转人工
+    /// 在 guard 层完成（yolo 仅极高风险确认，其余自动执行），此处照常执行、备份尽力而为。
     #[allow(clippy::too_many_arguments)]
     pub async fn run_command(
         &self,
@@ -297,8 +297,8 @@ impl AiActions {
     ///
     /// 自动备份：overwrite=true 时在 `upload_one` 前快照最终远程目标；目录覆盖时枚举本地
     /// 每个文件逐一快照，无法枚举（权限等）返回错误拒绝（已获「不保证完整备份」人工确认的
-    /// agent 场景除外——`impact` 为审批阶段 unbounded 计划时按用户确认放行）。overwrite=false
-    /// 创建新副本，不备份原同名文件。
+    /// agent 场景与 yolo 全自动模式除外——`impact` 为审批阶段 unbounded 计划，或当前项目
+    /// 为 yolo 时按「影响范围不明不拦截」原则放行）。overwrite=false 创建新副本，不备份原同名文件。
     #[allow(clippy::too_many_arguments)]
     pub async fn sftp_upload(
         &self,
@@ -415,7 +415,11 @@ impl AiActions {
                         }
                     }
                     Err(reason) => {
-                        let approved_unbounded = matches!(impact.as_ref().map(|p| p.effect), Some(Effect::Unbounded));
+                        // agent：审批阶段 unbounded 计划 = 用户已确认「不保证完整备份」放行；
+                        // yolo：全自动模式影响范围不明不拦截（仅 guard 识别的极高风险转人工），
+                        // 视同已确认——放弃该部分快照继续执行。
+                        let approved_unbounded = matches!(impact.as_ref().map(|p| p.effect), Some(Effect::Unbounded))
+                            || self.store.ai_mode(project_id) == Some(AiMode::Yolo);
                         if !approved_unbounded {
                             return Err(format!("批量上传覆盖范围无法完整枚举：{reason}，已拒绝写入"));
                         }
