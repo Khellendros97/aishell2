@@ -24,6 +24,7 @@ pub mod store;
 pub mod tunnel;
 pub mod term;
 pub mod timeline;
+pub mod timeline_upload;
 pub mod update;
 pub mod trace;
 pub mod xshell;
@@ -195,6 +196,9 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             tauri::async_runtime::spawn(async move {
                 cloud::refresh_on_startup(&app2, &store2, &cloud_mgr).await;
             });
+            // 时间线云同步上传器：60s 周期按水位增量上报（登录 + timelineSync 能力 + 本机开关
+            // 三层判定；未满足时空转）。首个 tick 延后 15s 等能力清单刷新。
+            timeline_upload::spawn_uploader(app.handle().clone());
             app.manage(mcp.clone());
             app.manage(browser);
             app.manage(tunnels.clone());
@@ -412,6 +416,8 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             timeline::timeline_tag_remove,
             timeline::timeline_tag_reclose,
             timeline::timeline_tags,
+            timeline_upload::timeline_cloud_info,
+            timeline_upload::timeline_cloud_purge,
             staging::staging_add,
             staging::staging_list,
             staging::staging_snapshot_read,

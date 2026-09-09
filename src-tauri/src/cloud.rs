@@ -572,6 +572,11 @@ fn parse_capabilities(c: &serde_json::Value) -> CloudCapabilities {
             .iter()
             .find_map(|k| c.get(k).and_then(|v| v.as_bool()))
             .unwrap_or(false),
+        // 时间线云同步能力：camelCase 为主，兼容旧服务端 snake_case
+        timeline_sync: ["timelineSync", "timeline_sync"]
+            .iter()
+            .find_map(|k| c.get(k).and_then(|v| v.as_bool()))
+            .unwrap_or(false),
         latest_version: c
             .get("latest_version")
             .or_else(|| c.get("latestVersion"))
@@ -699,6 +704,40 @@ async fn cloud_api_request(
         return Ok(serde_json::Value::Null);
     }
     serde_json::from_str(t).map_err(|e| format!("解析云平台响应失败: {e}"))
+}
+
+/// 时间线云同步等新接口共用：传输层请求，返回 (HTTP 状态, 响应体文本)。
+/// 与 [`cloud_api_request`] 的区别：非 2xx 不视为传输失败——调用方需要按稳定错误码
+/// （TIMELINE_NOT_ENABLED / QUOTA_EXCEEDED / RATE_LIMITED 等）分流处理，见 API 文档 §7。
+pub(crate) async fn cloud_api_raw(
+    cloud: &Arc<CloudManager>,
+    store: &Arc<Store>,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Result<(u16, String), String> {
+    let (server, ..) = credentials()?;
+    let token = cloud.valid_access_token(store).await?;
+    let url = format!("{server}{path}");
+    let client = reqwest::Client::new();
+    let mut req = client.request(method, &url).bearer_auth(&token);
+    if !query.is_empty() {
+        req = req.query(query);
+    }
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("连接云平台失败: {e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取云平台响应失败: {e}"))?;
+    Ok((status, text))
 }
 
 /// 带 Bearer 的二进制下载请求，响应体不经过 JSON 解析。
@@ -1826,19 +1865,22 @@ mod tests {
             "knowledge": false,
             "dataSync": true,
             "fileBackup": true,
+            "timelineSync": true,
             "latestVersion": "1.2.3"
         }));
         assert!(caps.data_sync && caps.file_backup && caps.search && !caps.knowledge);
+        assert!(caps.timeline_sync, "timelineSync 能力应解析");
         assert_eq!(caps.models, vec!["m1".to_string()]);
         assert_eq!(caps.latest_version.as_deref(), Some("1.2.3"));
 
         // 旧服务端 snake_case 兼容
-        let caps = parse_capabilities(&json!({"data_sync": true, "file_backup": true}));
-        assert!(caps.data_sync && caps.file_backup);
+        let caps = parse_capabilities(&json!({"data_sync": true, "file_backup": true, "timeline_sync": true}));
+        assert!(caps.data_sync && caps.file_backup && caps.timeline_sync);
 
         // 字段缺失一律按关闭
         let caps = parse_capabilities(&json!({}));
         assert!(!caps.data_sync && !caps.file_backup && !caps.search && !caps.knowledge);
+        assert!(!caps.timeline_sync, "缺失按关闭（旧服务端不误开）");
     }
 
     #[cfg(debug_assertions)]

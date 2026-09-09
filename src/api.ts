@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -454,6 +454,15 @@ export const timelineTagReclose = (projectId: string, name: string, anchorTs: nu
 /** 列出项目全部标签记录（按打标时间倒序；按名去重取最新颜色由调用方做） */
 export const timelineTags = (projectId: string) =>
   call<TimelineTag[]>('timeline_tags', { projectId });
+
+/* ---------------- 时间线云同步（Rust timeline_upload.rs） ----------------
+   60s 周期按水位把本地时间线脱敏增量上传云端（登录 + timelineSync 能力 + 本机开关三层判定），
+   协议见 docs/AIShell云服务-时间线云同步API文档.md；云端供工作台/管理后台跨项目统一时间线。 */
+/** 云同步状态（设置页展示：三层开关满足情况 + 容量超限标记） */
+export const timelineCloudInfo = () => call<TimelineCloudInfo>('timeline_cloud_info');
+/** 删除本人全部云端时间线（事件+标签，服务端写审计）；本机文件与水位不动，删除后从新事件重新累积 */
+export const timelineCloudPurge = () =>
+  call<{ deletedEvents: number; deletedTags: number }>('timeline_cloud_purge');
 
 /* ---------------- browser（内置浏览器多页面子 webview，Rust browser.rs） ----------------
    每个「页面」一个子 webview（viewId 由前端生成 p1/p2/…）；占位 div 经 ResizeObserver

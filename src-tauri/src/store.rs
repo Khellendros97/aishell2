@@ -163,6 +163,9 @@ pub struct CloudCapabilities {
     /// 本地文件/目录云备份能力；旧服务端缺失时按关闭。
     #[serde(default)]
     pub file_backup: bool,
+    /// 项目时间线云同步能力；旧服务端缺失时按关闭。
+    #[serde(default)]
+    pub timeline_sync: bool,
     #[serde(default)]
     pub latest_version: Option<String>,
 }
@@ -229,6 +232,11 @@ pub struct Settings {
     /// （仅窗口未聚焦时发送，门槛由前端判定）。旧配置无此字段时按开启处理（默认开启）。
     #[serde(default = "default_true")]
     pub notify_long_tasks: bool,
+    /// 时间线云同步：登录且平台开放 timelineSync 能力时，把项目时间线脱敏上传云端
+    /// （跨设备统一时间线 / 工作台与管理后台页面）。本机设置，不纳入 core_config 同步白名单。
+    /// 旧配置无此字段时按开启处理（默认开启，跟随能力开放）。
+    #[serde(default = "default_true")]
+    pub timeline_sync_enabled: bool,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -253,6 +261,7 @@ impl Default for Settings {
             tunnel_auto_start: true,
             notify_ai: true,
             notify_long_tasks: true,
+            timeline_sync_enabled: true,
         }
     }
 }
@@ -3933,6 +3942,7 @@ mod tests {
                 tunnel_auto_start: true,
                 notify_ai: true,
                 notify_long_tasks: true,
+                timeline_sync_enabled: true,
             },
             credentials: vec![
                 Credential {
@@ -7041,6 +7051,7 @@ mod tests {
                     tunnel_auto_start: true,
                     notify_ai: true,
                     notify_long_tasks: true,
+                    timeline_sync_enabled: true,
                 },
                 Some("sk-test-key"),
                 None,
@@ -7243,6 +7254,7 @@ mod tests {
                     tunnel_auto_start: true,
                     notify_ai: true,
                     notify_long_tasks: true,
+                    timeline_sync_enabled: true,
                 },
                 None,
                 Some("bsk-1"),
@@ -7654,6 +7666,7 @@ mod tests {
             knowledge: false,
             data_sync: true,
             file_backup: true,
+            timeline_sync: true,
             latest_version: Some("0.3.0".into()),
         };
         store.cloud_set_tokens("acc", "ref").unwrap();
@@ -7710,6 +7723,7 @@ mod tests {
                     knowledge: false,
                     data_sync: false,
                     file_backup: false,
+                    timeline_sync: false,
                     latest_version: None,
                 },
             )
@@ -8426,6 +8440,43 @@ mod tests {
         assert!(
             reloaded.settings().notify_long_tasks,
             "旧配置无 notifyLongTasks 字段默认开启"
+        );
+    }
+
+    /// 时间线云同步开关：旧配置无 timelineSyncEnabled 字段按开启（默认跟随能力开放）；
+    /// 显式关闭后持久化，重启不复活。
+    #[test]
+    fn timeline_sync_flag_defaults_on_and_persists_off() {
+        let config = temp_config_dir("timeline-sync-flag");
+        let store = test_store(config.clone());
+        store
+            .save_settings(store.settings().clone(), None, None)
+            .unwrap();
+        // 删字段模拟旧配置
+        let state_path = config.join(STATE_FILE);
+        let raw = fs::read(&state_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("timelineSyncEnabled");
+        fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = test_store(config.clone());
+        assert!(
+            reloaded.settings().timeline_sync_enabled,
+            "旧配置无 timelineSyncEnabled 字段默认开启"
+        );
+        // 用户关闭 → 持久化
+        let mut s = reloaded.settings().clone();
+        s.timeline_sync_enabled = false;
+        reloaded.save_settings(s, None, None).unwrap();
+        assert!(
+            !test_store(config).settings().timeline_sync_enabled,
+            "关闭后重启不应复活"
         );
     }
 

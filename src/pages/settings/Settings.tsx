@@ -12,8 +12,8 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
-import type { AppState, CloudMode, CloudStatus, LlmConfig, Settings as AppSettings, Theme, UpdateStatus } from '../../types';
-import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, saveSettings, setMcpPort, setTheme, updateCheck, updateDownload, updateInstall } from '../../api';
+import type { AppState, CloudMode, CloudStatus, LlmConfig, Settings as AppSettings, Theme, TimelineCloudInfo, UpdateStatus } from '../../types';
+import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, saveSettings, setMcpPort, setTheme, timelineCloudInfo, timelineCloudPurge, updateCheck, updateDownload, updateInstall } from '../../api';
 import { navigate } from '../../router';
 import { toast, confirmDialog } from '../../ui';
 import { CredentialsPanel } from './CredentialsPanel';
@@ -47,6 +47,7 @@ interface SysFields {
   tunnelAutoStart: boolean;
   notifyAi: boolean;
   notifyLongTasks: boolean;
+  timelineSync: boolean;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -56,6 +57,7 @@ const EMPTY_FIELDS: SysFields = {
   approvalMode: 'smart', autoBackup: false, mcpPort: '',
   kbAutoInject: false, kbInjectCount: '5', compactServerList: false,
   tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true,
+  timelineSync: true,
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -177,6 +179,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const hosted = cloudMode === 'hosted';
   /* 关于与更新：状态来自全局更新总线（Topbar 徽标同源，不重复检查） */
   const [upd, setUpd] = useState<UpdateStatus | null>(null);
+  /* 时间线云同步：三层开关满足情况 + 容量超限标记（后端 timeline_upload.rs 状态） */
+  const [tlCloud, setTlCloud] = useState<TimelineCloudInfo | null>(null);
 
   /* reason=missing-config：顶部黄色提示条（同 .proto/settings.js） */
   const warnShown = params.get('reason') === 'missing-config';
@@ -231,6 +235,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       tunnelAutoStart: s.settings.tunnelAutoStart ?? true,
       notifyAi: s.settings.notifyAi ?? true,
       notifyLongTasks: s.settings.notifyLongTasks ?? true,
+      timelineSync: s.settings.timelineSyncEnabled ?? true,
     });
     void refreshMcpStatus();
   };
@@ -264,6 +269,15 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
 
   /* 更新状态总线订阅（已有快照立即回调；卸载退订） */
   useEffect(() => onUpdateStatus(setUpd), []);
+
+  /* 时间线云同步状态：装载拉一次，开关保存/删除云端数据后由调用处刷新 */
+  useEffect(() => {
+    let cancelled = false;
+    void timelineCloudInfo()
+      .then((info) => { if (!cancelled) setTlCloud(info); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   /* 托管/个人模式（CR-2.2）：账号页切换后本页表单形态即时刷新；
      同时刷新 dbRef（保存时 settings.cloud 原样带回，需最新值） */
@@ -350,6 +364,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       tunnelAutoStart: fields.tunnelAutoStart,
       notifyAi: fields.notifyAi,
       notifyLongTasks: fields.notifyLongTasks,
+      timelineSyncEnabled: fields.timelineSync,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -359,6 +374,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       window.dispatchEvent(new CustomEvent('aishell:data-changed'));
       toast('设置已保存', 'success');
       void refreshMcpStatus();
+      /* 时间线云同步开关即时生效与否取决于后端三层判定，保存后重拉状态行 */
+      void timelineCloudInfo().then(setTlCloud).catch(() => {});
     } catch (err) {
       toast(String(err), 'error');
     }
@@ -415,6 +432,23 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     if (!ok) return;
     // Windows 上安装器拉起后应用即退出，本调用不会返回；失败（如版本被撤回）reject 中文错误
     void updateInstall().catch((err) => toast(String(err), 'error'));
+  };
+
+  /** 删除云端时间线（本机时间线与水位不动；删除后从新事件重新累积），二次确认 */
+  const doPurgeTimeline = async (): Promise<void> => {
+    const ok = await confirmDialog({
+      title: '删除云端时间线',
+      message: '将删除云平台上的全部时间线事件与标签（本机时间线不受影响），删除后从新事件重新上传累积。确定继续吗？',
+      okText: '删除云端时间线',
+    });
+    if (!ok) return;
+    try {
+      const r = await timelineCloudPurge();
+      toast(`已删除云端时间线：事件 ${r.deletedEvents} 条、标签 ${r.deletedTags} 条`, 'success');
+      void timelineCloudInfo().then(setTlCloud).catch(() => {});
+    } catch (err) {
+      toast(String(err), 'error');
+    }
   };
 
   return (
@@ -558,6 +592,37 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 />
                 <div className="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
               </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>时间线云同步</legend>
+              <div className="field">
+                <label>同步项目时间线到云端</label>
+                <input
+                  id="f-timeline-sync"
+                  type="checkbox"
+                  checked={fields.timelineSync}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, timelineSync: checked })); }}
+                />
+                <div className="hint">登录公司账号且平台开通后，项目时间线（SSH 连接、命令、文件传输、AI 会话）将脱敏上传云端，用于跨设备回溯与网页端「跨项目统一时间线」视图；云端保留期以服务端配置为准（默认 90 天）。本机时间线文件不受影响；关闭只停止上传，已上传数据可在下方删除</div>
+              </div>
+              {tlCloud && (
+                <div className="field">
+                  <div className={`mcp-status-line${tlCloud.quotaExceeded ? ' err' : tlCloud.eligible ? ' ok' : ''}`}>
+                    {tlCloud.quotaExceeded
+                      ? '云端时间线容量已超限，上传已暂停；删除云端时间线后恢复'
+                      : !tlCloud.loggedIn
+                        ? '未登录公司账号，暂不上传（时间线仍在本机记录）'
+                        : !tlCloud.capability
+                          ? '平台未开通时间线云同步，暂不上传（时间线仍在本机记录）'
+                          : tlCloud.eligible
+                            ? '上传已开启：按分钟增量上报（首次开启会自动回填本地近 30 天历史）'
+                            : '上传已停止（本机开关已关闭）'}
+                  </div>
+                  {tlCloud.loggedIn && (
+                    <button id="btn-timeline-purge" className="btn small" onClick={() => void doPurgeTimeline()}>删除云端时间线…</button>
+                  )}
+                </div>
+              )}
             </fieldset>
             <fieldset className="llm-group">
               <legend>SSH 隧道</legend>

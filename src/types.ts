@@ -70,6 +70,8 @@ export interface Settings {
   notifyAi: boolean;
   /** 耗时操作系统通知：上传/下载/备份/暂存目录等超过 30 秒的操作完成时发系统通知（仅窗口未聚焦时）；旧配置无此字段按开启 */
   notifyLongTasks: boolean;
+  /** 时间线云同步：登录且平台开放 timelineSync 能力时脱敏上传项目时间线（本机设置，不进云同步）；旧配置无此字段按开启 */
+  timelineSyncEnabled: boolean;
 }
 
 /** 云服务接入模式（与 store.rs CloudMode serde lowercase 对齐） */
@@ -93,6 +95,8 @@ export interface CloudCapabilities {
   dataSync: boolean;
   /** 是否开通文件云备份；旧服务端缺失时按关闭处理 */
   fileBackup: boolean;
+  /** 是否开通时间线云同步；旧服务端缺失时按关闭处理 */
+  timelineSync: boolean;
   latestVersion: string | null;
 }
 
@@ -801,6 +805,8 @@ export interface TimelineEntry {
   kind: string;
   summary: string;
   detail?: string;
+  /** 事件 id：云同步幂等去重键；旧文件条目缺省（上传侧按 sha256 补算） */
+  id?: string;
   /** 搜索时回填的标签标注（直接打标/选区命中） */
   tags?: TimelineTagInfo[];
 }
@@ -828,6 +834,19 @@ export interface TimelineQuery {
   toTs?: number;
   /** 最多返回条数（默认 200，上限 1000） */
   limit?: number;
+}
+
+/** 时间线云同步状态（timeline_upload.rs timeline_cloud_info 返回；设置页展示） */
+export interface TimelineCloudInfo {
+  /** 三层开关（登录 + 能力 + 本机开关）是否全部满足，满足即会上传 */
+  eligible: boolean;
+  loggedIn: boolean;
+  /** 平台是否开放 timelineSync 能力 */
+  capability: boolean;
+  /** 本机「时间线云同步」开关 */
+  settingEnabled: boolean;
+  /** 云端容量超限暂停中（413）；删除云端时间线后恢复 */
+  quotaExceeded: boolean;
 }
 
 export interface FsEntry {

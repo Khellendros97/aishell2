@@ -69,6 +69,7 @@ const EMPTY_STATE: AppState = {
     tunnelAutoStart: true,
     notifyAi: true,
     notifyLongTasks: true,
+    timelineSyncEnabled: true,
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},

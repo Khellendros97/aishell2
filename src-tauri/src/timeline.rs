@@ -60,6 +60,10 @@ pub struct TimelineEntry {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// 事件 id：云同步幂等去重键。写入时生成 uuid v4；存量文件无此字段（读取侧按
+    /// sha256(projectId+ts+kind+summary) 补算确定性 id，见 timeline_upload.rs）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// 搜索时回填的标签标注（不落盘：写入路径恒为 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<TimelineTagInfo>>,
@@ -129,6 +133,8 @@ fn append_to_dir(dir: &Path, kind: &str, summary: impl Into<String>, detail: Opt
         kind: kind.to_string(),
         summary: clip_graphemes(&summary.into(), MAX_SUMMARY_GRAPHEMES),
         detail: detail.map(|d| clip_graphemes(&d, MAX_DETAIL_GRAPHEMES)),
+        // 云同步幂等去重键：uuid v4（uuid crate 已有 v4 feature）
+        id: Some(uuid::Uuid::new_v4().to_string()),
         tags: None,
     };
     let Ok(line) = serde_json::to_string(&entry) else {
@@ -164,7 +170,7 @@ fn append_line_sync(path: &Path, line: &str) -> Result<(), String> {
 }
 
 /// 字素级裁剪：超限截断并追加标注（防半截 UTF-8 / 撑爆单行 JSON）。
-fn clip_graphemes(s: &str, max: usize) -> String {
+pub(crate) fn clip_graphemes(s: &str, max: usize) -> String {
     if s.graphemes(true).count() <= max {
         return s.to_string();
     }
@@ -247,7 +253,7 @@ fn writer_loop(rx: mpsc::Receiver<TimelineMsg>) {
 }
 
 /// 让写线程 flush（搜索前调用，容忍写线程未启动——无任何写入时本就无数据可读）。
-fn flush_writer() {
+pub(crate) fn flush_writer() {
     if let Some(tx) = writer_tx() {
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         if tx.send(TimelineMsg::Flush { ack: ack_tx }).is_ok() {
@@ -401,7 +407,7 @@ fn tag_reclose_in_dir(
 }
 
 /// 读取 tags.jsonl 全部标签（坏行跳过；锚点已超出保留期的标签视为失效丢弃）。
-fn load_tags(dir: &Path) -> Vec<TimelineTag> {
+pub(crate) fn load_tags(dir: &Path) -> Vec<TimelineTag> {
     let Ok(text) = std::fs::read_to_string(dir.join(TAGS_FILE)) else {
         return Vec::new();
     };
@@ -591,7 +597,7 @@ fn matches_query(
 
 /// 时间段 → 存在的日期文件列表（升序）。from/to 都为 None 时列目录全部日期文件；
 /// 否则按天展开（两端钳制在 31 天内防误传大区间扫空目录——超出部分本就被 30 天保留清理）。
-fn date_files_in_range(dir: &Path, from_ts: Option<u64>, to_ts: Option<u64>) -> Vec<PathBuf> {
+pub(crate) fn date_files_in_range(dir: &Path, from_ts: Option<u64>, to_ts: Option<u64>) -> Vec<PathBuf> {
     if from_ts.is_none() && to_ts.is_none() {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .map(|rd| {
@@ -624,6 +630,71 @@ fn date_files_in_range(dir: &Path, from_ts: Option<u64>, to_ts: Option<u64>) -> 
         }
     }
     files
+}
+
+/// 存量条目（无 id）补算确定性 id：`sha256(projectId + ts + kind + summary)` 前 32 hex。
+/// 同一 jsonl 行在任意设备回填得到同 id，服务端 `(user_id, event_id)` 去重后天然合并；
+/// 云同步的复合游标 `(ts, id)` 也用它比较（存量条目无原始 id）。
+pub(crate) fn stable_event_id(project_id: &str, e: &TimelineEntry) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(project_id.as_bytes());
+    h.update(e.ts.to_string().as_bytes());
+    h.update(e.kind.as_bytes());
+    h.update(e.summary.as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    hex[..32].to_string()
+}
+
+/// 单条事件的最终 id：已有 id 用原值，存量条目补算确定性 id。
+pub(crate) fn effective_event_id(project_id: &str, e: &TimelineEntry) -> String {
+    e.id.clone()
+        .unwrap_or_else(|| stable_event_id(project_id, e))
+}
+
+/// 读取待上传条目：按文件顺序（追加序 = 时间序）取 `ts >= from_ts` 的条目，最多 limit 条。
+///
+/// `after_id` 为上一次已上传的末条事件 id（复合游标 `(from_ts, after_id)`）：同毫秒事件成组时
+/// 仅靠 ts 水位无法前进（批次边界落在同毫秒组内会反复重读同一批），故按 id 跳过已传前缀。
+/// after_id 在当前窗口找不到（文件已过期/时钟回拨）时退化为纯 ts 过滤——服务端按 id 幂等去重兜底。
+/// 坏行静默跳过；调用方先 flush_writer 保证刚写入的事件已落盘。
+pub(crate) fn read_entries_since(
+    dir: &Path,
+    project_id: &str,
+    from_ts: u64,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Vec<TimelineEntry> {
+    let files = date_files_in_range(dir, Some(from_ts), None);
+    let mut out: Vec<TimelineEntry> = Vec::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        for line in text.lines() {
+            let Ok(e) = serde_json::from_str::<TimelineEntry>(line) else { continue };
+            if e.ts >= from_ts {
+                out.push(e);
+            }
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    // 复合游标：跳过 id 匹配条目及其之前的前缀（该前缀上一轮已成功上传）
+    if let Some(aid) = after_id {
+        if let Some(pos) = out
+            .iter()
+            .position(|e| effective_event_id(project_id, e) == aid)
+        {
+            out.drain(..=pos);
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
+/// 标记某项目的标签云端副本待同步（timeline_upload 周期任务消费）；打标/删除/改闭合后调用。
+pub(crate) fn mark_tags_dirty(project_id: &str) {
+    crate::timeline_upload::mark_tags_dirty(project_id);
 }
 
 /* ---------------- 命令 ---------------- */
@@ -667,7 +738,9 @@ pub fn timeline_tag_add(
         return Err("项目不存在或未设置路径".to_string());
     };
     let dir = PathBuf::from(project_path).join(".aishell").join("timeline");
-    tag_add_to_dir(&dir, &name, &color, anchor_ts, &anchor_kind)
+    let tag = tag_add_to_dir(&dir, &name, &color, anchor_ts, &anchor_kind)?;
+    mark_tags_dirty(&project_id);
+    Ok(tag)
 }
 
 /// 删除标签（TimelineTab 右键「删除标签」）：按 (name, anchorTs, anchorKind) 匹配删除。
@@ -683,7 +756,9 @@ pub fn timeline_tag_remove(
         return Err("项目不存在或未设置路径".to_string());
     };
     let dir = PathBuf::from(project_path).join(".aishell").join("timeline");
-    tag_remove_in_dir(&dir, &name, anchor_ts, &anchor_kind)
+    let removed = tag_remove_in_dir(&dir, &name, anchor_ts, &anchor_kind)?;
+    mark_tags_dirty(&project_id);
+    Ok(removed)
 }
 
 /// 更新闭合位置（打标时该名称已有闭合选区，用户选择「更新闭合位置」）：
@@ -700,7 +775,9 @@ pub fn timeline_tag_reclose(
         return Err("项目不存在或未设置路径".to_string());
     };
     let dir = PathBuf::from(project_path).join(".aishell").join("timeline");
-    tag_reclose_in_dir(&dir, &name, anchor_ts, &anchor_kind)
+    let tag = tag_reclose_in_dir(&dir, &name, anchor_ts, &anchor_kind)?;
+    mark_tags_dirty(&project_id);
+    Ok(tag)
 }
 
 /// 列出项目时间线的全部标签记录（按打标时间倒序；前端按名去重取最新颜色）。
@@ -781,6 +858,7 @@ mod tests {
             kind: kind.to_string(),
             summary: summary.to_string(),
             detail: detail.map(str::to_string),
+            id: None,
             tags: None,
         }
     }
