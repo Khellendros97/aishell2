@@ -123,6 +123,9 @@ export const termRecordStart = (id: string, path: string, header: string) =>
   call<void>('term_record_start', { id, path, header });
 export const termRecordStop = (id: string, footer: string) =>
   call<string | null>('term_record_stop', { id, footer });
+/** 导出终端会话输出到用户选定的本地文件（save 对话框已确认路径/覆盖）。 */
+export const termExport = (path: string, content: string) =>
+  call<string>('term_export', { path, content });
 export const onTermData = (id: string, cb: (data: string) => void): Promise<UnlistenFn> =>
   listen<{ data: string }>(`term:data:${id}`, (e) => cb(e.payload.data));
 export const onTermExit = (id: string, cb: (code: number | null) => void): Promise<UnlistenFn> =>
@@ -491,4 +494,4 @@ export const skillSetEnabled = (projectId: string, origin: SkillOrigin, name: st
   call<SkillSummary>('skill_set_enabled', { projectId, origin, name, enabled });
 
 /* ---------------- misc ---------------- */
-export { open as openDialog } from '@tauri-apps/plugin-dialog';
+export { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';

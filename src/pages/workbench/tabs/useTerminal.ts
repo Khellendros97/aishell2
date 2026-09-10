@@ -5,8 +5,12 @@
  * - addQuickCommandModal(「收藏为命令收藏」共享模态,legacy pages/workbench/quickcommand.ts,
  *   供信息栏 / 历史命令抽屉两处复用)。
  * 与后端的接口点(src/api.ts):term_create / term_input / term_resize / term_close、
- * term_record_start / term_record_stop,事件 term:data:<id> / term:exit:<id>;
+ * term_record_start / term_record_stop / term_export,事件 term:data:<id> / term:exit:<id>;
  * 认证失败识别前缀 SSH_AUTH_FAILED_PREFIX(与 ssh.rs AUTH_FAILED_PREFIX 对齐)。
+ *
+ * 会话结束(MobaXterm 式)提示条:进程退出/建连失败后在终端底部浮出,提供
+ * Enter 关闭标签页 / R 重新连接 / S 导出终端输出三个动作(快捷键 + 按钮双入口);
+ * 导出 = 全量 scrollback 纯文本经 save 对话框落盘(term_export,父目录自动创建)。
  *
  * React 差异(语义对齐 legacy):
  * - 无 tab.el / tab.pane 命令式 DOM:标签栏「已退出」置灰经 setTabBarExited 按
@@ -29,14 +33,14 @@ import '@xterm/xterm/css/xterm.css';
 
 import {
   SSH_AUTH_FAILED_PREFIX, SSH_NEED_DEPLOY_KEY_PREFIX, getState, onTermData, onTermExit, openDialog,
-  sshDeployPublicKey, termClose, termCreate, termInput, termRecordStart, termRecordStop, termResize,
-  timelineBindServer, timelineReport,
+  saveDialog, sshDeployPublicKey, termClose, termCreate, termExport, termInput, termRecordStart,
+  termRecordStop, termResize, timelineBindServer, timelineReport,
   upsertProject,
 } from '../../../api';
 import type { TermKind } from '../../../api';
 import type { QuickCommand, Server, ServerRef, TermSnapshot } from '../../../types';
 import { saveServerWithCredentialChoice } from '../../settings/server-save';
-import { icon } from '../../../icons';
+import { icon, type IconName } from '../../../icons';
 import { attachCombo, copyText, showContextMenu, toast, uid } from '../../../ui';
 import { dbg } from '../../../debug';
 import { currentTheme, onThemeChange } from '../../../theme';
@@ -244,10 +248,16 @@ class TermSession {
   /** 后端会话建立前到达的输入（含 xterm 对查询序列的自动应答）缓存,就绪后按序补发。 */
   private pendingInput: string[] = [];
   private pendingInputLen = 0;
-  /** 重连流程吞掉旧通道的 term:exit（setTimeout 兜底,防旧任务不醒来导致永久吞事件）。 */
+  /** 重连流程吞掉旧通道的 term:exit（setTimeout 兜底,防旧任务不醒来导致永久吞事件）。
+      只在旧会话确实在运行时置位（见 reconnect）：已退出/建连失败的会话不会补发事件。 */
   private ignoreExit = false;
   /** 抽屉刷新节流：输出捕获后末块内容变化，300ms 合并重绘 */
   private drawerTimer: number | null = null;
+  /** 会话结束提示条（进程退出/建连失败后浮在终端底部；Enter 关标签、R 重连、S 导出输出）。
+      懒创建，跨重连复用；null = 尚未创建或已随 destroy 移除。 */
+  private exitBar: HTMLElement | null = null;
+  private exitBarTitle: HTMLElement | null = null;
+  private exitBarDesc: HTMLElement | null = null;
 
   /** 日志用短 id（term:srv-xxx:t-yyyy → t-yyyy） */
   private get sid(): string {
@@ -321,6 +331,7 @@ class TermSession {
         this.recording
           ? { label: '停止录制', iconName: 'circle', action: () => { void this.stopRecording(false); this.term.focus(); } }
           : { label: '开始录制', iconName: 'circle', action: () => { void this.startRecording(); this.term.focus(); } },
+        { label: '导出终端输出…', iconName: 'download', action: () => void this.exportOutput() },
         { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
       ]);
     });
@@ -335,6 +346,8 @@ class TermSession {
        preventDefault 必须调：否则浏览器默认行为（Chromium 的粘贴为纯文本）会再粘贴一遍 */
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
+      /* 会话已结束:Enter/R/S 三个快捷键交本模块处理(不落终端) */
+      if (this.exited || this.failed) return !this.handleExitBarKey(e);
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
         e.preventDefault();
         this.copySelection();
@@ -385,6 +398,7 @@ class TermSession {
       toast(msg, 'error');
       this.term.write(`\r\n\x1b[31m[启动失败] ${msg}\x1b[0m\r\n`);
       this.handleConnectError(msg);
+      this.showExitBar('会话连接失败', msg);
       this.updateInfo();
     }
   }
@@ -664,6 +678,156 @@ class TermSession {
     const hint = code === null ? '[进程已退出]' : `[进程已退出 code=${code}]`;
     this.term.write(`\r\n\x1b[90m${hint}\x1b[0m\r\n`);
     this.updateInfo();
+    /* 浮出会话结束提示条(MobaXterm 式):Enter 关标签 / R 重连 / S 导出输出 */
+    const kind = (this.tab.data as { kind?: string }).kind;
+    const who = kind === 'ssh' ? '远端会话' : '本地会话';
+    this.showExitBar('会话已结束', code === null ? `${who}进程已退出` : `${who}进程已退出（退出码 ${code}）`);
+  }
+
+  /* ---------- 会话结束提示条(Enter 关标签 / R 重连 / S 导出输出) ---------- */
+  /**
+   * 懒创建并显示提示条：挂在 host 底部（position:absolute），随宽高自适应。
+   * 已存在则只更新文案并显示（重连失败可反复触发）。
+   */
+  private showExitBar(title: string, desc: string): void {
+    if (!this.exitBar) {
+      const bar = document.createElement('div');
+      bar.className = 'term-exitbar';
+      bar.tabIndex = -1; // 可聚焦：焦点落在提示条上时快捷键仍然生效（见下方 keydown）
+      const text = document.createElement('div');
+      text.className = 'term-exitbar-text';
+      const t = document.createElement('div');
+      t.className = 'term-exitbar-title';
+      const d = document.createElement('div');
+      d.className = 'term-exitbar-desc';
+      text.append(t, d);
+      const actions = document.createElement('div');
+      actions.className = 'term-exitbar-actions';
+      actions.append(
+        this.exitBarButton('logOut', '关闭标签页', 'Enter', () => this.closeTabAction()),
+        this.exitBarButton('refresh', '重新连接', 'R', () => void this.reconnectFromBar()),
+        this.exitBarButton('download', '导出终端输出', 'S', () => void this.exportOutput()),
+      );
+      bar.append(text, actions);
+      /* 提示条自身也收快捷键:点空白处聚焦提示条（xterm 失焦）后 Enter/R/S 仍可用 */
+      bar.addEventListener('mousedown', (e) => { if (e.target === bar || e.target === text) bar.focus(); });
+      bar.addEventListener('keydown', (e) => this.handleExitBarKey(e));
+      this.host.appendChild(bar);
+      this.exitBar = bar;
+      this.exitBarTitle = t;
+      this.exitBarDesc = d;
+    }
+    if (this.exitBarTitle) this.exitBarTitle.textContent = title;
+    if (this.exitBarDesc) this.exitBarDesc.textContent = desc;
+    this.exitBar.classList.add('open');
+    this.term.focus();
+  }
+
+  /** 提示条上的一个动作按钮：图标 + 中文动作 + 快捷键角标。点击后把焦点交还终端
+      （否则快捷键 Enter/R/S 失效——焦点在 DOM 按钮上时 xterm 收不到 keydown）。 */
+  private exitBarButton(iconName: IconName, label: string, key: string, onClick: () => void): HTMLButtonElement {
+    const btn = document.createElement('button');
+    btn.className = 'btn small term-exitbar-btn';
+    const kbd = document.createElement('kbd');
+    kbd.textContent = key;
+    const cap = document.createElement('span');
+    cap.textContent = label;
+    btn.innerHTML = icon(iconName);
+    btn.append(kbd, cap);
+    btn.onclick = () => {
+      onClick();
+      // 关标签/重连会把提示条收起:此时焦点归调用方处理(避免焦点写进已 dispose 的 xterm)
+      if (this.exitBar?.classList.contains('open')) this.term.focus();
+    };
+    return btn;
+  }
+
+  private hideExitBar(): void {
+    this.exitBar?.classList.remove('open');
+  }
+
+  /**
+   * 会话结束态下的快捷键:Enter 关标签 / R 重连 / S 导出。
+   * 返回 true = 已消费（xterm 不再处理该按键）。Escape 交给上层（不消费）。
+   */
+  private handleExitBarKey(e: KeyboardEvent): boolean {
+    if (e.ctrlKey || e.altKey || e.metaKey) return false;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      this.closeTabAction();
+      return true;
+    }
+    if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault();
+      void this.reconnectFromBar();
+      return true;
+    }
+    if (e.key === 's' || e.key === 'S') {
+      e.preventDefault();
+      void this.exportOutput();
+      return true;
+    }
+    return false;
+  }
+
+  /** 关闭本标签页（提示条 Enter 与按钮共用；先收起提示条再走 store 关闭）。 */
+  private closeTabAction(): void {
+    dbg(`${this.sid} fe-exitbar-close-tab`);
+    this.hideExitBar();
+    useWorkbench.getState().closeTab(this.tab.id);
+  }
+
+  /** 提示条「重新连接」：收起提示条后走既有 reconnect 流程（失败会再次浮出）。 */
+  private async reconnectFromBar(): Promise<void> {
+    this.hideExitBar();
+    await this.reconnect();
+  }
+
+  /**
+   * 导出当前终端输出到本地文件：默认落 `<项目>/.aishell/record/服务器-日期时间.log`
+   * （与录制同目录同命名，便于归档），用户可在 save 对话框改路径。
+   * 内容 = 全量 scrollback 纯文本（xterm buffer translateToString），过 xterm 解析后
+   * 无 ANSI 残留，符合「导出终端输出」语义。
+   */
+  private async exportOutput(): Promise<void> {
+    const content = this.exportText();
+    if (!content.trim()) { toast('终端暂无输出可导出', 'info'); return; }
+    const data = this.tab.data as { kind?: string };
+    const name = (data.kind === 'ssh' ? this.tabTitle : '本地终端').replace(/[\\/:*?"<>|]/g, '_');
+    const projectPath = useWorkbench.getState().project?.path?.replace(/[\\/]+$/, '');
+    const defaultPath = projectPath
+      ? `${projectPath}/.aishell/record/${name}-${this.fmtTs(new Date())}.log`
+      : `${name}-${this.fmtTs(new Date())}.log`;
+    let path: string | null;
+    try {
+      path = await saveDialog({
+        defaultPath,
+        filters: [{ name: '终端日志', extensions: ['log', 'txt'] }],
+      });
+    } catch (err) {
+      toast(String(err), 'error');
+      return;
+    }
+    if (!path) return; // 用户取消
+    try {
+      const saved = await termExport(path, content);
+      toast(`终端输出已导出: ${saved}`, 'success', 6000);
+    } catch (err) {
+      toast(String(err), 'error');
+    }
+  }
+
+  /** 全量 scrollback 纯文本（含可视区；逐行 translateToString 去 wrapped 补白）。 */
+  private exportText(): string {
+    const buf = this.term.buffer.active;
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const ln = buf.getLine(i);
+      lines.push(ln ? ln.translateToString(true) : '');
+    }
+    // 去掉尾部空行（xterm scrollback 预分配的空白行）
+    while (lines.length && !lines[lines.length - 1]) lines.pop();
+    return lines.join('\n');
   }
 
   /* ---------- 重连:旧通道关闭(吞掉其 term:exit),同 id 重建后端会话 ---------- */
@@ -671,8 +835,15 @@ class TermSession {
     // 失败态也允许重连（原实现 `if (this.failed) return` 导致密码错误等建连失败后
     // 右键重连失效）：establish 会重置失败态并重建会话，再次失败仍走 handleConnectError 兜底
     dbg(`${this.sid} fe-reconnect${this.failed ? '(failed 态重试)' : ''}`);
-    this.ignoreExit = true;
-    setTimeout(() => { this.ignoreExit = false; }, 8000);
+    /* 仅当旧会话仍在运行时才需要吞掉它的退出事件：只有这种会话后端 map 里还有句柄，
+       term_close 才会杀掉它、由其读任务补发一次 term:exit。
+       已退出(exited)或建连失败(failed)的会话后端句柄早已移除，term_close 不补发任何事件——
+       这两种情况若仍置 ignoreExit，标志会一直挂到 8s 超时，把新会话的首个退出事件误当旧事件吞掉，
+       表现为「重连成功后再次 exit 不弹提示条」。 */
+    if (!this.exited && !this.failed) {
+      this.ignoreExit = true;
+      setTimeout(() => { this.ignoreExit = false; }, 8000);
+    }
     try { await termClose(this.tab.id); } catch { /* 已关闭忽略 */ }
     await this.establish();
   }
@@ -688,6 +859,7 @@ class TermSession {
     this.ready = false;
     this.exited = false;
     this.failed = false;
+    this.hideExitBar();
     setTabBarExited(this.tab.id, false);
     this.pendingInput = [];
     this.pendingInputLen = 0;
@@ -714,6 +886,7 @@ class TermSession {
       toast(msg, 'error');
       this.term.write(`\r\n\x1b[31m[重连失败] ${msg}\x1b[0m\r\n`);
       this.handleConnectError(msg);
+      this.showExitBar('会话重连失败', msg);
     }
     this.updateInfo();
     this.renderDrawer();
@@ -991,6 +1164,10 @@ class TermSession {
     liveTerms.delete(this);
     this.resizer?.disconnect();
     if (this.recording) void this.stopRecording(true);
+    this.exitBar?.remove();
+    this.exitBar = null;
+    this.exitBarTitle = null;
+    this.exitBarDesc = null;
     this.unlisteners.forEach((u) => { try { u(); } catch { /* 忽略退订异常 */ } });
     this.unlisteners = [];
     if (!this.exited) void termClose(this.tab.id).catch(() => {});

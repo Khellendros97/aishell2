@@ -254,6 +254,7 @@ pub fn run() {
             term::term_close,
             term::term_record_start,
             term::term_record_stop,
+            term::term_export,
             term::debug_export,
             notify::system_notify,
             fsops::fs_list,

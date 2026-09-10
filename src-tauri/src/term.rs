@@ -896,6 +896,28 @@ pub async fn term_record_stop(
     manager.record_stop(&id, &footer)
 }
 
+/// 导出终端会话输出到用户选定路径（前端 save 对话框拿路径后调此命令写盘），
+/// 返回最终写入路径。与 fs_write 的差别：父目录不存在时自动创建（导出默认落在
+/// `<项目>/.aishell/record/`，该目录未必存在）。允许覆盖已有文件——用户在 save
+/// 对话框已确认过覆盖。
+#[tauri::command]
+pub fn term_export(path: String, content: String) -> Result<String, String> {
+    let file = PathBuf::from(path.trim());
+    if file.as_os_str().is_empty() {
+        return Err("导出路径为空".to_string());
+    }
+    if file.is_dir() {
+        return Err("导出路径是目录".to_string());
+    }
+    if let Some(parent) = file.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建导出目录失败: {e}"))?;
+        }
+    }
+    std::fs::write(&file, content).map_err(|e| format!("导出「{}」失败: {e}", file.display()))?;
+    Ok(file.to_string_lossy().into_owned())
+}
+
 /* ---------------- 单测：Recorder 内容与覆盖语义（temp_dir，不碰真实终端） ---------------- */
 
 #[cfg(test)]
@@ -946,6 +968,36 @@ mod tests {
             .read_to_string(&mut content)
             .expect("读录制文件");
         assert_eq!(content, "h1\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导出终端输出：父目录不存在时自动创建，且允许覆盖已有文件（save 对话框已确认）。
+    #[test]
+    fn term_export_creates_parent_and_overwrites() {
+        let dir = tmp_dir("export");
+        let path = dir.join("nested/deep/输出-20260910-120000.log");
+        let saved = super::term_export(path.to_string_lossy().into_owned(), "line1\nline2\n".to_string())
+            .expect("父目录缺失时应自动创建并写盘");
+        assert_eq!(saved, path.to_string_lossy(), "应返回最终写入路径");
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .expect("导出文件应存在")
+            .read_to_string(&mut content)
+            .expect("读导出文件");
+        assert_eq!(content, "line1\nline2\n");
+        // 二次导出同名路径：覆盖而非报错
+        super::term_export(path.to_string_lossy().into_owned(), "覆盖内容".to_string())
+            .expect("重复导出应覆盖成功");
+        let mut content2 = String::new();
+        std::fs::File::open(&path)
+            .expect("导出文件应存在")
+            .read_to_string(&mut content2)
+            .expect("读导出文件");
+        assert_eq!(content2, "覆盖内容");
+        // 空路径报错
+        assert!(super::term_export("   ".to_string(), "x".to_string()).is_err());
+        // 目标是目录时报错
+        assert!(super::term_export(dir.to_string_lossy().into_owned(), "x".to_string()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
