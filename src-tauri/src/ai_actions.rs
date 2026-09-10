@@ -181,9 +181,9 @@ impl AiActions {
                     return Err("本地目标不得使用 serverId".to_string());
                 }
                 let root = self.project_root(project_id)?;
-                let result = self.run_local(&root, &command, timeout).await;
-                self.timeline_command(project_id, format!("AI 执行（本地）：{command}"), &result);
-                result
+                // 时间线不再另写「命令」事件：run_command 已由 ai.rs 工具调用事件覆盖（去重），
+                // 目标标记（本地/服务器名）并入该事件摘要。
+                self.run_local(&root, &command, timeout).await
             }
             "remote" => {
                 let sid =
@@ -222,7 +222,7 @@ impl AiActions {
                 }
                 // 用同一绝对 cwd 包装命令（保证分析路径与实际执行环境一致）
                 let wrapped = format!("cd {} && {}", shell_quote(&effective_cwd), command);
-                // 时间线：exec 失败与超时也记录（先收集成 Result，统一在末尾落时间线）
+                // 超时转 Err（与本地执行一致以错误返回；自动备份刷新据此跳过）
                 let result = match self.ssh.exec_with_timeout(&sid, &wrapped, timeout).await {
                     Ok(r) if r.timed_out => Err(format!(
                         "命令执行超时（{} 秒），已尝试终止远端命令",
@@ -247,48 +247,15 @@ impl AiActions {
                         }
                     }
                 }
-                let label = self
-                    .ssh
-                    .server_label(&sid)
-                    .map(|n| format!("「{n}」"))
-                    .unwrap_or_default();
-                self.timeline_command(
-                    project_id,
-                    format!("AI 执行（{label}）：{command}"),
-                    &result,
-                );
                 result
             }
             other => Err(format!("未知命令目标：{other}")),
         }
     }
 
-    /// 时间线命令事件：AI run_command 的成功（退出码+裁剪输出）与失败都记录。
-    fn timeline_command(
-        &self,
-        project_id: &str,
-        summary: String,
-        result: &Result<CommandResult, String>,
-    ) {
-        let detail = match result {
-            Ok(r) => {
-                let mut d = format!(
-                    "退出码: {}",
-                    r.exit_code
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "超时/未知".into())
-                );
-                if !r.stdout.trim().is_empty() {
-                    d.push_str(&format!("\n{}", crate::ssh::clip_output(&r.stdout)));
-                }
-                if !r.stderr.trim().is_empty() {
-                    d.push_str(&format!("\n[stderr] {}", crate::ssh::clip_output(&r.stderr)));
-                }
-                Some(d)
-            }
-            Err(e) => Some(format!("执行失败：{e}")),
-        };
-        crate::timeline::append(&self.store, project_id, "command", summary, detail);
+    /// 服务器显示名（时间线 run_command 目标标记等只读用途，同步查询不涉网络）。
+    pub(crate) fn server_label(&self, server_id: &str) -> Option<String> {
+        self.ssh.server_label(server_id)
     }
 
     /// SFTP 上传：本地源必须在项目根内且已存在（文件或目录），远端目录必填。

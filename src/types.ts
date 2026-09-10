@@ -429,7 +429,7 @@ export interface TimelineTagInfo {
 /** 项目时间线条目（timeline.rs TimelineEntry serde camelCase 对齐） */
 export interface TimelineEntry {
   ts: number;
-  /** ssh_connect/ssh_disconnect/ssh_connect_failed/command/file_upload/file_download/ai_user/ai_assistant/ai_tool */
+  /** ssh_connect/ssh_disconnect/ssh_connect_failed/command/file_upload/file_download/ai_user/ai_assistant/ai_tool/skill */
   kind: string;
   summary: string;
   detail?: string;

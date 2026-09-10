@@ -308,6 +308,37 @@ fn select_enabled_skills(
     (final_list, covered)
 }
 
+/// read 工具读取 SKILL.md 时的时间线技能名：技能正文固定为 `<技能根>/<name>/SKILL.md`，
+/// 取父目录名即技能名；非 SKILL.md（大小写不敏感）或无父目录返回 None（走通用工具事件）。
+fn skill_name_from_read(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.file_name()?.to_str()?.eq_ignore_ascii_case("SKILL.md") {
+        p.parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    } else {
+        None
+    }
+}
+
+/// 时间线「提问」摘要：前端注入的 `[当前工作区域: …]` 上下文行固定在 prompt 头部，
+/// 预览里跳过它，其余非空行 trim 后以空格压平成单行（512 字素上限由 timeline::append
+/// 落盘兜底）；detail 仍存全文，展开可见完整内容。
+fn timeline_user_summary(prompt: &str) -> String {
+    let joined = prompt
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("[当前工作区域:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.is_empty() {
+        "（空输入）".to_string()
+    } else {
+        joined
+    }
+}
+
 /// 稳定「Skill 作用域提示」区：追加在系统提示尾部。scope 只提示何时优先使用，不是权限或加载过滤；
 /// 所有启用技能始终传给 pi，切换本地/远程工作区域不得重建或增删 --skill 参数（本区与指纹均不含
 /// 工作区域）。scope 摘要不得包含技能正文或任意密钥值。
@@ -867,25 +898,65 @@ impl AiManager {
                                     "args": args,
                                     "result": result_text,
                                 }));
-                                // 时间线：AI 工具调用（全量，含只读工具；与 trace 同一配对数据）
+                                // 时间线：AI 工具调用（全量，含只读工具；与 trace 同一配对数据）。
+                                // read 读到 SKILL.md 时改记「技能」事件（替换通用工具事件，避免同类重复）；
+                                // run_command 摘要带目标标记（本地/服务器名）——它不再另写「命令」事件
+                                //（原 ai_actions timeline_command 与本事件重复，已去除），目标信息并入这里防丢。
                                 {
-                                    let label = serde_json::from_str::<serde_json::Value>(&args)
-                                        .ok()
-                                        .and_then(|a| {
-                                            a.get("path")
-                                                .or_else(|| a.get("pattern"))
-                                                .or_else(|| a.get("command"))
-                                                .or_else(|| a.get("query"))
-                                                .or_else(|| a.get("name"))
-                                                .and_then(|v| v.as_str().map(str::to_string))
-                                        })
-                                        .unwrap_or_default();
                                     let status = if is_err { "失败" } else { "成功" };
                                     let duration = crate::trace::now_ms().saturating_sub(start);
-                                    let summary = if label.is_empty() {
-                                        format!("AI 工具 {t}（{status}，{duration}ms）")
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+                                    let skill_name = if t == "read" {
+                                        parsed
+                                            .get("path")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(skill_name_from_read)
                                     } else {
-                                        format!("AI 工具 {t} {label}（{status}，{duration}ms）")
+                                        None
+                                    };
+                                    let (kind, summary) = if let Some(name) = skill_name {
+                                        (
+                                            "skill",
+                                            format!("AI 读取技能 {name}（{status}，{duration}ms）"),
+                                        )
+                                    } else {
+                                        let mut label = parsed
+                                            .get("path")
+                                            .or_else(|| parsed.get("pattern"))
+                                            .or_else(|| parsed.get("command"))
+                                            .or_else(|| parsed.get("query"))
+                                            .or_else(|| parsed.get("name"))
+                                            .and_then(|v| v.as_str().map(str::to_string))
+                                            .unwrap_or_default();
+                                        if t == "run_command" {
+                                            let target =
+                                                parsed.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                                            let prefix = match target {
+                                                "local" => "[本地] ".to_string(),
+                                                "remote" => {
+                                                    let sid = parsed
+                                                        .get("serverId")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("");
+                                                    match actions.server_label(sid) {
+                                                        Some(n) => format!("[服务器 {n}] "),
+                                                        None if !sid.is_empty() => {
+                                                            format!("[服务器 {sid}] ")
+                                                        }
+                                                        None => "[远程] ".to_string(),
+                                                    }
+                                                }
+                                                _ => String::new(),
+                                            };
+                                            label = format!("{prefix}{label}");
+                                        }
+                                        let summary = if label.is_empty() {
+                                            format!("AI 工具 {t}（{status}，{duration}ms）")
+                                        } else {
+                                            format!("AI 工具 {t} {label}（{status}，{duration}ms）")
+                                        };
+                                        ("ai_tool", summary)
                                     };
                                     let detail = if result_text.is_empty() {
                                         None
@@ -895,7 +966,7 @@ impl AiManager {
                                     crate::timeline::append(
                                         &store2,
                                         &project_id2,
-                                        "ai_tool",
+                                        kind,
                                         summary,
                                         detail,
                                     );
@@ -2355,19 +2426,14 @@ pub async fn ai_chat(
             "bytes": img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0),
         })).collect::<Vec<_>>(),
     }));
-    // 时间线：用户提问（与 trace 同一脱敏后文本；summary 取首行、detail 保留全文）
+    // 时间线：用户提问（与 trace 同一脱敏后文本；summary 跳过工作区域注入行并压平全文，
+    // detail 保留原文供展开查看）
     {
-        let summary = prompt
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("（空输入）")
-            .to_string();
         crate::timeline::append(
             &mgr.store,
             &project_id,
             "ai_user",
-            summary,
+            timeline_user_summary(&prompt),
             Some(prompt.clone()),
         );
     }
@@ -3033,5 +3099,43 @@ mod tests {
         assert!(model.get("input").is_none(), "非 vision 模型不应带 input 字段");
         assert_eq!(model["reasoning"], false, "deepseek-chat 不支持思考档位");
         assert_eq!(vision["providers"]["deepseek"]["models"][0]["reasoning"], true, "v4 系列支持思考档位");
+    }
+
+    #[test]
+    fn skill_name_from_read_matches_skill_md_parent_dir() {
+        // <技能根>/<name>/SKILL.md → 技能名 = 父目录名；大小写不敏感；其余路径 → None（走通用工具事件）
+        assert_eq!(
+            skill_name_from_read("C:/ws/.aishell/skills/deploy-check/SKILL.md").as_deref(),
+            Some("deploy-check")
+        );
+        assert_eq!(
+            skill_name_from_read("C:/ws/.aishell/skills/deploy-check/skill.md").as_deref(),
+            Some("deploy-check"),
+            "文件名大小写不敏感"
+        );
+        assert_eq!(
+            skill_name_from_read("skills/deploy-check/SKILL.md").as_deref(),
+            Some("deploy-check"),
+            "相对路径同样取父目录名"
+        );
+        assert_eq!(skill_name_from_read("C:/ws/src/main.rs"), None, "普通文件不走技能事件");
+        assert_eq!(skill_name_from_read("SKILL.md"), None, "无父目录回退通用工具事件");
+    }
+
+    #[test]
+    fn timeline_user_summary_skips_workarea_line_and_flattens() {
+        // 头部 [当前工作区域: …] 注入行不进摘要；其余非空行 trim 后压平成单行
+        let prompt = "[当前工作区域: 服务器 web-1 (root@1.2.3.4:22)]\n帮我看看这个报错：\n  第二行细节  \n\n第三行";
+        assert_eq!(
+            timeline_user_summary(prompt),
+            "帮我看看这个报错： 第二行细节 第三行"
+        );
+        assert_eq!(
+            timeline_user_summary("[当前工作区域: 本地]\n修复登录超时"),
+            "修复登录超时"
+        );
+        // 只剩注入行/空白 → 回退占位
+        assert_eq!(timeline_user_summary("[当前工作区域: 本地]\n  \n"), "（空输入）");
+        assert_eq!(timeline_user_summary(""), "（空输入）");
     }
 }

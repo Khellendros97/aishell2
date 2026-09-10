@@ -41,6 +41,7 @@ const KINDS: Array<{ key: string; label: string; icon: IconName }> = [
   { key: 'ai_user', label: '提问', icon: 'user' },
   { key: 'ai_assistant', label: '回答', icon: 'bot' },
   { key: 'ai_tool', label: '工具', icon: 'wrench' },
+  { key: 'skill', label: '技能', icon: 'sparkles' },
 ];
 const KIND_META = new Map(KINDS.map((k) => [k.key, k]));
 

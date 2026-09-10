@@ -1290,7 +1290,7 @@ function timelineAnalysisPrompt(scope?: TimelineAnalysisScopeItem[]): string {
       '请分析本项目的项目时间线，生成项目日志与可重用 Skill。项目时间线记录了本项目近期的 SSH 连接、终端与远程命令及结果、文件上传下载、以及 AI 问答与工具调用历史（保留 30 天），用 timeline_search 工具检索。',
       '',
       '步骤：',
-      '1. 用 timeline_search 分批检索：先按类别总览（kinds 分别为 ["ssh_connect","ssh_disconnect","ssh_connect_failed"]、["command"]、["file_upload","file_download"]、["ai_user"]），再对关键主题用关键词/时间段细化；梳理出本项目近期的主要工作、关键命令与操作结果。',
+      '1. 用 timeline_search 分批检索：先按类别总览（kinds 分别为 ["ssh_connect","ssh_disconnect","ssh_connect_failed"]、["command"]、["file_upload","file_download"]、["ai_user","skill"]），再对关键主题用关键词/时间段细化；梳理出本项目近期的主要工作、关键命令与操作结果。',
       ...tail,
     ].join('\n');
   }
