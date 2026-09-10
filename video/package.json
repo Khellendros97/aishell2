@@ -13,6 +13,7 @@
     "render:06": "remotion render src/index.ts StagingDemo out/06-staging.mp4",
     "render:07": "remotion render src/index.ts SshTunnelDemo out/07-ssh-tunnel.mp4",
     "render:08": "remotion render src/index.ts CloudSyncDemo out/08-cloud-sync.mp4",
+    "render:09": "remotion render src/index.ts TimelineSyncDemo out/09-timeline-sync.mp4",
     "still": "remotion still src/index.ts InitAiDemo",
     "still:02": "remotion still src/index.ts ProjectSshDemo",
     "still:03": "remotion still src/index.ts FileSftpDemo",
@@ -20,7 +21,8 @@
     "still:05": "remotion still src/index.ts BrowserDemo",
     "still:06": "remotion still src/index.ts StagingDemo",
     "still:07": "remotion still src/index.ts SshTunnelDemo",
-    "still:08": "remotion still src/index.ts CloudSyncDemo"
+    "still:08": "remotion still src/index.ts CloudSyncDemo",
+    "still:09": "remotion still src/index.ts TimelineSyncDemo"
   },
   "dependencies": {
     "@remotion/cli": "^4.0.518",

@@ -126,6 +126,15 @@ export const ICONS = {
     '<path d="M20 7h-5V2"/><path d="M4 17h5v5"/><path d="M5.5 9A7 7 0 0 1 20 7"/><path d="M18.5 15A7 7 0 0 1 4 17"/>',
   chart:
     '<path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/>',
+  /* ---- 视频九(时间线云同步)补充,与主仓 src/icons.ts 同名条目一致 ---- */
+  hash: '<line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/>',
+  check: '<polyline points="20 6 9 17 4 12"/>',
+  timeline: '<circle cx="6" cy="12" r="2"/><circle cx="18" cy="12" r="2"/><path d="M8 12h8"/><path d="M2 12h2"/><path d="M20 12h2"/>',
+  /* ---- 视频九网页端(云平台浅色主题,对照 aishell-cloud web/admin Icon.tsx) ---- */
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  box: '<path d="M21 8 12 3 3 8v8l9 5 9-5V8Z"/><path d="m3 8 9 5 9-5"/><path d="M12 13v8"/>',
+  send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+  external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14 21 3"/>',
 } as const;
 
 export type IconName = keyof typeof ICONS;
