@@ -4,9 +4,10 @@
 //! 每行一个 JSON：`{"ts": <epoch-millis>, "kind": "<类别>", "summary": "...", "detail": "..."}`。
 //! 类别（kind）：
 //! - `ssh_connect` / `ssh_disconnect`  SSH 连接建立/断开（ssh.rs 连接池埋点）
-//! - `command`        命令执行（终端区块上报 / SFTP 面板远程命令 / AI run_command，detail 为裁剪输出）
+//! - `command`        命令执行（终端区块上报 / SFTP 面板远程命令；AI run_command 由 ai_tool 事件覆盖，不另写）
 //! - `file_upload` / `file_download`    SFTP 传输完成（手动通道与 AI 通道）
 //! - `ai_user` / `ai_assistant` / `ai_tool`  AI 会话的用户提问 / 助手回复 / 工具调用
+//! - `skill`          AI read 读取 SKILL.md（解析为技能事件，替换该次的 ai_tool）
 //!
 //! 写入仿 trace.rs：全局 mpsc + 单后台写线程（BufWriter，500ms 周期 flush），
 //! 埋点失败静默、绝不影响主路径；与 trace 不同——时间线是长期事实记录，无开关、默认常开。

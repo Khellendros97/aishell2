@@ -200,6 +200,11 @@
   color: var(--purple);
 }
 
+.timeline-kind-skill .timeline-kind-icon,
+.timeline-kind-skill .timeline-kind {
+  color: var(--yellow);
+}
+
 .timeline-kind-ssh_disconnect .timeline-summary {
   color: var(--text-2);
 }
