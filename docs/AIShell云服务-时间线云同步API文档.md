@@ -70,7 +70,7 @@ Authorization: Bearer <access_token>
 | `events` | 必填，1..500 条；单批请求体 ≤2 MB（超限 400 或代理层 413） |
 | `events[].id` | 必填，1..64 字符；规则见 §2.2 |
 | `events[].ts` | 必填，正整数 epoch 毫秒 |
-| `events[].kind` | 必填，9 类之一（见 §2.4） |
+| `events[].kind` | 必填，10 类之一（见 §2.4） |
 | `events[].summary` | 必填，1..512 字符 |
 | `events[].detail` | 可选，≤4096 字符（**云端上限**，本地 16K 裁剪不变，上报前截断） |
 
@@ -93,9 +93,14 @@ Authorization: Bearer <access_token>
 
 ### 2.4 事件类别枚举（服务端白名单校验）
 
-`ssh_connect` / `ssh_disconnect` / `ssh_connect_failed` / `command` / `file_upload` / `file_download` / `ai_user` / `ai_assistant` / `ai_tool`
+`ssh_connect` / `ssh_disconnect` / `ssh_connect_failed` / `command` / `file_upload` / `file_download` / `ai_user` / `ai_assistant` / `ai_tool` / `skill`
 
 未知类别整批 400。客户端新增类别必须与服务端版本同步发布。
+
+类别语义（客户端 v1.1.2 起，服务端需 ≥ 迁移 0016）：
+
+- `command`：**仅人工命令**（终端区块上报、SFTP 面板直执）。AI 的 run_command 不再另写 `command`，只由 `ai_tool` 事件覆盖（摘要带 `[本地]` / `[服务器 <名>]` 前缀）。
+- `skill`：AI 用 read 工具读取 `<目录名>/SKILL.md` 时触发，**替换该次的 `ai_tool` 事件**（同一次读取不会两条都写）。技能名为 SKILL.md 的父目录名，摘要格式 `AI 读取技能 <name>（成功|失败，Nms）`，detail 为读取内容原文（无结构化 name 字段，按摘要解析）。
 
 ### 2.5 脱敏（上传侧强制，不改本地文件）
 
@@ -122,7 +127,7 @@ Content-Type: application/json
 ```
 
 - **全量覆盖语义**：请求体即该项目标签全集，服务端事务内先删后写；用户在本地增删标签后整体上传该项目列表（传空数组即清空该项目云端标签）。标签总量小（单项目几十个）、变更低频，无增量协议。
-- 校验：单次 ≤200 条；`name` 1..64 字符（服务端 NFC 归一后存储）；`color` 必须 `#rrggbb`；`anchorKind` 限 9 类；`ts`/`anchorTs` 正整数。违例 400 `INVALID_TIMELINE_PAYLOAD`。
+- 校验：单次 ≤200 条；`name` 1..64 字符（服务端 NFC 归一后存储）；`color` 必须 `#rrggbb`；`anchorKind` 限 10 类（含 `skill`——注意客户端上传器的标签净化白名单需同步包含 `skill`，否则打在 skill 事件上的标签不会上传）；`ts`/`anchorTs` 正整数。违例 400 `INVALID_TIMELINE_PAYLOAD`。
 - 标签锚定 `(anchorTs, anchorKind)` 与本地一致；「同名标签两两配对构成选区」的配对计算统一在服务端做，客户端本地展示逻辑不受影响。
 
 ## 4. 查询（客户端可选）

@@ -454,10 +454,12 @@ enum TickAbort {
 }
 
 /// 上传前标签净化：剔除服务端会整批拒绝的条目（返回净化结果与被剔除条数）。
-/// 本地校验用字素裁剪，服务端用 rune 计数且限 9 类锚点——两侧口径差异必须在此吸收，
+/// 本地校验用字素裁剪，服务端用 rune 计数且限 10 类锚点——两侧口径差异必须在此吸收，
 /// 否则单条非法标签会让该项目标签基线永远无法成功（每 tick 重试）。
+/// 锚点类别须与服务端 `timeline_tags.anchor_kind` 白名单（迁移 0016 起含 `skill`）逐字一致，
+/// 漏一类会让打在该类事件上的标签静默丢失。
 fn sanitize_tags(tags: Vec<crate::timeline::TimelineTag>) -> (Vec<crate::timeline::TimelineTag>, usize) {
-    const KINDS: [&str; 9] = [
+    const KINDS: [&str; 10] = [
         "ssh_connect",
         "ssh_disconnect",
         "ssh_connect_failed",
@@ -467,6 +469,7 @@ fn sanitize_tags(tags: Vec<crate::timeline::TimelineTag>) -> (Vec<crate::timelin
         "ai_user",
         "ai_assistant",
         "ai_tool",
+        "skill",
     ];
     let before = tags.len();
     let kept = tags
@@ -815,16 +818,21 @@ mod tests {
             anchor_kind: kind.into(),
         };
         let tags = vec![
-            mk("发布", "#4f8ef7", "command"),         // 合法
-            mk("", "#4f8ef7", "command"),             // 空名
-            mk("ok", "4f8ef7", "command"),            // 缺 #
-            mk("ok", "#gggggg", "command"),           // 非 hex
-            mk("ok", "#4f8ef7", "unknown_kind"),      // 未知锚点类别
+            mk("发布", "#4f8ef7", "command"),          // 合法
+            mk("技能", "#f5a623", "skill"),            // 合法（v1.1.2 起新增的锚点类别）
+            mk("", "#4f8ef7", "command"),              // 空名
+            mk("ok", "4f8ef7", "command"),             // 缺 #
+            mk("ok", "#gggggg", "command"),            // 非 hex
+            mk("ok", "#4f8ef7", "unknown_kind"),       // 未知锚点类别
             mk(&"x".repeat(65), "#4f8ef7", "command"), // 超 64 rune
         ];
         let (kept, dropped) = sanitize_tags(tags);
-        assert_eq!(kept.len(), 1, "只保留合法标签");
+        assert_eq!(kept.len(), 2, "只保留合法标签");
         assert_eq!(kept[0].name, "发布");
+        assert_eq!(
+            kept[1].anchor_kind, "skill",
+            "skill 锚点须放行（漏一类会让打在 skill 事件上的标签静默丢失）"
+        );
         assert_eq!(dropped, 5);
     }
 

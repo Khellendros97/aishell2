@@ -1156,7 +1156,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "搜索项目时间线",
 		promptGuidelines: [
 			"用户问「之前执行过什么命令/连过哪台服务器/上传过什么文件/上次怎么解决的」或需要回顾项目历史时，用 timeline_search 检索，不要凭记忆猜测。",
-			"kinds 过滤类别：ssh_connect / ssh_disconnect / ssh_connect_failed / command / file_upload / file_download / ai_user / ai_assistant / ai_tool；不传则全部类别。",
+			"kinds 过滤类别：ssh_connect / ssh_disconnect / ssh_connect_failed / command / file_upload / file_download / ai_user / ai_assistant / ai_tool / skill（skill=AI 读取 SKILL.md 的技能事件）；不传则全部类别。",
 			"fromTs/toTs 为 epoch 毫秒（含边界）；不传则搜索全部保留期。结果较多时换更精确的关键词或更窄的时间段分批检索。",
 		],
 		parameters: Type.Object({
