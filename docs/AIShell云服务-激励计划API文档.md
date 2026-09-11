@@ -95,11 +95,28 @@
 
 ---
 
-## 三、积分规则 / 明细 / 排行榜
+## 三、积分展示（客户端直接查看）
 
-### GET /api/incentive/rules
+本节三组接口均为**登录即可读**，用于客户端内置「激励计划」页：规则说明 + 本人明细 + 全员排行榜（含查看任一成员的明细）。全部为只读 GET，无副作用。
 
-当前生效的计分规则（登录即可见）：
+### 3.1 维度键对照表（客户端展示务必按此映射中文）
+
+**同一个维度在两处使用不同命名的键，不要在客户端直接复用**：
+
+| 规则接口键（camelCase） | 明细/排行接口键（snake_case） | 中文名称 | 计分单位 |
+|---|---|---|---|
+| `aiTool` | `ai_tool` | AI 工具调用 | 次 |
+| `manualOps` | `manual_ops` | 人工命令/sftp | 次 |
+| `ticketReport` | `ticket_report` | 工单报告 | 条 |
+| `skillUpload` | `skill_upload` | skill 上传 | 个 |
+| `skillReference` | `skill_reference` | skill 被引用 | 次 |
+| `feedback` | `feedback` | 问题反馈 | 次 |
+
+`byDimension` 与 `items[].dimension` 用 snake_case，且**只包含已得分的维度**（无该维度流水时键不存在，客户端按缺省 0 处理）。建议客户端内置一张 snake_case → 中文的映射表用于渲染。
+
+### 3.2 GET /api/incentive/rules
+
+当前生效的计分规则（管理员可在后台调整，改后即时生效，客户端每次进入页面拉取即可）：
 
 ```json
 {
@@ -112,37 +129,62 @@
 }
 ```
 
-维度与中文对照：`aiTool` AI 助手工具调用（次）、`manualOps` 人工 ssh 命令/sftp 运维（次）、`ticketReport` 工单报告审核通过（条）、`skillUpload` 上传 skill（个）、`skillReference` skill 被他人引用（次）、`feedback` 问题反馈（次）。
+每个维度 `enabled` 为 false 表示该维度已停用（不再入账，存量流水保留），客户端可置灰展示。
 
-> 一期仅 `skillUpload`、`ticketReport` 两个维度有数据；其余维度待客户端时间线上报对接后开启采集。
+> 一期仅 `skillUpload`、`ticketReport` 两个维度有实际数据；其余维度待时间线上报对接后开启采集。
 
-### GET /api/incentive/points/mine
+### 3.3 GET /api/incentive/points/mine
 
-本人积分汇总与明细分页（`page`/`pageSize`）：
+本人积分汇总 + 明细分页。
+
+查询参数：`page`（默认 1）、`pageSize`（默认 20，最大 100）。
 
 ```json
 {
   "userId": 7, "userName": "张三", "userDept": "研发部",
-  "total": 40, "byDimension": { "skill_upload": 20, "ticket_report": 20 },
-  "items": [{ "id": 3, "userId": 7, "dimension": "ticket_report", "points": 20, "sourceType": "ticket_report", "sourceId": "1", "note": "工单报告「工单 #1024 磁盘扩容」审核通过", "createdAt": "..." }],
+  "total": 40,
+  "byDimension": { "skill_upload": 20, "ticket_report": 20 },
+  "items": [
+    { "id": 3, "userId": 7, "dimension": "ticket_report", "points": 20,
+      "sourceType": "ticket_report", "sourceId": "1",
+      "note": "工单报告「工单 #1024 磁盘扩容」审核通过",
+      "createdAt": "2026-09-10T12:38:43+08:00" }
+  ],
   "itemTotal": 2, "page": 1, "pageSize": 20
 }
 ```
 
-### GET /api/incentive/points/users/:id
+字段语义（易混，务必区分）：
 
-查看任意用户的积分明细（结构同上）——全员公开透明。用户不存在返回 404。
+- **`total`**：积分总分（各维度分值之和，用于展示"我的积分"）。
+- **`byDimension`**：各维度得分小计，键为 snake_case，仅含有分的维度。
+- **`itemTotal`**：**流水条数**（不是分值），用于算分页页码；而 `total` 是分值。二者不可混用。
+- `items`：按 `createdAt` 倒序（同时间按 id 倒序）。`note` 是人类可读的入账说明，可直接展示；`sourceType`/`sourceId` 为溯源标识（如工单报告 id），需要深链时使用。
 
-### GET /api/incentive/points/leaderboard
+### 3.4 GET /api/incentive/points/users/:id
 
-全员积分榜（登录即可见）：按总分降序，同分并列名次，含各维度小计。
+查看**任意用户**的积分明细，响应结构与 3.3 完全一致（`userId`/`userName`/`userDept` 为该用户）——全员公开透明，这是激励计划的既定规则。
+
+- `:id` 从排行榜条目的 `userId` 取得。
+- 用户不存在返回 404 `{"error":"用户不存在"}`。
+
+### 3.5 GET /api/incentive/points/leaderboard
+
+全员积分排行榜，**按总分降序、无分页**（全员一次返回）；同分并列名次（1、1、3 式竞赛排名）。含各维度小计，前端点击某成员即可用其 `userId` 调 3.4 看明细。
 
 ```json
 {
-  "items": [{ "rank": 1, "userId": 7, "name": "张三", "dept": "研发部", "total": 40, "byDimension": { "skill_upload": 20 } }],
-  "generatedAt": "..."
+  "items": [
+    { "rank": 1, "userId": 7, "name": "张三", "dept": "研发部", "total": 40,
+      "byDimension": { "skill_upload": 20, "ticket_report": 20 } }
+  ],
+  "generatedAt": "2026-09-10T12:36:56+08:00"
 }
 ```
+
+- 无人得分时 `items` 为空数组。
+- `generatedAt` 为服务端生成时间，客户端可用于提示"榜单更新于 …"。
+- 返回的 `name`/`dept` 即用户姓名与部门，无需另调用户接口。
 
 ---
 
@@ -150,4 +192,9 @@
 
 1. **上传 skill 成功后自动登记**：上传流程（浏览器自动化）拿到 skill 的 `namespace/slug` 后调 `POST /api/incentive/skill-uploads`。收到 404（刚上传可能不可见）或 502 时可延迟重试；409/403 为终态，不要重试。
 2. **工单报告**：若客户端内嵌报告提交入口，按上述 multipart 约定提交；也可引导用户到工作台「工单报告」页面提交。
-3. **积分榜轮询**：如需在客户端展示排名，建议 15–30 秒轮询 `leaderboard`；`points/mine` 展示本人明细。
+3. **激励计划页数据流**（对应第三节）：
+   - 进入页面：并行拉 `rules`（展示计分规则）+ `points/mine`（本人总分与明细）+ `leaderboard`（排行）；
+   - 实时性：排行榜建议 15–30 秒轮询（服务端无推送）；`points/mine` 在页面可见或操作后刷新即可；
+   - 查看他人明细：点排行榜某行 → 用其 `userId` 调 `points/users/:id`，分页行为与本人明细一致；
+   - 「我的排名」：在 `leaderboard.items` 中按本人 `userId` 查找 `rank`。
+4. **能力开关**：`GET /api/auth/me` 的 `capabilities.incentive` 为 false 时，隐藏所有激励入口，不要调本节接口（会 403）。
