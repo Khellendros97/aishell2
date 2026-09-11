@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -418,6 +418,32 @@ export const feedbackDetail = (id: number) => call<Feedback>('feedback_detail', 
 export const feedbackDownloadAttachment = (id: number, attachmentId: number, savePath: string) =>
   call<void>('feedback_download_attachment', { id, attachmentId, savePath });
 
+/* ---------------- 员工激励计划（激励计划 API 文档；token 全程留在 Rust 端） ----------------
+   能力位 capabilities.incentive 为 false 时隐藏全部入口（调用会 403）。
+   skill 上传登记在上传成功后由 SkillsPanel 自动调用；工单报告提交为 multipart（附件传本地绝对路径）。 */
+/** 计分规则（GET /api/incentive/rules，§3.2） */
+export const incentiveRules = () => call<IncentiveRules>('incentive_rules');
+/** 本人积分汇总 + 明细分页（GET /api/incentive/points/mine，§3.3） */
+export const incentivePointsMine = (page?: number, pageSize?: number) =>
+  call<IncentivePoints>('incentive_points_mine', { page: page ?? null, pageSize: pageSize ?? null });
+/** 查看任意用户积分明细（GET /api/incentive/points/users/:id，§3.4） */
+export const incentivePointsUser = (userId: number, page?: number, pageSize?: number) =>
+  call<IncentivePoints>('incentive_points_user', { userId, page: page ?? null, pageSize: pageSize ?? null });
+/** 全员积分排行榜（GET /api/incentive/points/leaderboard，§3.5） */
+export const incentiveLeaderboard = () => call<IncentiveLeaderboard>('incentive_leaderboard');
+/** skill 上传登记（POST /api/incentive/skill-uploads，§一）；namespace 缺省 global */
+export const incentiveRegisterSkillUpload = (slug: string, namespace?: string) =>
+  call<IncentiveSkillUpload>('incentive_register_skill_upload', { namespace: namespace ?? null, slug });
+/** 提交工单处理报告（POST /api/incentive/ticket-reports，§二）；attachmentPaths 为本地绝对路径 */
+export const incentiveSubmitTicketReport = (
+  title: string,
+  content: string,
+  ticketRef?: string,
+  attachmentPaths?: string[],
+) => call<IncentiveTicketReport>('incentive_submit_ticket_report', {
+  title, content, ticketRef: ticketRef ?? '', attachmentPaths: attachmentPaths ?? null,
+});
+
 /* ---------------- AI 会话 trace（Rust trace.rs） ----------------
    开关持久化在 AppState.traceEnabled（命令面板 `trace on/off`）；日志按会话分文件落盘
    （<config>/ai-trace/<日期>/<项目>__<会话>.jsonl），7 天过期由后端定时清理。
@@ -492,6 +518,9 @@ export const browserCloseView = (viewId: string) => call<void>('browser_close_vi
 /** 驱动受限本地 ZIP 走可见的 SkillHub 页面流程；只返回终态，不额外广播进度事件。 */
 export const browserPublishSkillhub = (projectId: string, origin: SkillOrigin, packagePath: string) =>
   call<SkillHubPublishOutcome>('browser_publish_skillhub', { projectId, origin, packagePath });
+/** 读取 SkillHub 发布页当前状态（URL + namespace）：手动发布计分观察器轮询用。
+ *  SPA 路由跳转不触发 browser:event 的 url 事件，只能主动轮询；非发布页返回空 url。 */
+export const browserPublishState = () => call<PublishPageState>('browser_publish_state');
 /** 记录地址栏历史：导航/标题事件后防抖上报（后端按 URL 合并去重保持 MRU，落盘 aishell.json） */
 export const browserHistoryAdd = (url: string, title: string) =>
   call<void>('browser_history_add', { url, title });

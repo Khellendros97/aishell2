@@ -65,6 +65,16 @@ pub enum SkillHubPublishStatus {
     Manual,
 }
 
+/// SkillHub 发布页实时状态（手动发布计分观察器轮询用）。
+/// `url` 为当前页面地址（SPA 路由变化也只有主动读取才能拿到）；`namespace` 为发布页
+/// namespace 下拉当前选中的坐标值（非发布页/未选中为 None）。
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishPageState {
+    pub url: String,
+    pub namespace: Option<String>,
+}
+
 const SKILLHUB_DASHBOARD_URL: &str = "https://skillhub.srun.com:6780/dashboard";
 const SKILLHUB_PUBLISH_URL: &str = "https://skillhub.srun.com:6780/dashboard/publish";
 const SKILLHUB_SKILLS_URL: &str = "https://skillhub.srun.com:6780/dashboard/skills";
@@ -129,6 +139,25 @@ fn manual_outcome(package_path: &Path, message: impl Into<String>) -> SkillHubPu
         package_path: package_path.to_string_lossy().into_owned(),
         message: message.into(),
     }
+}
+
+/// 发布页 namespace 显示文本 → 坐标值（激励登记用）。
+/// SkillHub 下拉显示形如 `Global (@global)`、`团队名 (@team)`，坐标在 `@` 之后的
+/// 字母数字/`._-` 段；带 `@` 但坐标为空（如仅 `@`）返回 None（不退回含 `@` 的原始文本，
+/// 否则会被服务端坐标校验拒绝）；无 `@` 时退回整段文本。空白返回 None。
+fn namespace_from_publish_text(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(idx) = t.rfind('@') {
+        let cand: String = t[idx + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect();
+        return if cand.is_empty() { None } else { Some(cand) };
+    }
+    Some(t.to_string())
 }
 
 fn publish_timeout_outcome(package_path: &Path) -> SkillHubPublishOutcome {
@@ -403,6 +432,36 @@ impl BrowserManager {
             )
             .await?;
         Ok(value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    /// 读取 SkillHub 发布页状态（当前 URL + 选中的 namespace），供前端「手动发布计分」观察器轮询。
+    /// 直接读 `location.href`——SkillHub 是 SPA，发布成功后是 pushState 客户端路由跳转，
+    /// `on_page_load` 不触发，故不能依赖 browser:event 的 url 事件，只能主动轮询页面。
+    /// 页面不存在返回空 URL（调用方跳过，不视为错误）。
+    async fn read_publish_state_live(self: &Arc<Self>, view_id: &str) -> PublishPageState {
+        if !self.views.lock().unwrap().contains_key(view_id) {
+            return PublishPageState::default();
+        }
+        let value = self
+            .eval_json(
+                view_id,
+                r#"(() => {
+                    try {
+                      const el = document.querySelector('#namespace[role="combobox"]');
+                      return { url: location.href, text: el ? (el.textContent || '').trim() : '' };
+                    } catch (e) { return { url: '', text: '' }; }
+                  })()"#
+                    .to_string(),
+                "读取 SkillHub 发布页状态",
+            )
+            .await
+            .unwrap_or_default();
+        PublishPageState {
+            url: value.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            namespace: namespace_from_publish_text(
+                value.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+            ),
+        }
     }
 
     async fn call_devtools_json(
@@ -1501,6 +1560,18 @@ pub async fn browser_publish_skillhub(
     Ok(outcome)
 }
 
+/// 读取 SkillHub 发布页当前状态（云分支）：手动发布时前端轮询本命令，
+/// 页面落到技能列表页（发布成功落地页）即视为发布成功并登记计分，解决
+/// 「自动化未点成功但用户手动发布」的漏计分。目标视图沿用与 browser_publish_skillhub
+/// 相同的 ai_target 语义。SPA 路由变化不会有 on_page_load，故必须主动读取。
+#[tauri::command]
+pub async fn browser_publish_state(
+    mgr: State<'_, Arc<BrowserManager>>,
+) -> Result<PublishPageState, String> {
+    let view_id = mgr.ai_target();
+    Ok(mgr.read_publish_state_live(&view_id).await)
+}
+
 /// 保存内置浏览器 SOCKS5 代理配置（AppState 顶层,不走 Settings 整表单）：
 /// 代理只能在子 webview 创建时注入——保存后关闭所有现有子 webview 并广播
 /// `browser:proxy-changed`,前端标签页按 URL 自动重建。
@@ -2017,6 +2088,19 @@ mod tests {
             manual_outcome(package, "提交超时").status,
             SkillHubPublishStatus::Manual
         );
+    }
+
+    #[test]
+    fn namespace_from_publish_text_extracts_coordinate() {
+        // SkillHub 下拉显示「Global (@global)」/「团队名 (@team)」→ 取 @ 后的坐标
+        assert_eq!(namespace_from_publish_text("Global (@global)").as_deref(), Some("global"));
+        assert_eq!(namespace_from_publish_text("研发团队 (@rd-team)").as_deref(), Some("rd-team"));
+        assert_eq!(namespace_from_publish_text("  @my.team_2  ").as_deref(), Some("my.team_2"));
+        // 无 @ 时退回整段文本；空白返回 None
+        assert_eq!(namespace_from_publish_text("global").as_deref(), Some("global"));
+        assert_eq!(namespace_from_publish_text("@"), None, "@ 后为空且无其它文本视为缺失");
+        assert_eq!(namespace_from_publish_text("   "), None);
+        assert_eq!(namespace_from_publish_text(""), None);
     }
 
     #[test]

@@ -119,6 +119,18 @@ html, body {
 .btn.danger:hover { background: var(--red-dim); border-color: var(--red); }
 .btn.danger-solid { background: var(--red); border-color: var(--red); color: #fff; }
 .btn.danger-solid:hover { background: #ee7a81; }
+/* 品牌蓝紫渐变（Skill Hub / 发布工单日志等推广与激励入口共用，单一来源） */
+.btn.brand-gradient {
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 55%, #d946ef 100%);
+  border-color: transparent;
+}
+.btn.brand-gradient:hover {
+  color: #fff;
+  background: linear-gradient(135deg, #7075f5 0%, #9967fa 55%, #e45cf1 100%);
+  border-color: transparent;
+  filter: brightness(1.08);
+}
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-1); }
 .btn.ghost:hover { background: var(--bg-hover); color: var(--text-0); }
 /* 密钥对表单「未发现密钥对，点击立即生成」：蓝色文字引导（区别于灰色说明文案） */

@@ -27,6 +27,8 @@ import { onThemeChange } from '../../../theme';
 import { Icon } from '../../../shared/Icon';
 import { reconfigureTheme, editorCmThemeExt } from './EditorTab';
 import { openPublishReportModal } from '../notes/PublishReportModal';
+import { openPublishTicketModal } from '../notes/PublishTicketModal';
+import { useIncentiveEnabled } from '../../../shared/useIncentive';
 import './note.css';
 
 /* Markdown 预览渲染器:配置抄 ai-engine.ts(html:false 转义原始 HTML 防 XSS,
@@ -133,6 +135,8 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
   const entryRef = useRef<NoteEntry | null>(null);
   const [mode, setMode] = useState<'edit' | 'preview'>('edit');
   const [, setContentVersion] = useState(0);
+  /** 激励计划能力（未开通时隐藏「发布工单日志」入口） */
+  const incentiveEnabled = useIncentiveEnabled();
 
   /* keep-alive:CodeMirror 实例生命周期 = 组件挂载/卸载;effect 依赖 tab.id(硬约束 9) */
   useEffect(() => {
@@ -227,6 +231,15 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
     else open();
   };
 
+  /* 发布工单日志(激励计划):同样先落盘(后端按路径读正文)再开表单;正文预填由模态框读盘完成 */
+  const publishTicket = (): void => {
+    const entry = entryRef.current;
+    if (!entry) return;
+    const open = (): void => openPublishTicketModal({ notePath: entry.path, noteName: entry.baseTitle });
+    if (entry.dirty) void queueSave(entry, true).then(open);
+    else open();
+  };
+
   /* 预览外链显式走系统浏览器（main 侧引入）：Markdown 预览里的 http/mailto 链接不被页面接管 */
   const onPreviewClick = (e: MouseEvent<HTMLDivElement>): void => {
     const target = e.target;
@@ -258,6 +271,11 @@ export function NoteTab({ tab }: TabProps): JSX.Element {
         <button className="btn small" title="将笔记整理后发布为钉钉日志" onClick={publishReport}>
           <Icon name="upload" /> 发布日志
         </button>
+        {incentiveEnabled && (
+          <button className="btn small brand-gradient" title="将笔记内容整理为工单处理报告提交到云平台（审核通过后计入激励积分）" onClick={publishTicket}>
+            <Icon name="ticket" /> 发布工单日志
+          </button>
+        )}
         <span className="note-path ellipsis" title={String(tab.data.path ?? '')}>
           {String(tab.data.path ?? '')}
         </span>

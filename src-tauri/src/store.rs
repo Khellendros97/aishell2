@@ -166,6 +166,9 @@ pub struct CloudCapabilities {
     /// 项目时间线云同步能力；旧服务端缺失时按关闭。
     #[serde(default)]
     pub timeline_sync: bool,
+    /// 员工激励计划能力（skill 上传登记 / 工单报告 / 积分展示）；旧服务端缺失时按关闭。
+    #[serde(default)]
+    pub incentive: bool,
     #[serde(default)]
     pub latest_version: Option<String>,
 }
@@ -7667,6 +7670,7 @@ mod tests {
             data_sync: true,
             file_backup: true,
             timeline_sync: true,
+            incentive: false,
             latest_version: Some("0.3.0".into()),
         };
         store.cloud_set_tokens("acc", "ref").unwrap();
@@ -7724,6 +7728,7 @@ mod tests {
                     data_sync: false,
                     file_backup: false,
                     timeline_sync: false,
+                    incentive: false,
                     latest_version: None,
                 },
             )

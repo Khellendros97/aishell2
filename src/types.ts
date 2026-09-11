@@ -97,6 +97,8 @@ export interface CloudCapabilities {
   fileBackup: boolean;
   /** 是否开通时间线云同步；旧服务端缺失时按关闭处理 */
   timelineSync: boolean;
+  /** 是否开通员工激励计划；旧服务端缺失时按关闭处理 */
+  incentive: boolean;
   latestVersion: string | null;
 }
 
@@ -995,6 +997,13 @@ export interface SkillHubPublishOutcome {
   message: string;
 }
 
+/** SkillHub 发布页实时状态（browser_publish_state）：手动发布计分观察器轮询用。
+ *  url 为当前页面地址（SPA 路由跳转只有主动读取才可见）；namespace 非发布页为 null。 */
+export interface PublishPageState {
+  url: string;
+  namespace: string | null;
+}
+
 /* ---------------- SkillHub（与 cloud.rs SkillHub API serde camelCase 对齐） ---------------- */
 export interface SkillHubVersion {
   id: number;
@@ -1217,4 +1226,104 @@ export interface SftpProgress {
   filesTotal: number;
   /** done 阶段携带传输是否成功（进度阶段恒为 true）；耗时操作完成通知仅在成功时发送 */
   ok?: boolean;
+}
+
+/* ---------- 员工激励计划（docs/AIShell云服务-激励计划API文档.md） ---------- */
+
+/** 维度键：规则接口用 camelCase，明细/排行接口用 snake_case（文档 §3.1，禁止混用） */
+export type IncentiveRuleKey = 'aiTool' | 'manualOps' | 'ticketReport' | 'skillUpload' | 'skillReference' | 'feedback';
+/** 明细/排行维度键（snake_case，仅含已得分的维度） */
+export type IncentiveDimensionKey = 'ai_tool' | 'manual_ops' | 'ticket_report' | 'skill_upload' | 'skill_reference' | 'feedback';
+
+/** 单维度计分规则（GET /api/incentive/rules） */
+export interface IncentiveDimensionRule {
+  enabled: boolean;
+  points: number;
+}
+
+/** 计分规则全集（§3.2） */
+export type IncentiveRules = Record<IncentiveRuleKey, IncentiveDimensionRule>;
+
+/** 积分流水条目（§3.3）；note 可直接展示，sourceType/sourceId 为溯源标识 */
+export interface IncentivePointEntry {
+  id: number;
+  userId: number;
+  dimension: string;
+  points: number;
+  sourceType: string;
+  sourceId: string;
+  note: string;
+  createdAt: string;
+}
+
+/** 积分汇总 + 明细分页（§3.3 / §3.4）；total 为分值、itemTotal 为流水条数 */
+export interface IncentivePoints {
+  userId: number;
+  userName: string;
+  userDept: string;
+  total: number;
+  /** 各维度小计（snake_case 键，仅含有分的维度） */
+  byDimension: Record<string, number>;
+  items: IncentivePointEntry[];
+  itemTotal: number;
+  page: number;
+  pageSize: number;
+}
+
+/** 排行榜条目（§3.5）；同分并列名次 */
+export interface IncentiveLeaderboardEntry {
+  rank: number;
+  userId: number;
+  name: string;
+  dept: string;
+  total: number;
+  byDimension: Record<string, number>;
+}
+
+/** 排行榜响应（§3.5）；generatedAt 用于「榜单更新于 …」提示 */
+export interface IncentiveLeaderboard {
+  items: IncentiveLeaderboardEntry[];
+  generatedAt: string;
+}
+
+/** skill 上传登记记录（§一）；status: verified | rejected */
+export interface IncentiveSkillUpload {
+  id: number;
+  userId: number;
+  namespace: string;
+  slug: string;
+  ownerName: string;
+  status: string;
+  reason: string;
+  createdAt: string;
+}
+
+/** 工单报告附件元数据（§二） */
+export interface IncentiveAttachment {
+  id: number;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  sha256: string;
+  createdAt: string;
+  downloadURL: string;
+}
+
+/** 工单处理报告（§二）；status 用户只读（pending/approved/rejected，后台审核流转） */
+export interface IncentiveTicketReport {
+  id: number;
+  reporterId: number;
+  reporterName: string;
+  reporterDept: string;
+  title: string;
+  content: string;
+  ticketRef: string;
+  status: string;
+  reviewComment: string;
+  reviewerName: string;
+  reviewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  attachments: IncentiveAttachment[];
+  attachmentCount: number;
 }

@@ -577,6 +577,11 @@ fn parse_capabilities(c: &serde_json::Value) -> CloudCapabilities {
             .iter()
             .find_map(|k| c.get(k).and_then(|v| v.as_bool()))
             .unwrap_or(false),
+        // 员工激励计划能力：camelCase 为主，兼容旧服务端 snake_case
+        incentive: ["incentive", "incentive_enabled"]
+            .iter()
+            .find_map(|k| c.get(k).and_then(|v| v.as_bool()))
+            .unwrap_or(false),
         latest_version: c
             .get("latest_version")
             .or_else(|| c.get("latestVersion"))
@@ -1836,6 +1841,355 @@ pub async fn feedback_download_attachment(
     std::fs::write(&save_path, &bytes).map_err(|e| format!("保存附件失败：{e}"))
 }
 
+// ---------------------------------------------------------------- 员工激励计划（文档：AIShell云服务-激励计划API文档.md）
+
+const INCENTIVE_TITLE_MAX_CHARS: usize = 120;
+const INCENTIVE_CONTENT_MAX_CHARS: usize = 10000;
+const INCENTIVE_TICKET_REF_MAX_CHARS: usize = 255;
+const INCENTIVE_MAX_ATTACHMENTS: usize = 10;
+const INCENTIVE_MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const INCENTIVE_MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+
+/// 单维度计分规则（§3.2）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentiveDimensionRule {
+    pub enabled: bool,
+    pub points: i64,
+}
+
+/// 计分规则全集（§3.2）：键固定 camelCase，服务端可后台调整、改后即时生效。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentiveRules {
+    pub ai_tool: IncentiveDimensionRule,
+    pub manual_ops: IncentiveDimensionRule,
+    pub ticket_report: IncentiveDimensionRule,
+    pub skill_upload: IncentiveDimensionRule,
+    pub skill_reference: IncentiveDimensionRule,
+    pub feedback: IncentiveDimensionRule,
+}
+
+/// 积分流水条目（§3.3）。dimension 为 snake_case；note 人类可读可直接展示。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentivePointEntry {
+    pub id: i64,
+    pub user_id: i64,
+    pub dimension: String,
+    pub points: i64,
+    pub source_type: String,
+    pub source_id: String,
+    pub note: String,
+    pub created_at: String,
+}
+
+/// 本人/他人积分汇总 + 明细分页（§3.3 / §3.4）。total 为分值、itemTotal 为流水条数。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentivePoints {
+    pub user_id: i64,
+    pub user_name: String,
+    pub user_dept: String,
+    pub total: i64,
+    /// 各维度得分小计（键 snake_case，仅含有分的维度）
+    pub by_dimension: std::collections::HashMap<String, i64>,
+    pub items: Vec<IncentivePointEntry>,
+    pub item_total: i64,
+    pub page: u32,
+    pub page_size: u32,
+}
+
+/// 排行榜条目（§3.5）：同分并列名次，name/dept 已随响应给出。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentiveLeaderboardEntry {
+    pub rank: i64,
+    pub user_id: i64,
+    pub name: String,
+    pub dept: String,
+    pub total: i64,
+    pub by_dimension: std::collections::HashMap<String, i64>,
+}
+
+/// 排行榜响应（§3.5）：无分页，一次返回全员；generatedAt 供「榜单更新于 …」提示。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentiveLeaderboard {
+    pub items: Vec<IncentiveLeaderboardEntry>,
+    pub generated_at: String,
+}
+
+/// skill 上传登记记录（§一）。status 为 verified / rejected。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentiveSkillUpload {
+    pub id: i64,
+    pub user_id: i64,
+    pub namespace: String,
+    pub slug: String,
+    pub owner_name: String,
+    pub status: String,
+    pub reason: String,
+    pub created_at: String,
+}
+
+/// 工单报告附件元数据（§二）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentiveAttachment {
+    pub id: i64,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub created_at: String,
+    #[serde(rename = "downloadURL")]
+    pub download_url: String,
+}
+
+/// 工单处理报告（§二）：创建响应 / 列表条目同构。status 用户只读（后台审核流转）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IncentiveTicketReport {
+    pub id: i64,
+    pub reporter_id: i64,
+    pub reporter_name: String,
+    pub reporter_dept: String,
+    pub title: String,
+    pub content: String,
+    pub ticket_ref: String,
+    pub status: String,
+    pub review_comment: String,
+    pub reviewer_name: String,
+    pub reviewed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub attachments: Vec<IncentiveAttachment>,
+    pub attachment_count: u32,
+}
+
+/// 计分规则（GET /api/incentive/rules，§3.2）：登录即可读。
+#[tauri::command]
+pub async fn incentive_rules(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+) -> Result<IncentiveRules, String> {
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::GET,
+        "/api/incentive/rules",
+        &[],
+        None,
+    )
+    .await?;
+    serde_json::from_value(v).map_err(|e| format!("解析计分规则失败: {e}"))
+}
+
+/// 本人积分汇总 + 明细分页（GET /api/incentive/points/mine，§3.3）。
+#[tauri::command]
+pub async fn incentive_points_mine(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<IncentivePoints, String> {
+    incentive_fetch_points(&cloud, &store, "/api/incentive/points/mine", page, page_size).await
+}
+
+/// 查看任意用户积分明细（GET /api/incentive/points/users/:id，§3.4）：全员公开透明。
+#[tauri::command]
+pub async fn incentive_points_user(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    user_id: i64,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<IncentivePoints, String> {
+    if user_id <= 0 {
+        return Err("用户 ID 无效".to_string());
+    }
+    incentive_fetch_points(
+        &cloud,
+        &store,
+        &format!("/api/incentive/points/users/{user_id}"),
+        page,
+        page_size,
+    )
+    .await
+}
+
+/// 积分明细分页共用取数（本人与他人接口响应同构，§3.3/§3.4）。
+async fn incentive_fetch_points(
+    cloud: &Arc<CloudManager>,
+    store: &Arc<Store>,
+    path: &str,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<IncentivePoints, String> {
+    let q: Vec<(&str, String)> = vec![
+        ("page", page.unwrap_or(1).max(1).to_string()),
+        ("pageSize", page_size.unwrap_or(20).clamp(1, 100).to_string()),
+    ];
+    let v = cloud_api_request(cloud, store, reqwest::Method::GET, path, &q, None).await?;
+    serde_json::from_value(v).map_err(|e| format!("解析积分明细失败: {e}"))
+}
+
+/// 全员积分排行榜（GET /api/incentive/points/leaderboard，§3.5）：无分页。
+#[tauri::command]
+pub async fn incentive_leaderboard(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+) -> Result<IncentiveLeaderboard, String> {
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::GET,
+        "/api/incentive/points/leaderboard",
+        &[],
+        None,
+    )
+    .await?;
+    serde_json::from_value(v).map_err(|e| format!("解析排行榜失败: {e}"))
+}
+
+/// skill 上传登记（POST /api/incentive/skill-uploads，§一）：skillhub 上传成功后由前端调用。
+/// 作者归属由服务端回查 skillhub 核实，客户端不声明作者信息。
+#[tauri::command]
+pub async fn incentive_register_skill_upload(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    namespace: Option<String>,
+    slug: String,
+) -> Result<IncentiveSkillUpload, String> {
+    let namespace = namespace.unwrap_or_default().trim().to_string();
+    let namespace = if namespace.is_empty() {
+        "global".to_string()
+    } else {
+        namespace
+    };
+    let slug = slug.trim().to_string();
+    // 客户端轻校验：与服务端 skillCoordPattern 同口径（字母数字开头 + ._-，≤128）
+    if !valid_skill_coord(&namespace) || !valid_skill_coord(&slug) {
+        return Err("namespace/slug 格式无效（仅字母数字开头，可含 . _ -，最长 128）".to_string());
+    }
+    let body = serde_json::json!({ "namespace": namespace, "slug": slug });
+    let v = cloud_api_request(
+        &cloud,
+        &store,
+        reqwest::Method::POST,
+        "/api/incentive/skill-uploads",
+        &[],
+        Some(body),
+    )
+    .await?;
+    serde_json::from_value(v).map_err(|e| format!("解析 skill 登记结果失败: {e}"))
+}
+
+/// skill 坐标校验（namespace/slug 共用，§一）：字母数字开头，其后 ._- 与字母数字，≤128。
+fn valid_skill_coord(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    s.chars().count() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// 提交工单处理报告（POST /api/incentive/ticket-reports，§二）：multipart/form-data。
+/// 附件为本地文件绝对路径列表（前端文件对话框给出），后端读取上传；客户端预检数量/大小/类型。
+#[tauri::command]
+pub async fn incentive_submit_ticket_report(
+    cloud: State<'_, Arc<CloudManager>>,
+    store: State<'_, Arc<Store>>,
+    title: String,
+    content: String,
+    ticket_ref: Option<String>,
+    attachment_paths: Option<Vec<String>>,
+) -> Result<IncentiveTicketReport, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("报告标题不能为空".to_string());
+    }
+    if title.chars().count() > INCENTIVE_TITLE_MAX_CHARS {
+        return Err(format!("报告标题不能超过 {INCENTIVE_TITLE_MAX_CHARS} 字"));
+    }
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("报告正文不能为空".to_string());
+    }
+    if content.chars().count() > INCENTIVE_CONTENT_MAX_CHARS {
+        return Err(format!("报告正文不能超过 {INCENTIVE_CONTENT_MAX_CHARS} 字"));
+    }
+    let ticket_ref = ticket_ref.unwrap_or_default().trim().to_string();
+    if ticket_ref.chars().count() > INCENTIVE_TICKET_REF_MAX_CHARS {
+        return Err(format!("工单号/链接不能超过 {INCENTIVE_TICKET_REF_MAX_CHARS} 字"));
+    }
+    let attachment_paths = attachment_paths.unwrap_or_default();
+    if attachment_paths.len() > INCENTIVE_MAX_ATTACHMENTS {
+        return Err(format!("附件最多 {INCENTIVE_MAX_ATTACHMENTS} 个"));
+    }
+    let (server, ..) = credentials()?;
+    let token = cloud.valid_access_token(&store).await?;
+    let mut form = reqwest::multipart::Form::new()
+        .text("title", title.to_string())
+        .text("content", content.to_string());
+    if !ticket_ref.is_empty() {
+        form = form.text("ticketRef", ticket_ref);
+    }
+    let mut total: u64 = 0;
+    for p in &attachment_paths {
+        let path = std::path::Path::new(p);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| format!("附件路径无效：{p}"))?;
+        feedback_check_attachment_name(&name)?;
+        let meta = std::fs::metadata(path).map_err(|e| format!("读取附件失败：{name}（{e}）"))?;
+        if !meta.is_file() {
+            return Err(format!("附件不是文件：{name}"));
+        }
+        let size = meta.len();
+        if size == 0 {
+            return Err(format!("附件是空文件：{name}"));
+        }
+        if size > INCENTIVE_MAX_FILE_BYTES {
+            return Err(format!("附件超过 20 MB 上限：{name}"));
+        }
+        total += size;
+        if total > INCENTIVE_MAX_TOTAL_BYTES {
+            return Err("附件总大小超过 100 MB 上限".to_string());
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("读取附件失败：{name}（{e}）"))?;
+        form = form.part(
+            "attachments",
+            reqwest::multipart::Part::bytes(bytes).file_name(name),
+        );
+    }
+    let url = format!("{server}/api/incentive/ticket-reports");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("连接云平台失败: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取云平台响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(api_error_text(status.as_u16(), &text));
+    }
+    serde_json::from_str(text.trim()).map_err(|e| format!("解析报告响应失败: {e}"))
+}
+
 /// 极简 URL 编码（授权 URL 参数；redirect_uri 只含 `:/-_` 无需全量编码，保守处理特殊字符）。
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1866,10 +2220,12 @@ mod tests {
             "dataSync": true,
             "fileBackup": true,
             "timelineSync": true,
+            "incentive": true,
             "latestVersion": "1.2.3"
         }));
         assert!(caps.data_sync && caps.file_backup && caps.search && !caps.knowledge);
         assert!(caps.timeline_sync, "timelineSync 能力应解析");
+        assert!(caps.incentive, "incentive 能力应解析");
         assert_eq!(caps.models, vec!["m1".to_string()]);
         assert_eq!(caps.latest_version.as_deref(), Some("1.2.3"));
 
@@ -1881,6 +2237,25 @@ mod tests {
         let caps = parse_capabilities(&json!({}));
         assert!(!caps.data_sync && !caps.file_backup && !caps.search && !caps.knowledge);
         assert!(!caps.timeline_sync, "缺失按关闭（旧服务端不误开）");
+        assert!(!caps.incentive, "缺失按关闭（旧服务端不误开）");
+    }
+
+    #[test]
+    fn valid_skill_coord_matches_server_pattern() {
+        // 合法：字母数字开头，可含 . _ -，≤128
+        assert!(valid_skill_coord("global"));
+        assert!(valid_skill_coord("my-deploy-skill"));
+        assert!(valid_skill_coord("team.sub_v2"));
+        assert!(valid_skill_coord("a"));
+        // 非法：空 / 非法首字符 / 含空格或斜杠 / 超长
+        assert!(!valid_skill_coord(""));
+        assert!(!valid_skill_coord("-leading"));
+        assert!(!valid_skill_coord(".leading"));
+        assert!(!valid_skill_coord("has space"));
+        assert!(!valid_skill_coord("has/slash"));
+        assert!(!valid_skill_coord("中文"));
+        assert!(valid_skill_coord(&"a".repeat(128)), "128 字符应放行");
+        assert!(!valid_skill_coord(&"a".repeat(129)), "超过 128 字符应拒绝");
     }
 
     #[cfg(debug_assertions)]
@@ -2120,6 +2495,78 @@ mod tests {
         );
         // 空体
         assert_eq!(api_error_text(204, ""), "无响应内容（HTTP 204）");
+    }
+
+    #[test]
+    fn incentive_dtos_parse_document_samples() {
+        // 规则（§3.2）：键固定 camelCase
+        let rules: IncentiveRules = serde_json::from_str(
+            r#"{"aiTool":{"enabled":true,"points":1},"manualOps":{"enabled":true,"points":5},
+                "ticketReport":{"enabled":true,"points":20},"skillUpload":{"enabled":true,"points":20},
+                "skillReference":{"enabled":false,"points":1},"feedback":{"enabled":true,"points":10}}"#,
+        )
+        .unwrap();
+        assert_eq!(rules.ticket_report.points, 20);
+        assert!(rules.ticket_report.enabled);
+        assert!(!rules.skill_reference.enabled, "停用维度应解析 enabled=false");
+
+        // 本人积分（§3.3）：total 是分值、itemTotal 是流水条数，二者不可混用
+        let points: IncentivePoints = serde_json::from_str(
+            r#"{"userId":7,"userName":"张三","userDept":"研发部","total":40,
+                "byDimension":{"skill_upload":20,"ticket_report":20},
+                "items":[{"id":3,"userId":7,"dimension":"ticket_report","points":20,
+                  "sourceType":"ticket_report","sourceId":"1","note":"工单报告「工单 #1024 磁盘扩容」审核通过",
+                  "createdAt":"2026-09-10T12:38:43+08:00"}],
+                "itemTotal":2,"page":1,"pageSize":20}"#,
+        )
+        .unwrap();
+        assert_eq!(points.total, 40);
+        assert_eq!(points.item_total, 2, "itemTotal 是流水条数不是分值");
+        assert_eq!(points.by_dimension.get("skill_upload"), Some(&20));
+        assert_eq!(points.items[0].note, "工单报告「工单 #1024 磁盘扩容」审核通过");
+
+        // 排行榜（§3.5）：同分并列名次，name/dept 随响应给出
+        let board: IncentiveLeaderboard = serde_json::from_str(
+            r#"{"items":[{"rank":1,"userId":7,"name":"张三","dept":"研发部","total":40,
+                "byDimension":{"skill_upload":20,"ticket_report":20}}],
+                "generatedAt":"2026-09-10T12:36:56+08:00"}"#,
+        )
+        .unwrap();
+        assert_eq!(board.items[0].rank, 1);
+        assert_eq!(board.items[0].name, "张三");
+        assert_eq!(board.generated_at, "2026-09-10T12:36:56+08:00");
+
+        // 空榜单（§3.5：无人得分时 items 为空数组）
+        let empty: IncentiveLeaderboard = serde_json::from_str(r#"{"items":[],"generatedAt":""}"#).unwrap();
+        assert!(empty.items.is_empty());
+
+        // skill 上传登记（§一）
+        let su: IncentiveSkillUpload = serde_json::from_str(
+            r#"{"id":1,"userId":7,"namespace":"global","slug":"my-deploy-skill",
+                "ownerName":"张三","status":"verified","reason":"","createdAt":"2026-09-10T12:00:00+08:00"}"#,
+        )
+        .unwrap();
+        assert_eq!(su.status, "verified");
+        assert_eq!(su.slug, "my-deploy-skill");
+
+        // 工单报告（§二）：downloadURL 需显式重命名，字段缺失按默认兜底
+        let report: IncentiveTicketReport = serde_json::from_str(
+            r#"{"id":1,"reporterId":7,"reporterName":"张三","reporterDept":"研发部",
+                "title":"工单 #1024 磁盘扩容","content":"...","ticketRef":"TICKET-1024",
+                "status":"pending","reviewComment":"","reviewerName":"","reviewedAt":null,
+                "createdAt":"...","updatedAt":"...",
+                "attachments":[{"id":1,"filename":"steps.md","contentType":"text/markdown",
+                  "sizeBytes":128,"sha256":"abc","createdAt":"...","downloadURL":"/api/incentive/ticket-reports/1/attachments/1"}],
+                "attachmentCount":1}"#,
+        )
+        .unwrap();
+        assert_eq!(report.attachment_count, 1);
+        assert_eq!(report.attachments[0].download_url, "/api/incentive/ticket-reports/1/attachments/1");
+        assert!(report.reviewed_at.is_none());
+        // 字段裁剪：缺字段不 panic（防御服务端结构微调）
+        let minimal: IncentiveTicketReport = serde_json::from_str(r#"{"id":2}"#).unwrap();
+        assert_eq!(minimal.id, 2);
+        assert!(minimal.attachments.is_empty());
     }
 
     #[test]

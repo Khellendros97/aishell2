@@ -95,3 +95,66 @@
   word-break: break-all;
   font-size: 12px;
 }
+
+/* ---------- 发布工单日志（PublishTicketModal.tsx） ---------- */
+
+.publish-ticket-modal {
+  width: 620px;
+}
+
+.publish-ticket-modal .modal-body {
+  max-height: 66vh;
+  overflow-y: auto;
+}
+
+.pt-content {
+  width: 100%;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+.pt-counter {
+  text-align: right;
+  margin-top: 4px;
+}
+
+.pt-attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.pt-attach-empty {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.pt-attach-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+}
+
+.pt-attach-name {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 醒目的发布按钮：蓝紫渐变走 design.css 的 .btn.brand-gradient（与 Skill Hub 一致） */
+.pt-publish {
+  font-weight: 600;
+  box-shadow: 0 2px 10px rgba(99, 102, 241, 0.35);
+}
+
+.pt-publish:hover {
+  box-shadow: 0 3px 14px rgba(139, 92, 246, 0.45);
+}

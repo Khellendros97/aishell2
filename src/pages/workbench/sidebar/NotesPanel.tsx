@@ -22,6 +22,8 @@ import type { NoteRef } from '../../../types';
 import { openNote } from '../tabs/NoteTab';
 import { openLocalFile } from '../tabs/EditorTab';
 import { openPublishReportModal } from '../notes/PublishReportModal';
+import { openPublishTicketModal } from '../notes/PublishTicketModal';
+import { useIncentiveEnabled } from '../../../shared/useIncentive';
 import './notes.css';
 
 /** 树节点:path 为相对 notes 根的路径('/' 分隔;根为空串 '') */
@@ -96,6 +98,8 @@ function NotesPanelBody(): JSX.Element {
   rootsRef.current = roots;
   const expandedRef = useRef(expanded);
   expandedRef.current = expanded;
+  /** 激励计划能力（未开通时隐藏右键「发布工单日志」） */
+  const incentiveEnabled = useIncentiveEnabled();
 
   /* 挂载取根路径 + 展开状态(workspace 未配置 → 空态提示) */
   useEffect(() => {
@@ -236,6 +240,9 @@ function NotesPanelBody(): JSX.Element {
       { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => openNode(node) },
       ...(!node.isDir && node.name.toLowerCase().endsWith('.md') ? [
         { label: '发布钉钉日志', iconName: 'upload', action: () => openPublishReportModal({ notePath: abs, noteName: node.name }) } as CtxItem,
+        ...(incentiveEnabled ? [
+          { label: '发布工单日志', iconName: 'ticket', action: () => openPublishTicketModal({ notePath: abs, noteName: node.name }) } as CtxItem,
+        ] : []),
       ] : []),
       ...(node.isDir ? [
         'sep' as const,

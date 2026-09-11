@@ -12,11 +12,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { Server, SkillOrigin, SkillSummary } from '../../../types';
-import { browserPublishSkillhub, getState, skillDelete, skillPackUpload, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
+import { browserPublishSkillhub, browserPublishState, getState, incentiveRegisterSkillUpload, skillDelete, skillPackUpload, skillRead, skillSave, skillSetEnabled, skillsList } from '../../../api';
 import { openInActivePage } from '../tabs/browser-engine';
 import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, toast } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
+import { useIncentiveEnabled } from '../../../shared/useIncentive';
 import type { SidebarPanelDef } from './panel-types';
 import './skills.css';
 
@@ -41,6 +42,120 @@ const projectId = (): string => useWorkbench.getState().project?.id ?? '';
 /** 面板刷新句柄:模态(HeadActions 与卡片共用的 body 级浮层)保存成功后触发列表重拉
     (对照 legacy 模块级 render 函数) */
 let refreshPanel: (() => void) | null = null;
+
+/** 上传成功后通知云平台登记计分（激励计划 API 文档 §一）。
+ *  作者归属由服务端回查 skillhub 核实，客户端只报 namespace/slug；
+ *  404（刚上传有可见性延迟）/ 502（回查 skillhub 失败）为可重试，409（已被他人登记）/
+ *  403（作者非本人）为终态不重试。失败只影响计分，不影响上传结果，故静默降级为提示。 */
+async function notifySkillUpload(slug: string, namespace: string): Promise<void> {
+  const RETRYABLE = ['（HTTP 404）', '（HTTP 502）'];
+  const DELAYS_MS = [3000, 8000];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await incentiveRegisterSkillUpload(slug, namespace);
+      toast(`Skill「${slug}」上传已登记，核实后计入激励积分`, 'success');
+      return;
+    } catch (err) {
+      const msg = String(err);
+      const retryable = RETRYABLE.some((m) => msg.includes(m));
+      if (!retryable || attempt >= DELAYS_MS.length) {
+        toast(`Skill 上传登记失败（不影响上传结果）：${msg}`, 'info', 4000);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, DELAYS_MS[attempt]));
+    }
+  }
+}
+
+/* ---------- 上传计分观察器（手动发布也能登记） ----------
+   自动化只有在「自己点了发布」时才拿得到 Published 终态；用户手动点发布时自动化只会拿到 Manual 超时，
+   计分便漏掉。此观察器把「登记」从「谁点的按钮」解耦：上传开始时武装，周期轮询发布页真实 URL——
+   SkillHub 是 SPA，发布成功后是 pushState 客户端路由跳转（不触发 on_page_load），所以必须主动读取
+   `location.href`，不能依赖 browser:event 的 url 事件。落到技能列表页即视为发布成功，用采样到的
+   namespace 登记。最长存活 10 分钟，命中或超时即解除。 */
+const SKILLHUB_SKILLS_URL = 'https://skillhub.srun.com:6780/dashboard/skills';
+/** 观察器最长存活（覆盖用户手动填写与确认的耗时） */
+const UPLOAD_WATCH_MS = 10 * 60 * 1000;
+/** 发布页状态轮询间隔（同时采样 URL 与 namespace） */
+const UPLOAD_POLL_MS = 3000;
+
+interface UploadWatch {
+  slug: string;
+  /** 最近采样到的 namespace（缺省 global；自动化固定 Global，手动可能选团队空间） */
+  namespace: string;
+  /** 已登记（自动成功或轮询命中），避免两条路径重复上报 */
+  done: boolean;
+  expires: number;
+  polling: boolean;
+  /** 是否已观察到「非技能列表页」的地址。上传开始时用户可能正停在技能列表页，
+   *  首次轮询会立刻读到落地页——必须先看到发布页/其它页（即确实离开过），
+   *  之后再次回到技能列表页才算发布成功，避免开局误判。 */
+  sawNonLanding: boolean;
+}
+
+let uploadWatch: UploadWatch | null = null;
+
+/** 目标 URL 是否为发布成功落地页（技能列表页；忽略 query/hash 与尾斜杠差异）。 */
+function isSkillhubSkillsLanding(url: string): boolean {
+  const u = url.split(/[?#]/)[0].replace(/\/+$/, '');
+  return u === SKILLHUB_SKILLS_URL.replace(/\/+$/, '');
+}
+
+function disarmUploadWatch(): void {
+  uploadWatch = null;
+}
+
+/** 命中发布成功：登记并解除观察器（done 置位防重复）。 */
+function fireUploadRegistration(w: UploadWatch): void {
+  if (w.done) return;
+  w.done = true;
+  const { slug, namespace } = w;
+  disarmUploadWatch();
+  void notifySkillUpload(slug, namespace);
+}
+
+/** 一次轮询：读发布页状态，更新 namespace 采样；若已落到技能列表页则登记。
+ *  仅当此轮询前已观察到非落地页（确实离开过技能列表页）才认定发布成功。 */
+async function pollUploadWatch(w: UploadWatch): Promise<void> {
+  if (uploadWatch !== w || w.done) return;
+  if (Date.now() > w.expires) { disarmUploadWatch(); return; }
+  if (w.polling) return; // 上一轮未回，避免堆积
+  w.polling = true;
+  try {
+    const st = await browserPublishState();
+    if (uploadWatch !== w || w.done) return;
+    if (st.namespace) w.namespace = st.namespace;
+    if (!st.url) return; // 读不到地址（页面加载中/已关）：不改判定状态
+    if (isSkillhubSkillsLanding(st.url)) {
+      if (w.sawNonLanding) fireUploadRegistration(w);
+    } else {
+      w.sawNonLanding = true;
+    }
+  } catch {
+    /* 页面已关/读取失败：保持观察，下一轮重试 */
+  } finally {
+    w.polling = false;
+  }
+}
+
+/** 上传动作开始时武装观察器：清掉上一次，重置坐标采样并立即轮询一次。 */
+function armUploadWatch(slug: string): void {
+  disarmUploadWatch();
+  const w: UploadWatch = {
+    slug, namespace: 'global', done: false,
+    expires: Date.now() + UPLOAD_WATCH_MS, polling: false, sawNonLanding: false,
+  };
+  uploadWatch = w;
+  void pollUploadWatch(w);
+  // 周期轮询由 setTimeout 自链（非 setInterval，避免上一轮未回时堆积）
+  const tick = (): void => {
+    if (uploadWatch !== w) return;
+    void pollUploadWatch(w).then(() => {
+      if (uploadWatch === w) setTimeout(tick, UPLOAD_POLL_MS);
+    });
+  };
+  setTimeout(tick, UPLOAD_POLL_MS);
+}
 
 /* ---------- 新增/编辑模态(scope 编辑区独立收集,保存时作为显式参数交给后端) ---------- */
 function SkillModal({ skill, onDone }: { skill: SkillSummary | null; onDone: () => void }): JSX.Element {
@@ -238,13 +353,15 @@ function openSkillModal(d: SkillSummary | null): void {
 }
 
 /* ---------- 卡片 ---------- */
-function SkillCard({ d, onToggle, onDelete, onUpload, uploading, uploadBusy }: {
+function SkillCard({ d, onToggle, onDelete, onUpload, onRegister, uploading, uploadBusy, incentiveEnabled }: {
   d: SkillSummary;
   onToggle(d: SkillSummary, next: boolean): Promise<boolean>;
   onDelete(d: SkillSummary): void;
   onUpload(d: SkillSummary): void;
+  onRegister(d: SkillSummary): void;
   uploading: boolean;
   uploadBusy: boolean;
+  incentiveEnabled: boolean;
 }): JSX.Element {
   const [pending, setPending] = useState(false);
   /** 请求期间的显示值(原值;成功后随 d.enabled 同步) */
@@ -282,6 +399,12 @@ function SkillCard({ d, onToggle, onDelete, onUpload, uploading, uploadBusy }: {
         <button className="icon-btn" title="上传到 Skill Hub" disabled={uploadBusy} onClick={() => onUpload(d)}>
           <Icon name={uploading ? 'loader' : 'upload'} />
         </button>
+        {incentiveEnabled && (
+          <button className="icon-btn" title="登记激励积分（上传到 Skill Hub 后手动补登记；服务端按作者核实）"
+            onClick={() => onRegister(d)}>
+            <Icon name="trophy" />
+          </button>
+        )}
         <button className="icon-btn" title="添加到 AI 对话" onClick={() => addSkillToChat(d)}><Icon name="chatPlus" /></button>
         <button className="icon-btn" title="编辑" disabled={uploading} onClick={() => openSkillModal(d)}><Icon name="gear" /></button>
         <button className="icon-btn danger" title="删除" disabled={uploading} onClick={() => void onDelete(d)}><Icon name="trash" /></button>
@@ -309,6 +432,8 @@ function SkillsPanelBody(): JSX.Element {
   const [uploadingSkillId, setUploadingSkillId] = useState<string | null>(null);
   const uploadingRef = useRef<string | null>(null);
   const aliveRef = useRef(true);
+  /** 激励计划能力（上传成功后登记计分；未开通时不上报，不影响上传本身） */
+  const incentiveEnabled = useIncentiveEnabled();
 
   useEffect(() => () => { aliveRef.current = false; }, []);
 
@@ -360,6 +485,8 @@ function SkillsPanelBody(): JSX.Element {
     if (uploadingRef.current) return;
     uploadingRef.current = d.id;
     setUploadingSkillId(d.id);
+    // 激励计分：上传动作开始即武装 URL 观察器，手动点发布也能在落地技能列表页时登记
+    if (incentiveEnabled) armUploadWatch(d.name);
     const navigation = new Promise<void>((resolve, reject) => {
       useWorkbench.getState().openTab({ id: 'browser', type: 'browser', title: '浏览器' });
       void (async () => {
@@ -371,6 +498,7 @@ function SkillsPanelBody(): JSX.Element {
     void Promise.allSettled([packed, navigation]).then(async ([packResult, navigationResult]) => {
       if (packResult.status === 'rejected') {
         if (aliveRef.current) toast(`Skill 打包失败：${String(packResult.reason)}`, 'error');
+        if (incentiveEnabled) disarmUploadWatch();
         return;
       }
       const packagePath = packResult.value;
@@ -382,20 +510,43 @@ function SkillsPanelBody(): JSX.Element {
             3000,
           );
         }
-        return;
+        return; // 保留观察器：用户可能仍能手动发布
       }
       try {
         const outcome = await browserPublishSkillhub(projectId(), d.origin, packagePath);
         if (!aliveRef.current) return;
-        if (outcome.status === 'published') toast(`Skill「${d.name}」已提交到 Skill Hub`, 'success');
-        else toast(outcome.message, 'info', 3000);
+        if (outcome.status === 'published') {
+          toast(`Skill「${d.name}」已提交到 Skill Hub`, 'success');
+          // 自动化自己点成功：立即登记（观察器若已因落地页命中则跳过，避免重复）
+          if (incentiveEnabled && uploadWatch && !uploadWatch.done) {
+            fireUploadRegistration(uploadWatch);
+          }
+        } else {
+          // Manual：自动化未点成功，但用户多半会手动发布 → 保留观察器，等落地技能列表页再登记
+          toast(outcome.message, 'info', 3000);
+          if (!incentiveEnabled) disarmUploadWatch();
+        }
       } catch (err) {
         if (aliveRef.current) toast(`自动上传失败：${String(err)}`, 'error');
+        if (incentiveEnabled) disarmUploadWatch();
       }
     }).finally(() => {
       uploadingRef.current = null;
       if (aliveRef.current) setUploadingSkillId(null);
     });
+  };
+
+  /** 手动补登记激励积分：上传到 Skill Hub 后若自动登记未命中（如手动点发布），用户可点卡片奖杯图标登记。
+   *  服务端按作者核实，重复登记幂等；slug 取技能名，namespace 取发布页当前选择（读不到按 global）。 */
+  const onRegister = (d: SkillSummary): void => {
+    void (async () => {
+      let namespace = 'global';
+      try {
+        const st = await browserPublishState();
+        if (st.namespace) namespace = st.namespace;
+      } catch { /* 非发布页时读不到，按缺省 global 登记 */ }
+      await notifySkillUpload(d.name, namespace);
+    })();
   };
 
   const toggleGroup = (origin: SkillOrigin): void => {
@@ -466,8 +617,10 @@ function SkillsPanelBody(): JSX.Element {
                       onToggle={onToggle}
                       onDelete={onDelete}
                       onUpload={onUpload}
+                      onRegister={onRegister}
                       uploading={uploadingSkillId === s.id}
                       uploadBusy={uploadingSkillId !== null}
+                      incentiveEnabled={incentiveEnabled}
                     />
                   ))}
                 </div>
@@ -485,7 +638,7 @@ function SkillsHeadActions(): JSX.Element {
   return (
     <div className="wbs-skills-head-actions">
       <button
-        className="btn small wbs-skillhub-btn"
+        className="btn small brand-gradient wbs-skillhub-btn"
         title="在主工作区打开 Skill Hub"
         onClick={() => useWorkbench.getState().openTab({ id: 'skill-hub', type: 'skill-hub', title: 'Skill Hub' })}
       >

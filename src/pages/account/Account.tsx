@@ -28,12 +28,13 @@ import { UsageView } from './UsageView';
 import { MemoriesView } from './MemoriesView';
 import { FeedbackView } from './FeedbackView';
 import { CloudSyncView } from './CloudSyncView';
+import { IncentiveView } from './IncentiveView';
 import '../account.css';
 
 /** 登录等待超时（与后端 LOGIN_TIMEOUT 120s 一致）：超时自动恢复按钮 */
 const LOGIN_WAIT_MS = 120_000;
 
-type ViewName = 'profile' | 'usage' | 'memories' | 'feedback' | 'sync';
+type ViewName = 'profile' | 'usage' | 'memories' | 'feedback' | 'sync' | 'incentive';
 
 export function Account(_props: { params: URLSearchParams }): JSX.Element {
   /** 云状态（cloud_status 初始拉取 + cloud:changed 驱动刷新；token 不在其中） */
@@ -129,12 +130,15 @@ export function Account(_props: { params: URLSearchParams }): JSX.Element {
     // eslint 语义同旧版一次性订阅：clearWait/setStatus/setView 均稳定
   }, []);
 
-  const navItem = (name: ViewName, icon: 'user' | 'chart' | 'database' | 'message' | 'cloudSync', title: string, label: string): JSX.Element => (
+  const navItem = (name: ViewName, icon: 'user' | 'chart' | 'database' | 'message' | 'cloudSync' | 'trophy', title: string, label: string): JSX.Element => (
     <div className={`account-nav-item${view === name ? ' active' : ''}`} data-tab={name} title={title}
          onClick={() => setView(name)}>
       <Icon name={icon} /><span>{label}</span>
     </div>
   );
+
+  /** 激励计划入口仅在平台能力开通时显示（能力关闭时接口 403） */
+  const incentiveOn = !!status?.serverUrl && !!status.loggedIn && status.capabilities?.incentive === true;
 
   return (
     <div className="settings-page account-page">
@@ -145,6 +149,7 @@ export function Account(_props: { params: URLSearchParams }): JSX.Element {
           {navItem('memories', 'database', '记忆宫殿', '记忆宫殿')}
           {navItem('feedback', 'message', '用户反馈', '用户反馈')}
           {navItem('sync', 'cloudSync', '云同步', '云同步')}
+          {incentiveOn ? navItem('incentive', 'trophy', '激励计划', '激励计划') : null}
         </aside>
         <main className="account-content">
           <section className={`account-view${view === 'profile' ? ' active' : ''}`} data-view="profile">
@@ -189,6 +194,12 @@ export function Account(_props: { params: URLSearchParams }): JSX.Element {
             <div className="account-view-head"><Icon name="cloudSync" /> 云同步</div>
             <div id="cloud-sync-body" className="account-body">
               {view === 'sync' ? <CloudSyncView status={status} onGoLogin={() => setView('profile')} /> : null}
+            </div>
+          </section>
+          <section className={`account-view${view === 'incentive' ? ' active' : ''}`} data-view="incentive">
+            <div className="account-view-head"><Icon name="trophy" /> 激励计划</div>
+            <div id="incentive-body" className="account-body">
+              {view === 'incentive' ? <IncentiveView status={status} onGoLogin={() => setView('profile')} /> : null}
             </div>
           </section>
         </main>
