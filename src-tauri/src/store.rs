@@ -240,6 +240,11 @@ pub struct Settings {
     /// 旧配置无此字段时按开启处理（默认开启，跟随能力开放）。
     #[serde(default = "default_true")]
     pub timeline_sync_enabled: bool,
+    /// 自动录制终端：开启后每个终端会话建立时自动开始录制到
+    /// `<项目>/.aishell/record/<名称>-<时间戳>.log`（见 useTerminal 的 maybeAutoRecord）。
+    /// 旧配置无此字段时按关闭处理（默认关闭，不改变既有用户行为）。
+    #[serde(default)]
+    pub auto_record_terminal: bool,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -265,6 +270,7 @@ impl Default for Settings {
             notify_ai: true,
             notify_long_tasks: true,
             timeline_sync_enabled: true,
+            auto_record_terminal: false,
         }
     }
 }
@@ -3946,6 +3952,7 @@ mod tests {
                 notify_ai: true,
                 notify_long_tasks: true,
                 timeline_sync_enabled: true,
+                auto_record_terminal: false,
             },
             credentials: vec![
                 Credential {
@@ -7055,6 +7062,7 @@ mod tests {
                     notify_ai: true,
                     notify_long_tasks: true,
                     timeline_sync_enabled: true,
+                    auto_record_terminal: false,
                 },
                 Some("sk-test-key"),
                 None,
@@ -7258,6 +7266,7 @@ mod tests {
                     notify_ai: true,
                     notify_long_tasks: true,
                     timeline_sync_enabled: true,
+                    auto_record_terminal: false,
                 },
                 None,
                 Some("bsk-1"),
@@ -8482,6 +8491,35 @@ mod tests {
         assert!(
             !test_store(config).settings().timeline_sync_enabled,
             "关闭后重启不应复活"
+        );
+    }
+
+    /// 自动录制终端：旧配置无 autoRecordTerminal 字段按关闭（默认不改既有用户行为）。
+    #[test]
+    fn auto_record_terminal_defaults_off_legacy_config() {
+        let config = temp_config_dir("autorecord-default");
+        let store = test_store(config.clone());
+        store
+            .save_settings(store.settings().clone(), None, None)
+            .unwrap();
+        assert!(!store.settings().auto_record_terminal, "全新默认应为关闭");
+        // 删掉字段模拟旧配置，重新装载仍应关闭
+        let state_path = config.join(STATE_FILE);
+        let raw = fs::read(&state_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("autoRecordTerminal");
+        fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = test_store(config);
+        assert!(
+            !reloaded.settings().auto_record_terminal,
+            "旧配置无 autoRecordTerminal 字段默认关闭"
         );
     }
 

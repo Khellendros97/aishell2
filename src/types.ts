@@ -72,6 +72,8 @@ export interface Settings {
   notifyLongTasks: boolean;
   /** 时间线云同步：登录且平台开放 timelineSync 能力时脱敏上传项目时间线（本机设置，不进云同步）；旧配置无此字段按开启 */
   timelineSyncEnabled: boolean;
+  /** 自动录制终端：开启后每个终端会话建立时自动开始录制日志（可手动停止）；旧配置无此字段按关闭 */
+  autoRecordTerminal: boolean;
 }
 
 /** 云服务接入模式（与 store.rs CloudMode serde lowercase 对齐） */
