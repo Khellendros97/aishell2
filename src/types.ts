@@ -41,6 +41,8 @@ export interface Settings {
   notifyAi: boolean;
   /** 耗时操作系统通知：上传/下载/备份/暂存目录等超过 30 秒的操作完成时发系统通知（仅窗口未聚焦时）；旧配置无此字段按开启 */
   notifyLongTasks: boolean;
+  /** 自动录制终端：开启后每个终端会话建立时自动开始录制日志（可手动停止）；旧配置无此字段按关闭 */
+  autoRecordTerminal: boolean;
 }
 
 /** MCP 服务全局配置（AppState 顶层字段）—— 与 store.rs McpServiceConfig serde camelCase 对齐。

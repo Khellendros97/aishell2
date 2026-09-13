@@ -12,6 +12,10 @@
  * Enter 关闭标签页 / R 重新连接 / S 导出终端输出三个动作(快捷键 + 按钮双入口);
  * 导出 = 全量 scrollback 纯文本经 save 对话框落盘(term_export,父目录自动创建)。
  *
+ * 自动录制(Settings.autoRecordTerminal,默认关闭):开关经 getState 惰性读取并缓存,
+ * 会话建立/重连成功后 maybeAutoRecord 自动启动录制(静默,失败只留日志);设置页保存广播
+ * `aishell:data-changed` 失效缓存,只影响此后新建的会话。
+ *
  * React 差异(语义对齐 legacy):
  * - 无 tab.el / tab.pane 命令式 DOM:标签栏「已退出」置灰经 setTabBarExited 按
  *   #tab-bar / #tab-content 子节点顺序定位(两容器同序渲染同一 tabs 数组);
@@ -81,6 +85,30 @@ declare global {
 }
 window.__terms = liveTerms;
 onThemeChange((t) => { liveTerms.forEach((s) => { s.term.options.theme = TERM_THEMES[t]; }); });
+
+/* ---------- 自动录制终端开关（Settings.autoRecordTerminal，默认关闭） ----------
+   照 shared/notify.ts 的惰性缓存模式：首次使用时经 getState 读取，设置页保存后广播
+   `aishell:data-changed` 失效缓存，后续新建的终端会话即取新值（已建立会话不追溯）。
+   读取失败保持关闭（自动行为宁可不做，也不误写用户磁盘）。 */
+let autoRecordTerminal = false;
+let autoRecordLoaded = false;
+let autoRecordLoading: Promise<void> | null = null;
+
+async function refreshAutoRecord(): Promise<void> {
+  try {
+    const s = await getState();
+    autoRecordTerminal = s.settings.autoRecordTerminal ?? false;
+    autoRecordLoaded = true;
+  } catch { /* 后端未就绪：保持默认关闭，下次建连前再取 */ }
+}
+
+function ensureAutoRecordLoaded(): Promise<void> {
+  if (autoRecordLoaded) return Promise.resolve();
+  if (!autoRecordLoading) autoRecordLoading = refreshAutoRecord().finally(() => { autoRecordLoading = null; });
+  return autoRecordLoading;
+}
+
+window.addEventListener('aishell:data-changed', () => { autoRecordLoaded = false; });
 
 /** 历史命令：一条已结算命令及其输出（纯文本，剥除 ANSI）。 */
 interface TermBlock {
@@ -391,6 +419,7 @@ class TermSession {
       this.resizer = new ResizeObserver(() => this.fitTerm());
       this.resizer.observe(this.host);
       this.term.focus();
+      void this.maybeAutoRecord();
     } catch (err) {
       this.failed = true;
       const msg = String(err);
@@ -869,6 +898,10 @@ class TermSession {
     this.altMode = false;
     this.altLastCommand = '';
     this.lastCommand = '';
+    /* 旧会话的录制器已随 term_close 释放（后端 records.remove，缺结束行）：
+       同步复位录制 UI 状态，否则 this.recording 会残留为 true，导致重连后
+       录制按钮仍显示「停止录制」且自动录制被误判为「已在录制」而跳过。 */
+    this.resetRecordingState();
     const data = this.tab.data as { kind?: string; serverId?: string; cwd?: string | null };
     const kind: TermKind = data.kind === 'ssh' ? 'ssh' : 'local';
     try {
@@ -880,6 +913,7 @@ class TermSession {
       this.fitTerm();
       this.term.focus();
       toast('终端已重连', 'success');
+      void this.maybeAutoRecord();
     } catch (err) {
       this.failed = true;
       const msg = String(err);
@@ -1115,11 +1149,12 @@ class TermSession {
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
 
-  /** 开始录制：文件名 服务器-yyyymmdd-HHMMSS.log（SSH 用 tab.title 服务器名，本地固定「本地终端」）。 */
-  private async startRecording(): Promise<void> {
+  /** 开始录制：文件名 服务器-yyyymmdd-HHMMSS.log（SSH 用 tab.title 服务器名，本地固定「本地终端」）。
+      auto=true 为「自动录制终端」开关触发的静默启动：失败只留日志，不弹错误打扰建连流程。 */
+  private async startRecording(auto = false): Promise<void> {
     const projectPath = useWorkbench.getState().project?.path;
     if (!projectPath) {
-      toast('项目未绑定本地目录，无法保存录制文件', 'error');
+      if (!auto) toast('项目未绑定本地目录，无法保存录制文件', 'error');
       return;
     }
     const data = this.tab.data as { kind?: string };
@@ -1129,13 +1164,27 @@ class TermSession {
     try {
       await termRecordStart(this.tab.id, path, header);
     } catch (err) {
-      toast(String(err), 'error');
+      if (auto) { dbg(`${this.sid} auto-record-failed ${String(err)}`); console.warn('自动录制启动失败', err); }
+      else toast(String(err), 'error');
       return;
     }
     this.recording = true;
     this.recBtn.classList.add('recording');
     this.recBtn.innerHTML = `${icon('circle')} 停止录制`;
-    toast('已开始录制', 'success');
+    if (auto) dbg(`${this.sid} auto-record-start ${path}`);
+    else toast('已开始录制', 'success');
+  }
+
+  /**
+   * 自动录制（Settings.autoRecordTerminal）：会话建立成功后按开关启动录制。
+   * 已退出/建连失败、已在录制（用户手动开了）、未绑定项目目录时静默跳过——
+   * 自动行为不打断终端主流程，也不覆盖用户已手动开启的录制。
+   */
+  private async maybeAutoRecord(): Promise<void> {
+    if (this.recording || this.exited || this.failed) return;
+    await ensureAutoRecordLoaded();
+    if (!autoRecordTerminal || this.recording || this.exited || this.failed) return;
+    await this.startRecording(true);
   }
 
   /** 停止录制：日志尾写结束时间，提示保存位置。auto=true 为关标签自动停止（同样提示）。 */
@@ -1154,6 +1203,14 @@ class TermSession {
     this.recBtn.classList.remove('recording');
     this.recBtn.innerHTML = `${icon('circle')} 录制`;
     if (p) toast(`录制已停止，日志保存至: ${p}`, 'success', 6000);
+  }
+
+  /** 只复位录制 UI 状态（不调后端）：重连时后端录制器已随 term_close 释放。 */
+  private resetRecordingState(): void {
+    if (!this.recording) return;
+    this.recording = false;
+    this.recBtn.classList.remove('recording');
+    this.recBtn.innerHTML = `${icon('circle')} 录制`;
   }
 
   /* ---------- 关闭清理（React 卸载时由 useTerminal 的 effect cleanup 调起） ---------- */

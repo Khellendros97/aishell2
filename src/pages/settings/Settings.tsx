@@ -42,6 +42,7 @@ interface SysFields {
   tunnelAutoStart: boolean;
   notifyAi: boolean;
   notifyLongTasks: boolean;
+  autoRecordTerminal: boolean;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -49,7 +50,7 @@ const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '', compactServerList: false,
-  tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true,
+  tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true, autoRecordTerminal: false,
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -199,6 +200,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       tunnelAutoStart: s.settings.tunnelAutoStart ?? true,
       notifyAi: s.settings.notifyAi ?? true,
       notifyLongTasks: s.settings.notifyLongTasks ?? true,
+      autoRecordTerminal: s.settings.autoRecordTerminal ?? false,
     });
     void refreshMcpStatus();
   };
@@ -287,6 +289,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       tunnelAutoStart: fields.tunnelAutoStart,
       notifyAi: fields.notifyAi,
       notifyLongTasks: fields.notifyLongTasks,
+      autoRecordTerminal: fields.autoRecordTerminal,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -454,6 +457,19 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, tunnelAutoStart: checked })); }}
                 />
                 <div className="hint">开启后，上次处于启用状态的 SSH 隧道随 AIShell 启动自动恢复。关闭后：AIShell 退出时会自动把所有隧道设为禁用（下次启动不再恢复），运行期间手动启动隧道不受影响</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>终端</legend>
+              <div className="field">
+                <label>自动录制终端</label>
+                <input
+                  id="f-auto-record-terminal"
+                  type="checkbox"
+                  checked={fields.autoRecordTerminal}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, autoRecordTerminal: checked })); }}
+                />
+                <div className="hint">开启后，每个终端（SSH/本地）会话建立时自动开始录制输出到项目目录 .aishell/record/&lt;名称&gt;-&lt;时间戳&gt;.log，可在终端顶部「停止录制」按钮手动结束；关闭后终端不再自动录制，已有的录制按钮仍可手动开启</div>
               </div>
             </fieldset>
             <fieldset className="llm-group">
