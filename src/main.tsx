@@ -3,15 +3,19 @@
  * - 主题先行(避免首屏亮暗闪烁)、无 hash 时按配置完整度跳转;
  * - OS 文件拖入全局兜底(dragDropEnabled:false 后 WebView2 默认行为是导航到拖入文件);
  * - 禁用 WebView2 原生右键菜单(输入框放行);F12 打开 DevTools(应用自控);
+ * - AI 任务未结束时拦截窗口关闭,弹确认框二次确认(anyAiBusy + onCloseRequested);
  * - 命令面板 / Debug 日志总线为自包含命令式浮层,保持旧模块不动,继续在此初始化。
  */
 import './styles/design.css';
 import { createRoot } from 'react-dom/client';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { getState, isConfigComplete, openDevtools } from './api';
 import { initCommandPanel } from './command-panel';
 import { initDebug } from './debug';
 import { navigate } from './router';
 import { applyTheme } from './theme';
+import { confirmDialog } from './ui';
+import { anyAiBusy } from './pages/workbench/ai/ai-engine';
 import { ErrorBoundary } from './shared/ErrorBoundary';
 import App from './App';
 
@@ -46,6 +50,37 @@ document.addEventListener('keydown', (e) => {
     void openDevtools();
   }
 });
+
+/* ---------- 程序关闭二次确认:AI 助手任务尚未结束时先拦截 ---------- */
+/* 有任务(anyAiBusy)一律 preventDefault 拦下,再弹确认框;确认后走 destroy() 强制关闭——
+   destroy 不再触发 closeRequested(不会递归回本守卫),后端 Destroyed 钩子
+   (ai.kill_all / 录制收尾)照常执行。确认框打开期间的再次关闭请求也拦下(不重复弹框,
+   也不放行——否则第二击会绕过未确认的对话框直接关窗)。无 Tauri 环境(纯浏览器)静默跳过。 */
+let closeGuardDialogOpen = false;
+void (async () => {
+  let win: ReturnType<typeof getCurrentWindow>;
+  try {
+    win = getCurrentWindow();
+    await win.onCloseRequested(async (event) => {
+      if (!anyAiBusy()) return; // 无 AI 任务:放行,不弹框
+      event.preventDefault();
+      if (closeGuardDialogOpen) return;
+      closeGuardDialogOpen = true;
+      let confirmed = false;
+      try {
+        confirmed = await confirmDialog({
+          title: 'AI 任务尚未结束',
+          message: 'AI 助手仍在生成回复或等待你的确认，关闭将中断进行中的任务。确定要关闭 AIShell 吗？',
+          danger: true,
+          okText: '仍然关闭',
+        });
+      } finally {
+        closeGuardDialogOpen = false;
+      }
+      if (confirmed) await win.destroy();
+    });
+  } catch { /* 无 Tauri 注入(vite dev 纯浏览器调试):无窗口概念,跳过 */ }
+})();
 
 /* 命令面板(Ctrl+T / Ctrl+P):全局组件,不随路由重渲染销毁 */
 initCommandPanel();

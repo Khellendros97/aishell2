@@ -3927,6 +3927,20 @@ function isGenerating(sid: string): boolean {
   return !!p && p.phase !== 'error';
 }
 
+/**
+ * 是否有任一项目上下文的 AI 任务未结束（与 isGenerating 同口径：typing/stream 算，
+ * error 气泡不算）。程序关闭二次确认用（main.tsx 窗口关闭守卫）：跨项目聚合全部
+ * 常驻上下文 projectContexts——后台保活会话（切走项目/会话不中断）也在覆盖范围内。
+ */
+export function anyAiBusy(): boolean {
+  for (const ctx of projectContexts.values()) {
+    for (const p of ctx.pendingBy.values()) {
+      if (p && p.phase !== 'error') return true;
+    }
+  }
+  return false;
+}
+
 /* ---------- 输入区内容读取（contenteditable → 有序段） ---------- */
 
 /** 输入区内容段：文本段与内嵌 chip 段（顺序即输入框视觉顺序；发送展开与落盘都按此顺序） */
