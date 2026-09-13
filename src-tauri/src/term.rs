@@ -673,10 +673,9 @@ impl TermManager {
         if let Some(h) = handle {
             h.close().await;
         }
-        // 防御：前端忘停录制时在此移除 recorder（BufWriter Drop 兜底落盘，日志缺结束行）
-        if let Ok(mut records) = self.records.lock() {
-            records.remove(id);
-        }
+        // 前端 stopRecording 与本命令并发竞态兜底：close 先到时补写异常结束行再落盘
+        // （record_stop 先到时 remove 得 None，结束行不会双写；此前裸 remove 缺结束行）
+        let _ = self.finish_record(id, "===== 录制结束（终端已关闭） =====");
         Ok(())
     }
 
@@ -705,10 +704,29 @@ impl TermManager {
 
     /// 停止录制：写 footer 收尾并返回文件路径；未在录制返回 None。
     pub fn record_stop(&self, id: &str, footer: &str) -> Result<Option<String>, String> {
-        let mut records = self.records.lock().map_err(|e| e.to_string())?;
-        Ok(records
-            .remove(id)
-            .map(|rec| rec.finish(footer).to_string_lossy().into_owned()))
+        Ok(self
+            .finish_record(id, footer)
+            .map(|p| p.to_string_lossy().into_owned()))
+    }
+
+    /// 取出并收尾一个录制器：写结束行、flush 并返回文件路径；未在录制返回 None。
+    /// close 与 record_stop 共用：二者并发竞态时无论谁先拿到，remove 幂等保证结束行只写一次。
+    fn finish_record(&self, id: &str, footer: &str) -> Option<PathBuf> {
+        let mut records = self.records.lock().ok()?;
+        let rec = records.remove(id)?;
+        Some(rec.finish(footer))
+    }
+
+    /// 程序退出收尾：给所有仍在录制的会话写「程序退出」结束行并落盘。
+    /// 窗口销毁时前端 JS 已随 webview 消亡，React cleanup（term_record_stop）不会执行，
+    /// 由 lib.rs 的 WindowEvent::Destroyed 钩子同步调用（主线程，进程仍在）。
+    pub fn finalize_all_recordings(&self) {
+        let footer = "===== 录制结束（程序退出） =====";
+        if let Ok(mut records) = self.records.lock() {
+            for (_, rec) in records.drain() {
+                let _ = rec.finish(footer);
+            }
+        }
     }
 }
 
@@ -950,6 +968,52 @@ mod tests {
             content,
             "===== 录制开始 2026-08-07 12:00:00 =====\n$ echo hi\r\nhi\r\n$ \n===== 录制结束 2026-08-07 12:05:00 =====\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 关标签竞态与程序退出兜底：close 路径（finish_record）与 finalize_all_recordings
+    /// 都给录制器写结束行；结束行不双写（先收尾的一方 remove 走空）。
+    #[test]
+    fn record_finalize_on_close_and_exit() {
+        use super::TermManager;
+        use std::sync::Arc;
+        let dir = tmp_dir("finalize");
+        let store = Arc::new(crate::store::test_store(dir.join("cfg")));
+        let mgr = TermManager::new(Arc::new(crate::ssh::SshManager::new(store)));
+        let path = dir.join("会话-20260913-120000.log");
+        mgr.records.lock().unwrap().insert(
+            "term:t-1".to_string(),
+            Recorder::create(path.clone(), "===== 录制开始 =====").unwrap(),
+        );
+        // close 兜底：写「终端已关闭」结束行
+        let got = mgr.finish_record("term:t-1", "===== 录制结束（终端已关闭） =====");
+        assert_eq!(got, Some(path.clone()), "finish_record 应返回录制文件路径");
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .expect("录制文件应存在")
+            .read_to_string(&mut content)
+            .expect("读录制文件");
+        assert_eq!(
+            content,
+            // finish 写 "\n{footer}\n"：header 后无输出时 footer 前留一个空行分隔
+            "===== 录制开始 =====\n\n===== 录制结束（终端已关闭） =====\n"
+        );
+        // 二次收尾（close 与 record_stop 竞态的另一方）：remove 走空，不双写
+        assert_eq!(mgr.finish_record("term:t-1", "x"), None);
+        // 程序退出兜底：finalize_all_recordings 清空所有录制并写「程序退出」结束行
+        let path2 = dir.join("会话-20260913-130000.log");
+        mgr.records.lock().unwrap().insert(
+            "term:t-2".to_string(),
+            Recorder::create(path2.clone(), "===== 录制开始 =====").unwrap(),
+        );
+        mgr.finalize_all_recordings();
+        assert!(mgr.records.lock().unwrap().is_empty(), "退出收尾应清空录制表");
+        let mut content2 = String::new();
+        std::fs::File::open(&path2)
+            .expect("录制文件应存在")
+            .read_to_string(&mut content2)
+            .expect("读录制文件");
+        assert_eq!(content2, "===== 录制开始 =====\n\n===== 录制结束（程序退出） =====\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

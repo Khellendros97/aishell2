@@ -158,6 +158,8 @@ pub fn run() {
             trace::init(config_dir.join("ai-trace"), store.trace_enabled());
             app.manage(store.clone());
             app.manage(ssh.clone());
+            // 退出收尾用（app.manage 移动 terms 前克隆；见下方 Destroyed 钩子）
+            let terms_exit = terms.clone();
             app.manage(terms);
             app.manage(ai.clone());
             app.manage(staging);
@@ -196,12 +198,15 @@ pub fn run() {
                         }
                     });
                 }
-                // 退出收尾：杀 AI 会话；「AIShell 启动时自动启动隧道」关闭时把所有隧道置为禁用，
+                // 退出收尾：杀 AI 会话；仍在录制的终端补写「程序退出」结束行（前端 JS 随
+                // webview 消亡，term_record_stop 不会到来，BufWriter 缓冲也会因此丢失）；
+                // 「AIShell 启动时自动启动隧道」关闭时把所有隧道置为禁用，
                 // 下次启动不再自动恢复（设置-功能特性 tunnel_auto_start，见 tunnel.rs recover）
                 let store_exit = store.clone();
                 win.on_window_event(move |_ev| {
                     if let tauri::WindowEvent::Destroyed = _ev {
                         ai.kill_all();
+                        terms_exit.finalize_all_recordings();
                         if !store_exit.settings().tunnel_auto_start {
                             store_exit.disable_all_tunnels();
                         }
