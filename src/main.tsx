@@ -16,7 +16,7 @@ import { initUpdates } from './updates';
 import { navigate } from './router';
 import { applyTheme } from './theme';
 import { confirmDialog } from './ui';
-import { anyAiBusy } from './pages/workbench/ai/ai-engine';
+import { anyAiBusy, flushAiPendingOutput } from './pages/workbench/ai/ai-engine';
 import { ErrorBoundary } from './shared/ErrorBoundary';
 import App from './App';
 
@@ -78,7 +78,12 @@ void (async () => {
       } finally {
         closeGuardDialogOpen = false;
       }
-      if (confirmed) await win.destroy();
+      if (confirmed) {
+        /* 关闭前把已流出但未定稿的助手正文落盘（await 到写入完成再销毁窗口，
+           否则进程退出后该段正文永久丢失） */
+        await flushAiPendingOutput().catch(() => { /* 落盘失败不阻塞关闭 */ });
+        await win.destroy();
+      }
     });
   } catch { /* 无 Tauri 注入(vite dev 纯浏览器调试):无窗口概念,跳过 */ }
 })();
