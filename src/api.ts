@@ -244,12 +244,14 @@ export const onTunnelsChanged = (cb: () => void): Promise<UnlistenFn> =>
 /** 后端发出的 AI 回合事件（key = `<projectId>:<sessionId>`）：
  *  - approval：Agent 模式逐调用审批请求（对应 pi extension_ui_request/confirm）；
  *  - actionStart/actionEnd：受控工具（write/edit/delete_path/run_command/sftp_upload/sftp_download）
- *    执行生命周期（来自 tool_execution_start/end，toolCallId 关联审批卡）。 */
+ *    执行生命周期（来自 tool_execution_start/end，toolCallId 关联审批卡）；
+ *  - settled：回合以 error 收尾（pi 不补发 done）时的收尾信号，前端据此把已流出的正文定稿落盘。 */
 export type AiEvent =
   | { type: 'delta'; text: string }
   | { type: 'tool'; tool: string; label: string }
   | { type: 'segment' }
   | { type: 'done' }
+  | { type: 'settled' }
   | { type: 'error'; message: string }
   | { type: 'approval'; requestId: string; toolCallId: string; action: string; intent: string; summary: string;
       /** 智能审批自动放行：true 时卡片直接展示「已智能放行」（后端已回 confirmed，无需再回复） */

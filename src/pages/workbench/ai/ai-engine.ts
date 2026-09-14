@@ -225,6 +225,12 @@ const STYLE = `
 .ai-msg.user .ai-bubble { background: var(--accent-dim); border-bottom-right-radius: 3px; }
 .ai-msg.ai .ai-bubble { background: var(--bg-2); border-bottom-left-radius: 3px; }
 .ai-msg.ai .ai-bubble.error { border: 1px solid var(--red); }
+/* 错误气泡内的报错说明：与上方已流出的正文区分（正文正常色，报错红字小字） */
+.ai-msg.ai .ai-bubble.error .ai-error-note {
+  color: var(--red); font-size: 11.5px; margin-top: 6px; padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.ai-msg.ai .ai-bubble.error .ai-error-note:only-child { margin-top: 0; padding-top: 0; border-top: 0; font-size: 12.5px; }
 .ai-text { white-space: normal; overflow-wrap: anywhere; }
 /* Markdown 渲染元素（md 输出嵌在 .ai-text 内） */
 .ai-text h1, .ai-text h2, .ai-text h3, .ai-text h4 {
@@ -1905,15 +1911,20 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     }
   } else if (ev.type === 'done') {
     finalize(sid);
+  } else if (ev.type === 'settled') {
+    /* 回合以 error 收尾（不发 done）：把已流出的正文定稿落盘，否则只活在内存流式
+       气泡里，下一条消息的 emptyPending / 切会话 / 退出进程都会把它丢掉 */
+    finalizeInterrupted(sid);
   } else {
     console.error('[AI] 事件错误:', ev.message);
     /* 保留本回合已积累的文本/工具行/动作卡：瞬时错误后 pi 自动重试成功时，后续 delta
        会把错误气泡复活为流式（见 delta 分支），回合现场与动作卡审计（collectActions）
-       不应随错误气泡清空 */
+       不应随错误气泡清空。文本一律沿用 cur.text（不再要求 phase==='stream'）——
+       同一回合连发多个错误事件时，后来的那个不能把先前已流出的正文重置成空串。 */
     const cur = pendingBy.get(sid) ?? null;
     pendingBy.set(sid, {
       phase: 'error',
-      text: cur?.phase === 'stream' ? cur.text : '',
+      text: cur?.text ?? '',
       error: ev.message,
       tools: cur?.tools ?? [],
       actions: cur?.actions ?? new Map(),
@@ -1947,16 +1958,8 @@ function collectActions(p: Pending): AiActionRecord[] {
   }));
 }
 
-/** done：把流式文本定稿为 assistant 消息并落盘（错误气泡不进历史）；零增量 done 给占位文案 */
-function finalize(sid: string): void {
-  const s = sessions.get(sid);
-  const p = pendingBy.get(sid) ?? null;
-  pendingBy.set(sid, null);
-  if (!s || !p || p.phase !== 'stream') {
-    if (s) persistSession(s);
-    return;
-  }  const hasText = !!p.text.trim();
-  const text = hasText ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
+/** 追加一条助手历史消息（done 定稿与错误/中止定稿共用同一形态） */
+function pushAssistantMessage(s: ChatSession, text: string, actions: AiActionRecord[]): void {
   s.messages.push({
     role: 'assistant',
     content: text,
@@ -1967,12 +1970,44 @@ function finalize(sid: string): void {
     browserRefs: [],
     skillRefs: [],
     noteRefs: [],
-    actions: collectActions(p),
+    actions,
     ts: Date.now(),
   });
+}
+
+/** done：把流式文本定稿为 assistant 消息并落盘（错误气泡不进历史）；零增量 done 给占位文案 */
+function finalize(sid: string): void {
+  const s = sessions.get(sid);
+  const p = pendingBy.get(sid) ?? null;
+  pendingBy.set(sid, null);
+  if (!s || !p || p.phase !== 'stream') {
+    if (s) persistSession(s);
+    return;
+  }
+  const hasText = !!p.text.trim();
+  const text = hasText ? p.text : '（AI 未返回内容，请重试或检查模型配置）';
+  pushAssistantMessage(s, text, collectActions(p));
   persistSession(s);
   /* 任务完成系统通知（开关与窗口焦点过滤在 shared/notify.ts）；错误/中止与空回复占位不发 */
   if (hasText) notifyOwnerOnly('AI 任务完成', clipBody(`${s.title}：${text}`));
+  if (sid === activeSessionId) renderSessionBar();
+}
+
+/** 错误/中止收尾定稿（settled 事件调用）：把 pending 里已流出的正文追加为历史消息并落盘。
+ *  与 finalize 的关键差别：不把 pending 置空——错误气泡要继续展示报错原因，只把正文交出去
+ *  （气泡内的 text 清空，避免与历史消息重复显示）。
+ *  只在 pending 仍是错误相时定稿：用户已经发出下一轮（pending 换成新一轮）时迟到到达的
+ *  settled 不得把新一轮的正文提前固化。 */
+function finalizeInterrupted(sid: string): void {
+  const s = sessions.get(sid);
+  const p = pendingBy.get(sid) ?? null;
+  if (!s || !p || p.phase !== 'error' || !p.text.trim()) {
+    if (s) persistSession(s);
+    return;
+  }
+  pushAssistantMessage(s, p.text, collectActions(p));
+  pendingBy.set(sid, { phase: 'error', text: '', error: p.error, tools: [], actions: new Map() });
+  persistSession(s);
   if (sid === activeSessionId) renderSessionBar();
 }
 
@@ -1981,22 +2016,12 @@ function leaveSession(sid: string, ctx: ProjectContext | null = viewContext): vo
   if (!ctx) return;
   const p = ctx.pendingBy.get(sid) ?? null;
   ctx.pendingBy.set(sid, null);
-  if (p && p.phase === 'stream' && p.text) {
+  /* 不限定 stream 相：错误相里同样存在已流出的正文（停止键/模式切换打断时），
+     丢掉它正是「最后一段输出被吞」的来源 */
+  if (p && p.text.trim()) {
     const s = ctx.sessions.get(sid);
     if (s) {
-      s.messages.push({
-        role: 'assistant',
-        content: p.text,
-        snapshots: [],
-        fileRefs: [],
-        serverRefs: [],
-        pathRefs: [],
-        browserRefs: [],
-        skillRefs: [],
-        noteRefs: [],
-        actions: collectActions(p),
-        ts: Date.now(),
-      });
+      pushAssistantMessage(s, p.text, collectActions(p));
       void persistSession(s, ctx);
     }
   }
@@ -2768,7 +2793,10 @@ function renderPending(p: Pending): HTMLElement {
       `<div class="ai-bubble">${headItems}` +
       '<span class="ai-typing"><span class="ai-typing-label">正在输入</span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span></span></div>';
   } else if (p.phase === 'error') {
-    wrap.innerHTML = `<div class="ai-bubble error"><div class="ai-text">${escapeHtml(p.error ?? '')}</div></div>`;
+    /* 错误只作为补充说明，已流出的正文照常渲染——此前 error 相只渲染报错文本，
+       已经显示在屏上的内容会当场被替换掉（用户视角即「输出被吞」） */
+    const partial = p.text.trim() ? `<div class="ai-text">${renderAI(p.text)}</div>` : '';
+    wrap.innerHTML = `<div class="ai-bubble error">${partial}<div class="ai-text ai-error-note">${escapeHtml(p.error ?? '')}</div></div>`;
   } else {
     /* 流式:工具行/动作卡按 textLen 锚点穿插进已生成文本(与历史时序排版同规则);
        全部无锚点时整组前置(尚无文本即发生工具调用的形态) */
@@ -4132,17 +4160,41 @@ function isGenerating(sid: string): boolean {
 }
 
 /**
- * 是否有任一项目上下文的 AI 任务未结束（与 isGenerating 同口径：typing/stream 算，
- * error 气泡不算）。程序关闭二次确认用（main.tsx 窗口关闭守卫）：跨项目聚合全部
- * 常驻上下文 projectContexts——后台保活会话（切走项目/会话不中断）也在覆盖范围内。
+ * 是否有任一项目上下文的 AI 任务未结束，或有尚未定稿落盘的助手正文。程序关闭二次确认用
+ * （main.tsx 窗口关闭守卫）：跨项目聚合全部常驻上下文 projectContexts——后台保活会话
+ * （切走项目/会话不中断）也在覆盖范围内。
+ * 除生成中（typing/stream）外，错误相里残留的正文同样算「未结束」：它还没进会话历史，
+ * 直接退出就永久丢失（这正是「最后一段输出被吞」里退出应用的那一半）。
  */
 export function anyAiBusy(): boolean {
   for (const ctx of projectContexts.values()) {
     for (const p of ctx.pendingBy.values()) {
-      if (p && p.phase !== 'error') return true;
+      if (!p) continue;
+      if (p.phase !== 'error' || p.text.trim()) return true;
     }
   }
   return false;
+}
+
+/**
+ * 把全部常驻上下文里「已流出但尚未定稿」的助手正文立即追加为历史消息并落盘（返回落盘
+ * 完成的 Promise）。程序关闭确认后的最后一道兜底（main.tsx 在 win.destroy() 前 await）：
+ * 正常路径由 settled/done 事件定稿，这里覆盖进程被直接销毁、收尾事件来不及处理的场景。
+ * 不 abort 后端（窗口正在关闭，后端 Destroyed 钩子会回收 pi 进程）。
+ */
+export function flushAiPendingOutput(): Promise<void> {
+  const jobs: Promise<void>[] = [];
+  for (const ctx of projectContexts.values()) {
+    for (const [sid, p] of ctx.pendingBy.entries()) {
+      if (!p || !p.text.trim()) continue;
+      const s = ctx.sessions.get(sid);
+      if (!s) continue;
+      pushAssistantMessage(s, p.text, collectActions(p));
+      ctx.pendingBy.set(sid, { phase: 'error', text: '', error: p.error, tools: [], actions: new Map() });
+      jobs.push(persistSession(s, ctx));
+    }
+  }
+  return Promise.allSettled(jobs).then(() => undefined);
 }
 
 /* ---------- 输入区内容读取（contenteditable → 有序段） ---------- */
@@ -4331,6 +4383,15 @@ async function send(textOverride?: string): Promise<void> {
               ? '引用'
               : '文件引用',
     );
+  }
+
+  /* 上一回合以错误/中止收尾、正文还留在 pending 里（isGenerating 对错误相返回 false，
+     所以能走到这里发起新一轮）：先定稿落盘再 push 新用户消息，否则下面的 emptyPending
+     会把它直接抹掉——这正是「最后一段输出被吞」的最后一环。 */
+  const leftover = pendingBy.get(sid) ?? null;
+  if (leftover && leftover.text.trim()) {
+    pushAssistantMessage(s, leftover.text, collectActions(leftover));
+    void persistSession(s, ctx);
   }
 
   s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, noteRefs: nrefs, imageRefs: imgs, actions: [], ts: Date.now() });

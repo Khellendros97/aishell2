@@ -16,7 +16,7 @@ import { initDebug } from './debug';
 import { navigate } from './router';
 import { applyTheme } from './theme';
 import { confirmDialog } from './ui';
-import { anyAiBusy } from './pages/workbench/ai/ai-engine';
+import { anyAiBusy, flushAiPendingOutput } from './pages/workbench/ai/ai-engine';
 import { ErrorBoundary } from './shared/ErrorBoundary';
 import App from './App';
 
@@ -93,6 +93,10 @@ void (async () => {
       }
       if (confirmed) {
         await aiWindowClose().catch(() => { /* 分离窗口可能已自行关闭 */ });
+        /* 关闭前把已流出但未定稿的助手正文落盘（await 到写入完成再销毁窗口，
+           否则进程退出后该段正文永久丢失）。分离是双端订阅，本窗口 ctx 已含分离窗口
+           的 pending，无需单独处理对方。 */
+        await flushAiPendingOutput().catch(() => { /* 落盘失败不阻塞关闭 */ });
         await win.destroy();
       }
     });

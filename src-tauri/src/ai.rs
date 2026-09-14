@@ -6,6 +6,8 @@
 //! 事件 `ai:event:<key>` payload：
 //!   - `{type:"delta",text}` / `{type:"tool",tool,label}` / `{type:"segment"}`
 //!   - `{type:"done"}` / `{type:"error",message}`
+//!   - `{type:"settled"}`：回合以 error 收尾、不发 done 时的收尾信号；前端据此把已流出的
+//!     正文定稿落盘（无此信号则只活在内存流式气泡里，下一条消息即被吞）
 //!   - `{type:"approval",requestId,toolCallId,action,intent,summary}`
 //!   - `{type:"actionStart",toolCallId,tool,args}` / `{type:"actionEnd",toolCallId,tool,isError,result}`
 //!
@@ -751,6 +753,11 @@ impl AiManager {
                         if !terminal_emitted {
                             terminal_emitted = true;
                             let _ = app2.emit(&event, json!({"type": "done"}));
+                        } else {
+                            // 本回合已发过终态 error（turn_start 后不再补发 done）：前端据此把
+                            // 已流出的正文定稿落盘。没有这个信号，正文只活在内存流式气泡里，
+                            // 下一条消息/切会话/退出都会把它丢掉（「最后一段输出被吞」）。
+                            let _ = app2.emit(&event, json!({"type": "settled"}));
                         }
                     }
                     // 瞬时错误自动重试（pi retry.enabled 默认开：429/过载/5xx）。重试期间
@@ -1123,7 +1130,12 @@ impl AiManager {
             trace_flush_output(&store2, &project_id2, &key2, &mut output_buf);
             busy2.store(false, Ordering::SeqCst);
             if !settled && !killed2.load(Ordering::SeqCst) {
-                let _ = app2.emit(&event, json!({"type": "error", "message": "pi 进程异常退出"}));
+                let _ = app2.emit(
+                    &event,
+                    json!({"type": "error", "message": "pi 进程异常退出"}),
+                );
+                // 进程崩溃不会再有 agent_settled：补发收尾信号，让前端把已流出的正文定稿落盘
+                let _ = app2.emit(&event, json!({"type": "settled"}));
             }
             procs2
                 .lock()
