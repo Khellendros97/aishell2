@@ -35,6 +35,8 @@ export interface Settings {
   autoBackupRemoteFiles: boolean;
   /** 服务器紧凑布局：开启后工作台侧栏服务器卡片默认折叠（仅图标/名称/IP），点击展开；旧配置无此字段按关闭 */
   compactServerList: boolean;
+  /** 工作台菜单栏默认打开项（设置-外观；旧配置按 explorer 保持原行为） */
+  sidebarDefault: 'collapsed' | 'dashboard' | 'explorer' | 'servers';
   /** AIShell 启动时自动恢复上次 enabled 的 SSH 隧道；关闭后退出时自动禁用所有隧道；旧配置无此字段按开启 */
   tunnelAutoStart: boolean;
   /** AI 助手系统通知：等待审批、ask/confirm 提问、任务完成时发系统通知（仅窗口未聚焦时）；旧配置无此字段按开启 */
@@ -740,4 +742,36 @@ export interface SftpProgress {
   filesTotal: number;
   /** done 阶段携带传输是否成功（进度阶段恒为 true）；耗时操作完成通知仅在成功时发送 */
   ok?: boolean;
+}
+
+/* ---------------- 仪表盘（Rust dashboard.rs；serde camelCase 逐字段对齐） ---------------- */
+/** 仪表盘组件：type 决定取用哪个载荷字段 */
+export interface DashboardComponent {
+  type: 'memo' | 'text' | 'table' | 'image' | 'chart';
+  id: string;
+  title: string;
+  /** memo：备忘文本（用户可编辑，存 memo.md）；memo 同时用 columns/rows 承载顶部可编辑表格（table.json） */
+  content?: string;
+  /** text：markdown 文本块 */
+  markdown?: string;
+  /** table：列定义与行数据（只读） */
+  columns?: { key: string; title: string }[];
+  rows?: Record<string, unknown>[];
+  /** image：base64 数据 + mime（image/png、image/svg+xml 等） */
+  data?: string;
+  mime?: string;
+  /** chart：echarts option（折线/柱状/饼图已按需注册） */
+  option?: Record<string, unknown>;
+}
+
+export interface DashboardSpec {
+  meta?: { refreshSeconds?: number };
+  components: DashboardComponent[];
+}
+
+/** dashboard_render 命令返回；脚本失败时 spec 为 null、error 为中文原因 */
+export interface DashboardRender {
+  spec: DashboardSpec | null;
+  error: string | null;
+  refreshedAt: number;
 }

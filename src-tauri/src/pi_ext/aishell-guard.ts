@@ -80,7 +80,7 @@ const VALID_MODES = ["suggest", "agent", "yolo"] as const;
 type AiMode = (typeof VALID_MODES)[number];
 
 /** 仅 agent/yolo 提供的变更工具（suggest 一律拒绝） */
-const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "staging_add", "staging_clear", "request_db_connection", "py"];
+const AI_ONLY_TOOLS = ["delete_path", "run_command", "sftp_upload", "sftp_download", "list_servers", "db_query", "staging_list", "staging_diff", "staging_restore", "staging_add", "staging_clear", "request_db_connection", "py", "dashboard_reload"];
 /** agent 模式逐调用审批的受控工具：staging_restore 为远程写操作需审批；
  *  staging_list / staging_diff 只读、staging_add 主动备份（只读远端）/ staging_clear 只清
  *  无变更条目，均不经审批（与 ai.rs CONTROLLED_TOOLS 注释一致，两侧列表已分化）。 */
@@ -222,6 +222,8 @@ export default function (pi: ExtensionAPI) {
 	const skillDirs = envDirs("AISHELL_SKILL_DIRS");
 	/** 笔记根（工作区全局 <workspace>/.aishell/notes）：AI 读/写/列笔记的额外允许目录；工作区未配置时为空 */
 	const notesDirs = envDirs("AISHELL_NOTES_DIR");
+	/** 仪表盘目录（<项目根>/.aishell/dashboard）：AI 定制仪表盘写 dashboard.py/memo.md 的额外允许目录 */
+	const dashboardDirs = envDirs("AISHELL_DASHBOARD_DIR");
 	const insideAny = (dirs: string[], targetLower: string): boolean =>
 		dirs.some((d) => inside(d, targetLower));
 
@@ -427,8 +429,8 @@ export default function (pi: ExtensionAPI) {
 				const raw = rawPath();
 				const p = path.resolve(cwd, raw);
 				const lower = p.toLowerCase();
-				// 项目根 + 最终启用技能目录（含全局技能目录；技能正文按绝对 SKILL.md 路径 read）+ 笔记根
-				if (!inside(root, lower) && !insideAny(skillDirs, lower) && !insideAny(notesDirs, lower)) {
+				// 项目根 + 最终启用技能目录（含全局技能目录；技能正文按绝对 SKILL.md 路径 read）+ 笔记根 + 仪表盘目录
+				if (!inside(root, lower) && !insideAny(skillDirs, lower) && !insideAny(notesDirs, lower) && !insideAny(dashboardDirs, lower)) {
 					return { block: true, reason: `AIShell 权限边界:只能读项目目录内的文件(拒绝:${raw})。` };
 				}
 				return undefined;
@@ -452,7 +454,7 @@ export default function (pi: ExtensionAPI) {
 				const limit = mode === "suggest" ? writableRoot : root;
 				// 全局技能根与笔记根内 write/edit 在 suggest 沿用「.aishell 内可写且无需受控审批」语义；
 				// agent/yolo 照常由 CONTROLLED_TOOLS 触发审批
-				if (!inside(limit, lower) && !insideAny(globalSkillsDir, lower) && !insideAny(notesDirs, lower)) {
+				if (!inside(limit, lower) && !insideAny(globalSkillsDir, lower) && !insideAny(notesDirs, lower) && !insideAny(dashboardDirs, lower)) {
 					return {
 						block: true,
 						reason:
@@ -545,6 +547,17 @@ export default function (pi: ExtensionAPI) {
 				return undefined;
 			case "timeline_search":
 				// 只读查询：项目时间线检索（无文件副作用）；三档模式可用
+				return undefined;
+			case "dashboard_view":
+				// 只读查询：当前仪表盘组件树摘要（读内存缓存，无文件副作用）；三档模式可用
+				return undefined;
+			case "dashboard_reload":
+				// 执行项目 .aishell/dashboard/dashboard.py 并重渲染：免逐次审批（定制流程由用户发起，
+				// 脚本写盘受 write/edit 白名单约束，脚本内 ssh/db 仍受服务器锁与命令白名单裁决）；
+				// 仅 agent/yolo 提供（AI_ONLY_TOOLS 已在 suggest 拒绝）
+				if (mode === "suggest") {
+					return { block: true, reason: "AIShell 权限边界:仅建议模式不提供仪表盘重载，请调用 request_agent_mode 申请切换到工作模式。" };
+				}
 				return undefined;
 			case "db_query": {
 				// 仅工作/全自动模式提供；参数校验（白名单权威裁决在 Rust）
@@ -1142,6 +1155,37 @@ export default function (pi: ExtensionAPI) {
 			if (params.toTs !== undefined) payload.toTs = params.toTs;
 			if (params.limit !== undefined) payload.limit = params.limit;
 			return await rustAction(ctx, toolCallId, payload);
+		},
+	});
+
+	pi.registerTool({
+		name: "dashboard_reload",
+		label: "重载仪表盘",
+		description:
+			"执行当前项目的仪表盘脚本（.aishell/dashboard/dashboard.py，经 py 工具同款 SDK 通道运行）并重新渲染侧栏仪表盘面板；返回组件树摘要或脚本错误（含退出码与 stderr 摘要）。定制仪表盘的调试循环：edit/write 修改脚本 → dashboard_reload → dashboard_view 核对。",
+		promptSnippet: "重载项目仪表盘",
+		promptGuidelines: [
+			"修改 .aishell/dashboard/dashboard.py 后必须调用 dashboard_reload 验证脚本可执行、组件已推送；失败时按返回的 stderr 摘要修正后重试。",
+			"仪表盘脚本的写法（aishell.dashboard 组件 API、memo.md 备忘录）先阅读 dashboard 技能的 SKILL.md。",
+		],
+		parameters: Type.Object({}),
+		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, { action: "dashboard_reload" });
+		},
+	});
+
+	pi.registerTool({
+		name: "dashboard_view",
+		label: "查看仪表盘",
+		description:
+			"查看当前项目仪表盘最近一次渲染的组件树摘要（组件类型/标题/表格行列数/图片 mime/自动刷新间隔，或渲染错误信息）。用于定制后核对部署效果；提示「尚未渲染」时先调用 dashboard_reload。",
+		promptSnippet: "查看仪表盘组件树",
+		promptGuidelines: [
+			"定制仪表盘后用 dashboard_view 核对组件是否齐全、表格行列数是否符合预期。",
+		],
+		parameters: Type.Object({}),
+		async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
+			return await rustAction(ctx, toolCallId, { action: "dashboard_view" });
 		},
 	});
 

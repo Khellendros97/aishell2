@@ -9,6 +9,7 @@ import { serversPanel } from './ServersPanel';
 import { commandsPanel } from './CommandsPanel';
 import { skillsPanel } from './SkillsPanel';
 import { notesPanel } from './NotesPanel';
+import { dashboardPanel } from './DashboardPanel';
 
 export const PANELS: Record<PanelKey, SidebarPanelDef> = {
   explorer: explorerPanel,
@@ -16,4 +17,5 @@ export const PANELS: Record<PanelKey, SidebarPanelDef> = {
   commands: commandsPanel,
   skills: skillsPanel,
   notes: notesPanel,
+  dashboard: dashboardPanel,
 };

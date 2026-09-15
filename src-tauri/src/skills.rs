@@ -73,6 +73,7 @@ pub struct SkillDocument {
 const SKILL_FILE: &str = "SKILL.md";
 pub const SKILL_MANAGEMENT_NAME: &str = "skill-management";
 pub const SKILL_PYTHON_SCRIPT_NAME: &str = "python-script";
+pub const SKILL_DASHBOARD_NAME: &str = "dashboard";
 
 /// 内置 skill-management 模板（include_str! 嵌入，不修改 Tauri bundle resources）。
 pub const BUILTIN_SKILL_MANAGEMENT: &str =
@@ -81,6 +82,10 @@ pub const BUILTIN_SKILL_MANAGEMENT: &str =
 /// 内置 python-script 模板（py 工具 + aishell SDK 用法指导）。
 pub const BUILTIN_SKILL_PYTHON_SCRIPT: &str =
     include_str!("builtin_skills/python-script/SKILL.md");
+
+/// 内置 dashboard 模板（项目仪表盘定制：组件 API + dashboard_reload/view 调试循环）。
+pub const BUILTIN_SKILL_DASHBOARD: &str =
+    include_str!("builtin_skills/dashboard/SKILL.md");
 
 // ---------------------------------------------------------------- 根目录推导
 
@@ -786,6 +791,7 @@ pub fn seed_builtin_skill_files(workspace: &str) -> Result<(), String> {
     for (name, content) in [
         (SKILL_MANAGEMENT_NAME, BUILTIN_SKILL_MANAGEMENT),
         (SKILL_PYTHON_SCRIPT_NAME, BUILTIN_SKILL_PYTHON_SCRIPT),
+        (SKILL_DASHBOARD_NAME, BUILTIN_SKILL_DASHBOARD),
     ] {
         seed_one_builtin_skill(workspace, name, content)?;
     }
@@ -1014,11 +1020,12 @@ mod tests {
         let root = project_skills_root(&store, "p1").unwrap();
         let list = list_skills(&store, "p1").unwrap();
         assert!(!root.exists(), "列表不应创建根");
-        // 只有两个全局内置技能（skill-management + python-script）
-        assert_eq!(list.len(), 2);
+        // 只有三个全局内置技能（skill-management + python-script + dashboard）
+        assert_eq!(list.len(), 3);
         assert!(list.iter().all(|s| s.origin == SkillOrigin::Global));
         assert!(list.iter().any(|s| s.name == "skill-management"));
         assert!(list.iter().any(|s| s.name == "python-script"));
+        assert!(list.iter().any(|s| s.name == "dashboard"));
         // 无 workspace 时全局根报错
         let store_no_ws = test_store(tmp_base("missing-root-nows"));
         let err = global_skills_root(&store_no_ws).unwrap_err();
@@ -1308,9 +1315,14 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let file = ws.join(".aishell").join("skills").join("skill-management").join("SKILL.md");
         let py_file = ws.join(".aishell").join("skills").join("python-script").join("SKILL.md");
+        let dash_file = ws.join(".aishell").join("skills").join("dashboard").join("SKILL.md");
         seed_builtin_skill_files(ws.to_str().unwrap()).unwrap();
         assert!(file.is_file(), "内置技能未播种");
         assert!(py_file.is_file(), "python-script 内置技能未播种");
+        assert!(dash_file.is_file(), "dashboard 内置技能未播种");
+        let dash_first = std::fs::read_to_string(&dash_file).unwrap();
+        assert!(dash_first.contains("aishell.dashboard"), "dashboard 缺少组件 API 说明");
+        assert!(dash_first.contains("name: dashboard"), "dashboard frontmatter 名称不符");
         let first = std::fs::read_to_string(&file).unwrap();
         assert!(first.contains("## 两个技能根目录"), "内置文档缺少目录结构说明");
         assert!(first.contains("## scope 语义"), "内置文档缺少 scope 语义");

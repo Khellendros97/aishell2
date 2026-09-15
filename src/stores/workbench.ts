@@ -82,6 +82,8 @@ export interface AiHandle {
   addImageRef?(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void;
   /** 当前 AI 会话 ID;会话尚未加载时返回 null。 */
   currentSessionId?(): string | null;
+  /** 新建独立会话并发送首条纯文本消息（仪表盘「定制」等程序化任务入口） */
+  startConversation?(prompt: string): Promise<void>;
 }
 
 const TYPE_ICONS: Record<string, IconName> = {
@@ -89,7 +91,7 @@ const TYPE_ICONS: Record<string, IconName> = {
   browser: 'globe', trace: 'history', note: 'note', tunnel: 'tunnel', timeline: 'timeline',
 };
 
-export type PanelKey = 'explorer' | 'servers' | 'commands' | 'skills' | 'notes';
+export type PanelKey = 'explorer' | 'servers' | 'commands' | 'skills' | 'notes' | 'dashboard';
 
 interface WorkbenchState {
   project: Project | null;

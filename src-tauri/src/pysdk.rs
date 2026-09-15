@@ -37,16 +37,20 @@ type BoxBodyRes = BoxBody<Bytes, std::io::Error>;
 pub struct PySdkBridge {
     url: String,
     token: String,
+    ctx: Arc<SdkCtx>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl PySdkBridge {
     /// 绑定 127.0.0.1:0 起监听并返回句柄；失败时脚本应不带 SDK 环境继续（调用方决定）。
+    /// progress_tx：仪表盘渐进渲染通道——每次 dashboard_emit 除了入槽还实时转发一份
+    /// （py 工具传 None，脚本声明组件不会外发事件）。
     pub async fn start(
         actions: Arc<AiActions>,
         project_id: &str,
         session_id: &str,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -61,9 +65,13 @@ impl PySdkBridge {
             project_id: project_id.to_string(),
             session_id: session_id.to_string(),
             token: token.clone(),
+            dashboard_spec: std::sync::Mutex::new(None),
+            progress_tx,
         });
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
+        let task = {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop_rx.changed() => break,
@@ -88,10 +96,12 @@ impl PySdkBridge {
                     }
                 }
             }
-        });
+            })
+        };
         Ok(PySdkBridge {
             url: format!("http://127.0.0.1:{port}/rpc"),
             token,
+            ctx,
             stop_tx,
             task,
         })
@@ -117,6 +127,15 @@ impl PySdkBridge {
         &self.token
     }
 
+    /// 取走脚本经 `dashboard_emit` 推送的仪表盘组件 spec（重复推送以最后一次为准）。
+    pub fn take_dashboard_spec(&self) -> Option<Value> {
+        self.ctx
+            .dashboard_spec
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     /// 销毁通道：停止接受新连接并终止监听任务（token 随之失效——只在内存）。
     /// await 任务句柄确保监听 socket 已释放（abort 是异步调度的）。
     pub async fn stop(self) {
@@ -132,6 +151,10 @@ struct SdkCtx {
     project_id: String,
     session_id: String,
     token: String,
+    /// 仪表盘脚本经 dashboard_emit 推送的组件 spec（dashboard.rs 渲染管线取走）
+    dashboard_spec: std::sync::Mutex<Option<Value>>,
+    /// 渐进渲染转发（仅仪表盘渲染管线注入；每次 emit 实时转发给前端）
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 }
 
 impl SdkCtx {
@@ -318,8 +341,26 @@ impl SdkCtx {
             "import_commands" => self.actions.sdk_import_commands(&params),
             "import_skill" => self.actions.sdk_import_skill(&self.project_id, &params),
             "import_note" => self.actions.sdk_import_note(&params),
+            // 仪表盘组件 spec 推送（纯通道：只暂存，由 dashboard.rs 渲染管线取走）
+            "dashboard_emit" => {
+                let spec = params.get("spec").cloned().unwrap_or(Value::Null);
+                if !spec.is_object() {
+                    Err("dashboard_emit 参数缺少 spec 对象".to_string())
+                } else {
+                    match self.dashboard_spec.lock() {
+                        Ok(mut slot) => {
+                            if let Some(tx) = &self.progress_tx {
+                                let _ = tx.send(spec.clone());
+                            }
+                            *slot = Some(spec);
+                            Ok(json!("仪表盘组件已接收"))
+                        }
+                        Err(_) => Err("仪表盘通道暂存失败".to_string()),
+                    }
+                }
+            }
             other => Err(format!(
-                "未知 SDK 方法：{other}（可用：list_servers/ssh_exec/sftp_*/db_list_connections/db_query/import_*）"
+                "未知 SDK 方法：{other}（可用：list_servers/ssh_exec/sftp_*/db_list_connections/db_query/import_*/dashboard_emit）"
             )),
         };
         match result {
@@ -446,7 +487,8 @@ mod tests {
             staging,
             Arc::new(crate::browser::BrowserManager::new()),
         ));
-        let bridge = PySdkBridge::start(actions, "p1", "s1").await.unwrap();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = PySdkBridge::start(actions, "p1", "s1", Some(progress_tx)).await.unwrap();
         let client = reqwest::Client::new();
 
         // 无令牌 / 错误令牌 → 401
@@ -500,6 +542,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+
+        // dashboard_emit：spec 入槽、take 取走后清空；重复推送以最后一次为准
+        let resp = client
+            .post(bridge.url())
+            .bearer_auth(bridge.token())
+            .json(&json!({"method": "dashboard_emit", "params": {"spec": {"meta": {}, "components": []}}}))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(
+            bridge.take_dashboard_spec(),
+            Some(json!({"meta": {}, "components": []}))
+        );
+        assert_eq!(bridge.take_dashboard_spec(), None);
+        // 渐进渲染通道：emit 同时实时转发一份（仪表盘管线据此边采集边推给前端）
+        assert_eq!(
+            progress_rx.recv().await,
+            Some(json!({"meta": {}, "components": []}))
+        );
+        // 缺 spec 对象 → 中文错误
+        let resp = client
+            .post(bridge.url())
+            .bearer_auth(bridge.token())
+            .json(&json!({"method": "dashboard_emit", "params": {}}))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["error"].as_str().unwrap_or("").contains("spec"));
 
         // stop 后连接拒绝（通道销毁；换全新 client 避开 keep-alive 连接复用）
         let url = bridge.url().to_string();

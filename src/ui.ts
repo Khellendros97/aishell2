@@ -74,9 +74,10 @@ export function confirmDialog({
 }
 
 /** 输入对话框（如压缩包命名）：确定返回 trim 后的值（空/含路径分隔符时拒绝并提示），取消返回 null。
- *  allowPath=true 时跳过「名称不能包含路径分隔符」校验（分类目录等按路径输入的场景）。 */
+ *  allowPath=true 时跳过「名称不能包含路径分隔符」校验（分类目录等按路径输入的场景）。
+ *  multiline=true 时换成多行 textarea：Enter 换行，Ctrl/Cmd+Enter 确认（仪表盘定制需求等长文本场景）。 */
 export function promptDialog({
-  title = '输入', label = '', defaultValue = '', placeholder = '', okText = '确定', allowPath = false,
+  title = '输入', label = '', defaultValue = '', placeholder = '', okText = '确定', allowPath = false, multiline = false,
 }: {
   title?: string;
   label?: string;
@@ -84,6 +85,7 @@ export function promptDialog({
   placeholder?: string;
   okText?: string;
   allowPath?: boolean;
+  multiline?: boolean;
 } = {}): Promise<string | null> {
   const { promise, resolve } = Promise.withResolvers<string | null>();
   const mask = document.createElement('div');
@@ -93,7 +95,10 @@ export function promptDialog({
       <div class="modal-head"><h3></h3></div>
       <div class="modal-body" style="color:var(--text-1);line-height:1.6">
         ${label ? `<div class="prompt-label"></div>` : ''}
-        <input class="input prompt-input" type="text" style="width:100%;margin-top:8px" spellcheck="false">
+        ${multiline
+          ? '<textarea class="input prompt-input" rows="5" style="width:100%;margin-top:8px;resize:vertical" spellcheck="false"></textarea>'
+          : '<input class="input prompt-input" type="text" style="width:100%;margin-top:8px" spellcheck="false">'}
+        ${multiline ? '<div style="color:var(--text-2);font-size:11.5px;margin-top:4px">Ctrl+Enter 确认，Enter 换行</div>' : ''}
         <div class="prompt-error" style="color:var(--red);font-size:12px;margin-top:6px;min-height:16px"></div>
       </div>
       <div class="modal-foot">
@@ -104,7 +109,7 @@ export function promptDialog({
   mask.querySelector('h3')!.textContent = title;
   const labelEl = mask.querySelector('.prompt-label');
   if (labelEl) labelEl.textContent = label;
-  const input = mask.querySelector('.prompt-input') as HTMLInputElement;
+  const input = mask.querySelector('.prompt-input') as HTMLInputElement | HTMLTextAreaElement;
   input.value = defaultValue;
   input.placeholder = placeholder;
   mask.querySelector('[data-act=ok]')!.textContent = okText;
@@ -125,7 +130,7 @@ export function promptDialog({
   const submit = (): void => {
     const value = input.value.trim();
     if (!value) {
-      mask.querySelector('.prompt-error')!.textContent = '名称不能为空';
+      mask.querySelector('.prompt-error')!.textContent = multiline ? '内容不能为空' : '名称不能为空';
       return;
     }
     if (!allowPath && /[\\/]/.test(value)) {
@@ -137,9 +142,10 @@ export function promptDialog({
   (mask.querySelector('[data-act=cancel]') as HTMLButtonElement).onclick = () => close(null);
   (mask.querySelector('[data-act=ok]') as HTMLButtonElement).onclick = submit;
   input.addEventListener('keydown', (e) => {
-    e.stopPropagation();
-    if (e.key === 'Enter') submit();
-    else if (e.key === 'Escape') close(null);
+    const ev = e as KeyboardEvent;
+    ev.stopPropagation();
+    if (ev.key === 'Enter' && (!multiline || ev.ctrlKey || ev.metaKey)) submit();
+    else if (ev.key === 'Escape') close(null);
   });
   mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(null); });
   return promise;

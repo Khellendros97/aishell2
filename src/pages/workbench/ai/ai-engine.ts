@@ -542,6 +542,8 @@ const ACTION_NAMES: Record<string, string> = {
   staging_clear: '清理无变更暂存',
   request_db_connection: '申请数据库连接',
   py: '执行 Python 脚本',
+  dashboard_reload: '重载仪表盘',
+  dashboard_view: '查看仪表盘',
   ask: '向用户提问',
   confirm: '请求确认',
 };
@@ -604,6 +606,10 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       const lines = code ? code.split('\n').length : 0;
       return `执行内联 Python 脚本（${lines} 行）`;
     }
+    case 'dashboard_reload':
+      return '执行 dashboard.py 并重渲染仪表盘';
+    case 'dashboard_view':
+      return '查看仪表盘组件树';
     default:
       return '';
   }
@@ -1279,6 +1285,7 @@ function createForwardingHandle(projectId: string): AiHandle {
     addImageRef: (ref) => { if (ref) forward('image', { ref }); },
     convertNoteToSkill: (ref) => { if (ref) forward('convertNote', { ref }); },
     analyzeTimeline: (scope) => forward('analyzeTimeline', { scope: scope ?? null }),
+    startConversation: (prompt) => { forward('startConversation', { prompt }); return Promise.resolve(); },
     currentSessionId: () => projectContexts.get(projectId)?.activeSessionId ?? null,
   };
 }
@@ -1309,6 +1316,9 @@ function dispatchForwardRef(payload: Record<string, unknown>): void {
     case 'image': h.addImageRef?.(ref); break;
     case 'convertNote': h.convertNoteToSkill?.(ref); break;
     case 'analyzeTimeline': h.analyzeTimeline?.((payload.scope as TimelineAnalysisScopeItem[] | null) ?? undefined); break;
+    case 'startConversation':
+      if (typeof payload.prompt === 'string') void h.startConversation?.(payload.prompt);
+      break;
     default: break;
   }
 }
@@ -1406,6 +1416,12 @@ function createAiHandle() {
   },
   currentSessionId(): string | null {
     return activeSessionId || null;
+  },
+  /** 程序化任务入口（仪表盘「定制」等）：新建会话并发送首条消息（复用 AiPanelController 同款流程） */
+  startConversation(prompt: string): Promise<void> {
+    const ctx = viewContext;
+    if (!ctx || unmounted) return Promise.reject(new Error('AI 面板尚未就绪'));
+    return startConversation(ctx, prompt);
   },
   };
 }

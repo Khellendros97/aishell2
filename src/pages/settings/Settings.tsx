@@ -39,6 +39,7 @@ interface SysFields {
   autoBackup: boolean;
   mcpPort: string;
   compactServerList: boolean;
+  sidebarDefault: AppSettings['sidebarDefault'];
   tunnelAutoStart: boolean;
   notifyAi: boolean;
   notifyLongTasks: boolean;
@@ -50,6 +51,7 @@ const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
   effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '', compactServerList: false,
+  sidebarDefault: 'explorer',
   tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true, autoRecordTerminal: false,
 };
 
@@ -197,6 +199,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       autoBackup: s.settings.autoBackupRemoteFiles ?? true,
       mcpPort: String(s.mcp?.port ?? 8945),
       compactServerList: s.settings.compactServerList ?? false,
+      sidebarDefault: s.settings.sidebarDefault ?? 'explorer',
       tunnelAutoStart: s.settings.tunnelAutoStart ?? true,
       notifyAi: s.settings.notifyAi ?? true,
       notifyLongTasks: s.settings.notifyLongTasks ?? true,
@@ -286,6 +289,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       approvalMode: fields.approvalMode,
       autoBackupRemoteFiles: fields.autoBackup,
       compactServerList: fields.compactServerList,
+      sidebarDefault: fields.sidebarDefault,
       tunnelAutoStart: fields.tunnelAutoStart,
       notifyAi: fields.notifyAi,
       notifyLongTasks: fields.notifyLongTasks,
@@ -348,6 +352,21 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, compactServerList: checked })); }}
               />
               <div className="hint">开启后工作台侧栏的服务器卡片默认折叠，仅显示图标、名称和 IP；点击卡片展开操作按钮</div>
+            </div>
+            <div className="field">
+              <label>菜单栏默认打开</label>
+              <select
+                id="f-sidebar-default"
+                className="select"
+                value={fields.sidebarDefault}
+                onChange={(e) => { const v = e.currentTarget.value as AppSettings['sidebarDefault']; setFields((f) => ({ ...f, sidebarDefault: v })); }}
+              >
+                <option value="collapsed">收起菜单栏</option>
+                <option value="dashboard">仪表盘</option>
+                <option value="explorer">本地文件</option>
+                <option value="servers">服务器列表</option>
+              </select>
+              <div className="hint">进入工作台时菜单栏的初始状态；保存后下次进入工作台生效</div>
             </div>
             <div className="form-actions">
               <button id="btn-save-system" className="btn primary" onClick={() => void save()}>保存</button>

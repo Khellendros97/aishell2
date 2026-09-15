@@ -223,6 +223,17 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     if (s.panel === 'commands' && (!activeTab || activeTab.type !== 'terminal')) s.setPanel('explorer');
   }, [activeId, panel]);
 
+  /* ---------- 菜单栏默认打开(设置-外观「菜单栏默认打开」):工作台实例挂载时应用一次 ---------- */
+  useEffect(() => {
+    void getState().then((st) => {
+      const def = st.settings.sidebarDefault ?? 'explorer';
+      const s = useWorkbench.getState();
+      if (def === 'collapsed') s.setSidebarCollapsed(true);
+      else if (def === 'dashboard' || def === 'servers') s.setPanel(def);
+      // explorer 是 store 默认值,无需处理
+    }).catch(() => { /* 无 Tauri 环境(纯浏览器冒烟)静默 */ });
+  }, []);
+
   /* ---------- activity-bar 点击:面板切换 / 浏览器标签页入口 / AI 面板开关 / 侧栏折叠 ---------- */
   const onActivityClick = (e: ReactMouseEvent<HTMLDivElement>): void => {
     const iconEl = (e.target as HTMLElement).closest('.activity-icon');
@@ -297,6 +308,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
               title={sidebarCollapsed ? '展开侧栏' : '折叠侧栏'}
               aria-label={sidebarCollapsed ? '展开侧栏' : '折叠侧栏'}
             ><Icon name={sidebarCollapsed ? 'chevronRight' : 'chevronLeft'} /></div>
+            <div className={`activity-icon${panel === 'dashboard' ? ' active' : ''}`} data-panel="dashboard" title="仪表盘"><Icon name="compass" /></div>
             <div className={`activity-icon${panel === 'explorer' ? ' active' : ''}`} data-panel="explorer" title="文件资源管理器"><Icon name="folder" /></div>
             <div className={`activity-icon${panel === 'servers' ? ' active' : ''}`} data-panel="servers" title="服务器列表"><Icon name="monitor" /></div>
             <div className={`activity-icon${panel === 'commands' ? ' active' : ''}`} data-panel="commands" title="命令收藏"><Icon name="star" /></div>
