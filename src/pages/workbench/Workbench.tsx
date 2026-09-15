@@ -11,7 +11,7 @@
  * - panes 常驻挂载(keep-alive),active 仅切显隐 —— 终端/SSH/AI 会话不随标签切换销毁。
  * 项目装载失败自行导航回欢迎页并 onFail();实例销毁(换项目)时关闭全部标签并复位 store。
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import { getState } from '../../api';
 import { navigate } from '../../router';
@@ -24,11 +24,15 @@ import { usePanelResize } from '../../shared/panelResize';
 import {
   useWorkbench, wbEvents, wbHandles, type PanelKey, type Tab,
 } from '../../stores/workbench';
+import { isAiDetached, subscribeAiDetach } from './ai/ai-engine';
 import { PANELS } from './sidebar/panels';
 import { TAB_TYPES } from './tabs/registry';
 import { setWorkbenchActive } from './tabs/browser-engine';
 import { AiPanel } from './ai/AiPanel';
 import './workbench.css';
+
+/** 工作台 AI 面板的分离模式常量（模块级，避免每次渲染生成新对象触发 AiPanel 重挂） */
+const HOST_DETACH = { role: 'host', host: 'workbench' } as const;
 
 /* ---------- 面板宽度钳制与应用(语义同旧版 bindPanelResize;交互在共享钩子) ---------- */
 function applyPanelWidth(
@@ -78,6 +82,8 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
   const tabs = useWorkbench((s) => s.tabs);
   const activeId = useWorkbench((s) => s.activeId);
   const project = useWorkbench((s) => s.project);
+  /* 当前项目 AI 是否已分离到独立窗口（引擎模块级状态 + ai:window-changed 广播驱动） */
+  const aiDetached = useSyncExternalStore(subscribeAiDetach, () => isAiDetached(project?.id));
   const activeTab = tabs.find((t) => t.id === activeId) ?? null;
 
   const workbenchRef = useRef<HTMLDivElement>(null);
@@ -194,7 +200,12 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     const p = iconEl.getAttribute('data-panel');
     const s = useWorkbench.getState();
     if (p === 'sidebar-toggle') { s.setSidebarCollapsed(!s.sidebarCollapsed); return; }
-    if (p === 'ai') { s.setAiVisible(!s.aiVisible); return; }
+    if (p === 'ai') {
+      // AI 已分离到独立窗口：面板不随 aiVisible 显隐，提示后聚焦路径由状态栏提示代替
+      if (isAiDetached(s.project?.id)) { toast('AI 助手已分离到独立窗口'); return; }
+      s.setAiVisible(!s.aiVisible);
+      return;
+    }
     if (p === 'browser') {
       // 浏览器是中央标签页(非侧栏面板):固定 id 单实例,openTab 同 id 去重激活
       s.openTab({ id: 'browser', type: 'browser', title: '浏览器' });
@@ -305,13 +316,16 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
         <div
           id="ai-resizer"
           ref={aiResizerRef}
-          className={`wb-resize-handle${aiVisible ? '' : ' hidden'}`}
+          className={`wb-resize-handle${aiVisible && !aiDetached ? '' : ' hidden'}`}
           role="separator" aria-orientation="vertical" aria-label="调整 AI 面板宽度" tabIndex={0}
         ></div>
         {/* AI 面板须在项目装载完成后才挂载(对照旧版 workbench.ts:装载段完成后才 setAiVisible(true)→mountAiPanel):
             ai-engine 在挂载时一次性快照 useWorkbench.getState().project,渲染即挂载会早于异步装载读到 null,
-            导致发送消息恒报「项目未加载」。project 门控恢复旧版时序;换项目时整树经 key 重建,AiPanel 随之重挂。 */}
-        <div id="ai-panel" ref={aiPanelRef} className={aiVisible ? '' : 'hidden'}>{project && active ? <AiPanel /> : null}</div>
+            导致发送消息恒报「项目未加载」。project 门控恢复旧版时序;换项目时整树经 key 重建,AiPanel 随之重挂。
+            AI 分离到独立窗口期间(aiDetached)整块隐藏,聚合后经 ai:window-changed 事件重挂还原。 */}
+        <div id="ai-panel" ref={aiPanelRef} className={aiVisible && !aiDetached ? '' : 'hidden'}>
+          {project && active && !aiDetached ? <AiPanel detach={HOST_DETACH} /> : null}
+        </div>
         </div>
         {/* 底栏为三页共用组件(components/Statusbar):进度区/隧道角标在组件内自持,
             这里只传工作台特有的左信息区与 AI 面板开关 */}
@@ -326,6 +340,8 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
           }
           aiVisible={aiVisible}
           aiControls="ai-panel"
+          aiDisabled={aiDetached}
+          aiDisabledHint="AI 助手已分离到独立窗口"
           onToggleAi={() => useWorkbench.getState().setAiVisible(!aiVisible)}
         />
       </div>

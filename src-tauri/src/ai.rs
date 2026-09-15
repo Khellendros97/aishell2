@@ -1167,6 +1167,15 @@ impl AiManager {
         self.kill_keys(|_| true);
     }
 
+    /// 是否有任一 pi 进程处于生成/审批等待（busy=true，语义同空闲回收判定）。
+    /// 程序关闭守卫的跨窗口查询用（ai_any_busy 命令）：AI 分离到独立窗口后，
+    /// 主窗口前端的 projectContexts 已释放，本窗口 anyAiBusy() 看不到分离窗口的忙态，
+    /// 必须以后端进程表为准。
+    pub fn any_busy(&self) -> bool {
+        let procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
+        procs.values().any(|p| p.busy.load(Ordering::SeqCst))
+    }
+
     fn kill_keys(&self, select: impl Fn(&str) -> bool) {
         let mut procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         let dead: Vec<String> = procs.keys().filter(|k| select(k)).cloned().collect();

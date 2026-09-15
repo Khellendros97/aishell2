@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
+  AiMode, AiWindowChangedEvent, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -310,6 +310,26 @@ export const aiRespondConfirm = (key: string, requestId: string, confirmed: bool
   call<void>('ai_respond_confirm', { key, requestId, confirmed });
 export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<UnlistenFn> =>
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
+
+/* ---------------- AI 助手窗口分离/聚合（Rust ai_window.rs） ----------------
+   分离 = 宿主窗口释放该项目引擎上下文（flush 落盘 + 退订），pi 进程与 aishell.json
+   会话快照 app 级共享，独立窗口重新挂载即可无缝续流；聚合 = 反向。 */
+/** 分离 AI 助手到独立窗口（同项目重复调用 = 聚焦；异项目已有分离窗口时返回中文错误） */
+export const aiWindowOpen = (projectId: string, sessionId: string | null, host: 'workbench' | 'welcome') =>
+  call<void>('ai_window_open', { projectId, sessionId, host });
+/** 聚合还原：优雅关闭分离窗口（分离窗口 JS 侧先释放上下文再放行） */
+export const aiWindowClose = () => call<void>('ai_window_close');
+/** 后端进程表是否有任一 pi 忙（生成/审批等待）：主窗口关闭守卫的跨窗口查询 */
+export const aiAnyBusy = () => call<boolean>('ai_any_busy');
+/** 「添加到对话」跨窗口转发：wbHandles.ai 转发桩 → 分离窗口插入引用 chip */
+export const aiForwardRef = (projectId: string, payload: Record<string, unknown>) =>
+  call<void>('ai_forward_ref', { projectId, payload });
+/** 分离状态广播（建窗/窗口销毁都会发；宿主窗口据此显隐 AI 面板） */
+export const onAiWindowChanged = (cb: (ev: AiWindowChangedEvent) => void): Promise<UnlistenFn> =>
+  listen<AiWindowChangedEvent>('ai:window-changed', (e) => cb(e.payload));
+/** 「添加到对话」转发事件（仅分离窗口监听） */
+export const onAiForwardRef = (projectId: string, cb: (payload: Record<string, unknown>) => void): Promise<UnlistenFn> =>
+  listen<Record<string, unknown>>(`ai:forward-ref:${projectId}`, (e) => cb(e.payload));
 
 /* ---------------- AI 会话 trace（Rust trace.rs） ----------------
    开关持久化在 AppState.traceEnabled（命令面板 `trace on/off`）；日志按会话分文件落盘

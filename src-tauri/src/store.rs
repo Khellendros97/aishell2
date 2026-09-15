@@ -909,6 +909,18 @@ pub struct ChatSession {
     pub archived: bool,
 }
 
+/// AI 分离窗口（label = `ai-detach`，见 ai_window.rs）最近一次的窗口几何（物理像素）。
+/// AppState 顶层字段而非 Settings：设置页保存时整体提交 Settings 表单，表单无此字段会被覆盖
+/// （同 trace_enabled 先例）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiWindowGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// sessions: projectId -> Vec<ChatSession>
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -975,6 +987,10 @@ pub struct AppState {
     /// 内置浏览器子 webview，浏览器标签页重建时生效）。
     #[serde(default)]
     pub browser_proxy: BrowserProxyConfig,
+    /// AI 分离窗口最近一次几何（物理像素）；关闭分离窗口时由后端写回，下次分离恢复。
+    /// 旧配置无此字段按 None（默认尺寸居中打开）。
+    #[serde(default)]
+    pub ai_window_geometry: Option<AiWindowGeometry>,
 }
 
 /// Xshell 扫描产物：服务器 + 其相对 Sessions 目录（空串 = 根目录未分类）。
@@ -2832,6 +2848,22 @@ impl Store {
         })
     }
 
+    /// AI 分离窗口最近一次几何（ai_window.rs 建窗时读取）。
+    pub fn ai_window_geometry(&self) -> Option<AiWindowGeometry> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|g| g.ai_window_geometry)
+    }
+
+    /// 原子落盘 AI 分离窗口几何（窗口 Moved/Resized 缓存 + Destroyed 时写回）。
+    pub fn set_ai_window_geometry(&self, geo: AiWindowGeometry) -> Result<(), String> {
+        self.with_state(|s| {
+            s.ai_window_geometry = Some(geo);
+            Ok(())
+        })
+    }
+
     /// 当前全局设置（clone）。
     pub fn settings(&self) -> Settings {
         let guard = self
@@ -3746,6 +3778,7 @@ mod tests {
             trace_enabled: false,
             ssh_tunnels: vec![],
             browser_proxy: BrowserProxyConfig::default(),
+            ai_window_geometry: None,
         }
     }
 

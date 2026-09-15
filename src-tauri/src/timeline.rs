@@ -384,7 +384,7 @@ fn tag_reclose_in_dir(
         .filter(|t| t.name.to_lowercase() == name_lower)
         .collect();
     group.sort_by_key(|t| t.anchor_ts);
-    let Some(closing) = group.chunks_exact(2).last().map(|pair| pair[1].clone()) else {
+    let Some(closing) = group.as_chunks::<2>().0.last().map(|pair| pair[1].clone()) else {
         return Err(format!("标签「{name}」没有已闭合的选区"));
     };
     // 按打标 ts 精确定位那一条记录删除（同名同锚点可能存在多条，只删闭合端这条）
@@ -431,7 +431,7 @@ impl TagIndex {
         let mut regions = Vec::new();
         for mut group in by_name.into_values() {
             group.sort_by_key(|t| t.anchor_ts);
-            for pair in group.chunks_exact(2) {
+            for pair in group.as_chunks::<2>().0 {
                 regions.push((
                     pair[0].name.to_lowercase(),
                     pair[0].anchor_ts,

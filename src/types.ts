@@ -375,6 +375,21 @@ export interface NotesListing {
 /** session_archive 归档模式：new = 新建笔记 / update = 整合进既有笔记 / only = 仅归档不生成笔记 */
 export type ArchiveMode = 'new' | 'update' | 'only';
 
+/** AI 分离窗口最近一次几何（物理像素，ai_window.rs Destroyed 时写回；下次分离恢复） */
+export interface AiWindowGeometry {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** ai:window-changed 事件载荷（ai_window.rs）：某项目的 AI 助手分离状态变更 */
+export interface AiWindowChangedEvent {
+  projectId: string;
+  /** true = 已分离出独立窗口；false = 已聚合回宿主窗口 */
+  detached: boolean;
+}
+
 /** sessions: projectId -> ChatSession[] */
 export interface AppState {
   settings: Settings;
@@ -411,6 +426,8 @@ export interface AppState {
   browserProxy: BrowserProxyConfig;
   /** 内置浏览器收藏夹（全局平铺，url 即键，按添加序）；旧配置无此字段为空数组 */
   browserFavorites: BrowserFavorite[];
+  /** AI 分离窗口最近一次几何（物理像素，后端在分离窗口关闭时写回）；旧配置无此字段为 null */
+  aiWindowGeometry: AiWindowGeometry | null;
 }
 
 /** AI 会话 trace 条目（trace.rs TraceEntry serde camelCase 对齐）：text 为后端已格式化的单行展示文本 */

@@ -26,7 +26,7 @@
  *   避免 React 按 vdom 记录的父节点移除输入框时父节点不匹配（.combo 包装）抛异常。
  */
 import {
-  useEffect, useLayoutEffect, useRef, useState,
+  useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore,
   type CSSProperties, type DragEvent, type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import type { AppState, Project, Server } from '../../types';
@@ -44,10 +44,14 @@ import { navigate } from '../../router';
 import { ServerForm, type ServerFormHandle } from '../settings/ServerForm';
 import { saveServerWithCredentialChoice } from '../settings/server-save';
 import { AiPanel } from '../workbench/ai/AiPanel';
+import { isAiDetached, subscribeAiDetach } from '../workbench/ai/ai-engine';
 import type { AiPanelController } from '../workbench/ai/ai-engine';
 import { Statusbar } from '../../components/Statusbar';
 import { usePanelResize } from '../../shared/panelResize';
 import '../welcome.css';
+
+/** 欢迎页 AI 面板的分离模式常量（模块级，避免每次渲染生成新对象触发 AiPanel 重挂） */
+const HOST_DETACH = { role: 'host', host: 'welcome' } as const;
 
 const welcomeLogoUrl = new URL('../../assets/logo.svg', import.meta.url).href;
 
@@ -75,6 +79,7 @@ const EMPTY_STATE: AppState = {
   sshTunnels: [],
   browserProxy: { enabled: false, source: 'tunnel', tunnelId: null, host: '', port: 0 },
   browserFavorites: [],
+  aiWindowGeometry: null,
 };
 
 /**
@@ -166,6 +171,8 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
   /** 通用 SSH 工具迁移任务启动状态。 */
   const [importBusy, setImportBusy] = useState(false);
   const [taskProject, setTaskProject] = useState<Project | null>(null);
+  /* 任务 AI 是否已分离到独立窗口（按项目 id 判定，ai:window-changed 广播驱动） */
+  const taskAiDetached = useSyncExternalStore(subscribeAiDetach, () => isAiDetached(taskProject?.id));
   const [taskError, setTaskError] = useState<string | null>(null);
   const [taskAiReady, setTaskAiReady] = useState(false);
   const taskAiRef = useRef<AiPanelController | null>(null);
@@ -1142,21 +1149,22 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
           <div>没有匹配的项目，试试其他关键词</div>
         </div>
       </main>
-      {/* AI 面板拖宽分隔条（交互语义同工作台 ai-resizer；AI 隐藏时一并收起） */}
+      {/* AI 面板拖宽分隔条（交互语义同工作台 ai-resizer；AI 隐藏或已分离时一并收起） */}
       <div
         ref={aiResizerRef}
-        className={`wb-resize-handle welcome-ai-resizer${aiVisible ? '' : ' hidden'}`}
+        className={`wb-resize-handle welcome-ai-resizer${aiVisible && !taskAiDetached ? '' : ' hidden'}`}
         role="separator" aria-orientation="vertical" aria-label="调整 AI 助手面板宽度" tabIndex={0}
       ></div>
-      <aside id="welcome-ai" ref={aiAsideRef} className={`welcome-ai${aiVisible ? '' : ' hidden'}`} aria-label="AI 助手">
+      <aside id="welcome-ai" ref={aiAsideRef} className={`welcome-ai${aiVisible && !taskAiDetached ? '' : ' hidden'}`} aria-label="AI 助手">
         <div className="welcome-ai-head"><Icon name="bot" /><span>AI 助手</span><span className="tag">本地任务</span></div>
         <div className="welcome-ai-body">
-          {taskProject ? (
+          {taskProject && !taskAiDetached ? (
             <AiPanel
               project={taskProject}
               workbenchIntegration={false}
               fixedWorkareaPath={taskProject.path ?? undefined}
               lockedMode="agent"
+              detach={HOST_DETACH}
               onReady={(controller) => { taskAiRef.current = controller; setTaskAiReady(true); }}
             />
           ) : (
@@ -1175,6 +1183,8 @@ export function Welcome(_props: { params: URLSearchParams }): JSX.Element {
       <Statusbar
         aiVisible={aiVisible}
         aiControls="welcome-ai"
+        aiDisabled={taskAiDetached}
+        aiDisabledHint="AI 助手已分离到独立窗口"
         onToggleAi={() => setAiVisible((v) => !v)}
       />
 

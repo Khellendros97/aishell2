@@ -2,6 +2,7 @@ pub mod ai;
 pub mod ai_actions;
 pub mod ai_images;
 pub mod ai_impact;
+pub mod ai_window;
 pub mod browser;
 pub mod mcp;
 pub mod notes;
@@ -45,6 +46,57 @@ async fn delete_project_with_ai(
 ) -> Result<(), String> {
     ai.kill_project(&id);
     store::delete_project(store, id).await
+}
+
+/// 禁用 WebView2 浏览器快捷键（Ctrl+Shift+C 开 DevTools、Ctrl+滚轮缩放、F5 刷新等）：
+/// 它们在页面 keydown 之前的 accelerator 阶段被宿主拦截，JS 无法阻止，
+/// 会劫持终端的 Ctrl+Shift+C/V。F12 DevTools 改由前端监听 + open_devtools 命令。
+/// 主窗口与 AI 分离窗口（ai_window.rs）共用；非 Windows 无 WebView2，为空实现。
+#[cfg(windows)]
+pub(crate) fn disable_webview2_browser_keys(win: &tauri::WebviewWindow) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use windows::core::Interface;
+    let _ = win.with_webview(|wv| unsafe {
+        if let Ok(core) = wv.controller().CoreWebView2() {
+            if let Ok(settings) = core.Settings() {
+                if let Ok(s3) = settings.cast::<ICoreWebView2Settings3>() {
+                    let _ = s3.SetAreBrowserAcceleratorKeysEnabled(false);
+                }
+            }
+        }
+    });
+}
+
+/// 非 Windows 平台的空实现（签名对齐）。
+#[cfg(not(windows))]
+pub(crate) fn disable_webview2_browser_keys(_win: &tauri::WebviewWindow) {}
+
+/// 退出收尾（最后一个窗口销毁时执行一次）：杀 AI 会话；仍在录制的终端补写「程序退出」
+/// 结束行（前端 JS 随 webview 消亡，term_record_stop 不会到来，BufWriter 缓冲也会因此
+/// 丢失）；「AIShell 启动时自动启动隧道」关闭时把所有隧道置为禁用，下次启动不再自动
+/// 恢复（设置-功能特性 tunnel_auto_start，见 tunnel.rs recover）。
+/// 主窗口与 AI 分离窗口（ai_window.rs）共用：AI 分离后双窗口都可能最后关闭——
+/// 主窗口先关而分离窗口还在时跳过清理（分离窗口的 AI 会话继续存活），由最后销毁的
+/// 窗口兜底执行。
+/// 「最后一个窗口」必须按 label 排除正在销毁的窗口后判定，不能按窗口数：tauri 分发
+/// Destroyed 事件前就把销毁窗口移出窗口表（manager.on_window_close 先于事件回调），
+/// 数窗口会把「聚合分离窗口（main 还开着）」误判成最后窗口，kill_all 会打断仍在
+/// 流式输出的会话。
+pub(crate) fn exit_cleanup_if_last_window(app: &tauri::AppHandle, dying_label: &str) {
+    use tauri::Manager as _;
+    if app
+        .webview_windows()
+        .into_iter()
+        .any(|(label, _)| label != dying_label)
+    {
+        return;
+    }
+    app.state::<Arc<ai::AiManager>>().kill_all();
+    app.state::<Arc<term::TermManager>>().finalize_all_recordings();
+    let store = app.state::<Arc<store::Store>>();
+    if !store.settings().tunnel_auto_start {
+        store.disable_all_tunnels();
+    }
 }
 
 pub fn run() {
@@ -158,8 +210,6 @@ pub fn run() {
             trace::init(config_dir.join("ai-trace"), store.trace_enabled());
             app.manage(store.clone());
             app.manage(ssh.clone());
-            // 退出收尾用（app.manage 移动 terms 前克隆；见下方 Destroyed 钩子）
-            let terms_exit = terms.clone();
             app.manage(terms);
             app.manage(ai.clone());
             app.manage(staging);
@@ -181,38 +231,21 @@ pub fn run() {
             // AI 会话 trace：启动 7 天过期清理任务（启动即清一次 + 每 24h）
             trace::spawn_cleanup_task();
             if let Some(win) = app.get_webview_window("main") {
-                // 禁用 WebView2 浏览器快捷键（Ctrl+Shift+C 开 DevTools、Ctrl+滚轮缩放、F5 刷新等）：
-                // 它们在页面 keydown 之前的 accelerator 阶段被宿主拦截，JS 无法阻止，
-                // 会劫持终端的 Ctrl+Shift+C/V。F12 DevTools 改由前端监听 + open_devtools 命令。
+                // 禁用 WebView2 浏览器快捷键（Ctrl+Shift+C 开 DevTools、Ctrl+滚轮缩放、F5 刷新等），
+                // 见 disable_webview2_browser_keys 注释（AI 分离窗口在 ai_window_open 里同样处理）
                 #[cfg(windows)]
-                {
-                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
-                    use windows::core::Interface;
-                    let _ = win.with_webview(|wv| unsafe {
-                        if let Ok(core) = wv.controller().CoreWebView2() {
-                            if let Ok(settings) = core.Settings() {
-                                if let Ok(s3) = settings.cast::<ICoreWebView2Settings3>() {
-                                    let _ = s3.SetAreBrowserAcceleratorKeysEnabled(false);
-                                }
-                            }
-                        }
-                    });
-                }
-                // 退出收尾：杀 AI 会话；仍在录制的终端补写「程序退出」结束行（前端 JS 随
-                // webview 消亡，term_record_stop 不会到来，BufWriter 缓冲也会因此丢失）；
-                // 「AIShell 启动时自动启动隧道」关闭时把所有隧道置为禁用，
-                // 下次启动不再自动恢复（设置-功能特性 tunnel_auto_start，见 tunnel.rs recover）
-                let store_exit = store.clone();
+                disable_webview2_browser_keys(&win);
+                // 退出收尾：主窗口与 AI 分离窗口都可能最后关闭，收尾统一走
+                // exit_cleanup_if_last_window（杀 AI 会话 / 录制收尾 / 隧道禁用）
+                let app2 = app.handle().clone();
                 win.on_window_event(move |_ev| {
                     if let tauri::WindowEvent::Destroyed = _ev {
-                        ai.kill_all();
-                        terms_exit.finalize_all_recordings();
-                        if !store_exit.settings().tunnel_auto_start {
-                            store_exit.disable_all_tunnels();
-                        }
+                        exit_cleanup_if_last_window(&app2, "main");
                     }
                 });
             }
+            // AI 分离窗口运行态（当前分离的项目 id + 窗口几何缓存），见 ai_window.rs
+            app.manage(ai_window::AiWindowState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -313,6 +346,10 @@ pub fn run() {
             ai::ai_respond_ask,
             ai::ai_respond_confirm,
             session_title::ai_generate_session_title,
+            ai_window::ai_window_open,
+            ai_window::ai_window_close,
+            ai_window::ai_any_busy,
+            ai_window::ai_forward_ref,
             notes::notes_root_cmd,
             notes::notes_list_cmd,
             notes::session_archive,
