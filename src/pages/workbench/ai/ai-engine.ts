@@ -3859,6 +3859,22 @@ function extractImageFiles(dt: DataTransfer | null): File[] {
 
 /** 输入框粘贴：含图片文件时拦截默认行为并转为附件（一次可多张）；
  *  文本粘贴统一以纯文本插入（contenteditable 默认会带富文本格式） */
+/** 向输入框光标处插入纯文本（粘贴/中键共用）。
+ *  多行文本不能走 execCommand('insertText')：Chromium 对含换行的 insertText 逐行拆分插入，
+ *  每行各自触发 DOM 变更/事件分发/布局计算（嵌套 flex + 滚动区布局很贵），几十行即卡顿数秒。
+ *  改为一次性 insertHTML（转义 + \n→<br>，与 Shift+Enter 的 <br> 换行 DOM 模型一致，
+ *  readInputSegments 原生支持）：单次编辑操作、单轮布局，且保留原生撤销。
+ *  单行仍走 insertText（零行为变化）。 */
+function insertPlainText(text: string): void {
+  if (!text) return;
+  if (!text.includes('\n')) {
+    document.execCommand('insertText', false, text);
+    return;
+  }
+  const normalized = escapeHtml(text.replace(/\r\n?/g, '\n')).replace(/\n/g, '<br>');
+  document.execCommand('insertHTML', false, normalized);
+}
+
 function onInputPaste(e: ClipboardEvent): void {
   const files = extractImageFiles(e.clipboardData);
   if (files.length) {
@@ -3871,7 +3887,7 @@ function onInputPaste(e: ClipboardEvent): void {
   const text = e.clipboardData?.getData('text/plain');
   if (typeof text === 'string' && text) {
     e.preventDefault();
-    document.execCommand('insertText', false, text);
+    insertPlainText(text);
   }
 }
 
@@ -3910,7 +3926,7 @@ function onMiddleMouseDown(e: MouseEvent): void {
     const current = window.getSelection();
     current?.removeAllRanges();
     current?.addRange(next);
-    document.execCommand('insertText', false, text);
+    insertPlainText(text);
     if (current?.rangeCount) savedRange = current.getRangeAt(0).cloneRange();
     onInputInput();
   }).catch(() => toast('读取剪贴板失败', 'error'));
