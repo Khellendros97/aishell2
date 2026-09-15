@@ -49,12 +49,20 @@
 }
 #tab-bar::-webkit-scrollbar { height: 4px; }
 .wb-tab {
+  position: relative;
   display: flex; align-items: center; gap: 6px; padding: 0 8px 0 12px; max-width: 200px; min-width: 110px;
   border-right: 1px solid var(--border); color: var(--text-1); cursor: pointer; user-select: none; flex: none;
   border-top: 2px solid transparent; font-size: 12.5px;
 }
 .wb-tab:hover { background: var(--bg-hover); }
 .wb-tab.active { background: var(--bg-0); color: var(--text-0); border-top-color: var(--accent); }
+/* 拖拽排序插入位置指示：悬停标签左/右半区时高亮对应边缘竖线（Workbench.tsx drop-before/after） */
+.wb-tab.drop-before::before, .wb-tab.drop-after::after {
+  content: ''; position: absolute; top: 2px; bottom: 2px; width: 2px;
+  background: var(--accent); border-radius: 1px; pointer-events: none;
+}
+.wb-tab.drop-before::before { left: 0; }
+.wb-tab.drop-after::after { right: 0; }
 .wb-tab .tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .wb-tab .tab-close { border: none; background: none; color: var(--text-2); cursor: pointer; border-radius: 3px; width: 18px; height: 18px; font-size: 12px; line-height: 1; }
 .wb-tab .tab-close:hover { background: var(--bg-active); color: var(--text-0); }

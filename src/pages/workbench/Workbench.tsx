@@ -7,7 +7,9 @@
  * - commands 准入在 store.setPanel(活跃标签须为终端);活跃标签变为非终端时自动切回 explorer;
  * - 侧栏/ AI 面板可拖宽(语义同旧版 bindPanelResize:指针拖拽 + 键盘方向键 + 出屏钳制,
  *   交互逻辑在 shared/panelResize.ts 共享钩子,本组件只负责钳制与落地);
- * - 标签栏:同 id 去重激活、终端同名自动编号、终端右键菜单(添加到对话/重命名/复制 SSH 渠道/关闭);
+ * - 标签栏:同 id 去重激活、终端同名自动编号、拖拽排序(HTML5 DnD,悬停半区显示插入位置
+ *   指示线,拖到空白区移到末尾;store.moveTab 仅调序保留 Tab 引用)、终端右键菜单
+ *   (添加到对话/重命名/复制 SSH 渠道/关闭);
  * - panes 常驻挂载(keep-alive),active 仅切显隐 —— 终端/SSH/AI 会话不随标签切换销毁。
  * 项目装载失败自行导航回欢迎页并 onFail();实例销毁(换项目)时关闭全部标签并复位 store。
  */
@@ -33,6 +35,34 @@ import './workbench.css';
 
 /** 工作台 AI 面板的分离模式常量（模块级，避免每次渲染生成新对象触发 AiPanel 重挂） */
 const HOST_DETACH = { role: 'host', host: 'workbench' } as const;
+
+/* ---------- 标签拖拽排序（HTML5 DnD，类浏览器标签页） ----------
+   dataTransfer 仅作 effectAllowed/dropEffect 载体（dragover 期间 getData 被安全策略禁读），
+   拖拽中的标签 id 记在模块级 tabDragId；插入位置指示线用 DOM class 直改——拖拽 dragover
+   是高频事件，不走 React 状态避免整栏重渲。落点计算见 dropIndexFor。 */
+const DND_TAB_MIME = 'application/x-aishell-tab';
+let tabDragId: string | null = null;
+let dropIndicator: { el: HTMLElement; side: 'before' | 'after' } | null = null;
+
+function clearDropIndicator(): void {
+  if (!dropIndicator) return;
+  dropIndicator.el.classList.remove('drop-before', 'drop-after');
+  dropIndicator = null;
+}
+
+function setDropIndicator(el: HTMLElement, side: 'before' | 'after'): void {
+  if (dropIndicator && dropIndicator.el === el && dropIndicator.side === side) return;
+  clearDropIndicator();
+  el.classList.add(side === 'before' ? 'drop-before' : 'drop-after');
+  dropIndicator = { el, side };
+}
+
+/** 悬停半区 → 最终数组下标：左半 = 插到悬停标签之前，右半 = 之后；
+ *  from 与 hover 同一标签时两侧都折算回原位（no-op）。 */
+function dropIndexFor(from: number, hoverIndex: number, before: boolean): number {
+  if (from < hoverIndex) return before ? hoverIndex - 1 : hoverIndex;
+  return before ? hoverIndex : hoverIndex + 1;
+}
 
 /* ---------- 面板宽度钳制与应用(语义同旧版 bindPanelResize;交互在共享钩子) ---------- */
 function applyPanelWidth(
@@ -286,11 +316,52 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
         </div>
         <div id="sidebar-resizer" ref={sidebarResizerRef} className="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整左侧边栏宽度" tabIndex={0}></div>
         <div id="center">
-          <div id="tab-bar">
+          <div
+            id="tab-bar"
+            onDragOver={(e) => { if (tabDragId) e.preventDefault(); }}
+            onDrop={(e) => {
+              /* 空白区落点 = 移到末尾;子标签的 drop 已 stopPropagation 不会走到这里 */
+              if (!tabDragId) return;
+              e.preventDefault();
+              const dragId = tabDragId;
+              clearDropIndicator();
+              useWorkbench.getState().moveTab(dragId, useWorkbench.getState().tabs.length - 1);
+            }}
+          >
             {tabs.map((t) => (
               <div
                 key={t.id}
                 className={`wb-tab${t.id === activeId ? ' active' : ''}`}
+                draggable
+                onDragStart={(e) => {
+                  tabDragId = t.id;
+                  e.dataTransfer.effectAllowed = 'move';
+                  e.dataTransfer.setData(DND_TAB_MIME, t.id);
+                }}
+                onDragOver={(e) => {
+                  if (!tabDragId || tabDragId === t.id) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setDropIndicator(e.currentTarget, e.clientX < rect.left + rect.width / 2 ? 'before' : 'after');
+                }}
+                onDrop={(e) => {
+                  if (!tabDragId) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const dragId = tabDragId;
+                  clearDropIndicator();
+                  const list = useWorkbench.getState().tabs;
+                  const from = list.findIndex((x) => x.id === dragId);
+                  const hover = list.findIndex((x) => x.id === t.id);
+                  if (from < 0 || hover < 0) return;
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  useWorkbench.getState().moveTab(dragId, dropIndexFor(from, hover, e.clientX < rect.left + rect.width / 2));
+                }}
+                onDragEnd={() => {
+                  tabDragId = null;
+                  clearDropIndicator();
+                }}
                 onClick={(e) => { if (!(e.target as HTMLElement).closest('.tab-close')) useWorkbench.getState().activateTab(t.id); }}
                 onContextMenu={(e) => onTabContextMenu(e, t)}
               >

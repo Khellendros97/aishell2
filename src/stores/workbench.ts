@@ -103,6 +103,9 @@ interface WorkbenchState {
   closeTab(id: string): void;
   activateTab(id: string): void;
   setTabTitle(id: string, title: string): void;
+  /** 拖拽排序:把 id 标签移到 toIndex(最终数组下标,自动钳制);仅调整顺序,
+   *  Tab 对象引用原样保留(keep-alive 不变量:行闭包引用不可被无差别替换) */
+  moveTab(id: string, toIndex: number): void;
   /** 切换侧栏面板;commands 有准入(活跃标签须为终端),不满足时 toast 并拒绝 */
   setPanel(panel: PanelKey): void;
   setAiVisible(visible: boolean): void;
@@ -205,6 +208,18 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
 
   setTabTitle(id, title) {
     set({ tabs: get().tabs.map((t) => (t.id === id ? { ...t, title } : t)) });
+  },
+
+  moveTab(id, toIndex) {
+    const tabs = get().tabs;
+    const from = tabs.findIndex((t) => t.id === id);
+    if (from < 0) return;
+    const target = Math.max(0, Math.min(tabs.length - 1, toIndex));
+    if (target === from) return;
+    const next = tabs.slice();
+    const [tab] = next.splice(from, 1);
+    next.splice(target, 0, tab);
+    set({ tabs: next });
   },
 
   setPanel(panel) {
