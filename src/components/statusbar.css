@@ -24,6 +24,9 @@
 }
 .statusbar-ai-toggle:hover { background: var(--bg-hover); color: var(--text-0); }
 .statusbar-ai-toggle.active { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-dim); }
+/* AI 分离到独立窗口时的禁用态（显隐开关无意义，置灰） */
+.statusbar-ai-toggle.disabled { opacity: 0.45; cursor: not-allowed; }
+.statusbar-ai-toggle.disabled:hover { background: transparent; color: var(--text-1); }
 
 /* 底边栏进度区（SFTP 传输 / 暂存清理；statusbar-progress.ts 驱动，多容器逐一渲染） */
 .statusbar-progress {

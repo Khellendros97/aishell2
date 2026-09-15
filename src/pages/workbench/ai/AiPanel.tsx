@@ -11,26 +11,30 @@
  */
 import { useEffect, useRef } from 'react';
 import type { Project } from '../../../types';
-import { mountAiPanel, type AiPanelController } from './ai-engine';
+import { mountAiPanel, type AiDetachMode, type AiPanelController } from './ai-engine';
 
 export interface AiPanelProps {
   project?: Project;
   workbenchIntegration?: boolean;
   fixedWorkareaPath?: string;
   lockedMode?: 'suggest' | 'agent' | 'yolo';
+  /** 窗口分离模式：host = 宿主面板（显示分离按钮）；detached = 独立窗口本体（显示聚合按钮） */
+  detach?: AiDetachMode;
+  /** 分离窗口打开时定位的会话（缺省回落引擎记录的分离前会话） */
+  initialSessionId?: string;
   onReady?(controller: AiPanelController): void;
 }
 
-export function AiPanel({ project, workbenchIntegration, fixedWorkareaPath, lockedMode, onReady }: AiPanelProps): JSX.Element {
+export function AiPanel({ project, workbenchIntegration, fixedWorkareaPath, lockedMode, detach, initialSessionId, onReady }: AiPanelProps): JSX.Element {
   const ref = useRef<HTMLDivElement>(null);
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const controller = mountAiPanel(el, { project, workbenchIntegration, fixedWorkareaPath, lockedMode });
+    const controller = mountAiPanel(el, { project, workbenchIntegration, fixedWorkareaPath, lockedMode, detach, initialSessionId });
     onReadyRef.current?.(controller);
     return controller.cleanup;
-  }, [fixedWorkareaPath, lockedMode, project, workbenchIntegration]);
+  }, [fixedWorkareaPath, lockedMode, project, workbenchIntegration, detach, initialSessionId]);
   return <div ref={ref} style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }} />;
 }

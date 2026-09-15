@@ -24,9 +24,13 @@ export interface StatusbarProps {
   onToggleAi?: () => void;
   /** AI 开关 aria-controls 指向的面板元素 id */
   aiControls?: string;
+  /** AI 开关禁用态（AI 已分离到独立窗口时显隐开关无意义，置灰提示） */
+  aiDisabled?: boolean;
+  /** 禁用态的提示文案（title） */
+  aiDisabledHint?: string;
 }
 
-export function Statusbar({ left, aiVisible, onToggleAi, aiControls }: StatusbarProps): JSX.Element {
+export function Statusbar({ left, aiVisible, onToggleAi, aiControls, aiDisabled, aiDisabledHint }: StatusbarProps): JSX.Element {
   /* 运行中隧道角标：挂载拉一次 + tunnels:changed 驱动刷新（全服务器，不过滤） */
   const [runningTunnels, setRunningTunnels] = useState<TunnelState[]>([]);
   useEffect(() => {
@@ -61,11 +65,12 @@ export function Statusbar({ left, aiVisible, onToggleAi, aiControls }: Statusbar
         {onToggleAi && (
           <button
             type="button"
-            className={`statusbar-ai-toggle${aiVisible ? ' active' : ''}`}
-            title={aiVisible ? '隐藏 AI 助手' : '显示 AI 助手'}
+            className={`statusbar-ai-toggle${aiVisible ? ' active' : ''}${aiDisabled ? ' disabled' : ''}`}
+            title={aiDisabled ? (aiDisabledHint ?? 'AI 助手已分离到独立窗口') : (aiVisible ? '隐藏 AI 助手' : '显示 AI 助手')}
             aria-controls={aiControls}
             aria-expanded={aiVisible}
-            onClick={onToggleAi}
+            aria-disabled={aiDisabled || undefined}
+            onClick={() => { if (!aiDisabled) onToggleAi(); }}
           >
             <Icon name="bot" />
             <span>AI 助手</span>

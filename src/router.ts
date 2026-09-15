@@ -1,4 +1,6 @@
-/** 极简 hash 路由：'#/welcome' | '#/settings' | '#/workbench?project=<id>' */
+/** 极简 hash 路由：'#/welcome' | '#/settings' | '#/workbench?project=<id>'
+ *  | '#/ai-window?project=<id>&session=<sid>&host=<workbench|welcome>'（AI 分离窗口，
+ *  仅 label = ai-detach 的独立窗口使用，hash 由后端 ai_window.rs initialization_script 注入） */
 export interface ParsedRoute {
   name: string;
   params: URLSearchParams;

@@ -56,6 +56,11 @@
  *   ai_attach_images（图片附件物化）/ ai_read_image（缩略图/预览回读），事件 on_ai_event（ai:event:<key>）。
  *  AI 事件订阅按 projectId:sessionId 常驻在模块级项目上下文中：切换会话/项目只切换视图，
  *  不退订、不 abort；卸载仅回收当前面板 DOM 监听，不杀项目 pi 进程。
+ *  窗口分离（ai_window.rs）采用双端订阅：分离后宿主与独立窗口的项目上下文都在线接收
+ *  同一事件流（各自独立 ctx，无交接空窗，流式中的对话跨窗口无缝），宿主侧仅抑制系统
+ *  通知（notifyOwnerOnly）；分离状态按项目 id 记录在模块级 detachedProjects
+ *  （ai:window-changed 驱动），isAiDetached/subscribeAiDetach 供宿主 React 外部订阅
+ *  显隐 AI 面板；宿主「添加到对话」经转发桩（ai_forward_ref 命令）送达独立窗口。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -63,12 +68,12 @@ import MarkdownIt from 'markdown-it';
 import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, NoteRef, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon, type IconName } from '../../../icons';
 import {
-  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, getState, kbSearch, onAiEvent, onAiSessionTitle, saveDbConnection, saveSettings,
+  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiForwardRef, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, aiWindowClose, aiWindowOpen, getState, kbSearch, onAiEvent, onAiForwardRef, onAiSessionTitle, onAiWindowChanged, saveDbConnection, saveSettings,
   sessionArchive, sessionNote, sessionUpsert, sessionsGet, setAiMode, stagingAccept, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
 } from '../../../api';
-import { DND_MIME, getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type Tab, type TerminalApi, type TimelineAnalysisScopeItem } from '../../../stores/workbench';
+import { DND_MIME, getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type AiHandle, type Tab, type TerminalApi, type TimelineAnalysisScopeItem } from '../../../stores/workbench';
 import { getBrowserPagesForMention, openInActivePage } from '../tabs/browser-engine';
 import { addQuickCommandModal } from '../tabs/useTerminal';
 import { hideProgress } from '../statusbar-progress';
@@ -592,6 +597,13 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
       return `主动暂存 ${String(args.remotePath ?? '')}（服务器 ${String(args.serverId ?? '')}）`;
     case 'staging_clear':
       return '清理暂存区无变更条目';
+    case 'py': {
+      const p = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '';
+      if (p) return `执行 Python 脚本 ${p}`;
+      const code = typeof args.code === 'string' ? args.code.trim() : '';
+      const lines = code ? code.split('\n').length : 0;
+      return `执行内联 Python 脚本（${lines} 行）`;
+    }
     default:
       return '';
   }
@@ -632,6 +644,32 @@ function cloneChatSession(s: ChatSession): ChatSession {
   };
 }
 
+export interface AiPanelOptions {
+  /** 显式 AI 上下文；工作台不传时沿用 zustand 当前项目。 */
+  project?: Project;
+  /** 是否接入工作台标签、暂存区和 wbHandles；欢迎页任务上下文关闭。 */
+  workbenchIntegration?: boolean;
+  /** 固定本地工作区域说明；设置后不跟随工作台标签切换。 */
+  fixedWorkareaPath?: string;
+  /** 锁定模式选择；系统任务上下文固定为工作模式。 */
+  lockedMode?: AiMode;
+  /** 窗口分离模式（不传 = 不渲染分离按钮，如隐藏系统任务上下文）：
+   *  - host：宿主窗口面板（工作台/欢迎页），会话条显示「分离到独立窗口」按钮；
+   *  - detached：分离出来的独立窗口本体，会话条显示「聚合回主窗口」按钮。 */
+  detach?: AiDetachMode;
+  /** 分离窗口打开时定位的会话（缺省回落到分离瞬间记录的 lastSessionByProject） */
+  initialSessionId?: string;
+}
+
+/** 窗口分离模式（见 AiPanelOptions.detach） */
+export type AiDetachMode = { role: 'host'; host: 'workbench' | 'welcome' } | { role: 'detached' };
+
+export interface AiPanelController {
+  cleanup(): void;
+  /** 新建独立会话并发送首条纯文本消息。 */
+  startConversation(prompt: string): Promise<void>;
+}
+
 interface ProjectContext {
   project: Project;
   sessions: Map<string, ChatSession>;
@@ -659,6 +697,52 @@ let project: Project | null = null;
 let panelOptions: Required<Pick<AiPanelOptions, 'workbenchIntegration'>> & Omit<AiPanelOptions, 'workbenchIntegration' | 'project'> = {
   workbenchIntegration: true,
 };
+
+/* ---------- AI 窗口分离状态（模块级，本窗口的 JS 堆内） ----------
+   分离状态按项目 id 记录，由后端 ai:window-changed 广播驱动（建窗/窗口销毁都会发），
+   发起分离的窗口在命令成功后乐观置位（避免等事件期间面板闪烁）。宿主 React 通过
+   isAiDetached + subscribeAiDetach（useSyncExternalStore）显隐 AI 面板。
+   分离是双端订阅（见「窗口分离」段落），上下文不释放，宿主重挂即无缝还原。 */
+const detachedProjects = new Set<string>();
+const detachListeners = new Set<() => void>();
+let detachListenerStarted = false;
+
+/** 后端分离状态广播（全局单例订阅，同 session-title listener 模式） */
+function ensureDetachListener(): void {
+  if (detachListenerStarted) return;
+  detachListenerStarted = true;
+  onAiWindowChanged((ev) => markDetached(ev.projectId, ev.detached)).catch(() => {
+    detachListenerStarted = false;
+  });
+}
+
+function markDetached(projectId: string, detached: boolean): void {
+  const changed = detached ? !detachedProjects.has(projectId) : detachedProjects.has(projectId);
+  if (detached) detachedProjects.add(projectId);
+  else detachedProjects.delete(projectId);
+  if (!changed) return;
+  /* 聚合时后台刷新宿主常驻 ctx 的会话列表：分离期间独立窗口可能新建了会话
+     （双端订阅下消息/流式状态本就收敛，只有会话条目需要补拉）。 */
+  if (!detached) {
+    const ctx = projectContexts.get(projectId);
+    if (ctx?.loaded) {
+      ctx.loaded = false;
+      void loadSessions(ctx);
+    }
+  }
+  for (const fn of [...detachListeners]) fn();
+}
+
+/** 该项目的 AI 助手是否已分离到独立窗口（null/undefined 安全） */
+export function isAiDetached(projectId: string | null | undefined): boolean {
+  return !!projectId && detachedProjects.has(projectId);
+}
+
+/** 分离状态变化订阅（返回反注册函数）；React useSyncExternalStore 用 */
+export function subscribeAiDetach(fn: () => void): () => void {
+  detachListeners.add(fn);
+  return () => { detachListeners.delete(fn); };
+}
 /** 以下是当前视图上下文的别名，保留命令式引擎原有函数结构。 */
 let sessions = new Map<string, ChatSession>();
 let pendingBy = new Map<string, Pending | null>();
@@ -737,6 +821,11 @@ const pendingSessionTitleEvents = new Map<string, AiSessionTitleEvent[]>();
 /** store activeId 变化订阅（原 bus 'tab-activated'，清理时退订） */
 let offTabActivated: (() => void) | null = null;
 let stagingRefreshVersion = 0;
+/** 分离窗口路由定位：mountAiPanel 记下目标会话，loadSessions 完成后消费（见其尾部） */
+let pendingInitialSessionId: string | null = null;
+/** 分离窗口的「添加到对话」转发订阅与当前句柄（cleanup 时回收） */
+let offForwardRef: (() => void) | null = null;
+let mountedForwardHandle: AiHandle | null = null;
 
 /* ---------- 流式渲染增量缓存（见文件头「流式渲染性能」说明） ---------- */
 /** 已渲染历史消息节点（按消息下标缓存复用；消息只追加不插入，下标即稳定 key） */
@@ -888,24 +977,6 @@ function saveViewContext(): void {
   if (viewContext) viewContext.activeSessionId = activeSessionId;
 }
 
-/** 面板挂载选项（main 侧引入） */
-export interface AiPanelOptions {
-  /** 显式 AI 上下文；工作台不传时沿用 zustand 当前项目。 */
-  project?: Project;
-  /** 是否接入工作台标签、暂存区和 wbHandles；欢迎页任务上下文关闭。 */
-  workbenchIntegration?: boolean;
-  /** 固定本地工作区域说明；设置后不跟随工作台标签切换。 */
-  fixedWorkareaPath?: string;
-  /** 锁定模式选择；系统任务上下文固定为工作模式。 */
-  lockedMode?: AiMode;
-}
-
-export interface AiPanelController {
-  cleanup(): void;
-  /** 新建独立会话并发送首条纯文本消息。 */
-  startConversation(prompt: string): Promise<void>;
-}
-
 export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {}): AiPanelController {
   const nextProject = options.project ?? useWorkbench.getState().project;
   if (!nextProject) {
@@ -921,8 +992,10 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
     workbenchIntegration: options.workbenchIntegration !== false,
     fixedWorkareaPath: options.fixedWorkareaPath,
     lockedMode: options.lockedMode,
+    detach: options.detach,
   };
   unmounted = false;
+  ensureDetachListener();
 
   /* 输入引用属于当前面板，跨项目不串入下一个输入框；会话/流式状态属于项目上下文，
      面板重挂或切项目时保留并继续接收事件。 */
@@ -942,10 +1015,33 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   browserWorkarea = false;
   workareaChipEl = null;
   activeSessionId = ctx.activeSessionId;
+  /* 分离窗口路由定位：显式 initialSessionId（hash 注入）优先；上下文已有活跃会话
+     （普通重挂/聚合还原）不覆盖；未加载完时记入 pendingInitialSessionId，
+     待 loadSessions 完成后消费（见其尾部） */
+  {
+    const wanted = options.initialSessionId ?? null;
+    pendingInitialSessionId = null;
+    if (wanted && wanted !== ctx.activeSessionId) {
+      if (ctx.loaded && ctx.sessions.has(wanted)) {
+        ctx.activeSessionId = wanted;
+        activeSessionId = wanted;
+      } else if (!ctx.loaded) {
+        pendingInitialSessionId = wanted;
+      }
+    }
+  }
 
-  const style = document.createElement('style');
-  style.textContent = STYLE;
-  document.head.appendChild(style);
+  if (!document.getElementById('aishell-ai-panel-style')) {
+    const style = document.createElement('style');
+    style.id = 'aishell-ai-panel-style';
+    style.textContent = STYLE;
+    document.head.appendChild(style);
+  }
+
+  const detachRole = panelOptions.detach?.role;
+  const detachBtnHtml = panelOptions.detach
+    ? `<button id="ai-detach" class="icon-btn" type="button" title="${detachRole === 'detached' ? '聚合回主窗口' : '分离到独立窗口'}" aria-label="${detachRole === 'detached' ? '聚合回主窗口' : '分离到独立窗口'}">${icon(detachRole === 'detached' ? 'combine' : 'popout')}</button>`
+    : '';
 
   container.innerHTML = `
     <div id="ai-session-bar">
@@ -955,7 +1051,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
         </button>
         <div id="ai-session-menu" role="listbox" aria-label="AI 会话列表" hidden></div>
       </div>
-      <button id="ai-new-session" class="icon-btn" type="button" title="新建会话">${icon('plus')}</button>
+      <button id="ai-new-session" class="icon-btn" type="button" title="新建会话">${icon('plus')}</button>${detachBtnHtml}
     </div>
     <div id="ai-chat"></div>
     <button id="ai-staging-notice" type="button">
@@ -1008,7 +1104,11 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
     modeSelect.title = '系统任务上下文固定为工作模式';
   }
 
-  if (panelOptions.workbenchIntegration) wbHandles.ai = aiHandle;
+  const mountedHandle = createAiHandle();
+  if (panelOptions.workbenchIntegration) wbHandles.ai = mountedHandle;
+  /* 分离窗口的「添加到对话」转发接收（host 不订阅；cleanup 退订） */
+  mountedForwardHandle = mountedHandle;
+  if (panelOptions.detach?.role === 'detached') void ensureForwardRefListener();
 
   /* 自动切换 AI 工作区域：激活终端标签（含新开终端）时跟随切换。
      legacy 由 bus 'tab-activated' 广播（activeId 变化时发激活 Tab），
@@ -1032,6 +1132,10 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   void aiDebugInfo().then((info) => console.log('[AI] pi 运行时诊断:\n' + info));
 
   bindEvents();
+  /* 分离/聚合按钮（panelOptions.detach 为空 = 不渲染，见会话条模板） */
+  container.querySelector<HTMLButtonElement>('#ai-detach')?.addEventListener('click', () => {
+    void (panelOptions.detach?.role === 'detached' ? attachAiWindow() : detachAiWindow());
+  });
   panelRoot = container;
   container.addEventListener('keydown', onPanelKeydown, true);
   container.addEventListener('mousedown', onMiddleMouseDown);
@@ -1040,7 +1144,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   if (panelOptions.workbenchIntegration) void refreshStagingNotice();
   else stagingNotice.hidden = true;
   return {
-    cleanup,
+    cleanup: () => cleanup(mountedHandle),
     startConversation: (prompt: string) => startConversation(ctx, prompt),
   };
 }
@@ -1089,7 +1193,7 @@ function replayPendingSessionTitleEvents(ctx: ProjectContext): void {
   }
 }
 
-function cleanup(): void {
+function cleanup(handle: ReturnType<typeof createAiHandle>): void {
   if (unmounted) return;
   unmounted = true;
   cancelPendingRender();
@@ -1110,14 +1214,116 @@ function cleanup(): void {
   if (offSessionOutside) { offSessionOutside(); offSessionOutside = null; }
   if (offStagingChanged) { offStagingChanged(); offStagingChanged = null; }
   if (offTabActivated) { offTabActivated(); offTabActivated = null; }
-  if (wbHandles.ai === aiHandle) wbHandles.ai = null;
+  if (offForwardRef) { offForwardRef(); offForwardRef = null; }
+  mountedForwardHandle = null;
+  if (wbHandles.ai === handle) wbHandles.ai = null;
   /* 不退订项目/会话事件，也不 aiAbort/aiKillProject；上下文继续接收并保存后台流。 */
   viewContext = null;
   project = null;
 }
 
+/* ---------- 窗口分离（后端 ai_window.rs；见文件头「窗口分离」说明） ----------
+   分离采用「双端保持订阅」而非交接释放：分离后宿主与独立窗口的项目上下文都在线接收
+   同一事件流（各自独立 ctx，事件各自恰好收到一次，互不缺流），独立窗口是用户可见的
+   拥有者；宿主侧照常后台定稿落盘（与切走项目的 keep-alive 语义一致，天然无交接空窗），
+   仅系统通知在宿主侧抑制（notifyOwnerOnly）避免每个事件弹两条。聚合 = 关闭独立窗口，
+   后端广播让宿主面板重挂——宿主 ctx 一直在线，流式中的对话连渲染状态都无缝续上。
+   宿主「添加到对话」经转发桩（createForwardingHandle）跨窗口送达独立窗口插 chip。 */
+
+/** 系统通知出口（分离期间宿主侧抑制）：AI 已分离且本窗口不是独立窗口本体时不弹，
+ *  否则宿主与独立窗口会对同一完成/审批事件各弹一条系统通知。 */
+function notifyOwnerOnly(title: string, body: string): void {
+  const pid = eventContext?.project.id ?? project?.id ?? null;
+  if (pid && isAiDetached(pid) && panelOptions.detach?.role !== 'detached') return;
+  notifyAi(title, body);
+}
+
+/** 宿主「分离」：后端建窗成功 → 置位触发面板卸载 → 句柄换转发桩。
+ *  项目上下文保持在线（后台收流落盘），独立窗口自行挂载订阅同一事件流。
+ *  失败（如已有其他项目的分离窗口）只 toast，宿主面板保持原状。 */
+async function detachAiWindow(): Promise<void> {
+  const detach = panelOptions.detach;
+  if (!detach || detach.role !== 'host' || !project) return;
+  const pid = project.id;
+  try {
+    await aiWindowOpen(pid, activeSessionId || null, detach.host);
+  } catch (err) {
+    toast(`打开 AI 分离窗口失败: ${String(err)}`, 'error');
+    return;
+  }
+  markDetached(pid, true);
+  /* 面板卸载（React gating）会把 wbHandles.ai 置空——换转发桩保持「添加到对话」可用：
+     cleanup 的 `wbHandles.ai === handle` 守卫不会覆盖桩 */
+  if (panelOptions.workbenchIntegration) wbHandles.ai = createForwardingHandle(pid);
+}
+
+/** 独立窗口「聚合」：优雅关窗，后端 Destroyed 广播 ai:window-changed {detached:false}，
+ *  宿主据此重挂面板（宿主 ctx 全程在线，正在生成的回复无缝继续显示）。 */
+async function attachAiWindow(): Promise<void> {
+  const detach = panelOptions.detach;
+  if (!detach || detach.role !== 'detached' || !project) return;
+  try {
+    await aiWindowClose();
+  } catch (err) {
+    toast(`聚合 AI 助手失败: ${String(err)}`, 'error');
+  }
+}
+
+/** 分离期间宿主窗口的 wbHandles.ai 转发桩：explorer/终端/服务器/笔记等「添加到对话」
+ *  入口照常调用句柄，桩把引用载荷经 ai_forward_ref 命令转发给分离窗口插入 chip。
+ *  currentSessionId 读宿主常驻 ctx（timeline 等入口拼 key 用）。 */
+function createForwardingHandle(projectId: string): AiHandle {
+  const forward = (kind: string, payload: Record<string, unknown>): void => {
+    void aiForwardRef(projectId, { kind, ...payload }).catch(() => { /* 分离窗口可能正在关闭 */ });
+  };
+  return {
+    addSnapshot: (snap) => { if (snap) forward('snapshot', { snapshot: snap }); },
+    addFileRef: (ref) => { if (ref) forward('file', { ref }); },
+    addServerRef: (ref) => { if (ref) forward('server', { ref }); },
+    addPathRef: (ref) => { if (ref) forward('path', { ref }); },
+    addBrowserRef: (ref) => { if (ref) forward('browser', { ref }); },
+    addSkillRef: (ref) => { if (ref) forward('skill', { ref }); },
+    addNoteRef: (ref) => { if (ref) forward('note', { ref }); },
+    addImageRef: (ref) => { if (ref) forward('image', { ref }); },
+    convertNoteToSkill: (ref) => { if (ref) forward('convertNote', { ref }); },
+    analyzeTimeline: (scope) => forward('analyzeTimeline', { scope: scope ?? null }),
+    currentSessionId: () => projectContexts.get(projectId)?.activeSessionId ?? null,
+  };
+}
+
+/** 分离窗口接收转发（挂载期间订阅 ai:forward-ref:<projectId>，cleanup 退订） */
+async function ensureForwardRefListener(): Promise<void> {
+  if (offForwardRef || !project) return;
+  const pid = project.id;
+  try {
+    offForwardRef = await onAiForwardRef(pid, (payload) => dispatchForwardRef(payload));
+  } catch { /* 无 Tauri 环境静默 */ }
+}
+
+function dispatchForwardRef(payload: Record<string, unknown>): void {
+  const h = mountedForwardHandle;
+  if (unmounted || !h) return;
+  const ref = payload.ref as never;
+  switch (payload.kind) {
+    case 'snapshot':
+      if (payload.snapshot) h.addSnapshot(payload.snapshot as TermSnapshot);
+      break;
+    case 'file': h.addFileRef?.(ref); break;
+    case 'server': h.addServerRef?.(ref); break;
+    case 'path': h.addPathRef?.(ref); break;
+    case 'browser': h.addBrowserRef?.(ref); break;
+    case 'skill': h.addSkillRef?.(ref); break;
+    case 'note': h.addNoteRef?.(ref); break;
+    case 'image': h.addImageRef?.(ref); break;
+    case 'convertNote': h.convertNoteToSkill?.(ref); break;
+    case 'analyzeTimeline': h.analyzeTimeline?.((payload.scope as TimelineAnalysisScopeItem[] | null) ?? undefined); break;
+    default: break;
+  }
+}
+
 /* ---------- wbHandles.ai 句柄（终端模块添加快照 / 服务器引用 / 路径引用） ---------- */
-const aiHandle = {
+function createAiHandle() {
+  return {
   addSnapshot(snap: TermSnapshot): void {
     if (!snap || !snap.id) return;
     snapshots.set(snap.id, snap);
@@ -1209,7 +1415,8 @@ const aiHandle = {
   currentSessionId(): string | null {
     return activeSessionId || null;
   },
-};
+  };
+}
 
 /* ---------- 会话管理 ---------- */
 /** 新建独立会话并发送首条纯文本消息（main 侧引入：startConversation 程序化入口）。 */
@@ -1369,9 +1576,11 @@ async function refreshStagingNotice(): Promise<void> {
   }
 }
 
-async function loadSessions(): Promise<void> {
-  const ctx = viewContext;
-  if (!ctx || !project) {
+/** 拉取会话列表：缺省刷新当前视图上下文；传 ctx 时刷新指定项目（聚合后补拉新会话用，
+ *  非可见上下文只合并不触碰 DOM——见尾部 viewContext 守卫）。 */
+async function loadSessions(target?: ProjectContext): Promise<void> {
+  const ctx = target ?? viewContext;
+  if (!ctx) {
     toast('项目未加载', 'error');
     return;
   }
@@ -1426,6 +1635,13 @@ async function loadSessions(): Promise<void> {
   ctx.loadPromise = promise;
   await promise;
   if (viewContext !== ctx || unmounted) return;
+  /* 分离窗口路由定位：恢复 hash 指定的会话，找不到回退服务端最新（见 mountAiPanel） */
+  const wanted = pendingInitialSessionId;
+  pendingInitialSessionId = null;
+  if (wanted && ctx.sessions.has(wanted)) {
+    ctx.activeSessionId = wanted;
+    activeSessionId = wanted;
+  }
   ensureActiveSession(ctx);
   renderSessionBar();
   renderHistory();
@@ -1525,20 +1741,25 @@ function handleEvent(ctx: ProjectContext, sid: string, ev: AiEvent): void {
 }
 
 function handleEventBody(sid: string, ev: AiEvent): void {
+  /* 回合已结束/被用户中断（pending 为 null）时，迟到的回合事件一律丢弃，不复活新
+     pending：复活会把 isGenerating 置回 true——发送键退化成停止键（「中断后再次
+     发消息发不出去」的来源之一），且复活气泡与本地已定稿的正文重复。正常回合的
+     首个事件（actionStart/delta）必然先于 send() 建立的 pending 到达，不存在
+     合法的「null + 事件」流。done/settled 例外：finalize 自带 null 安全（仅落盘）。 */
   if (ev.type === 'delta') {
     /* 瞬时错误（限流/过载）后 pi 自动重试成功、增量恢复：复用当前 pending（可能是
        错误相）转回流式，错误气泡被内容取代；后端 delta 恢复时已重置终态抑制，
        回合结束仍会收到 done（见 ai.rs 读取线程 text_delta 分支） */
-    const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    const p = pendingBy.get(sid) ?? null;
+    if (!p) return;
     p.phase = 'stream';
     p.text += ev.text;
     pendingBy.set(sid, p);
   } else if (ev.type === 'tool') {
     /* 工具活动行：瞬时展示，不进历史；锚定到发生时已生成文本位置（时序穿插），
        相邻重复行折叠为 ×N（锚点保留首次发生位置） */
-    const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    const p = pendingBy.get(sid) ?? null;
+    if (!p) return;
     const label = ev.label ? `${ev.tool} ${ev.label}` : ev.tool;
     const last = p.tools[p.tools.length - 1];
     if (last && last.label === label) {
@@ -1551,7 +1772,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* 受控工具开始：Agent 模式进入等待批准（审批事件随后到达）；YOLO 直接执行中，
        极高风险转人工时由后续 approval 事件翻转为 approving */
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     const timeoutArg = ev.args.timeoutSeconds;
     p.actions.set(ev.toolCallId, {
@@ -1575,14 +1797,15 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* AI 申请切换到工作模式（suggest 模式的 request_agent_mode 工具）：弹确认框，
        不进动作卡；其余仍为 Agent 逐调用审批卡 */
     if (ev.action === 'request_agent_mode') {
-      notifyAi('AI 请求切换到工作模式', clipBody(ev.intent || ev.summary));
+      notifyOwnerOnly('AI 请求切换到工作模式', clipBody(ev.intent || ev.summary));
       void handleModeRequest(eventContext!, sid, ev);
     } else if (ev.action === 'request_db_connection') {
       /* AI 申请数据库连接：插入审批卡片（带 AI 填写的连接信息，只读展示），
          点【审批】打开审批对话框（见 openDbApproval）；关闭对话框不回执、可重开 */
-      notifyAi('AI 申请数据库连接', clipBody(ev.summary || ev.intent));
+      notifyOwnerOnly('AI 申请数据库连接', clipBody(ev.summary || ev.intent));
       const cur = pendingBy.get(sid) ?? null;
-      const p = cur ?? emptyPending();
+      if (!cur) return;
+      const p = cur;
       const existing = p.actions.get(ev.toolCallId);
       p.actions.set(ev.toolCallId, {
         toolCallId: ev.toolCallId,
@@ -1599,7 +1822,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     } else if (ev.smart) {
       /* 智能审批自动放行：后端已判定非危险并直接回 confirmed，卡片进入「已智能放行」态 */
       const cur = pendingBy.get(sid) ?? null;
-      const p = cur ?? emptyPending();
+      if (!cur) return;
+      const p = cur;
       const existing = p.actions.get(ev.toolCallId);
       p.actions.set(ev.toolCallId, {
         toolCallId: ev.toolCallId,
@@ -1619,9 +1843,10 @@ function handleEventBody(sid: string, ev: AiEvent): void {
       /* 审批请求（Agent 逐调用 / YOLO 极高风险转人工）：卡片进入审批态（显示意图 + 批准/拒绝按钮）。
          无条件置 approving——actionStart 已先行把卡片置为 running（YOLO）或 approving（Agent），
          审批事件本身即「等待人工决策」，保留 running 态会丢按钮 */
-      notifyAi('AI 操作等待审批', clipBody(ev.summary || ev.intent));
+      notifyOwnerOnly('AI 操作等待审批', clipBody(ev.summary || ev.intent));
       const cur = pendingBy.get(sid) ?? null;
-      const p = cur ?? emptyPending();
+      if (!cur) return;
+      const p = cur;
       const existing = p.actions.get(ev.toolCallId);
       p.actions.set(ev.toolCallId, {
         toolCallId: ev.toolCallId,
@@ -1642,9 +1867,10 @@ function handleEventBody(sid: string, ev: AiEvent): void {
   } else if (ev.type === 'ask') {
     /* ask 工具（通用问答）：插入问答卡片（每问候选选项 + 自由输入框），
        提交/取消经 aiRespondAsk 回执（submitAsk/cancelAsk）；卡片终态由前端本地标记 */
-    notifyAi('AI 助手有问题等待回答', clipBody(ev.questions[0]?.question ?? ''));
+    notifyOwnerOnly('AI 助手有问题等待回答', clipBody(ev.questions[0]?.question ?? ''));
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     p.actions.set(ev.toolCallId, {
       toolCallId: ev.toolCallId,
@@ -1660,9 +1886,10 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     pendingBy.set(sid, p);
   } else if (ev.type === 'confirm') {
     /* confirm 工具（通用是非确认）：插入确认卡片（确认/取消），经 aiRespondConfirm 回执 */
-    notifyAi('AI 助手请求确认', clipBody(ev.question));
+    notifyOwnerOnly('AI 助手请求确认', clipBody(ev.question));
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     p.actions.set(ev.toolCallId, {
       toolCallId: ev.toolCallId,
@@ -1679,7 +1906,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
   } else if (ev.type === 'actionEnd') {
     /* 受控工具结束：更新终态（拒绝场景由前端本地标记，不走此事件） */
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     if (existing) {
       existing.status = ev.isError ? 'failed' : 'succeeded';
@@ -1716,14 +1944,16 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* 保留本回合已积累的文本/工具行/动作卡：瞬时错误后 pi 自动重试成功时，后续 delta
        会把错误气泡复活为流式（见 delta 分支），回合现场与动作卡审计（collectActions）
        不应随错误气泡清空。文本一律沿用 cur.text（不再要求 phase==='stream'）——
-       同一回合连发多个错误事件时，后来的那个不能把先前已流出的正文重置成空串。 */
+       同一回合连发多个错误事件时，后来的那个不能把先前已流出的正文重置成空串。
+       pending 为 null（回合已结束/中断）时丢弃：不复活错误气泡。 */
     const cur = pendingBy.get(sid) ?? null;
+    if (!cur) return;
     pendingBy.set(sid, {
       phase: 'error',
-      text: cur?.text ?? '',
+      text: cur.text,
       error: ev.message,
-      tools: cur?.tools ?? [],
-      actions: cur?.actions ?? new Map(),
+      tools: cur.tools,
+      actions: cur.actions,
     });
   }
   if (eventContext === viewContext && sid === activeSessionId && !unmounted) {
@@ -1785,7 +2015,7 @@ function finalize(sid: string): void {
   pushAssistantMessage(s, text, collectActions(p));
   persistSession(s);
   /* 任务完成系统通知（开关与窗口焦点过滤在 shared/notify.ts）；错误/中止与空回复占位不发 */
-  if (hasText) notifyAi('AI 任务完成', clipBody(`${s.title}：${text}`));
+  if (hasText) notifyOwnerOnly('AI 任务完成', clipBody(`${s.title}：${text}`));
   if (sid === activeSessionId) renderSessionBar();
 }
 
@@ -3655,6 +3885,23 @@ function extractImageFiles(dt: DataTransfer | null): File[] {
 
 /** 输入框粘贴：含图片文件时拦截默认行为并转为附件（一次可多张）；
  *  文本粘贴统一以纯文本插入（contenteditable 默认会带富文本格式） */
+/** 向输入框光标处插入纯文本（粘贴/中键共用）。
+ *  多行文本不能走 execCommand('insertText')：Chromium 对含换行的 insertText 逐行拆分插入，
+ *  每行各自触发 DOM 变更/事件分发/布局计算（嵌套 flex + 滚动区布局很贵），几十行即卡顿数秒。
+ *  也不能逐行转 <br> 插入：几十个 text+<br> 兄弟节点的全选删除会触发 Chromium 删除命令的
+ *  逐段段落归并（每步强制布局），Ctrl+A 删除同样卡顿。
+ *  因此多行一次性 insertHTML 成「单个含字面 \n 的文本节点」——输入框是 white-space:pre-wrap，
+ *  渲染效果与 <br> 完全相同，删除只动一个节点；readInputSegments 对文本节点原样读取，
+ *  发送/落盘内容不变，insertHTML 仍保留原生撤销。单行仍走 insertText（零行为变化）。 */
+function insertPlainText(text: string): void {
+  if (!text) return;
+  if (!text.includes('\n')) {
+    document.execCommand('insertText', false, text);
+    return;
+  }
+  document.execCommand('insertHTML', false, escapeHtml(text.replace(/\r\n?/g, '\n')));
+}
+
 function onInputPaste(e: ClipboardEvent): void {
   const files = extractImageFiles(e.clipboardData);
   if (files.length) {
@@ -3667,7 +3914,7 @@ function onInputPaste(e: ClipboardEvent): void {
   const text = e.clipboardData?.getData('text/plain');
   if (typeof text === 'string' && text) {
     e.preventDefault();
-    document.execCommand('insertText', false, text);
+    insertPlainText(text);
   }
 }
 
@@ -3706,7 +3953,7 @@ function onMiddleMouseDown(e: MouseEvent): void {
     const current = window.getSelection();
     current?.removeAllRanges();
     current?.addRange(next);
-    document.execCommand('insertText', false, text);
+    insertPlainText(text);
     if (current?.rangeCount) savedRange = current.getRangeAt(0).cloneRange();
     onInputInput();
   }).catch(() => toast('读取剪贴板失败', 'error'));

@@ -131,6 +131,12 @@ export const PATHS = {  folder:
     '<rect x="5" y="2" width="14" height="20" rx="2"/><path d="M9 5h6"/><path d="M11 18h2"/>',
   sync:
     '<path d="M20 7h-5V2"/><path d="M4 17h5v5"/><path d="M5.5 9A7 7 0 0 1 20 7"/><path d="M18.5 15A7 7 0 0 1 4 17"/>',
+  /** AI 助手窗口分离（lucide square-arrow-out-up-right：方框 + 右上外指箭头） */
+  popout:
+    '<path d="M21 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h6"/><path d="m21 3-9 9"/><path d="M15 3h6v6"/>',
+  /** AI 助手窗口聚合（lucide square-arrow-down-left：方框 + 内指箭头，分离的逆操作） */
+  combine:
+    '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="m16 8-8 8"/><path d="M16 16H8V8"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

@@ -7,11 +7,13 @@
  * - commands 准入在 store.setPanel(活跃标签须为终端);活跃标签变为非终端时自动切回 explorer;
  * - 侧栏/ AI 面板可拖宽(语义同旧版 bindPanelResize:指针拖拽 + 键盘方向键 + 出屏钳制,
  *   交互逻辑在 shared/panelResize.ts 共享钩子,本组件只负责钳制与落地);
- * - 标签栏:同 id 去重激活、终端同名自动编号、终端右键菜单(添加到对话/重命名/复制 SSH 渠道/关闭);
+ * - 标签栏:同 id 去重激活、终端同名自动编号、拖拽排序(HTML5 DnD,悬停半区显示插入位置
+ *   指示线,拖到空白区移到末尾;store.moveTab 仅调序保留 Tab 引用)、终端右键菜单
+ *   (添加到对话/重命名/复制 SSH 渠道/关闭);
  * - panes 常驻挂载(keep-alive),active 仅切显隐 —— 终端/SSH/AI 会话不随标签切换销毁。
  * 项目装载失败自行导航回欢迎页并 onFail();实例销毁(换项目)时关闭全部标签并复位 store。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import { cloudStatus, getState, onCloudChanged } from '../../api';
 import { navigate } from '../../router';
@@ -24,11 +26,43 @@ import { usePanelResize } from '../../shared/panelResize';
 import {
   useWorkbench, wbEvents, wbHandles, type PanelKey, type Tab,
 } from '../../stores/workbench';
+import { isAiDetached, subscribeAiDetach } from './ai/ai-engine';
 import { PANELS } from './sidebar/panels';
 import { TAB_TYPES } from './tabs/registry';
 import { setWorkbenchActive } from './tabs/browser-engine';
 import { AiPanel } from './ai/AiPanel';
 import './workbench.css';
+
+/** 工作台 AI 面板的分离模式常量（模块级，避免每次渲染生成新对象触发 AiPanel 重挂） */
+const HOST_DETACH = { role: 'host', host: 'workbench' } as const;
+
+/* ---------- 标签拖拽排序（HTML5 DnD，类浏览器标签页） ----------
+   dataTransfer 仅作 effectAllowed/dropEffect 载体（dragover 期间 getData 被安全策略禁读），
+   拖拽中的标签 id 记在模块级 tabDragId；插入位置指示线用 DOM class 直改——拖拽 dragover
+   是高频事件，不走 React 状态避免整栏重渲。落点计算见 dropIndexFor。 */
+const DND_TAB_MIME = 'application/x-aishell-tab';
+let tabDragId: string | null = null;
+let dropIndicator: { el: HTMLElement; side: 'before' | 'after' } | null = null;
+
+function clearDropIndicator(): void {
+  if (!dropIndicator) return;
+  dropIndicator.el.classList.remove('drop-before', 'drop-after');
+  dropIndicator = null;
+}
+
+function setDropIndicator(el: HTMLElement, side: 'before' | 'after'): void {
+  if (dropIndicator && dropIndicator.el === el && dropIndicator.side === side) return;
+  clearDropIndicator();
+  el.classList.add(side === 'before' ? 'drop-before' : 'drop-after');
+  dropIndicator = { el, side };
+}
+
+/** 悬停半区 → 最终数组下标：左半 = 插到悬停标签之前，右半 = 之后；
+ *  from 与 hover 同一标签时两侧都折算回原位（no-op）。 */
+function dropIndexFor(from: number, hoverIndex: number, before: boolean): number {
+  if (from < hoverIndex) return before ? hoverIndex - 1 : hoverIndex;
+  return before ? hoverIndex : hoverIndex + 1;
+}
 
 /* ---------- 面板宽度钳制与应用(语义同旧版 bindPanelResize;交互在共享钩子) ---------- */
 function applyPanelWidth(
@@ -78,6 +112,8 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
   const tabs = useWorkbench((s) => s.tabs);
   const activeId = useWorkbench((s) => s.activeId);
   const project = useWorkbench((s) => s.project);
+  /* 当前项目 AI 是否已分离到独立窗口（引擎模块级状态 + ai:window-changed 广播驱动） */
+  const aiDetached = useSyncExternalStore(subscribeAiDetach, () => isAiDetached(project?.id));
   const activeTab = tabs.find((t) => t.id === activeId) ?? null;
 
   const workbenchRef = useRef<HTMLDivElement>(null);
@@ -211,7 +247,12 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
     const p = iconEl.getAttribute('data-panel');
     const s = useWorkbench.getState();
     if (p === 'sidebar-toggle') { s.setSidebarCollapsed(!s.sidebarCollapsed); return; }
-    if (p === 'ai') { s.setAiVisible(!s.aiVisible); return; }
+    if (p === 'ai') {
+      // AI 已分离到独立窗口：面板不随 aiVisible 显隐，提示后聚焦路径由状态栏提示代替
+      if (isAiDetached(s.project?.id)) { toast('AI 助手已分离到独立窗口'); return; }
+      s.setAiVisible(!s.aiVisible);
+      return;
+    }
     if (p === 'browser') {
       // 浏览器是中央标签页(非侧栏面板):固定 id 单实例,openTab 同 id 去重激活
       s.openTab({ id: 'browser', type: 'browser', title: '浏览器' });
@@ -304,11 +345,52 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
         </div>
         <div id="sidebar-resizer" ref={sidebarResizerRef} className="wb-resize-handle" role="separator" aria-orientation="vertical" aria-label="调整左侧边栏宽度" tabIndex={0}></div>
         <div id="center">
-          <div id="tab-bar">
+          <div
+            id="tab-bar"
+            onDragOver={(e) => { if (tabDragId) e.preventDefault(); }}
+            onDrop={(e) => {
+              /* 空白区落点 = 移到末尾;子标签的 drop 已 stopPropagation 不会走到这里 */
+              if (!tabDragId) return;
+              e.preventDefault();
+              const dragId = tabDragId;
+              clearDropIndicator();
+              useWorkbench.getState().moveTab(dragId, useWorkbench.getState().tabs.length - 1);
+            }}
+          >
             {tabs.map((t) => (
               <div
                 key={t.id}
                 className={`wb-tab${t.id === activeId ? ' active' : ''}`}
+                draggable
+                onDragStart={(e) => {
+                  tabDragId = t.id;
+                  e.dataTransfer.effectAllowed = 'move';
+                  e.dataTransfer.setData(DND_TAB_MIME, t.id);
+                }}
+                onDragOver={(e) => {
+                  if (!tabDragId || tabDragId === t.id) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setDropIndicator(e.currentTarget, e.clientX < rect.left + rect.width / 2 ? 'before' : 'after');
+                }}
+                onDrop={(e) => {
+                  if (!tabDragId) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const dragId = tabDragId;
+                  clearDropIndicator();
+                  const list = useWorkbench.getState().tabs;
+                  const from = list.findIndex((x) => x.id === dragId);
+                  const hover = list.findIndex((x) => x.id === t.id);
+                  if (from < 0 || hover < 0) return;
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  useWorkbench.getState().moveTab(dragId, dropIndexFor(from, hover, e.clientX < rect.left + rect.width / 2));
+                }}
+                onDragEnd={() => {
+                  tabDragId = null;
+                  clearDropIndicator();
+                }}
                 onClick={(e) => { if (!(e.target as HTMLElement).closest('.tab-close')) useWorkbench.getState().activateTab(t.id); }}
                 onContextMenu={(e) => onTabContextMenu(e, t)}
               >
@@ -334,20 +416,24 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
         <div
           id="ai-resizer"
           ref={aiResizerRef}
-          className={`wb-resize-handle${aiVisible ? '' : ' hidden'}`}
+          className={`wb-resize-handle${aiVisible && !aiDetached ? '' : ' hidden'}`}
           role="separator" aria-orientation="vertical" aria-label="调整 AI 面板宽度" tabIndex={0}
         ></div>
         {/* AI 面板须在项目装载完成后才挂载(对照旧版 workbench.ts:装载段完成后才 setAiVisible(true)→mountAiPanel):
             ai-engine 在挂载时一次性快照 useWorkbench.getState().project,渲染即挂载会早于异步装载读到 null,
-            导致发送消息恒报「项目未加载」。project 门控恢复旧版时序;换项目时整树经 key 重建,AiPanel 随之重挂。 */}
-        <div id="ai-panel" ref={aiPanelRef} className={aiVisible ? '' : 'hidden'}>{project && active ? <AiPanel
-          onReady={(controller) => {
-            // ai-engine 已在本工作台上下文写 wbHandles.ai(含 addSnapshot 等);这里仅补充 startConversation,
-            // 供外部入口(如发布日志引导安装 dws)触发 AI 任务。
-            const handle = wbHandles.ai;
-            if (handle) handle.startConversation = (prompt: string) => controller.startConversation(prompt);
-          }}
-        /> : null}</div>
+            导致发送消息恒报「项目未加载」。project 门控恢复旧版时序;换项目时整树经 key 重建,AiPanel 随之重挂。
+            AI 分离到独立窗口期间(aiDetached)整块隐藏,聚合后经 ai:window-changed 事件重挂还原。 */}
+        <div id="ai-panel" ref={aiPanelRef} className={aiVisible && !aiDetached ? '' : 'hidden'}>
+          {project && active && !aiDetached ? <AiPanel
+            detach={HOST_DETACH}
+            onReady={(controller) => {
+              // ai-engine 已在本工作台上下文写 wbHandles.ai(含 addSnapshot 等);这里仅补充 startConversation,
+              // 供外部入口(如发布日志引导安装 dws)触发 AI 任务。
+              const handle = wbHandles.ai;
+              if (handle) handle.startConversation = (prompt: string) => controller.startConversation(prompt);
+            }}
+          /> : null}
+        </div>
         </div>
         {/* 底栏为三页共用组件(components/Statusbar):进度区/隧道角标在组件内自持,
             这里只传工作台特有的左信息区与 AI 面板开关 */}
@@ -362,6 +448,8 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
           }
           aiVisible={aiVisible}
           aiControls="ai-panel"
+          aiDisabled={aiDetached}
+          aiDisabledHint="AI 助手已分离到独立窗口"
           onToggleAi={() => useWorkbench.getState().setAiVisible(!aiVisible)}
         />
       </div>

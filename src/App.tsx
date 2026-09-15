@@ -16,6 +16,7 @@ import { Topbar } from './components/Topbar';
 import { Welcome } from './pages/welcome/Welcome';
 import { Settings } from './pages/settings/Settings';
 import { Account } from './pages/account/Account';
+import { AiWindowPage } from './pages/aiwindow/AiWindowPage';
 import Workbench from './pages/workbench/Workbench';
 
 interface WbInstance {
@@ -88,24 +89,30 @@ export default function App(): JSX.Element {
         </div>
       ) : null}
       {!isWb ? (
-        <div className="page-root">
-          {route.name === '/settings' ? (
-            <>
-              <Topbar activePage="settings" workbenchProjectId={wb?.projectId ?? null} />
-              <Settings params={route.params} />
-            </>
-          ) : route.name === '/account' ? (
-            <>
-              <Topbar activePage="account" workbenchProjectId={wb?.projectId ?? null} />
-              <Account params={route.params} />
-            </>
-          ) : (
-            <>
-              <Topbar activePage="welcome" workbenchProjectId={wb?.projectId ?? null} />
-              <Welcome params={route.params} />
-            </>
-          )}
-        </div>
+        route.name === '/ai-window' ? (
+          /* AI 分离窗口（label = ai-detach，独立 OS 窗口）：只渲染迷你标题栏 + AI 面板，
+             不渲染主 Topbar/页面导航；参数由 ai_window.rs 的 initialization_script 注入 */
+          <AiWindowPage params={route.params} />
+        ) : (
+          <div className="page-root">
+            {route.name === '/settings' ? (
+              <>
+                <Topbar activePage="settings" workbenchProjectId={wb?.projectId ?? null} />
+                <Settings params={route.params} />
+              </>
+            ) : route.name === '/account' ? (
+              <>
+                <Topbar activePage="account" workbenchProjectId={wb?.projectId ?? null} />
+                <Account params={route.params} />
+              </>
+            ) : (
+              <>
+                <Topbar activePage="welcome" workbenchProjectId={wb?.projectId ?? null} />
+                <Welcome params={route.params} />
+              </>
+            )}
+          </div>
+        )
       ) : null}
     </>
   );
