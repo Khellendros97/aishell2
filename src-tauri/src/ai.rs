@@ -2485,11 +2485,28 @@ pub async fn ai_chat(
 #[tauri::command]
 pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(), String> {
     let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
-    if let Some(proc) = procs.get_mut(&key) {
+    let Some(proc) = procs.get_mut(&key) else {
+        return Ok(());
+    };
+    if !proc.busy.load(Ordering::SeqCst) {
+        // 空闲：轻量 abort——pi 正常收尾，被中断回合的转录（含尾部）仍写入 session 文件
         cancel_approvals(proc);
         let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
         w.write_all(b"{\"type\":\"abort\"}\n")
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
+        return Ok(());
+    }
+    // busy（工具执行中/审批等待）：pi 在工具调用返回前无法消费 stdin 里的 abort——
+    // 远程命令挂住时（连接不通等）abort 与后续新 prompt 全部排队失效，表现为
+    // 「中断后再发消息长时间无响应」。直接 kill + 摘除（同 ai_chat needs_restart
+    // 流程）：killed 标记让读取线程不再补发 error/settled（前端中断时已本地定稿，
+    // 不会收到迟到事件复活生成态）；下一条 ai_chat 按同一 session 文件懒重生，
+    // 上下文从转录恢复（被中断回合的残尾不入模型上下文，本就是要丢弃的部分）。
+    if let Some(mut old) = procs.remove(&key) {
+        cancel_approvals(&mut old);
+        old.killed.store(true, Ordering::SeqCst);
+        let _ = old.child.kill();
+        let _ = old.child.wait();
     }
     Ok(())
 }

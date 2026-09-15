@@ -1729,20 +1729,25 @@ function handleEvent(ctx: ProjectContext, sid: string, ev: AiEvent): void {
 }
 
 function handleEventBody(sid: string, ev: AiEvent): void {
+  /* 回合已结束/被用户中断（pending 为 null）时，迟到的回合事件一律丢弃，不复活新
+     pending：复活会把 isGenerating 置回 true——发送键退化成停止键（「中断后再次
+     发消息发不出去」的来源之一），且复活气泡与本地已定稿的正文重复。正常回合的
+     首个事件（actionStart/delta）必然先于 send() 建立的 pending 到达，不存在
+     合法的「null + 事件」流。done/settled 例外：finalize 自带 null 安全（仅落盘）。 */
   if (ev.type === 'delta') {
     /* 瞬时错误（限流/过载）后 pi 自动重试成功、增量恢复：复用当前 pending（可能是
        错误相）转回流式，错误气泡被内容取代；后端 delta 恢复时已重置终态抑制，
        回合结束仍会收到 done（见 ai.rs 读取线程 text_delta 分支） */
-    const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    const p = pendingBy.get(sid) ?? null;
+    if (!p) return;
     p.phase = 'stream';
     p.text += ev.text;
     pendingBy.set(sid, p);
   } else if (ev.type === 'tool') {
     /* 工具活动行：瞬时展示，不进历史；锚定到发生时已生成文本位置（时序穿插），
        相邻重复行折叠为 ×N（锚点保留首次发生位置） */
-    const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    const p = pendingBy.get(sid) ?? null;
+    if (!p) return;
     const label = ev.label ? `${ev.tool} ${ev.label}` : ev.tool;
     const last = p.tools[p.tools.length - 1];
     if (last && last.label === label) {
@@ -1755,7 +1760,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* 受控工具开始：Agent 模式进入等待批准（审批事件随后到达）；YOLO 直接执行中，
        极高风险转人工时由后续 approval 事件翻转为 approving */
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     const timeoutArg = ev.args.timeoutSeconds;
     p.actions.set(ev.toolCallId, {
@@ -1786,7 +1792,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
          点【审批】打开审批对话框（见 openDbApproval）；关闭对话框不回执、可重开 */
       notifyOwnerOnly('AI 申请数据库连接', clipBody(ev.summary || ev.intent));
       const cur = pendingBy.get(sid) ?? null;
-      const p = cur ?? emptyPending();
+      if (!cur) return;
+      const p = cur;
       const existing = p.actions.get(ev.toolCallId);
       p.actions.set(ev.toolCallId, {
         toolCallId: ev.toolCallId,
@@ -1803,7 +1810,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     } else if (ev.smart) {
       /* 智能审批自动放行：后端已判定非危险并直接回 confirmed，卡片进入「已智能放行」态 */
       const cur = pendingBy.get(sid) ?? null;
-      const p = cur ?? emptyPending();
+      if (!cur) return;
+      const p = cur;
       const existing = p.actions.get(ev.toolCallId);
       p.actions.set(ev.toolCallId, {
         toolCallId: ev.toolCallId,
@@ -1825,7 +1833,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
          审批事件本身即「等待人工决策」，保留 running 态会丢按钮 */
       notifyOwnerOnly('AI 操作等待审批', clipBody(ev.summary || ev.intent));
       const cur = pendingBy.get(sid) ?? null;
-      const p = cur ?? emptyPending();
+      if (!cur) return;
+      const p = cur;
       const existing = p.actions.get(ev.toolCallId);
       p.actions.set(ev.toolCallId, {
         toolCallId: ev.toolCallId,
@@ -1848,7 +1857,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
        提交/取消经 aiRespondAsk 回执（submitAsk/cancelAsk）；卡片终态由前端本地标记 */
     notifyOwnerOnly('AI 助手有问题等待回答', clipBody(ev.questions[0]?.question ?? ''));
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     p.actions.set(ev.toolCallId, {
       toolCallId: ev.toolCallId,
@@ -1866,7 +1876,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* confirm 工具（通用是非确认）：插入确认卡片（确认/取消），经 aiRespondConfirm 回执 */
     notifyOwnerOnly('AI 助手请求确认', clipBody(ev.question));
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     p.actions.set(ev.toolCallId, {
       toolCallId: ev.toolCallId,
@@ -1883,7 +1894,8 @@ function handleEventBody(sid: string, ev: AiEvent): void {
   } else if (ev.type === 'actionEnd') {
     /* 受控工具结束：更新终态（拒绝场景由前端本地标记，不走此事件） */
     const cur = pendingBy.get(sid) ?? null;
-    const p = cur ?? emptyPending();
+    if (!cur) return;
+    const p = cur;
     const existing = p.actions.get(ev.toolCallId);
     if (existing) {
       existing.status = ev.isError ? 'failed' : 'succeeded';
@@ -1920,14 +1932,16 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* 保留本回合已积累的文本/工具行/动作卡：瞬时错误后 pi 自动重试成功时，后续 delta
        会把错误气泡复活为流式（见 delta 分支），回合现场与动作卡审计（collectActions）
        不应随错误气泡清空。文本一律沿用 cur.text（不再要求 phase==='stream'）——
-       同一回合连发多个错误事件时，后来的那个不能把先前已流出的正文重置成空串。 */
+       同一回合连发多个错误事件时，后来的那个不能把先前已流出的正文重置成空串。
+       pending 为 null（回合已结束/中断）时丢弃：不复活错误气泡。 */
     const cur = pendingBy.get(sid) ?? null;
+    if (!cur) return;
     pendingBy.set(sid, {
       phase: 'error',
-      text: cur?.text ?? '',
+      text: cur.text,
       error: ev.message,
-      tools: cur?.tools ?? [],
-      actions: cur?.actions ?? new Map(),
+      tools: cur.tools,
+      actions: cur.actions,
     });
   }
   if (eventContext === viewContext && sid === activeSessionId && !unmounted) {

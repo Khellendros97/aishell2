@@ -310,13 +310,23 @@ impl SshManager {
 
     /// 带整体超时的单命令执行：超时后尝试中断远端命令，返回已收集输出并标记
     /// `timed_out=true`（ssh_exec 映射为 code=null；AI run_command 转成明确失败）。
+    /// 超时覆盖**全程**（建连/认证/开通道/执行）：此前只包住读输出，连接阶段
+    /// （TCP+握手+认证，最多可耗 30s+）不计入——用户设 30s 命令超时、连接不通时
+    /// 实际要等「连接超时+30s」才失败，体验为「不受超时约束一直卡住」。
     pub async fn exec_with_timeout(
         self: &Arc<Self>,
         server_id: &str,
         command: &str,
         timeout: Duration,
     ) -> Result<crate::ai_actions::CommandResult, String> {
-        self.exec_impl(server_id, command, Some(timeout)).await
+        match tokio::time::timeout(timeout, self.exec_impl(server_id, command, None)).await {
+            Ok(r) => r,
+            // 全程超时：连接阶段失败按连接错误语义（run_command 会区分连接失败与命令超时）
+            Err(_) => Err(format!(
+                "命令执行超时（{} 秒，含连接建立）：请检查服务器是否可达或增大超时时间",
+                timeout.as_secs()
+            )),
+        }
     }
 
     /// exec 公共实现；timeout=None 时不设限。
