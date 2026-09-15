@@ -3862,17 +3862,18 @@ function extractImageFiles(dt: DataTransfer | null): File[] {
 /** 向输入框光标处插入纯文本（粘贴/中键共用）。
  *  多行文本不能走 execCommand('insertText')：Chromium 对含换行的 insertText 逐行拆分插入，
  *  每行各自触发 DOM 变更/事件分发/布局计算（嵌套 flex + 滚动区布局很贵），几十行即卡顿数秒。
- *  改为一次性 insertHTML（转义 + \n→<br>，与 Shift+Enter 的 <br> 换行 DOM 模型一致，
- *  readInputSegments 原生支持）：单次编辑操作、单轮布局，且保留原生撤销。
- *  单行仍走 insertText（零行为变化）。 */
+ *  也不能逐行转 <br> 插入：几十个 text+<br> 兄弟节点的全选删除会触发 Chromium 删除命令的
+ *  逐段段落归并（每步强制布局），Ctrl+A 删除同样卡顿。
+ *  因此多行一次性 insertHTML 成「单个含字面 \n 的文本节点」——输入框是 white-space:pre-wrap，
+ *  渲染效果与 <br> 完全相同，删除只动一个节点；readInputSegments 对文本节点原样读取，
+ *  发送/落盘内容不变，insertHTML 仍保留原生撤销。单行仍走 insertText（零行为变化）。 */
 function insertPlainText(text: string): void {
   if (!text) return;
   if (!text.includes('\n')) {
     document.execCommand('insertText', false, text);
     return;
   }
-  const normalized = escapeHtml(text.replace(/\r\n?/g, '\n')).replace(/\n/g, '<br>');
-  document.execCommand('insertHTML', false, normalized);
+  document.execCommand('insertHTML', false, escapeHtml(text.replace(/\r\n?/g, '\n')));
 }
 
 function onInputPaste(e: ClipboardEvent): void {
