@@ -17,6 +17,13 @@ use crate::store::{AuthType, CloudCapabilities, Credential, Store};
 
 use super::api::{ApiError, ReqwestTransport, SyncApi};
 use super::core_config::{apply_remote, from_app_state, merge_three_way, CoreConfigPayloadV1};
+use super::dashboard_sync::{
+    dashboard_path_prefix, diff_dashboard_indexes, scan_dashboard_roots, split_dashboard_path,
+    DashboardFilePayloadV1,
+    DashboardIndexRecord, DashboardIndexRecordBaseline, DashboardRootSpec,
+    DASHBOARD_ENTITY_TYPE, DASHBOARD_INDEX_BASELINE_ID, DASHBOARD_INDEX_BASELINE_TYPE,
+    DASHBOARD_PAYLOAD_SCHEMA_VERSION,
+};
 use super::crypto::{
     create_key_envelope, decrypt_sync_item, encode_base64, encrypt_sync_item, generate_vault_key,
     open_key_envelope, sha256_hex, EncryptedSyncItem, KdfParams,
@@ -130,6 +137,8 @@ pub struct ClientSyncStatus {
     pub config_counts: Option<ClientConfigCounts>,
     /// 本轮扫描到的技能个数（全局 + 各项目技能根）；尚未扫描过为 None。
     pub skill_count: Option<usize>,
+    /// 本轮扫描到的仪表盘个数（有仪表盘目录的项目数）；尚未扫描过为 None。
+    pub dashboard_count: Option<usize>,
 }
 
 impl Default for ClientSyncStatus {
@@ -149,6 +158,7 @@ impl Default for ClientSyncStatus {
             device: None,
             config_counts: None,
             skill_count: None,
+            dashboard_count: None,
         }
     }
 }
@@ -275,6 +285,13 @@ impl CloudSyncManager {
         }
     }
 
+    /// 记录本轮扫描到的仪表盘个数（有仪表盘目录的项目数），供前端展示同步规模。
+    fn record_dashboard_count(&self, count: usize) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.status.dashboard_count = Some(count);
+        }
+    }
+
     /// 技能根清单：全局根 + 每个项目的技能根（根推导复用 skills.rs 的权威规则；
     /// workspace 未配置时根推导失败，技能同步整体跳过——sync_now 已先行门禁）。
     fn skill_scan_specs(&self, projects: &[crate::store::Project]) -> Vec<SkillRootSpec> {
@@ -309,6 +326,15 @@ impl CloudSyncManager {
                 )?)),
                 None => Ok(None),
             },
+        }
+    }
+
+    /// 仪表盘同步根：项目存在即返回解析路径（目录本体可能尚未创建——apply 时按需
+    /// 创建，扫描时缺失=未使用，不算错误）。
+    fn dashboard_root_for_scope(&self, project_id: &str) -> Result<Option<PathBuf>, String> {
+        match self.store.project(project_id) {
+            Some(_) => Ok(Some(crate::dashboard::dashboard_dir_path(&self.store, project_id)?)),
+            None => Ok(None),
         }
     }
 
@@ -662,6 +688,19 @@ impl CloudSyncManager {
                     None => return Ok(false),
                 }
             }
+            DASHBOARD_ENTITY_TYPE => {
+                let payload: DashboardFilePayloadV1 = serde_json::from_slice(plaintext).map_err(|error| format!("云端仪表盘文件格式损坏: {error}"))?;
+                let (project_id, file_name) = split_dashboard_path(&payload.path)?;
+                match self.dashboard_root_for_scope(&project_id)? {
+                    Some(root) => {
+                        super::dashboard_sync::apply_remote_file(&root, &file_name, &payload)?;
+                        // 面板监听 dashboard:changed 即时重渲；fs:changed 让打开中的编辑器感知外部变更。
+                        let _ = self.app.emit("dashboard:changed", json!({ "projectId": project_id }));
+                        let _ = self.app.emit("fs:changed", json!({"path": root.join(&file_name).to_string_lossy()}));
+                    }
+                    None => return Ok(false),
+                }
+            }
             _ => return Err(format!("当前客户端不支持同步实体类型 {}，请升级 AIShell", item.entity_type)),
         }
         Ok(true)
@@ -688,6 +727,17 @@ impl CloudSyncManager {
                     let (scope, within_root) = split_skill_path(&record.path)?;
                     if let Some(root) = self.skill_root_for_scope(&scope)? {
                         super::skills_sync::apply_remote_tombstone(&root, &within_root, record.entry_type)?;
+                    }
+                }
+                Ok(())
+            }
+            DASHBOARD_ENTITY_TYPE => {
+                let baseline: Option<DashboardIndexRecordBaseline> = self.local.load_baseline(user_id, DASHBOARD_ENTITY_TYPE, &item.entity_id).map_err(|error| error.to_string())?;
+                if let Some(record) = baseline {
+                    if let Ok((project_id, file_name)) = split_dashboard_path(&record.path) {
+                        if let Some(root) = self.dashboard_root_for_scope(&project_id)? {
+                            super::dashboard_sync::apply_remote_tombstone(&root, &file_name)?;
+                        }
                     }
                 }
                 Ok(())
@@ -842,6 +892,48 @@ impl CloudSyncManager {
             }
             self.local.save_baseline(user_id, SKILL_INDEX_BASELINE_TYPE, SKILL_INDEX_BASELINE_ID, &scan.index).map_err(|error| error.to_string())?;
             self.record_skill_count(scan.skill_count);
+        }
+
+        // ---- 仪表盘文件同步（各项目 <root>/.aishell/dashboard 固定三文件） ----
+        // tombstone 保留策略与技能一致：只对「本轮确认过状态」的前缀生效；目录从未存在
+        // （面板从未打开）的根不进 scanned_prefixes，绝不据此误删云端。
+        let dashboard_specs: Vec<DashboardRootSpec> = snapshot
+            .projects
+            .iter()
+            .filter_map(|project| {
+                crate::dashboard::dashboard_dir_path(&self.store, &project.id)
+                    .ok()
+                    .map(|root| DashboardRootSpec { prefix: format!("project/{}", project.id), root })
+            })
+            .collect();
+        if !dashboard_specs.is_empty() {
+            let scan = scan_dashboard_roots(&dashboard_specs, vault);
+            self.record_dashboard_count(scan.scanned_prefixes.len());
+            let old_index: Vec<DashboardIndexRecord> = self.local.load_baseline(user_id, DASHBOARD_INDEX_BASELINE_TYPE, DASHBOARD_INDEX_BASELINE_ID).map_err(|error| error.to_string())?.unwrap_or_default();
+            let mut dashboard_plan = diff_dashboard_indexes(&old_index, &scan.index);
+            let mut considered = scan.scanned_prefixes.clone();
+            let active_project_ids: HashSet<&str> = snapshot.projects.iter().map(|project| project.id.as_str()).collect();
+            // 已从配置删除的项目级联清理（保留前缀使 tombstone 生效）。
+            for record in &old_index {
+                if let Some(pid) = record.path.strip_prefix("project/").and_then(|rest| rest.split('/').next()) {
+                    if !active_project_ids.contains(pid) { considered.insert(format!("project/{pid}")); }
+                }
+            }
+            dashboard_plan.tombstones.retain(|tombstone| dashboard_path_prefix(&tombstone.path).is_some_and(|prefix| considered.contains(prefix)));
+            let mut dashboard_pending = Vec::new();
+            for upsert in &dashboard_plan.upserts {
+                let bytes = serde_json::to_vec(scan.file_payload(&upsert.path).ok_or_else(|| "仪表盘同步计划缺少文件 payload".to_string())?).map_err(|error| format!("序列化仪表盘失败: {error}"))?;
+                dashboard_pending.push(self.prepare_upsert(api, user_id, vault, state, DASHBOARD_ENTITY_TYPE, &upsert.entity_id, DASHBOARD_PAYLOAD_SCHEMA_VERSION as i64, &bytes, remote_status.limits.inline_payload_bytes).await?);
+                self.local.save_baseline(user_id, DASHBOARD_ENTITY_TYPE, &upsert.entity_id, &DashboardIndexRecordBaseline { path: upsert.path.clone() }).map_err(|error| error.to_string())?;
+            }
+            for tombstone in &dashboard_plan.tombstones {
+                let version = state.entities.get(&entity_key(DASHBOARD_ENTITY_TYPE, &tombstone.entity_id)).map(|entity| entity.version).unwrap_or(0);
+                dashboard_pending.push(prepared_delete(DASHBOARD_ENTITY_TYPE, &tombstone.entity_id, version));
+            }
+            if !dashboard_pending.is_empty() {
+                self.submit_pending(api, user_id, state, &dashboard_pending, remote_status.limits.max_batch_items.max(1) as usize).await?;
+            }
+            self.local.save_baseline(user_id, DASHBOARD_INDEX_BASELINE_TYPE, DASHBOARD_INDEX_BASELINE_ID, &scan.index).map_err(|error| error.to_string())?;
         }
 
         self.local.save_baseline(user_id, CORE_ENTITY_TYPE, CORE_ENTITY_ID, &core).map_err(|error| error.to_string())?;

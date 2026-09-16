@@ -105,6 +105,14 @@ fn render_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// 项目仪表盘目录：`<项目根>/.aishell/dashboard`（项目根解析规则照 skills::project_skills_root；
 /// 不存在则创建）。
 pub(crate) fn dashboard_dir(store: &Store, project_id: &str) -> Result<PathBuf, String> {
+    let dir = dashboard_dir_path(store, project_id)?;
+    fs::create_dir_all(&dir).map_err(|e| format!("创建仪表盘目录失败：{e}"))?;
+    Ok(dir)
+}
+
+/// 只解析仪表盘目录路径，不创建（云同步扫描用：不能对未打开过仪表盘的项目
+/// 凭空造出 `.aishell/dashboard` 目录，否则会把「从未使用」变成「待同步空态」）。
+pub(crate) fn dashboard_dir_path(store: &Store, project_id: &str) -> Result<PathBuf, String> {
     let project = store
         .project(project_id)
         .ok_or_else(|| format!("项目不存在：{project_id}"))?;
@@ -119,9 +127,7 @@ pub(crate) fn dashboard_dir(store: &Store, project_id: &str) -> Result<PathBuf, 
             PathBuf::from(ws).join(&project.name)
         }
     };
-    let dir = root.join(".aishell").join("dashboard");
-    fs::create_dir_all(&dir).map_err(|e| format!("创建仪表盘目录失败：{e}"))?;
-    Ok(dir)
+    Ok(root.join(".aishell").join("dashboard"))
 }
 
 /// 播种默认仪表盘脚本、备忘录与可编辑表格（均只在缺失时写入，用户改过不动）。

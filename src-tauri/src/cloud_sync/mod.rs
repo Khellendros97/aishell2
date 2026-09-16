@@ -7,6 +7,7 @@ pub mod api;
 pub mod backup;
 pub mod core_config;
 pub mod crypto;
+pub mod dashboard_sync;
 pub mod engine;
 pub mod manager;
 pub mod notes_sync;

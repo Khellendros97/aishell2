@@ -429,6 +429,22 @@ pub fn skill_entity_id(
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
+/// 仪表盘同步实体的不透明标识，派生方式与 note_entity_id 相同但用途域隔离：
+/// `base64url(HMAC-SHA256(dashboardIndexKey, "dashboard:" + NFC(path)))`。
+/// 路径形如 `project/<projectId>/<固定文件名>`（dashboard.py / memo.md / table.json）。
+pub fn dashboard_entity_id(
+    vault_key: &[u8; KEY_BYTES],
+    relative_path: &str,
+) -> Result<String, CryptoError> {
+    let path = normalize_note_path(relative_path)?;
+    let index_key = derive_purpose_key(vault_key, "dashboard-index")?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(index_key.as_ref())
+        .map_err(|_| CryptoError::Derivation)?;
+    mac.update(b"dashboard:");
+    mac.update(path.as_bytes());
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
 /// 让测试和调用方安全清理临时秘密缓冲区。
 pub fn clear_secret(buffer: &mut [u8]) {
     buffer.zeroize();
