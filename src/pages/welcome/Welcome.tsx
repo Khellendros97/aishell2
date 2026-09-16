@@ -74,7 +74,7 @@ const EMPTY_STATE: AppState = {
     notifyAi: true,
     notifyLongTasks: true,
     timelineSyncEnabled: true,
-    autoRecordTerminal: false,
+    autoRecordTerminal: false, sidebarDefault: 'explorer',
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},

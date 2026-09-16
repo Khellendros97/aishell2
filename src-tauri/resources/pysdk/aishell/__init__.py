@@ -24,9 +24,9 @@
 """
 
 from aishell import client as _client
-from aishell import config, db, servers, sftp, ssh
+from aishell import config, dashboard, db, servers, sftp, ssh
 
 SdkError = _client.SdkError
 
-__all__ = ["servers", "ssh", "sftp", "db", "config", "SdkError"]
+__all__ = ["servers", "ssh", "sftp", "db", "config", "dashboard", "SdkError"]
 __version__ = "0.1.0"

@@ -6,7 +6,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, AiWindowChangedEvent, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, DashboardSpec, DashboardRender, AiWindowChangedEvent, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -718,3 +719,20 @@ export const onUpdateReady = (cb: (info: UpdateReadyInfo) => void): Promise<Unli
 
 /* ---------------- misc ---------------- */
 export { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
+
+/* ---------------- 仪表盘 ---------------- */
+/** 渲染项目仪表盘（执行 .aishell/dashboard/dashboard.py 并取组件 spec） */
+export const dashboardRender = (projectId: string) =>
+  call<DashboardRender>('dashboard_render', { projectId });
+/** 保存仪表盘备忘录（memo.md，原子写） */
+export const dashboardSaveMemo = (projectId: string, content: string) =>
+  call<void>('dashboard_save_memo', { projectId, content });
+/** 保存备忘录顶部的可编辑表格（table.json 整表覆盖写） */
+export const dashboardSaveTable = (projectId: string, columns: { key: string; title: string }[], rows: Record<string, string>[]) =>
+  call<void>('dashboard_save_table', { projectId, columns, rows });
+/** 渐进渲染帧（脚本每声明一个组件推一帧；面板边采集边渲染，不等脚本跑完） */
+export const onDashboardProgress = (cb: (projectId: string, spec: DashboardSpec) => void): Promise<UnlistenFn> =>
+  listen<{ projectId: string; spec: DashboardSpec }>('dashboard:progress', (e) => cb(e.payload.projectId, e.payload.spec));
+/** 仪表盘变更通知（AI reload / memo 保存后广播，面板据此即时刷新） */
+export const onDashboardChanged = (cb: (projectId: string) => void): Promise<UnlistenFn> =>
+  listen<{ projectId: string }>('dashboard:changed', (e) => cb(e.payload.projectId));

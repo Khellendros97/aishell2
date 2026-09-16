@@ -6,6 +6,7 @@ pub mod ai_window;
 pub mod browser;
 pub mod cloud;
 pub mod cloud_sync;
+pub mod dashboard;
 pub mod dws;
 pub mod fsops;
 pub mod mcp;
@@ -191,6 +192,8 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             // 内置浏览器（主窗口内嵌多子 webview，按页面懒创建）：先注入 AppHandle（事件发射/建视图用），
             // AiActions 的 browser_* 动作桥与前端 browser_* 命令共用同一管理器（多页面共享）
             browser::set_app(app.handle().clone());
+            // 仪表盘：渲染/memo 变更后向面板广播 dashboard:changed（面板监听即时刷新）
+            dashboard::set_app(app.handle().clone());
             let browser = Arc::new(browser::BrowserManager::new());
             let ai = Arc::new(ai::AiManager::new(
                 store.clone(),
@@ -446,6 +449,9 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             ai_window::ai_any_busy,
             ai_window::ai_forward_ref,
             notes::notes_root_cmd,
+            dashboard::dashboard_render,
+            dashboard::dashboard_save_memo,
+            dashboard::dashboard_save_table,
             notes::notes_list_cmd,
             notes::session_archive,
             notes::session_note,

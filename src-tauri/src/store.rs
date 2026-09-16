@@ -87,6 +87,18 @@ pub enum ProjectView {
     List,
 }
 
+/// 工作台菜单栏默认打开项；旧配置无此字段按本地文件（explorer，保持原行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarDefault {
+    /// 收起菜单栏
+    Collapsed,
+    Dashboard,
+    #[default]
+    Explorer,
+    Servers,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchConfig {
@@ -245,6 +257,10 @@ pub struct Settings {
     /// 旧配置无此字段时按关闭处理（默认关闭，不改变既有用户行为）。
     #[serde(default)]
     pub auto_record_terminal: bool,
+    /// 工作台菜单栏默认打开项（收起菜单栏/仪表盘/本地文件/服务器列表）；
+    /// 旧配置无此字段时按本地文件处理（保持原行为）。
+    #[serde(default)]
+    pub sidebar_default: SidebarDefault,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -271,6 +287,7 @@ impl Default for Settings {
             notify_long_tasks: true,
             timeline_sync_enabled: true,
             auto_record_terminal: false,
+            sidebar_default: SidebarDefault::default(),
         }
     }
 }
@@ -1312,7 +1329,7 @@ fn task_project_for_workspace(workspace: &str) -> Project {
 /// 内置技能播种代际：skills.rs 新增内置技能时 +1。记录值为 `<ws>#gen<N>`；
 /// 老记录是裸 `<ws>`（gen1，仅 skill-management 时代），不匹配新一代标记 →
 /// 老工作区会补种一次（seed_one_builtin_skill 文件级幂等，已有技能文件不覆盖）。
-const SEED_GENERATION: u32 = 2;
+const SEED_GENERATION: u32 = 3;
 
 /// 播种记录标记（`<ws>#gen<N>`）， seeded_skill_workspaces 按此精确匹配去重。
 fn seed_marker(ws: &str) -> String {
@@ -3985,6 +4002,7 @@ mod tests {
                 notify_long_tasks: true,
                 timeline_sync_enabled: true,
                 auto_record_terminal: false,
+                sidebar_default: crate::store::SidebarDefault::default(),
             },
             credentials: vec![
                 Credential {
@@ -7096,6 +7114,7 @@ mod tests {
                     notify_long_tasks: true,
                     timeline_sync_enabled: true,
                     auto_record_terminal: false,
+                    sidebar_default: crate::store::SidebarDefault::default(),
                 },
                 Some("sk-test-key"),
                 None,
@@ -7300,6 +7319,7 @@ mod tests {
                     notify_long_tasks: true,
                     timeline_sync_enabled: true,
                     auto_record_terminal: false,
+                    sidebar_default: crate::store::SidebarDefault::default(),
                 },
                 None,
                 Some("bsk-1"),

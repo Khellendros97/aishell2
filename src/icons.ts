@@ -25,6 +25,12 @@ export const PATHS = {  folder:
   hash: '<line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/>',
   pause: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
   play: '<polygon points="6 3 20 12 6 21 6 3"/>',
+  // 指南针（lucide compass 风格；仪表盘面板入口）
+  compass:
+    '<circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>',
+  // 仪表盘（lucide layout-dashboard 风格）
+  dashboard:
+    '<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>',
   eyeOff:
     '<path d="M2 12s3.5-7 10-7c1.8 0 3.4.5 4.8 1.2M22 12s-3.5 7-10 7c-1.8 0-3.4-.5-4.8-1.2"/><path d="M3 3l18 18"/>',

@@ -1,0 +1,224 @@
+/* 仪表盘侧栏面板样式 —— 对照 DashboardPanel.tsx;组件卡片纵向排列,配色走设计变量 */
+
+.dash-panel {
+  padding: 8px;
+  gap: 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+.dash-error {
+  flex: none;
+  padding: 6px 8px;
+  border: 1px solid var(--red, #e5534b);
+  border-radius: 6px;
+  color: var(--red, #e5534b);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.dash-busy {
+  flex: none;
+  padding: 3px 8px;
+  font-size: 11.5px;
+  color: var(--text-2, #8b949e);
+}
+
+.dash-card {
+  flex: none;
+  border: 1px solid var(--border, #30363d);
+  border-radius: 8px;
+  background: var(--bg-2, #161b22);
+  overflow: hidden;
+}
+
+.dash-card-title {
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2, #8b949e);
+  border-bottom: 1px solid var(--border, #30363d);
+}
+
+.dash-memo {
+  display: block;
+  width: 100%;
+  min-height: 88px;
+  padding: 8px 10px;
+  border: none;
+  outline: none;
+  resize: vertical;
+  background: transparent;
+  color: var(--text-1, #e6edf3);
+  font-size: 12.5px;
+  line-height: 1.6;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.dash-md {
+  padding: 8px 10px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-1, #e6edf3);
+  word-break: break-word;
+}
+
+.dash-md p { margin: 0 0 6px; }
+.dash-md p:last-child { margin-bottom: 0; }
+.dash-md code {
+  background: var(--bg-3, #21262d);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 11.5px;
+}
+
+.dash-table-wrap {
+  overflow-x: auto;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.dash-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.dash-table th,
+.dash-table td {
+  padding: 4px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border, #30363d);
+  color: var(--text-1, #e6edf3);
+  white-space: nowrap;
+}
+
+/* 列与列之间的竖向分割线 */
+.dash-table th + th,
+.dash-table td + td {
+  border-left: 1px solid var(--border, #30363d);
+}
+
+.dash-table th {
+  color: var(--text-2, #8b949e);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  background: var(--bg-2, #161b22);
+}
+
+.dash-table-empty {
+  color: var(--text-2, #8b949e);
+  text-align: center;
+}
+
+.dash-image {
+  display: block;
+  max-width: 100%;
+  padding: 8px 10px;
+  box-sizing: border-box;
+}
+
+.dash-svg :is(svg) {
+  max-width: 100%;
+  height: auto;
+}
+
+.dash-chart {
+  width: 100%;
+  height: 190px;
+}
+
+.dash-unknown {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-2, #8b949e);
+}
+
+/* 备忘录顶部可编辑表格 */
+.dash-edit-table-wrap {
+  border-bottom: 1px solid var(--border, #30363d);
+}
+
+/* 两列(项目|内容)时 4:6 定宽;操作列固定 30px,内容列吃剩余 */
+.dash-edit-table {
+  table-layout: fixed;
+}
+
+.dash-col-first {
+  width: 40%;
+}
+
+.dash-col-ops {
+  width: 30px;
+}
+
+.dash-cell {
+  position: relative;
+}
+
+.dash-cell-input {
+  width: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dash-cell.has-copy .dash-cell-input {
+  padding-right: 22px;
+}
+
+/* 可编辑区域 hover/聚焦显示虚线框,表示可编辑;
+   负偏移画在元素内侧——外侧会被 .dash-card 的 overflow:hidden 裁掉只剩上边 */
+.dash-cell-input:hover,
+.dash-cell-input:focus,
+.dash-memo:hover,
+.dash-memo:focus {
+  outline: 1px dashed var(--text-2, #8b949e);
+  outline-offset: -3px;
+}
+
+.dash-cell-copy {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+  color: var(--text-2, #8b949e);
+  opacity: 0;
+}
+
+.dash-cell:hover .dash-cell-copy,
+.dash-cell-copy:focus-visible {
+  opacity: 1;
+}
+
+.dash-edit-ops {
+  width: 30px;
+  text-align: center;
+  vertical-align: middle;
+}
+
+/* 操作格按钮居中(覆盖 .dash-table 单元格默认 10px 横向内边距,否则按钮被挤到右缘) */
+.dash-table .dash-edit-ops {
+  padding: 2px 4px;
+}
+
+.dash-edit-ops .icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-2, #8b949e);
+}

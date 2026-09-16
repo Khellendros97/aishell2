@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "aishell"
-version = "1.2.0"
+version = "1.2.5"
 dependencies = [
  "argon2 0.5.3",
  "async-trait",

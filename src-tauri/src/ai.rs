@@ -146,7 +146,7 @@ const KB_EXT: &str = include_str!("pi_ext/aishell-kb.ts");
 /// 默认工具白名单；settings.search.enabled 时追加 web_search。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
 /// ask/confirm 为通用交互工具（execute 内自带前端问答/确认卡片，交互即授权），三档模式可用。
-const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list,timeline_search";
+const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list,timeline_search,dashboard_view";
 
 /// 需要动作卡 / 审批的受控工具。
 /// 注意：ai.rs 侧（动作卡渲染）与 aishell-guard.ts 侧（逐调用审批）不再完全一致——
@@ -653,7 +653,7 @@ impl AiManager {
         let mut tools = if mode == AiMode::Suggest {
             format!("{BASE_TOOLS},request_agent_mode")
         } else {
-            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py")
+            format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py,dashboard_reload")
         };
         if search_enabled {
             tools.push_str(",web_search");
@@ -740,12 +740,18 @@ impl AiManager {
             Ok(root) => vec![root.to_string_lossy().into_owned()],
             Err(_) => vec![],
         };
+        // 仪表盘目录（<项目根>/.aishell/dashboard）：AI 定制仪表盘时写 dashboard.py/memo.md 的允许目录。
+        let dashboard_dirs = match crate::dashboard::dashboard_dir(&self.store, project_id) {
+            Ok(dir) => vec![dir.to_string_lossy().into_owned()],
+            Err(_) => vec![],
+        };
         let enc = |v: &[String]| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
         cmd.env("PI_CODING_AGENT_DIR", &self.agent_dir)
             .env("AISHELL_AI_MODE", mode.as_str())
             .env("AISHELL_SKILL_DIRS", enc(&skill_dirs))
             .env("AISHELL_GLOBAL_SKILLS_DIR", enc(&global_skills))
-            .env("AISHELL_NOTES_DIR", enc(&notes_dirs));
+            .env("AISHELL_NOTES_DIR", enc(&notes_dirs))
+            .env("AISHELL_DASHBOARD_DIR", enc(&dashboard_dirs));
         if hosted {
             // 托管模式（CR-3.1 / CR-4.1）：models.json 引用 $AISHELL_CLOUD_TOKEN；
             // 搜索扩展读 $AISHELL_SEARCH_URL + $AISHELL_SEARCH_TOKEN 走公司服务器代理
@@ -2247,7 +2253,7 @@ async fn run_internal_action(
                     }
                 },
             };
-            let bridge = match crate::pysdk::PySdkBridge::start(actions.clone(), project_id, session_id).await {
+            let bridge = match crate::pysdk::PySdkBridge::start(actions.clone(), project_id, session_id, None).await {
                 Ok(b) => b,
                 Err(e) => return json!({"ok": false, "error": format!("SDK 通道启动失败：{e}")}),
             };
@@ -2505,6 +2511,12 @@ async fn run_internal_action(
                 None => Err("云服务不可用，无法提交反馈".to_string()),
             }
         }
+        // 仪表盘：reload 免审批（用户已授权定制流程；脚本内 ssh/db 仍受锁与白名单裁决），
+        // 成功后向面板广播 dashboard:changed；view 只读缓存摘要供 AI 验证部署效果
+        "dashboard_reload" => crate::dashboard::reload_for_ai(actions, store, project_id)
+            .await
+            .map(|text| json!({"ok": true, "text": text})),
+        "dashboard_view" => Ok(json!({"ok": true, "text": crate::dashboard::view_summary(project_id)})),
         other => Err(format!("未知动作：{other}")),
     };
     match result {
@@ -3582,20 +3594,68 @@ mod tests {
         );
         // suggest 模式不提供受控远程工具（工具集变量中无 staging_*）
         let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
-        assert!(
-            !tools_suggest.contains("staging_"),
-            "suggest 工具集不应含暂存工具"
-        );
-        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,py");
+        assert!(!tools_suggest.contains("staging_"), "suggest 工具集不应含暂存工具");
+        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,py,dashboard_reload");
         assert!(tools_agent.contains("staging_list"));
         assert!(tools_agent.contains("staging_restore"));
         assert!(tools_agent.contains("staging_add"));
         assert!(tools_agent.contains("staging_clear"));
         // ai.rs 侧动作卡列表：staging_restore 有卡片，但接受类动作绝不入列
         assert!(CONTROLLED_TOOLS.contains(&"staging_restore"));
-        assert!(!CONTROLLED_TOOLS
-            .iter()
-            .any(|t| t.contains("staging_accept")));
+        assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("staging_accept")));
+    }
+
+    #[test]
+    fn guard_extension_registers_py_tool() {
+        // py 工具探针：guard 注册 + 动作桥 run_py + 受控审批 + 仅 agent/yolo；
+        // ai.rs 侧工具白名单（agent/yolo）含 py、suggest 不含，受控列表含 py
+        assert!(GUARD_EXT.contains("name: \"py\""), "guard 应注册 py 工具");
+        assert!(GUARD_EXT.contains("\"run_py\""), "py 应走 run_py 动作桥");
+        let controlled_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const CONTROLLED_TOOLS"))
+            .unwrap_or_default();
+        assert!(controlled_line.contains("\"py\""), "py 应受控审批");
+        let ai_only_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const AI_ONLY_TOOLS"))
+            .unwrap_or_default();
+        assert!(ai_only_line.contains("\"py\""), "py 应仅 agent/yolo 可用");
+        assert!(CONTROLLED_TOOLS.contains(&"py"));
+        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py,dashboard_reload");
+        assert!(tools_agent.contains(",py"), "agent/yolo 工具集应含 py");
+        let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
+        assert!(!tools_suggest.contains(",py"), "suggest 工具集不应含 py");
+    }
+
+    #[test]
+    fn guard_extension_registers_dashboard_tools() {
+        // 仪表盘工具探针：guard 注册 dashboard_reload / dashboard_view + 动作桥两臂；
+        // reload 免审批（不进 CONTROLLED_TOOLS）但仅 agent/yolo（AI_ONLY_TOOLS + agent 工具串）；
+        // view 只读三档可用（BASE_TOOLS，不进 AI_ONLY/CONTROLLED）；目录白名单读 AISHELL_DASHBOARD_DIR
+        assert!(GUARD_EXT.contains("name: \"dashboard_reload\""), "guard 应注册 dashboard_reload");
+        assert!(GUARD_EXT.contains("name: \"dashboard_view\""), "guard 应注册 dashboard_view");
+        assert!(GUARD_EXT.contains("action: \"dashboard_reload\""), "reload 应走动作桥");
+        assert!(GUARD_EXT.contains("action: \"dashboard_view\""), "view 应走动作桥");
+        assert!(GUARD_EXT.contains("AISHELL_DASHBOARD_DIR"), "guard 应读取仪表盘目录环境变量");
+        let ai_only_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const AI_ONLY_TOOLS"))
+            .unwrap_or_default();
+        assert!(ai_only_line.contains("\"dashboard_reload\""), "reload 应仅 agent/yolo 可用");
+        assert!(!ai_only_line.contains("dashboard_view"), "view 应三档模式可用");
+        let controlled_line = GUARD_EXT
+            .lines()
+            .find(|l| l.contains("const CONTROLLED_TOOLS"))
+            .unwrap_or_default();
+        assert!(!controlled_line.contains("dashboard_reload"), "reload 免逐次审批");
+        assert!(!CONTROLLED_TOOLS.iter().any(|t| t.contains("dashboard")));
+        let tools_agent = format!("{BASE_TOOLS},delete_path,run_command,sftp_upload,sftp_download,list_servers,db_query,staging_list,staging_diff,staging_restore,staging_add,staging_clear,request_db_connection,py,dashboard_reload");
+        assert!(tools_agent.contains("dashboard_reload"), "agent 工具集应含 reload");
+        assert!(tools_agent.contains("dashboard_view"), "agent 工具集应含 view（BASE_TOOLS）");
+        let tools_suggest = format!("{BASE_TOOLS},request_agent_mode");
+        assert!(!tools_suggest.contains("dashboard_reload"), "suggest 工具集不应含 reload");
+        assert!(tools_suggest.contains("dashboard_view"), "suggest 工具集应含 view");
     }
 
     #[test]
