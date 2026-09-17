@@ -37,6 +37,7 @@ dashboard.emit()                            # 可选：显式推送；脚本结�
 - **渐进渲染**：每声明一个组件面板就立即显示它，不用等脚本跑完——采集快、信息重要的组件放前面声明，耗时采集（多台服务器串行 exec）放后面，用户能先看到已完成的部分。
 - **备忘录组件固定在最顶部**：顶部是可编辑表格（数据存 `.aishell/dashboard/table.json`，用户记账号/密码等关键信息），下方是备忘文本（`.aishell/dashboard/memo.md`），均可在面板上直接编辑；脚本无法删除它。需要程序化维护这些信息时直接读写 table.json（{"columns":[{"key","title"}],"rows":[{key:值}]}）与 memo.md（都在写白名单内）。
 - chart 的 option 直接透传 echarts：折线 `{"xAxis": {"type": "category", "data": [...]}, "yAxis": {"type": "value"}, "series": [{"type": "line", "data": [...]}]}`；柱状/饼图同理（series type 用 bar/pie，前端已按需注册这三类）。
+- **不用手写配色**：面板已按当前主题（深/亮）自动补齐网格线、坐标轴数字/名称、系列数值标注的颜色，跟着主题切换走；option 里显式写过的样式优先于这层基底，只有需要强调色（比如按阈值标红的系列）时才自己指定 `itemStyle.color` 等。
 
 ## 示例：服务器负载监控表格
 

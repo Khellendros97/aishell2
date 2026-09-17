@@ -78,8 +78,9 @@ export const PATHS = {  folder:
     '<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
   history:
     '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 3"/>',
-  /** 项目时间线（lucide git-commit-horizontal 风格：横向轴 + 节点） */
-  timeline: '<circle cx="6" cy="12" r="2"/><circle cx="18" cy="12" r="2"/><path d="M8 12h8"/><path d="M2 12h2"/><path d="M20 12h2"/>',
+  /** 项目时间线（lucide calendar-clock 风格：日历 + 右下角钟表；活动栏入口与时间线标签页共用） */
+  timeline:
+    '<path d="M16 14v2.2l1.6 1"/><path d="M16 2v3"/><path d="M21 7.338V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h2.338"/><path d="M3 9h5.859"/><path d="M8 2v3"/><circle cx="16" cy="16" r="6"/>',
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
   home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/>',
   arrowUp: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>',
@@ -117,6 +118,9 @@ export const PATHS = {  folder:
     '<circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/>',
   sparkles:
     '<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>',
+  /** 仙女棒 + 星点（lucide wand-sparkles；仪表盘「定制仪表盘」按钮，与 Skill 的 sparkles 区分） */
+  wandSparkles:
+    '<path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/>',
   diff:
     '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/><path d="M6.5 9h3"/><path d="M8 7.5v3"/><path d="M14.5 15h3"/>',
   /** AI 助手窗口分离（lucide square-arrow-out-up-right：方框 + 右上外指箭头） */

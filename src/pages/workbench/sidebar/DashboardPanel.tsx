@@ -3,11 +3,17 @@
  * 每个项目一个 <项目根>/.aishell/dashboard/dashboard.py:Rust 渲染管线执行脚本(复用 pysdk),
  * 组件 spec 经 dashboard_render 命令返回,本面板渲染 备忘录/markdown 文本/只读表格/图片/echarts 图表。
  * - 数据流:dashboardRender → 本地 state;wbEvents 'project-changed' 与 onDashboardChanged(AI reload/memo 保存广播)触发重载;
+ * - 渐进帧合并:采集期间每帧只含「已声明的组件」,按 id 合并到已显示内容上(卸载后置:本帧未声明的组件保留,
+ *   内容未变复用旧对象,图表不重建);删除/改序由最终结果整体替换生效,避免刷新时组件先消失再逐个回来;
  * - 自动刷新:spec.meta.refreshSeconds 声明间隔 + 头部 play/pause 开关(默认开);脚本失败保留上次 spec、顶部行内报错;
  * - 备忘录组件:顶部可编辑表格(table.json,记账号/密码等;单元格失焦保存、行列操作即时保存) + 下方备忘文本(memo.md);
  *   服务器内容回流时未脏才跟随,防打字被覆盖;SDK 声明的 table 组件才是只读的;
  * - 「定制仪表盘」:promptDialog 收集需求 → wbHandles.ai.startConversation 发任务(AI 经 dashboard 技能 +
- *   dashboard_reload/dashboard_view 工具迭代)。
+ *   dashboard_reload/dashboard_view 工具迭代);
+ * - 图表基底配色:echarts 无主题时是亮色皮肤,在暗色卡片上网格线过亮、坐标轴数字过暗,故由面板按设计变量
+ *   补一层基底(网格线/坐标轴数字/数值标注),脚本 option 里显式写过的样式优先;主题切换重取色重设 option;
+ * - 文本组件 markdown:排版在 dashboard.css(.dash-md,照 NoteTab 的 .note-md);外链点击委托 openUrl 走系统浏览器,
+ *   不在应用窗口内导航(否则整个工作台被顶掉);
  * 接口点:src/api.ts 仪表盘段(dashboardRender/dashboardSaveMemo/onDashboardChanged)、stores/workbench.ts wbHandles.ai。
  */
 import { useEffect, useRef, useState } from 'react';
@@ -16,8 +22,10 @@ import * as echarts from 'echarts/core';
 import { BarChart, LineChart, PieChart } from 'echarts/charts';
 import { GridComponent, LegendComponent, TitleComponent, TooltipComponent } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { dashboardRender, dashboardSaveMemo, dashboardSaveTable, onDashboardChanged, onDashboardProgress } from '../../../api';
 import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
+import { onThemeChange } from '../../../theme';
 import { copyText, promptDialog, toast } from '../../../ui';
 import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
@@ -27,7 +35,15 @@ import './dashboard.css';
 echarts.use([LineChart, BarChart, PieChart, GridComponent, TooltipComponent, LegendComponent, TitleComponent, CanvasRenderer]);
 
 /** markdown 渲染(html:false 与笔记/AI 消息同标准) */
-const md = new MarkdownIt({ html: false, breaks: true, linkify: true });
+const md = new MarkdownIt({ html: false, breaks: true, linkify: true, typographer: false });
+// 外链不在应用窗口内导航(会把整个工作台顶掉):标 target/rel,点击由容器委托 openUrl 走系统浏览器
+const defaultLinkOpen = md.renderer.rules.link_open
+  ?? ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  tokens[idx].attrSet('target', '_blank');
+  tokens[idx].attrSet('rel', 'noopener');
+  return defaultLinkOpen(tokens, idx, options, env, self);
+};
 
 /** 模块级面板操作句柄:HeadActions(独立组件)触发面板主体的刷新/自动刷新切换 */
 let panelApi: { refresh: () => void; toggleAuto: () => boolean; autoOn: () => boolean; hasInterval: () => boolean } | null = null;
@@ -165,29 +181,163 @@ function MemoText({ projectId, content }: { projectId: string; content: string }
   );
 }
 
+/* ---------- 渐进帧合并:刷新时把「已显示内容」与「本帧已声明的组件」按 id 合成 ---------- */
+
+/** 组件内容深比较(JSON 文本;组件数有限,只用于决定能否复用旧对象) */
+function sameComponent(a: DashboardComponent, b: DashboardComponent): boolean {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 合并一帧渐进数据(卸载后置):脚本每声明一个组件推一帧,帧内只有「已声明的组件」,
+ * 整帧替换会让上一轮组件先卸载、等脚本重新声明(可能还要等慢采集)才逐个回来。
+ * 合并规则:本帧已声明的按 id 就地替换、内容未变的复用旧对象(echarts 因此不重建);
+ * 本帧未声明的旧组件按原位置保留——真正的删除/改序由最终结果整体替换生效。
+ */
+function mergeProgress(prev: DashboardSpec | null, next: DashboardSpec): DashboardSpec {
+  const prevComps = prev?.components ?? [];
+  const nextComps = next.components ?? [];
+  if (prevComps.length === 0) return next;
+  // 空帧(脚本尚未声明组件)不动已显示内容:这是组件「先卸载」的主要来源
+  if (nextComps.length === 0) return { ...next, components: prevComps };
+  const nextIds = new Set(nextComps.map((c) => c.id));
+  const carried = prevComps.filter((c) => !nextIds.has(c.id));
+  const prevById = new Map(prevComps.map((c) => [c.id, c]));
+  const prevPos = new Map(prevComps.map((c, i) => [c.id, i]));
+  const out: DashboardComponent[] = [];
+  let cursor = 0;
+  for (const c of nextComps) {
+    const at = prevPos.get(c.id);
+    // 补上本帧声明的组件「在旧列表中的位置之前」那些未被声明的旧组件,保持原有排列
+    while (at !== undefined && cursor < carried.length && (prevPos.get(carried[cursor].id) ?? 0) < at) {
+      out.push(carried[cursor]);
+      cursor += 1;
+    }
+    const old = prevById.get(c.id);
+    out.push(old && sameComponent(old, c) ? old : c);
+  }
+  while (cursor < carried.length) out.push(carried[cursor++]);
+  return { ...next, components: out };
+}
+
+/* ---------- 图表基底配色:echarts 无主题时是亮色皮肤,面板按设计变量补一层暗色基底 ---------- */
+
+interface ChartSkin {
+  /** 网格线(深灰) */
+  grid: string;
+  /** 坐标轴数字(浅灰) */
+  label: string;
+  /** 坐标轴名(弱化) */
+  name: string;
+  /** 系列数值标注(白) */
+  value: string;
+}
+
+/** 取设计变量当前实际值(echarts 画在 canvas 上,拿不到 CSS 变量;取不到用暗色兜底) */
+function cssVar(name: string, fallback: string): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+/** 当前主题下的图表配色:网格线深灰(border)、坐标轴数字浅灰(text-1)、坐标轴名弱化(text-2)、数值标注白(text-0) */
+function chartSkin(): ChartSkin {
+  return {
+    grid: cssVar('--border', '#363c48'),
+    label: cssVar('--text-1', '#a8adbb'),
+    name: cssVar('--text-2', '#6b7180'),
+    value: cssVar('--text-0', '#e8eaf0'),
+  };
+}
+
+/**
+ * 用基底补空缺(基底只填空缺,脚本 option 里显式写过的键一律优先):
+ * 对象递归合并;基底是对象模板、脚本给数组时(如 series),模板套用到每个成员上。
+ */
+function withDefaults(base: unknown, over: unknown): unknown {
+  if (Array.isArray(over)) {
+    return over.map((o) => withDefaults(Array.isArray(base) ? base[0] : base, o));
+  }
+  if (over && typeof over === 'object' && base && typeof base === 'object' && !Array.isArray(base)) {
+    const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+    for (const [k, v] of Object.entries(over as Record<string, unknown>)) {
+      out[k] = k in out ? withDefaults(out[k], v) : v;
+    }
+    return out;
+  }
+  return over === undefined ? base : over;
+}
+
+/** 把暗色基底套到脚本 option 上:只补脚本未声明的部分,脚本显式写过的键一律优先 */
+function applyChartSkin(option: Record<string, unknown>, skin: ChartSkin): Record<string, unknown> {
+  const axis = {
+    axisLabel: { color: skin.label },
+    nameTextStyle: { color: skin.name },
+    // 只给颜色不给 show:类目轴默认不画分隔线,补色不会凭空多出竖线
+    splitLine: { lineStyle: { color: skin.grid } },
+  };
+  const base: Record<string, unknown> = {
+    xAxis: axis,
+    yAxis: axis,
+    series: { label: { color: skin.value } },
+    legend: { textStyle: { color: skin.label } },
+    title: { textStyle: { color: skin.value } },
+  };
+  const out: Record<string, unknown> = { ...option };
+  for (const [k, v] of Object.entries(option)) {
+    if (k in base) out[k] = withDefaults(base[k], v);
+  }
+  return out;
+}
+
 /* ---------- echarts 图表组件 ---------- */
 function ChartView({ option }: { option: Record<string, unknown> }): JSX.Element {
   const ref = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
+  // 主题切换(深/亮)需重取色重设一次;option 引用可能未变(渐进帧复用),故靠版本号触发
+  const [skinVersion, setSkinVersion] = useState(0);
+  useEffect(() => onThemeChange(() => setSkinVersion((v) => v + 1)), []);
+  // 初始化只在挂载时做一次:数据更新走原地 setOption,避免每次刷新 dispose+init 造成图表闪白
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     const chart = echarts.init(el);
-    try {
-      chart.setOption(option);
-    } catch {
-      /* AI 生成的 option 非法时保持空白,不拖垮面板 */
-    }
+    chartRef.current = chart;
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(el);
     return () => {
       ro.disconnect();
       chart.dispose();
+      chartRef.current = null;
     };
-  }, [option]);
+  }, []);
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    try {
+      chart.setOption(applyChartSkin(option, chartSkin()), { notMerge: true });
+    } catch {
+      /* AI 生成的 option 非法时保持空白,不拖垮面板 */
+    }
+  }, [option, skinVersion]);
   return <div className="dash-chart" ref={ref} />;
 }
 
 /* ---------- 单个组件卡片 ---------- */
+/** 文本组件外链:交给系统浏览器,不在应用窗口内导航(照 NoteTab 预览) */
+function onMarkdownClick(e: React.MouseEvent<HTMLDivElement>): void {
+  const target = e.target;
+  const link = target instanceof Element ? target.closest('a[href]') : null;
+  if (!(link instanceof HTMLAnchorElement)) return;
+  const url = new URL(link.href);
+  if (!['http:', 'https:', 'mailto:', 'tel:'].includes(url.protocol)) return;
+  e.preventDefault();
+  void openUrl(url.href).catch((err) => toast(`无法打开链接: ${String(err)}`, 'error'));
+}
+
 function ComponentCard({ projectId, comp }: { projectId: string; comp: DashboardComponent }): JSX.Element {
   let body: JSX.Element;
   switch (comp.type) {
@@ -200,7 +350,10 @@ function ComponentCard({ projectId, comp }: { projectId: string; comp: Dashboard
       );
       break;
     case 'text':
-      body = <div className="dash-md" dangerouslySetInnerHTML={{ __html: md.render(comp.markdown ?? '') }} />;
+      body = (
+        <div className="dash-md" onClick={onMarkdownClick}
+          dangerouslySetInnerHTML={{ __html: md.render(comp.markdown ?? '') }} />
+      );
       break;
     case 'table': {
       const cols = comp.columns ?? [];
@@ -257,9 +410,10 @@ function DashboardPanelBody(): JSX.Element {
     if (!projectId) return;
     let cancelled = false;
     let offProgress: (() => void) | undefined;
-    // 渐进渲染：脚本采集期间每声明一个组件推一帧（已含备忘录头部合并），边采集边出内容
+    // 渐进渲染：脚本采集期间每声明一个组件推一帧（已含备忘录头部合并），边采集边出内容；
+    // 帧按 id 合并进已显示内容（见 mergeProgress），本帧还没轮到的组件不会被卸载
     void onDashboardProgress((pid, next) => {
-      if (!cancelled && pid === projectId) setSpec(next);
+      if (!cancelled && pid === projectId) setSpec((prev) => mergeProgress(prev, next));
     }).then((un) => { offProgress = un; }).catch(() => { /* 无 Tauri 环境静默 */ });
     setLoading(true);
     dashboardRender(projectId)
@@ -343,7 +497,7 @@ function DashboardHeadActions(): JSX.Element {
   return (
     <>
       <button className="icon-btn" title="定制仪表盘(描述需求,AI 自动定制)" disabled={!active}
-        onClick={() => void customize()}><Icon name="sparkles" /></button>
+        onClick={() => void customize()}><Icon name="wandSparkles" /></button>
       <button className="icon-btn" title={panelApi?.autoOn() ? '暂停自动刷新' : '恢复自动刷新'}
         disabled={!active || !panelApi?.hasInterval()}
         onClick={() => { panelApi?.toggleAuto(); force((n) => n + 1); }}>
