@@ -13,6 +13,7 @@
 import React from 'react';
 import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
 import { Stop, track1 } from './anim';
+import { AnchorStop, useAnchorTrack } from './components/anchors';
 import { Click, Cursor } from './components/Cursor';
 import { ChatMsg, Workbench } from './components/Workbench';
 import { AI_INPUT, AI_PANEL, WIN_H, WIN_W } from './scene';
@@ -46,34 +47,34 @@ const CAM_Y: readonly Stop[] = [
   { f: 1195, v: 600 },
 ];
 
-/* ---------- 指针轨道(设计稿坐标) ---------- */
-/* 到位后静置约 10 帧再点击(对齐场景一的悬停手感) */
-const CUR_X: readonly Stop[] = [
-  { f: 575, v: PANEL_CX },
-  { f: 690, v: PANEL_CX },
-  { f: 720, v: AI_INPUT.x },
-  { f: 778, v: AI_INPUT.x },
-  { f: 793, v: PARK.x },
-  { f: 915, v: PARK.x },
-  { f: 945, v: AI_INPUT.x },
-  { f: 1000, v: AI_INPUT.x },
-  { f: 1015, v: PARK.x },
-];
-const CUR_Y: readonly Stop[] = [
-  { f: 575, v: 900 },
-  { f: 690, v: 900 },
-  { f: 720, v: AI_INPUT.y },
-  { f: 778, v: AI_INPUT.y },
-  { f: 793, v: PARK.y },
-  { f: 915, v: PARK.y },
-  { f: 945, v: AI_INPUT.y },
-  { f: 1000, v: AI_INPUT.y },
-  { f: 1015, v: PARK.y },
+/* ---------- 指针轨道(锚点实测优先;x/y 为冷启动首帧兜底,按该段相机 (1.55,PANEL_CX,830) 换算) ---------- */
+/** 设计稿窗口坐标 → canvas 兜底坐标(仅冷启动首帧兜底,实测就绪后即被替换) */
+const wf = (wx: number, wy: number): { x: number; y: number } => ({
+  x: wx * 1.55 + (960 - PANEL_CX * 1.55),
+  y: wy * 1.55 + (540 - 830 * 1.55),
+});
+
+/** 全景相机 (0.75,960,600) 下换算 */
+const wfWide = (wx: number, wy: number): { x: number; y: number } => ({
+  x: wx * 0.75 + 240,
+  y: wy * 0.75 + 90,
+});
+
+const CUR_PATH: readonly AnchorStop[] = [
+  { f: 575, ...wfWide(PANEL_CX, 900) },
+  { f: 690, ...wfWide(PANEL_CX, 900) },
+  { f: 720, at: 'ai-input', ...wf(AI_INPUT.x, AI_INPUT.y) },
+  { f: 778, at: 'ai-input', ...wf(AI_INPUT.x, AI_INPUT.y) },
+  { f: 793, x: PARK.x * 1.55 + (960 - PANEL_CX * 1.55), y: PARK.y * 1.55 + (540 - 830 * 1.55) },
+  { f: 915, x: PARK.x * 1.55 + (960 - PANEL_CX * 1.55), y: PARK.y * 1.55 + (540 - 830 * 1.55) },
+  { f: 945, at: 'ai-input', ...wf(AI_INPUT.x, AI_INPUT.y) },
+  { f: 1000, at: 'ai-input', ...wf(AI_INPUT.x, AI_INPUT.y) },
+  { f: 1015, x: PARK.x * 1.55 + (960 - PANEL_CX * 1.55), y: PARK.y * 1.55 + (540 - 830 * 1.55) },
 ];
 
 const CLICKS: readonly Click[] = [
-  { f: 730, x: AI_INPUT.x, y: AI_INPUT.y, target: 'input' },
-  { f: 955, x: AI_INPUT.x, y: AI_INPUT.y, target: 'input' },
+  { f: 730, ...wf(AI_INPUT.x, AI_INPUT.y), anchor: 'ai-input', target: 'input' },
+  { f: 955, ...wf(AI_INPUT.x, AI_INPUT.y), anchor: 'ai-input', target: 'input' },
 ];
 
 /* ---------- 问答内容与节拍 ---------- */
@@ -149,7 +150,7 @@ export const AiDemo: React.FC = () => {
   const frame = useCurrentFrame();
 
   const cam = { s: track1(CAM_S, frame), cx: track1(CAM_X, frame), cy: track1(CAM_Y, frame) };
-  const cur = { x: track1(CUR_X, frame), y: track1(CUR_Y, frame) };
+  const cur = useAnchorTrack(CUR_PATH, frame);
 
   const fade = interpolate(frame, [570, 600], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' });
   const cursorOpacity = interpolate(frame, [575, 585], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' });
@@ -167,8 +168,11 @@ export const AiDemo: React.FC = () => {
         }}
       >
         <Workbench state={chatAt(frame)} frame={frame} />
-        <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
       </AbsoluteFill>
+      {/* 指针(锚点实测画布坐标,不随相机变换) */}
+      <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
+        <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
+      </div>
     </AbsoluteFill>
   );
 };

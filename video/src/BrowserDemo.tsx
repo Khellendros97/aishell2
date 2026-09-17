@@ -6,24 +6,25 @@
 import React from 'react';
 import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
 import { track1 } from './anim';
+import { AnchorRoot, useAnchorTrack } from './components/anchors';
 import { Caption } from './components/Caption';
 import { Cursor } from './components/Cursor';
 import { Highlight } from './components/Highlight';
 import { C, FONT_UI, IconName } from './theme';
 import { Icon } from './ui';
 import {
-  CAM_S, CAM_X, CAM_Y, CAPTIONS5, CLICKS, CUR_X, CUR_Y, DURATION, HIGHLIGHTS5, KBD5, NOTES5, wbAt,
+  CAM_S, CAM_X, CAM_Y, CAPTIONS5, CLICKS, CUR_PATH, DURATION, HIGHLIGHTS5, KBD5, NOTES5, wbAt,
 } from './browser5/script';
 import { Wb5 } from './browser5/Wb5';
 
 const NOTE_ICON: Record<'info' | 'alert', IconName> = { info: 'info', alert: 'alert' };
 const NOTE_COLOR = { info: { edge: 'rgba(79,142,247,0.55)', text: C.accent }, alert: { edge: 'rgba(229,98,106,0.55)', text: C.red } };
 
-export const BrowserDemo: React.FC = () => {
+const Body: React.FC = () => {
   const frame = useCurrentFrame();
 
   const cam = { s: track1(CAM_S, frame), cx: track1(CAM_X, frame), cy: track1(CAM_Y, frame) };
-  const cur = { x: track1(CUR_X, frame), y: track1(CUR_Y, frame) };
+  const cur = useAnchorTrack(CUR_PATH, frame);
   const state = wbAt(frame);
 
   const fadeIn = interpolate(frame, [0, 8], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' });
@@ -44,15 +45,6 @@ export const BrowserDemo: React.FC = () => {
           }}
         >
           <Wb5 state={state} frame={frame} />
-
-          {HIGHLIGHTS5.map((h, i) => (
-            <Highlight key={i} {...h} />
-          ))}
-
-          {/* 指针置于最上层 */}
-          <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
-            <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
-          </div>
 
           {/* 教学说明卡 */}
           {NOTES5.map((n) => {
@@ -116,6 +108,16 @@ export const BrowserDemo: React.FC = () => {
         </AbsoluteFill>
       </AbsoluteFill>
 
+      {/* 高亮环 + 指针(锚点实测画布坐标,不随相机变换) */}
+      <div style={{ position: 'absolute', inset: 0, zIndex: 55, pointerEvents: 'none' }}>
+        {HIGHLIGHTS5.map((h) => (
+          <Highlight key={`${h.target}:${h.from}`} target={h.target} pad={h.pad} r={h.r} from={h.from} to={h.to} />
+        ))}
+      </div>
+      <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
+        <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
+      </div>
+
       {/* 暗角 + 字幕 + 总淡出 */}
       <AbsoluteFill style={{ background: 'radial-gradient(ellipse at center, transparent 58%, rgba(0,0,0,0.26) 100%)', pointerEvents: 'none' }} />
       {CAPTIONS5.map((c) => (
@@ -125,3 +127,9 @@ export const BrowserDemo: React.FC = () => {
     </AbsoluteFill>
   );
 };
+
+export const BrowserDemo: React.FC = () => (
+  <AnchorRoot>
+    <Body />
+  </AnchorRoot>
+);

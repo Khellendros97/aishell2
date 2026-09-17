@@ -93,6 +93,7 @@ export const OsWindow: React.FC<{ opacity: number; offsetY: number; dragRow: num
         return (
           <div
             key={f.name}
+            data-anchor={i < 2 ? `w3-os-row${i}` : undefined}
             style={{
               height: 32,
               flex: 'none',

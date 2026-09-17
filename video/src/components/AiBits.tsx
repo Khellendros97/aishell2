@@ -87,6 +87,7 @@ export const CommandCard: React.FC<{ cmd: string; hovered?: boolean; pressed?: b
       <span style={{ fontSize: 11, color: C.text2 }}>点击卡片粘贴到终端</span>
       <div style={{ flex: 1 }} />
       <div
+        data-anchor="w2-card-paste"
         style={{
           display: 'inline-flex',
           alignItems: 'center',

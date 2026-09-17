@@ -372,6 +372,7 @@ export const Workbench: React.FC<{ state: WorkbenchState; frame: number }> = ({ 
             </span>
           </div>
           <div
+            data-anchor="ai-input"
             style={{
               position: 'relative',
               minHeight: 70,

@@ -11,7 +11,8 @@
  *   F 3900–4340  收尾分屏(客户端 ⇄ 网页端)+ 三张特性卡
  */
 import { interpolate } from 'remotion';
-import { Stop } from '../anim';
+import { Stop, track1 } from '../anim';
+import { AnchorStop } from '../components/anchors';
 import { Click } from '../components/Cursor';
 import { ACT_TL, ADLG9_F, AI2, DEMO, MENU9_Y1, MENU9_Y2, TL, TL_ROWS, TL_COL, TL_ROWS as ROWS, WEB, WEB_ROWS, WebRow, dropOptCy, menuItemCy, tlRowY, webChipX, webRowY } from './layout';
 import { H9, Wb9State } from './Wb9';
@@ -133,85 +134,97 @@ const W_KIND1 = { x: webChipX(3) + 28, y: WEB.chipsY + WEB.chipH / 2 };
 const W_KIND2 = { x: webChipX(4) + 28, y: WEB.chipsY + WEB.chipH / 2 };
 const W_TAG = { x: WEB.tagSel.x + WEB.tagSel.w / 2, y: WEB.tagSel.y + WEB.tagSel.h / 2 };
 const W_ROW = { x: 800, y: webRowY(0) + 21 };
-const CURVE: readonly (readonly [number, number, number])[] = [
-  [30, 1500, 900],
-  [ACT_CLICK - 10, ACT_TL.x, ACT_TL.y],
-  [ACT_CLICK, ACT_TL.x, ACT_TL.y],
-  [470, 800, 300],
-  [RCT1, 800, ROW1_Y],
-  [TAGBTN1 - 10, 635, menuItemCy(MENU9_Y1)],
-  [TAGBTN1, 635, menuItemCy(MENU9_Y1)],
-  [TYPE1 - 8, 960, 517],
-  [OK1 - 10, 1134, 721],
-  [OK1, 1134, 721],
-  [812, 800, 430],
-  [RCT2, 800, ROW5_Y],
-  [TAGBTN2 - 10, 635, menuItemCy(MENU9_Y2)],
-  [TAGBTN2, 635, menuItemCy(MENU9_Y2)],
-  [TYPE2 - 8, 960, 517],
-  [OK2 - 10, 1134, 721],
-  [OK2, 1134, 721],
-  [CHIP_CLICK - 10, 360, 140],
-  [CHIP_CLICK, 360, 140],
-  [AI_CLICK - 10, TL.aiBtn.x + TL.aiBtn.w / 2, TL.aiBtn.y + TL.aiBtn.h / 2],
-  [AI_CLICK, TL.aiBtn.x + TL.aiBtn.w / 2, TL.aiBtn.y + TL.aiBtn.h / 2],
-  [ACHK - 10, ACHK_PT.x, ACHK_PT.y],
-  [ACHK, ACHK_PT.x, ACHK_PT.y],
-  [AOK - 10, AOK_PT.x, AOK_PT.y],
-  [AOK, AOK_PT.x, AOK_PT.y],
-  [SAVE_CLICK - 10, SAVE_PT.x, SAVE_PT.y],
-  [SAVE_CLICK, SAVE_PT.x, SAVE_PT.y],
-  [1830, 1500, 700],
-  [SET_CLICK - 10, 1675, 34],
-  [SET_CLICK, 1675, 34],
-  [2234, 498, 409],
-  [2380, 900, 780],
-  [SEL_CLICK - 10, W_SEL.x, W_SEL.y],
-  [SEL_CLICK, W_SEL.x, W_SEL.y],
-  [OPT_CLICK - 10, W_OPT.x, W_OPT.y],
-  [OPT_CLICK, W_OPT.x, W_OPT.y],
-  [KIND1 - 10, W_KIND1.x, W_KIND1.y],
-  [KIND1, W_KIND1.x, W_KIND1.y],
-  [KIND2 - 10, W_KIND2.x, W_KIND2.y],
-  [KIND2, W_KIND2.x, W_KIND2.y],
-  [TAGSEL - 10, W_TAG.x, W_TAG.y],
-  [TAGSEL, W_TAG.x, W_TAG.y],
-  [ROW_CLICK - 10, W_ROW.x, W_ROW.y],
-  [ROW_CLICK, W_ROW.x, W_ROW.y],
-  [3280, 900, 800],
-  [PURGE_CLICK - 10, 386, 610],
-  [PURGE_CLICK, 386, 610],
-  [CFM_OK - 10, 1116, 689],
-  [CFM_OK, 1116, 689],
-  [3800, 700, 900],
-  [DURATION, 1200, 850],
-];
-export const CUR_X: readonly Stop[] = CURVE.map(([f, x]) => ({ f, v: x }));
-export const CUR_Y: readonly Stop[] = CURVE.map(([f, , y]) => ({ f, v: y }));
+/* ============ 指针轨道(wx/wy 为设计稿兜底坐标,at 为锚点 id 实测优先) ============ */
+/** 设计稿窗口坐标 → canvas 兜底坐标(按该帧相机;仅冷启动首帧兜底,实测就绪后即被替换) */
+const wfAt = (f: number, wx: number, wy: number): { x: number; y: number } => {
+  const s = track1(CAM_S, f);
+  const cx0 = track1(CAM_X, f);
+  const cy0 = track1(CAM_Y, f);
+  return { x: wx * s + (960 - cx0 * s), y: wy * s + (540 - cy0 * s) };
+};
 
-/* ============ 点击(涟漪) ============ */
+const CUR_DEF: readonly { f: number; wx: number; wy: number; at?: string }[] = [
+  { f: 30, wx: 1500, wy: 900 },
+  { f: ACT_CLICK - 10, wx: ACT_TL.x, wy: ACT_TL.y, at: 'w9-act-tl' },
+  { f: ACT_CLICK, wx: ACT_TL.x, wy: ACT_TL.y, at: 'w9-act-tl' },
+  { f: 470, wx: 800, wy: 300 },
+  { f: RCT1, wx: 800, wy: ROW1_Y, at: 'w9-tl-row-1' },
+  { f: TAGBTN1 - 10, wx: 635, wy: menuItemCy(MENU9_Y1), at: 'w9-menu-tag' },
+  { f: TAGBTN1, wx: 635, wy: menuItemCy(MENU9_Y1), at: 'w9-menu-tag' },
+  { f: TYPE1 - 8, wx: 960, wy: 517 },
+  { f: OK1 - 10, wx: 1134, wy: 721, at: 'w9-dlg-ok' },
+  { f: OK1, wx: 1134, wy: 721, at: 'w9-dlg-ok' },
+  { f: 812, wx: 800, wy: 430 },
+  { f: RCT2, wx: 800, wy: ROW5_Y, at: 'w9-tl-row-5' },
+  { f: TAGBTN2 - 10, wx: 635, wy: menuItemCy(MENU9_Y2), at: 'w9-menu-tag' },
+  { f: TAGBTN2, wx: 635, wy: menuItemCy(MENU9_Y2), at: 'w9-menu-tag' },
+  { f: TYPE2 - 8, wx: 960, wy: 517 },
+  { f: OK2 - 10, wx: 1134, wy: 721, at: 'w9-dlg-ok' },
+  { f: OK2, wx: 1134, wy: 721, at: 'w9-dlg-ok' },
+  { f: CHIP_CLICK - 10, wx: 360, wy: 140, at: 'w9-tag-chip' },
+  { f: CHIP_CLICK, wx: 360, wy: 140, at: 'w9-tag-chip' },
+  { f: AI_CLICK - 10, wx: TL.aiBtn.x + TL.aiBtn.w / 2, wy: TL.aiBtn.y + TL.aiBtn.h / 2, at: 'w9-ai-btn' },
+  { f: AI_CLICK, wx: TL.aiBtn.x + TL.aiBtn.w / 2, wy: TL.aiBtn.y + TL.aiBtn.h / 2, at: 'w9-ai-btn' },
+  { f: ACHK - 10, wx: ACHK_PT.x, wy: ACHK_PT.y, at: 'w9-ana-check' },
+  { f: ACHK, wx: ACHK_PT.x, wy: ACHK_PT.y, at: 'w9-ana-check' },
+  { f: AOK - 10, wx: AOK_PT.x, wy: AOK_PT.y, at: 'w9-ana-ok' },
+  { f: AOK, wx: AOK_PT.x, wy: AOK_PT.y, at: 'w9-ana-ok' },
+  { f: SAVE_CLICK - 10, wx: SAVE_PT.x, wy: SAVE_PT.y, at: 'w9-ask-save' },
+  { f: SAVE_CLICK, wx: SAVE_PT.x, wy: SAVE_PT.y, at: 'w9-ask-save' },
+  { f: 1830, wx: 1500, wy: 700 },
+  { f: SET_CLICK - 10, wx: 1675, wy: 34, at: 'w9-set-nav' },
+  { f: SET_CLICK, wx: 1675, wy: 34, at: 'w9-set-nav' },
+  { f: 2234, wx: 498, wy: 409 },
+  { f: 2380, wx: 900, wy: 780 },
+  { f: SEL_CLICK - 10, wx: W_SEL.x, wy: W_SEL.y, at: 'w9w-proj-sel' },
+  { f: SEL_CLICK, wx: W_SEL.x, wy: W_SEL.y, at: 'w9w-proj-sel' },
+  { f: OPT_CLICK - 10, wx: W_OPT.x, wy: W_OPT.y, at: 'w9w-drop-opt' },
+  { f: OPT_CLICK, wx: W_OPT.x, wy: W_OPT.y, at: 'w9w-drop-opt' },
+  { f: KIND1 - 10, wx: W_KIND1.x, wy: W_KIND1.y, at: 'w9w-kind-cmd' },
+  { f: KIND1, wx: W_KIND1.x, wy: W_KIND1.y, at: 'w9w-kind-cmd' },
+  { f: KIND2 - 10, wx: W_KIND2.x, wy: W_KIND2.y, at: 'w9w-kind-up' },
+  { f: KIND2, wx: W_KIND2.x, wy: W_KIND2.y, at: 'w9w-kind-up' },
+  { f: TAGSEL - 10, wx: W_TAG.x, wy: W_TAG.y, at: 'w9w-tag-sel' },
+  { f: TAGSEL, wx: W_TAG.x, wy: W_TAG.y, at: 'w9w-tag-sel' },
+  { f: ROW_CLICK - 10, wx: W_ROW.x, wy: W_ROW.y, at: 'w9w-row-0' },
+  { f: ROW_CLICK, wx: W_ROW.x, wy: W_ROW.y, at: 'w9w-row-0' },
+  { f: 3280, wx: 900, wy: 800 },
+  { f: PURGE_CLICK - 10, wx: 386, wy: 610, at: 'w9w-purge' },
+  { f: PURGE_CLICK, wx: 386, wy: 610, at: 'w9w-purge' },
+  { f: CFM_OK - 10, wx: 1116, wy: 689, at: 'w9-cfm-ok' },
+  { f: CFM_OK, wx: 1116, wy: 689, at: 'w9-cfm-ok' },
+  { f: 3800, wx: 700, wy: 900 },
+  { f: DURATION, wx: 1200, wy: 850 },
+];
+
+export const CUR_PATH: readonly AnchorStop[] = CUR_DEF.map(({ f, wx, wy, at }) => ({ f, at, ...wfAt(f, wx, wy) }));
+
+/* ============ 点击(涟漪;anchor 命中实测中心) ============ */
+const click = (f: number, wx: number, wy: number, target: Click['target'], anchor?: string): Click => ({
+  f, target, anchor, ...wfAt(f, wx, wy),
+});
 export const CLICKS: readonly Click[] = [
-  { f: ACT_CLICK, x: ACT_TL.x, y: ACT_TL.y, target: 'browse' },
-  { f: RCT1, x: 800, y: ROW1_Y, target: 'row' },
-  { f: TAGBTN1, x: 635, y: menuItemCy(MENU9_Y1), target: 'browse' },
-  { f: OK1, x: 1134, y: 721, target: 'confirm' },
-  { f: RCT2, x: 800, y: ROW5_Y, target: 'row' },
-  { f: TAGBTN2, x: 635, y: menuItemCy(MENU9_Y2), target: 'browse' },
-  { f: OK2, x: 1134, y: 721, target: 'confirm' },
-  { f: CHIP_CLICK, x: 360, y: 140, target: 'browse' },
-  { f: AI_CLICK, x: TL.aiBtn.x + TL.aiBtn.w / 2, y: TL.aiBtn.y + TL.aiBtn.h / 2, target: 'browse' },
-  { f: ACHK, x: ACHK_PT.x, y: ACHK_PT.y, target: 'browse' },
-  { f: AOK, x: AOK_PT.x, y: AOK_PT.y, target: 'confirm' },
-  { f: SAVE_CLICK, x: SAVE_PT.x, y: SAVE_PT.y, target: 'confirm' },
-  { f: SET_CLICK, x: 1675, y: 34, target: 'browse' },
-  { f: SEL_CLICK, x: W_SEL.x, y: W_SEL.y, target: 'browse' },
-  { f: OPT_CLICK, x: W_OPT.x, y: W_OPT.y, target: 'browse' },
-  { f: KIND1, x: W_KIND1.x, y: W_KIND1.y, target: 'browse' },
-  { f: KIND2, x: W_KIND2.x, y: W_KIND2.y, target: 'browse' },
-  { f: TAGSEL, x: W_TAG.x, y: W_TAG.y, target: 'browse' },
-  { f: ROW_CLICK, x: W_ROW.x, y: W_ROW.y, target: 'row' },
-  { f: PURGE_CLICK, x: 386, y: 610, target: 'save' },
-  { f: CFM_OK, x: 1116, y: 689, target: 'confirm' },
+  click(ACT_CLICK, ACT_TL.x, ACT_TL.y, 'browse', 'w9-act-tl'),
+  click(RCT1, 800, ROW1_Y, 'row', 'w9-tl-row-1'),
+  click(TAGBTN1, 635, menuItemCy(MENU9_Y1), 'browse', 'w9-menu-tag'),
+  click(OK1, 1134, 721, 'confirm', 'w9-dlg-ok'),
+  click(RCT2, 800, ROW5_Y, 'row', 'w9-tl-row-5'),
+  click(TAGBTN2, 635, menuItemCy(MENU9_Y2), 'browse', 'w9-menu-tag'),
+  click(OK2, 1134, 721, 'confirm', 'w9-dlg-ok'),
+  click(CHIP_CLICK, 360, 140, 'browse', 'w9-tag-chip'),
+  click(AI_CLICK, TL.aiBtn.x + TL.aiBtn.w / 2, TL.aiBtn.y + TL.aiBtn.h / 2, 'browse', 'w9-ai-btn'),
+  click(ACHK, ACHK_PT.x, ACHK_PT.y, 'browse', 'w9-ana-check'),
+  click(AOK, AOK_PT.x, AOK_PT.y, 'confirm', 'w9-ana-ok'),
+  click(SAVE_CLICK, SAVE_PT.x, SAVE_PT.y, 'confirm', 'w9-ask-save'),
+  click(SET_CLICK, 1675, 34, 'browse', 'w9-set-nav'),
+  click(SEL_CLICK, W_SEL.x, W_SEL.y, 'browse', 'w9w-proj-sel'),
+  click(OPT_CLICK, W_OPT.x, W_OPT.y, 'browse', 'w9w-drop-opt'),
+  click(KIND1, W_KIND1.x, W_KIND1.y, 'browse', 'w9w-kind-cmd'),
+  click(KIND2, W_KIND2.x, W_KIND2.y, 'browse', 'w9w-kind-up'),
+  click(TAGSEL, W_TAG.x, W_TAG.y, 'browse', 'w9w-tag-sel'),
+  click(ROW_CLICK, W_ROW.x, W_ROW.y, 'row', 'w9w-row-0'),
+  click(PURGE_CLICK, 386, 610, 'save', 'w9w-purge'),
+  click(CFM_OK, 1116, 689, 'confirm', 'w9-cfm-ok'),
 ];
 
 /* ============ 字幕 ============ */
@@ -269,32 +282,32 @@ export const NOTES9: readonly Note9[] = [
   },
 ];
 
-/* ============ 焦点高亮环 ============ */
+/* ============ 焦点高亮环(锚点实测,pad 外扩) ============ */
 export const HIGHLIGHTS9 = [
-  { x: 4, y: ACT_TL.y - 20, w: 40, h: 40, r: 8, from: ACT_CLICK - 22, to: ACT_CLICK - 2 },
-  { x: 312, y: 240, w: 1256, h: 34, r: 4, from: RCT1 - 30, to: RCT1 - 2 },
-  { x: 564, y: 272, w: 142, h: 30, r: 4, from: TAGBTN1 - 22, to: TAGBTN1 - 2 },
-  { x: 1090, y: 700, w: 88, h: 36, r: 4, from: OK1 - 22, to: OK1 - 2 },
-  { x: 312, y: 384, w: 1256, h: 34, r: 4, from: RCT2 - 30, to: RCT2 - 2 },
-  { x: 564, y: 416, w: 142, h: 30, r: 4, from: TAGBTN2 - 22, to: TAGBTN2 - 2 },
-  { x: 1090, y: 700, w: 88, h: 36, r: 4, from: OK2 - 22, to: OK2 - 2 },
-  { x: 318, y: 126, w: 84, h: 28, r: 4, from: CHIP_CLICK - 22, to: CHIP_CLICK - 2 },
-  { x: TL.aiBtn.x - 4, y: TL.aiBtn.y - 4, w: TL.aiBtn.w + 8, h: TL.aiBtn.h + 8, r: 4, from: AI_CLICK - 22, to: AI_CLICK - 2 },
-  { x: ACHK_PT.x - 14, y: ACHK_PT.y - 14, w: 28, h: 28, r: 4, from: ACHK - 22, to: ACHK - 2 },
-  { x: ADLG9_F.btnOk.x - 4, y: ADLG9_F.btnOk.y - 4, w: ADLG9_F.btnOk.w + 8, h: ADLG9_F.btnOk.h + 8, r: 4, from: AOK - 22, to: AOK - 2 },
-  { x: AI2.saveBtn.x - 4, y: AI2.saveBtn.y - 4, w: AI2.saveBtn.w + 8, h: AI2.saveBtn.h + 8, r: 4, from: SAVE_CLICK - 22, to: SAVE_CLICK - 2 },
-  { x: 1649, y: 13, w: 52, h: 38, r: 6, from: SET_CLICK - 22, to: SET_CLICK - 2 },
-  { x: 484, y: 395, w: 28, h: 28, r: 4, from: 1966, to: 2180 },
-  { x: 306, y: 548, w: 640, h: 26, r: 4, from: 1966, to: 2180 },
-  { x: WEB.projSel.x - 4, y: WEB.projSel.y - 4, w: WEB.projSel.w + 8, h: WEB.projSel.h + 8, r: 6, from: SEL_CLICK - 22, to: SEL_CLICK - 2 },
-  { x: WEB.drop.x - 2, y: WEB.drop.y + WEB.drop.pad + 36 - 2, w: WEB.drop.w + 4, h: 40, r: 6, from: OPT_CLICK - 22, to: OPT_CLICK - 2 },
-  { x: webChipX(3) - 4, y: WEB.chipsY - 4, w: 64, h: WEB.chipH + 8, r: 12, from: KIND1 - 22, to: KIND1 - 2 },
-  { x: webChipX(4) - 4, y: WEB.chipsY - 4, w: 64, h: WEB.chipH + 8, r: 12, from: KIND2 - 22, to: KIND2 - 2 },
-  { x: WEB.tagSel.x - 4, y: WEB.tagSel.y - 4, w: WEB.tagSel.w + 8, h: WEB.tagSel.h + 8, r: 6, from: TAGSEL - 22, to: TAGSEL - 2 },
-  { x: WEB.rowX - 4, y: webRowY(0) - 4, w: WEB.rowW + 8, h: 50, r: 8, from: ROW_CLICK - 22, to: ROW_CLICK - 2 },
-  { x: 306, y: 590, w: 160, h: 36, r: 4, from: PURGE_CLICK - 22, to: PURGE_CLICK - 2 },
-  { x: 1066, y: 667, w: 100, h: 40, r: 4, from: CFM_OK - 22, to: CFM_OK - 2 },
-];
+  { target: 'w9-act-tl', pad: 0, r: 8, from: ACT_CLICK - 22, to: ACT_CLICK - 2 },
+  { target: 'w9-tl-row-1', pad: 0, r: 4, from: RCT1 - 30, to: RCT1 - 2 },
+  { target: 'w9-menu-tag', pad: 0, r: 4, from: TAGBTN1 - 22, to: TAGBTN1 - 2 },
+  { target: 'w9-dlg-ok', pad: 4, r: 4, from: OK1 - 22, to: OK1 - 2 },
+  { target: 'w9-tl-row-5', pad: 0, r: 4, from: RCT2 - 30, to: RCT2 - 2 },
+  { target: 'w9-menu-tag', pad: 0, r: 4, from: TAGBTN2 - 22, to: TAGBTN2 - 2 },
+  { target: 'w9-dlg-ok', pad: 4, r: 4, from: OK2 - 22, to: OK2 - 2 },
+  { target: 'w9-tag-chip', pad: 0, r: 4, from: CHIP_CLICK - 22, to: CHIP_CLICK - 2 },
+  { target: 'w9-ai-btn', pad: 4, r: 4, from: AI_CLICK - 22, to: AI_CLICK - 2 },
+  { target: 'w9-ana-check', pad: 0, r: 4, from: ACHK - 22, to: ACHK - 2 },
+  { target: 'w9-ana-ok', pad: 4, r: 4, from: AOK - 22, to: AOK - 2 },
+  { target: 'w9-ask-save', pad: 4, r: 4, from: SAVE_CLICK - 22, to: SAVE_CLICK - 2 },
+  { target: 'w9-set-nav', pad: 0, r: 6, from: SET_CLICK - 22, to: SET_CLICK - 2 },
+  { target: 'w9-set-ckb', pad: 0, r: 4, from: 1966, to: 2180 },
+  { target: 'w9-set-status', pad: 0, r: 4, from: 1966, to: 2180 },
+  { target: 'w9w-proj-sel', pad: 4, r: 6, from: SEL_CLICK - 22, to: SEL_CLICK - 2 },
+  { target: 'w9w-drop-opt', pad: 0, r: 6, from: OPT_CLICK - 22, to: OPT_CLICK - 2 },
+  { target: 'w9w-kind-cmd', pad: 4, r: 12, from: KIND1 - 22, to: KIND1 - 2 },
+  { target: 'w9w-kind-up', pad: 4, r: 12, from: KIND2 - 22, to: KIND2 - 2 },
+  { target: 'w9w-tag-sel', pad: 4, r: 6, from: TAGSEL - 22, to: TAGSEL - 2 },
+  { target: 'w9w-row-0', pad: 4, r: 8, from: ROW_CLICK - 22, to: ROW_CLICK - 2 },
+  { target: 'w9w-purge', pad: 0, r: 4, from: PURGE_CLICK - 22, to: PURGE_CLICK - 2 },
+  { target: 'w9-cfm-ok', pad: 0, r: 4, from: CFM_OK - 22, to: CFM_OK - 2 },
+] as const;
 
 /* ============ 工具 ============ */
 const inSpan = (frame: number, a: number, b: number): boolean => frame >= a && frame < b;

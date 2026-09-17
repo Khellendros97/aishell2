@@ -10,11 +10,12 @@
  *   E  1900–2560 收藏夹 / 搜索 / 列表视图排序 / 收尾
  */
 import { interpolate } from 'remotion';
-import { Stop } from '../anim';
+import { Stop, track1 } from '../anim';
+import { AnchorStop } from '../components/anchors';
 import { Click } from '../components/Cursor';
 import {
   APPS_ENTRIES, BACKUP, ARCHIVE, DEMO, DIR_MENU, FILE_MENU, HOME_ENTRIES, UPLOADED, osRow,
-  menuItemY, SFTP_BTN, ACT, FAV_OK,
+  menuItemY, SFTP_BTN, SF, ACT, FAV_OK,
 } from './layout';
 import { EditorDoc, SftpEntry, Tok, Wb3State, Wb3Target } from './Wb3';
 
@@ -98,78 +99,74 @@ const DL_ITEM = { x: 569 + 108, y: menuItemY(258, 18, FILE_MENU) };
 const ZIP_ITEM = { x: 665 + 108, y: menuItemY(180, 8, DIR_MENU) };
 const BAK_ITEM = { x: 376 + 108, y: menuItemY(180, 9, DIR_MENU) };
 
-export const CUR_X: readonly Stop[] = [
-  { f: 60, v: 1200 }, { f: 148, v: row0.x }, { f: 172, v: row0.x }, { f: 190, v: 300 }, { f: 214, v: 245 },
-  { f: 236, v: 240 }, { f: 260, v: 240 }, { f: 330, v: 420 },
-  { f: 436, v: ACT.servers.x }, { f: 446, v: ACT.servers.x }, { f: 458, v: 177 }, { f: 470, v: 177 },
-  { f: 500, v: 211 }, { f: 512, v: 211 }, { f: 540, v: ACT.explorer.x }, { f: 552, v: ACT.explorer.x },
-  { f: 596, v: 180 }, { f: 610, v: 180 }, { f: 632, v: 450 }, { f: 662, v: 880 }, { f: 690, v: 880 },
-  { f: 726, v: row1.x }, { f: 734, v: row1.x }, { f: 756, v: 500 }, { f: 776, v: 800 }, { f: 796, v: 880 },
-  { f: 800, v: 880 }, { f: 826, v: row1.x }, { f: 870, v: row1.x },
-  { f: 878, v: 559 }, { f: 890, v: 559 }, { f: 930, v: DL_ITEM.x }, { f: 958, v: DL_ITEM.x }, { f: 1000, v: 700 },
-  { f: 1060, v: 462 }, { f: 1096, v: 462 }, { f: 1150, v: 464 }, { f: 1190, v: 464 }, { f: 1280, v: 700 },
-  { f: 1350, v: 150 }, { f: 1385, v: 150 }, { f: 1420, v: 150 }, { f: 1470, v: 536 }, { f: 1500, v: 536 },
-  { f: 1516, v: 700 }, { f: 1560, v: 655 }, { f: 1572, v: 655 }, { f: 1600, v: ZIP_ITEM.x }, { f: 1618, v: ZIP_ITEM.x },
-  { f: 1660, v: 600 }, { f: 1690, v: 366 }, { f: 1732, v: 366 }, { f: 1756, v: BAK_ITEM.x }, { f: 1774, v: BAK_ITEM.x },
-  { f: 1810, v: 700 }, { f: 1950, v: 1373 }, { f: 1968, v: 1373 }, { f: 2036, v: FAV_OK.x }, { f: 2050, v: FAV_OK.x },
-  { f: 2058, v: 1526 }, { f: 2070, v: 1526 }, { f: 2095, v: 371 }, { f: 2108, v: 371 }, { f: 2126, v: 371 },
-  { f: 2136, v: 1450 }, { f: 2150, v: 1450 }, { f: 2160, v: 1556 }, { f: 2174, v: 1556 }, { f: 2210, v: 1560 },
-  { f: 2246, v: 1330 }, { f: 2270, v: 1330 }, { f: 2284, v: 1248 }, { f: 2400, v: 1248 }, { f: 2460, v: 900 },
-];
-export const CUR_Y: readonly Stop[] = [
-  { f: 60, v: 800 }, { f: 148, v: row0.y }, { f: 172, v: row0.y }, { f: 190, v: 620 }, { f: 214, v: 300 },
-  { f: 236, v: 186 }, { f: 260, v: 186 }, { f: 330, v: 300 },
-  { f: 436, v: ACT.servers.y }, { f: 446, v: ACT.servers.y }, { f: 458, v: 157 }, { f: 470, v: 157 },
-  { f: 500, v: 215 }, { f: 512, v: 215 }, { f: 540, v: ACT.explorer.y }, { f: 552, v: ACT.explorer.y },
-  { f: 596, v: 162 }, { f: 610, v: 162 }, { f: 632, v: 300 }, { f: 662, v: 470 }, { f: 690, v: 470 },
-  { f: 726, v: row1.y }, { f: 734, v: row1.y }, { f: 756, v: 640 }, { f: 776, v: 500 }, { f: 796, v: 470 },
-  { f: 800, v: 470 }, { f: 826, v: row1.y }, { f: 870, v: row1.y },
-  { f: 878, v: 244 }, { f: 890, v: 244 }, { f: 930, v: DL_ITEM.y }, { f: 958, v: DL_ITEM.y }, { f: 1000, v: 500 },
-  { f: 1060, v: 244 }, { f: 1096, v: 244 }, { f: 1150, v: 219 }, { f: 1190, v: 219 }, { f: 1280, v: 400 },
-  { f: 1350, v: 234 }, { f: 1385, v: 234 }, { f: 1420, v: 234 }, { f: 1470, v: 58 }, { f: 1500, v: 58 },
-  { f: 1516, v: 300 }, { f: 1560, v: 166 }, { f: 1572, v: 166 }, { f: 1600, v: ZIP_ITEM.y }, { f: 1618, v: ZIP_ITEM.y },
-  { f: 1660, v: 260 }, { f: 1690, v: 166 }, { f: 1732, v: 166 }, { f: 1756, v: BAK_ITEM.y }, { f: 1774, v: BAK_ITEM.y },
-  { f: 1810, v: 400 }, { f: 1950, v: 96 }, { f: 1968, v: 96 }, { f: 2036, v: FAV_OK.y }, { f: 2050, v: FAV_OK.y },
-  { f: 2058, v: 96 }, { f: 2070, v: 96 }, { f: 2095, v: 166 }, { f: 2108, v: 166 }, { f: 2126, v: 166 },
-  { f: 2136, v: 164 }, { f: 2150, v: 164 }, { f: 2160, v: 96 }, { f: 2174, v: 96 }, { f: 2210, v: 140 },
-  { f: 2246, v: 96 }, { f: 2270, v: 96 }, { f: 2284, v: 141 }, { f: 2400, v: 141 }, { f: 2460, v: 700 },
+/** 设计稿窗口坐标 → canvas 兜底坐标(按该帧相机;仅冷启动首帧兜底,实测就绪后即被替换) */
+const wfAt = (f: number, wx: number, wy: number): { x: number; y: number } => {
+  const s = track1(CAM_S, f);
+  const cx0 = track1(CAM_X, f);
+  const cy0 = track1(CAM_Y, f);
+  return { x: wx * s + (960 - cx0 * s), y: wy * s + (540 - cy0 * s) };
+};
+
+/* 原始轨道定义:wx/wy 为设计稿兜底坐标,at 为锚点 id(实测优先) */
+const CUR_DEF: readonly { f: number; wx: number; wy: number; at?: string }[] = [
+  { f: 60, wx: 1200, wy: 800 }, { f: 148, wx: row0.x, wy: row0.y, at: 'w3-os-row0' }, { f: 172, wx: row0.x, wy: row0.y, at: 'w3-os-row0' }, { f: 190, wx: 300, wy: 620 }, { f: 214, wx: 245, wy: 300 },
+  { f: 236, wx: 240, wy: 186 }, { f: 260, wx: 240, wy: 186 }, { f: 330, wx: 420, wy: 300 },
+  { f: 436, wx: ACT.servers.x, wy: ACT.servers.y, at: 'w3-act-servers' }, { f: 446, wx: ACT.servers.x, wy: ACT.servers.y, at: 'w3-act-servers' }, { f: 458, wx: 177, wy: 157, at: 'w3-card' }, { f: 470, wx: 177, wy: 157, at: 'w3-card' },
+  { f: 500, wx: 211, wy: 215, at: 'w3-sftp-btn' }, { f: 512, wx: 211, wy: 215, at: 'w3-sftp-btn' }, { f: 540, wx: ACT.explorer.x, wy: ACT.explorer.y, at: 'w3-act-explorer' }, { f: 552, wx: ACT.explorer.x, wy: ACT.explorer.y, at: 'w3-act-explorer' },
+  { f: 596, wx: 180, wy: 162, at: 'w3-os-row0' }, { f: 610, wx: 180, wy: 162, at: 'w3-os-row0' }, { f: 632, wx: 450, wy: 300 }, { f: 662, wx: 880, wy: 470 }, { f: 690, wx: 880, wy: 470 },
+  { f: 726, wx: row1.x, wy: row1.y, at: 'w3-os-row1' }, { f: 734, wx: row1.x, wy: row1.y, at: 'w3-os-row1' }, { f: 756, wx: 500, wy: 640 }, { f: 776, wx: 800, wy: 500 }, { f: 796, wx: 880, wy: 470 },
+  { f: 800, wx: 880, wy: 470 }, { f: 826, wx: row1.x, wy: row1.y, at: 'w3-os-row1' }, { f: 870, wx: row1.x, wy: row1.y, at: 'w3-os-row1' },
+  { f: 878, wx: 559, wy: 244, at: 'w3-entry-deploy.md' }, { f: 890, wx: 559, wy: 244, at: 'w3-entry-deploy.md' }, { f: 930, wx: DL_ITEM.x, wy: DL_ITEM.y, at: 'w3-menu-18' }, { f: 958, wx: DL_ITEM.x, wy: DL_ITEM.y, at: 'w3-menu-18' }, { f: 1000, wx: 700, wy: 500 },
+  { f: 1060, wx: 462, wy: 244, at: 'w3-entry-app-config.yml' }, { f: 1096, wx: 462, wy: 244, at: 'w3-entry-app-config.yml' }, { f: 1150, wx: 464, wy: 219 }, { f: 1190, wx: 464, wy: 219 }, { f: 1280, wx: 700, wy: 400 },
+  { f: 1350, wx: 150, wy: 234, at: 'w3-tree-README.md' }, { f: 1385, wx: 150, wy: 234, at: 'w3-tree-README.md' }, { f: 1420, wx: 150, wy: 234, at: 'w3-tree-README.md' }, { f: 1470, wx: 536, wy: 58, at: 'w3-tab-sftp' }, { f: 1500, wx: 536, wy: 58, at: 'w3-tab-sftp' },
+  { f: 1516, wx: 700, wy: 300 }, { f: 1560, wx: 655, wy: 166, at: 'w3-entry-logs' }, { f: 1572, wx: 655, wy: 166, at: 'w3-entry-logs' }, { f: 1600, wx: ZIP_ITEM.x, wy: ZIP_ITEM.y, at: 'w3-menu-8' }, { f: 1618, wx: ZIP_ITEM.x, wy: ZIP_ITEM.y, at: 'w3-menu-8' },
+  { f: 1660, wx: 600, wy: 260 }, { f: 1690, wx: 366, wy: 166, at: 'w3-entry-apps' }, { f: 1732, wx: 366, wy: 166, at: 'w3-entry-apps' }, { f: 1756, wx: BAK_ITEM.x, wy: BAK_ITEM.y, at: 'w3-menu-9' }, { f: 1774, wx: BAK_ITEM.x, wy: BAK_ITEM.y, at: 'w3-menu-9' },
+  { f: 1810, wx: 700, wy: 400 }, { f: 1950, wx: SF.star.x, wy: SF.star.y, at: 'w3-sf-star' }, { f: 1968, wx: SF.star.x, wy: SF.star.y, at: 'w3-sf-star' }, { f: 2036, wx: FAV_OK.x, wy: FAV_OK.y, at: 'w3-fav-ok' }, { f: 2050, wx: FAV_OK.x, wy: FAV_OK.y, at: 'w3-fav-ok' },
+  { f: 2058, wx: SF.favBtn.x, wy: SF.favBtn.y, at: 'w3-sf-fav' }, { f: 2070, wx: SF.favBtn.x, wy: SF.favBtn.y, at: 'w3-sf-fav' }, { f: 2095, wx: 371, wy: 166, at: 'w3-entry-apps' }, { f: 2108, wx: 371, wy: 166, at: 'w3-entry-apps' }, { f: 2126, wx: 371, wy: 166, at: 'w3-entry-apps' },
+  { f: 2136, wx: 1450, wy: 164, at: 'w3-fav-item' }, { f: 2150, wx: 1450, wy: 164, at: 'w3-fav-item' }, { f: 2160, wx: SF.searchBtn.x, wy: SF.searchBtn.y, at: 'w3-sf-search' }, { f: 2174, wx: SF.searchBtn.x, wy: SF.searchBtn.y, at: 'w3-sf-search' }, { f: 2210, wx: 1560, wy: 140 },
+  { f: 2246, wx: SF.listBtn.x, wy: SF.listBtn.y, at: 'w3-sf-list' }, { f: 2270, wx: SF.listBtn.x, wy: SF.listBtn.y, at: 'w3-sf-list' }, { f: 2284, wx: 1248, wy: 141, at: 'w3-sort-th' }, { f: 2400, wx: 1248, wy: 141, at: 'w3-sort-th' }, { f: 2460, wx: 900, wy: 700 },
 ];
 
-/* ============ 点击(涟漪) ============ */
+export const CUR_PATH: readonly AnchorStop[] = CUR_DEF.map(({ f, wx, wy, at }) => ({ f, at, ...wfAt(f, wx, wy) }));
+
+/* ============ 点击(涟漪;anchor 命中实测中心,wx/wy 为冷启动兜底) ============ */
+const click = (f: number, wx: number, wy: number, target: Click['target'], anchor?: string): Click => ({
+  f, target, anchor, ...wfAt(f, wx, wy),
+});
 export const CLICKS: readonly Click[] = [
-  { f: A_PRESS, x: row0.x, y: row0.y, target: 'row' },
-  { f: A_DROP, x: 240, y: 186, target: 'row' },
-  { f: B_SERVERS, x: ACT.servers.x, y: ACT.servers.y, target: 'browse' },
-  { f: B_CARD, x: 177, y: 157, target: 'browse' },
-  { f: B_SFTP, x: SFTP_BTN.x + 13, y: SFTP_BTN.y + 13, target: 'browse' },
-  { f: B_EXPLORER, x: ACT.explorer.x, y: ACT.explorer.y, target: 'browse' },
-  { f: B_UP_PRESS, x: 180, y: 162, target: 'row' },
-  { f: B_UP_DROP, x: 880, y: 470, target: 'row' },
-  { f: B_REJ_PRESS, x: row1.x, y: row1.y, target: 'row' },
-  { f: B_REJ_DROP, x: 880, y: 470, target: 'row' },
-  { f: B_RC_DEPLOY, x: 559, y: 244, target: 'row' },
-  { f: B_DL_CLICK, x: DL_ITEM.x, y: DL_ITEM.y, target: 'confirm' },
-  { f: C_OPEN1, x: 462, y: 244, target: 'row' },
-  { f: C_OPEN1 + 12, x: 462, y: 244, target: 'row' },
-  { f: C_SEL1, x: 464, y: 219, target: 'input' },
-  { f: C_SEL1 + 11, x: 464, y: 219, target: 'input' },
-  { f: C_OPEN2, x: 150, y: 234, target: 'row' },
-  { f: C_OPEN2 + 11, x: 150, y: 234, target: 'row' },
-  { f: D_TAB, x: 536, y: 58, target: 'browse' },
-  { f: D_RC_LOGS, x: 655, y: 166, target: 'row' },
-  { f: D_ZIP, x: ZIP_ITEM.x, y: ZIP_ITEM.y, target: 'confirm' },
-  { f: D_RC_APPS, x: 366, y: 166, target: 'row' },
-  { f: D_BAK, x: BAK_ITEM.x, y: BAK_ITEM.y, target: 'confirm' },
-  { f: E_STAR, x: 1373, y: 96, target: 'browse' },
-  { f: E_FAVOK, x: FAV_OK.x, y: FAV_OK.y, target: 'save' },
-  { f: E_FAVBTN, x: 1526, y: 96, target: 'browse' },
-  { f: E_APPS1, x: 371, y: 166, target: 'row' },
-  { f: E_APPS2, x: 371, y: 166, target: 'row' },
-  { f: E_JUMP, x: 1450, y: 164, target: 'confirm' },
-  { f: E_SEARCH, x: 1556, y: 96, target: 'browse' },
-  { f: E_LIST, x: 1330, y: 96, target: 'browse' },
-  { f: E_SORT1, x: 1248, y: 141, target: 'confirm' },
-  { f: E_SORT2, x: 1248, y: 141, target: 'confirm' },
+  click(A_PRESS, row0.x, row0.y, 'row', 'w3-os-row0'),
+  click(A_DROP, 240, 186, 'row'),
+  click(B_SERVERS, ACT.servers.x, ACT.servers.y, 'browse', 'w3-act-servers'),
+  click(B_CARD, 177, 157, 'browse', 'w3-card'),
+  click(B_SFTP, SFTP_BTN.x + 13, SFTP_BTN.y + 13, 'browse', 'w3-sftp-btn'),
+  click(B_EXPLORER, ACT.explorer.x, ACT.explorer.y, 'browse', 'w3-act-explorer'),
+  click(B_UP_PRESS, 180, 162, 'row', 'w3-os-row0'),
+  click(B_UP_DROP, 880, 470, 'row'),
+  click(B_REJ_PRESS, row1.x, row1.y, 'row', 'w3-os-row1'),
+  click(B_REJ_DROP, 880, 470, 'row'),
+  click(B_RC_DEPLOY, 559, 244, 'row', 'w3-entry-deploy.md'),
+  click(B_DL_CLICK, DL_ITEM.x, DL_ITEM.y, 'confirm', 'w3-menu-18'),
+  click(C_OPEN1, 462, 244, 'row', 'w3-entry-app-config.yml'),
+  click(C_OPEN1 + 12, 462, 244, 'row', 'w3-entry-app-config.yml'),
+  click(C_SEL1, 464, 219, 'input'),
+  click(C_SEL1 + 11, 464, 219, 'input'),
+  click(C_OPEN2, 150, 234, 'row', 'w3-tree-README.md'),
+  click(C_OPEN2 + 11, 150, 234, 'row', 'w3-tree-README.md'),
+  click(D_TAB, 536, 58, 'browse', 'w3-tab-sftp'),
+  click(D_RC_LOGS, 655, 166, 'row', 'w3-entry-logs'),
+  click(D_ZIP, ZIP_ITEM.x, ZIP_ITEM.y, 'confirm', 'w3-menu-8'),
+  click(D_RC_APPS, 366, 166, 'row', 'w3-entry-apps'),
+  click(D_BAK, BAK_ITEM.x, BAK_ITEM.y, 'confirm', 'w3-menu-9'),
+  click(E_STAR, SF.star.x, SF.star.y, 'browse', 'w3-sf-star'),
+  click(E_FAVOK, FAV_OK.x, FAV_OK.y, 'save', 'w3-fav-ok'),
+  click(E_FAVBTN, SF.favBtn.x, SF.favBtn.y, 'browse', 'w3-sf-fav'),
+  click(E_APPS1, 371, 166, 'row', 'w3-entry-apps'),
+  click(E_APPS2, 371, 166, 'row', 'w3-entry-apps'),
+  click(E_JUMP, 1450, 164, 'confirm', 'w3-fav-item'),
+  click(E_SEARCH, SF.searchBtn.x, SF.searchBtn.y, 'browse', 'w3-sf-search'),
+  click(E_LIST, SF.listBtn.x, SF.listBtn.y, 'browse', 'w3-sf-list'),
+  click(E_SORT1, 1248, 141, 'confirm', 'w3-sort-th'),
+  click(E_SORT2, 1248, 141, 'confirm', 'w3-sort-th'),
 ];
 
 /* ============ 字幕 ============ */
@@ -209,15 +206,15 @@ export const KBD3 = [
   { from: 2224, to: 2250, x: 1520, y: 140, label: 'Esc' },
 ];
 
-/** 焦点高亮环 */
+/** 焦点高亮环(锚点实测,pad 外扩) */
 export const HIGHLIGHTS3 = [
-  { x: SFTP_BTN.x - 5, y: SFTP_BTN.y - 5, w: SFTP_BTN.w + 10, h: SFTP_BTN.h + 10, r: 6, from: 496, to: 516 },
-  { x: 1351, y: 74, w: 44, h: 44, r: 8, from: 1950, to: 1976 },
-  { x: 1508, y: 78, w: 36, h: 36, r: 6, from: 2052, to: 2072 },
-  { x: 1538, y: 78, w: 36, h: 36, r: 6, from: 2156, to: 2176 },
-  { x: 1312, y: 78, w: 36, h: 36, r: 6, from: 2252, to: 2272 },
-  { x: 1206, y: 127, w: 96, h: 26, r: 4, from: 2290, to: 2336 },
-];
+  { target: 'w3-sftp-btn', pad: 5, r: 6, from: 496, to: 516 },
+  { target: 'w3-sf-star', pad: 10, r: 8, from: 1950, to: 1976 },
+  { target: 'w3-sf-fav', pad: 4, r: 6, from: 2052, to: 2072 },
+  { target: 'w3-sf-search', pad: 4, r: 6, from: 2156, to: 2176 },
+  { target: 'w3-sf-list', pad: 4, r: 6, from: 2252, to: 2272 },
+  { target: 'w3-sort-th', pad: 4, r: 4, from: 2290, to: 2336 },
+] as const;
 
 /* ============ 编辑器文档 ============ */
 const APP_LINES_BEFORE: Tok[][] = [

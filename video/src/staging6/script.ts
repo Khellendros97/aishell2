@@ -12,7 +12,8 @@
  *   G  2790–2960 收尾全景
  */
 import { interpolate } from 'remotion';
-import { Stop } from '../anim';
+import { Stop, track1 } from '../anim';
+import { AnchorStop } from '../components/anchors';
 import { Click } from '../components/Cursor';
 import {
   ChatItem, ChatSpec, DEMO, DIFF, EXP_BTN, NOTICE, SES_NEW, SES_SELECT, STG, TAB_STAGING_X, TAB_W,
@@ -146,61 +147,72 @@ const SES_NEW_C = { x: SES_NEW.x + SES_NEW.w / 2, y: SES_NEW.y + SES_NEW.h / 2 }
 const SES_SEL_C = { x: SES_SELECT.x + SES_SELECT.w / 2, y: SES_SELECT.y + SES_SELECT.h / 2 };
 const SES_ITEM0 = { x: SES_SELECT.x + SES_SELECT.w / 2, y: sesMenuItemCy(0) };
 
-/* ============ 指针轨道 ============ */
-const CURVE: readonly (readonly [number, number, number])[] = [
-  [60, 1450, 900],
-  [160, 1750, 860],
-  [310, 1850, 960],
-  [466, 1750, 1130],
-  [600, 1750, 1130],
-  [620, 1850, 960],
-  [862, NOTICE_ANCHOR.x, NOTICE_ANCHOR.y],
-  [916, NOTICE_ANCHOR.x, NOTICE_ANCHOR.y],
-  [958, 700, 300],
-  [1088, DIFF_BTN.x, DIFF_BTN.y],
-  [1146, DIFF_BTN.x, DIFF_BTN.y],
-  [1340, STG_TAB.x, STG_TAB.y],
-  [1352, STG_TAB.x, STG_TAB.y],
-  [1420, EXPORT_BTN.x, EXPORT_BTN.y],
-  [1478, EXPORT_BTN.x, EXPORT_BTN.y],
-  [1546, EXP_BTN.ok.x, EXP_BTN.ok.y],
-  [1600, EXP_BTN.ok.x, EXP_BTN.ok.y],
-  [1796, RESTORE_BTN.x, RESTORE_BTN.y],
-  [1854, RESTORE_BTN.x, RESTORE_BTN.y],
-  [1936, 1115, 672],
-  [1996, 1115, 672],
-  [2096, ACCEPT_BTN.x, ACCEPT_BTN.y],
-  [2154, ACCEPT_BTN.x, ACCEPT_BTN.y],
-  [2236, 1115, 672],
-  [2296, 1115, 672],
-  [2426, SES_NEW_C.x, SES_NEW_C.y],
-  [2484, SES_NEW_C.x, SES_NEW_C.y],
-  [2526, SES_SEL_C.x, SES_SEL_C.y],
-  [2610, SES_SEL_C.x, SES_SEL_C.y],
-  [2630, SES_ITEM0.x, SES_ITEM0.y],
-  [2690, SES_ITEM0.x, SES_ITEM0.y],
-  [2760, 1500, 940],
-  [2940, 1500, 940],
-];
-export const CUR_X: readonly Stop[] = CURVE.map(([f, x]) => ({ f, v: x }));
-export const CUR_Y: readonly Stop[] = CURVE.map(([f, , y]) => ({ f, v: y }));
+/* ============ 指针轨道(wx/wy 为设计稿兜底坐标,at 为锚点 id 实测优先) ============ */
+/** 设计稿窗口坐标 → canvas 兜底坐标(按该帧相机;仅冷启动首帧兜底,实测就绪后即被替换) */
+const wfAt = (f: number, wx: number, wy: number): { x: number; y: number } => {
+  const s = track1(CAM_S, f);
+  const cx0 = track1(CAM_X, f);
+  const cy0 = track1(CAM_Y, f);
+  return { x: wx * s + (960 - cx0 * s), y: wy * s + (540 - cy0 * s) };
+};
 
-/* ============ 点击(涟漪) ============ */
+const CUR_DEF: readonly { f: number; wx: number; wy: number; at?: string }[] = [
+  { f: 60, wx: 1450, wy: 900 },
+  { f: 160, wx: 1750, wy: 860 },
+  { f: 310, wx: 1850, wy: 960 },
+  { f: 466, wx: 1750, wy: 1130, at: 'w6-ai-input' },
+  { f: 600, wx: 1750, wy: 1130, at: 'w6-ai-input' },
+  { f: 620, wx: 1850, wy: 960 },
+  { f: 862, wx: NOTICE_ANCHOR.x, wy: NOTICE_ANCHOR.y, at: 'w6-notice' },
+  { f: 916, wx: NOTICE_ANCHOR.x, wy: NOTICE_ANCHOR.y, at: 'w6-notice' },
+  { f: 958, wx: 700, wy: 300 },
+  { f: 1088, wx: DIFF_BTN.x, wy: DIFF_BTN.y, at: 'w6-stg-diff-0' },
+  { f: 1146, wx: DIFF_BTN.x, wy: DIFF_BTN.y, at: 'w6-stg-diff-0' },
+  { f: 1340, wx: STG_TAB.x, wy: STG_TAB.y, at: 'w6-tab-staging' },
+  { f: 1352, wx: STG_TAB.x, wy: STG_TAB.y, at: 'w6-tab-staging' },
+  { f: 1420, wx: EXPORT_BTN.x, wy: EXPORT_BTN.y, at: 'w6-stg-export-0' },
+  { f: 1478, wx: EXPORT_BTN.x, wy: EXPORT_BTN.y, at: 'w6-stg-export-0' },
+  { f: 1546, wx: EXP_BTN.ok.x, wy: EXP_BTN.ok.y, at: 'w6-exp-ok' },
+  { f: 1600, wx: EXP_BTN.ok.x, wy: EXP_BTN.ok.y, at: 'w6-exp-ok' },
+  { f: 1796, wx: RESTORE_BTN.x, wy: RESTORE_BTN.y, at: 'w6-stg-restore-1' },
+  { f: 1854, wx: RESTORE_BTN.x, wy: RESTORE_BTN.y, at: 'w6-stg-restore-1' },
+  { f: 1936, wx: 1115, wy: 672, at: 'w6-dlg-ok' },
+  { f: 1996, wx: 1115, wy: 672, at: 'w6-dlg-ok' },
+  { f: 2096, wx: ACCEPT_BTN.x, wy: ACCEPT_BTN.y, at: 'w6-stg-accept-0' },
+  { f: 2154, wx: ACCEPT_BTN.x, wy: ACCEPT_BTN.y, at: 'w6-stg-accept-0' },
+  { f: 2236, wx: 1115, wy: 672, at: 'w6-dlg-ok' },
+  { f: 2296, wx: 1115, wy: 672, at: 'w6-dlg-ok' },
+  { f: 2426, wx: SES_NEW_C.x, wy: SES_NEW_C.y, at: 'w6-ses-new' },
+  { f: 2484, wx: SES_NEW_C.x, wy: SES_NEW_C.y, at: 'w6-ses-new' },
+  { f: 2526, wx: SES_SEL_C.x, wy: SES_SEL_C.y, at: 'w6-ses-select' },
+  { f: 2610, wx: SES_SEL_C.x, wy: SES_SEL_C.y, at: 'w6-ses-select' },
+  { f: 2630, wx: SES_ITEM0.x, wy: SES_ITEM0.y, at: 'w6-ses-item-0' },
+  { f: 2690, wx: SES_ITEM0.x, wy: SES_ITEM0.y, at: 'w6-ses-item-0' },
+  { f: 2760, wx: 1500, wy: 940 },
+  { f: 2940, wx: 1500, wy: 940 },
+];
+
+export const CUR_PATH: readonly AnchorStop[] = CUR_DEF.map(({ f, wx, wy, at }) => ({ f, at, ...wfAt(f, wx, wy) }));
+
+/* ============ 点击(涟漪;anchor 命中实测中心) ============ */
+const click = (f: number, wx: number, wy: number, target: Click['target'], anchor?: string): Click => ({
+  f, target, anchor, ...wfAt(f, wx, wy),
+});
 export const CLICKS: readonly Click[] = [
-  { f: U2_CLICK, x: 1750, y: 1130, target: 'input' },
-  { f: U2_ENTER, x: 1750, y: 1130, target: 'input' },
-  { f: STG_CLICK, x: NOTICE_ANCHOR.x, y: NOTICE_ANCHOR.y, target: 'browse' },
-  { f: DIFF_CLICK, x: DIFF_BTN.x, y: DIFF_BTN.y, target: 'row' },
-  { f: BACK_CLICK, x: STG_TAB.x, y: STG_TAB.y, target: 'browse' },
-  { f: EXP_CLICK, x: EXPORT_BTN.x, y: EXPORT_BTN.y, target: 'row' },
-  { f: EXP_OK, x: EXP_BTN.ok.x, y: EXP_BTN.ok.y, target: 'confirm' },
-  { f: RES_CLICK, x: RESTORE_BTN.x, y: RESTORE_BTN.y, target: 'row' },
-  { f: RES_OK, x: 1115, y: 672, target: 'confirm' },
-  { f: ACC_CLICK, x: ACCEPT_BTN.x, y: ACCEPT_BTN.y, target: 'row' },
-  { f: ACC_OK, x: 1115, y: 672, target: 'confirm' },
-  { f: NEWSES_CLICK, x: SES_NEW_C.x, y: SES_NEW_C.y, target: 'browse' },
-  { f: SES_MENU_CLICK, x: SES_SEL_C.x, y: SES_SEL_C.y, target: 'browse' },
-  { f: BACKSES_CLICK, x: SES_ITEM0.x, y: SES_ITEM0.y, target: 'row' },
+  click(U2_CLICK, 1750, 1130, 'input', 'w6-ai-input'),
+  click(U2_ENTER, 1750, 1130, 'input', 'w6-ai-input'),
+  click(STG_CLICK, NOTICE_ANCHOR.x, NOTICE_ANCHOR.y, 'browse', 'w6-notice'),
+  click(DIFF_CLICK, DIFF_BTN.x, DIFF_BTN.y, 'row', 'w6-stg-diff-0'),
+  click(BACK_CLICK, STG_TAB.x, STG_TAB.y, 'browse', 'w6-tab-staging'),
+  click(EXP_CLICK, EXPORT_BTN.x, EXPORT_BTN.y, 'row', 'w6-stg-export-0'),
+  click(EXP_OK, EXP_BTN.ok.x, EXP_BTN.ok.y, 'confirm', 'w6-exp-ok'),
+  click(RES_CLICK, RESTORE_BTN.x, RESTORE_BTN.y, 'row', 'w6-stg-restore-1'),
+  click(RES_OK, 1115, 672, 'confirm', 'w6-dlg-ok'),
+  click(ACC_CLICK, ACCEPT_BTN.x, ACCEPT_BTN.y, 'row', 'w6-stg-accept-0'),
+  click(ACC_OK, 1115, 672, 'confirm', 'w6-dlg-ok'),
+  click(NEWSES_CLICK, SES_NEW_C.x, SES_NEW_C.y, 'browse', 'w6-ses-new'),
+  click(SES_MENU_CLICK, SES_SEL_C.x, SES_SEL_C.y, 'browse', 'w6-ses-select'),
+  click(BACKSES_CLICK, SES_ITEM0.x, SES_ITEM0.y, 'row', 'w6-ses-item-0'),
 ];
 
 /* ============ 字幕 ============ */
@@ -252,21 +264,20 @@ export const NOTES6: readonly Note6[] = [
 
 export const KBD6: readonly { from: number; to: number; x: number; y: number; label: string }[] = [];
 
-/* ============ 焦点高亮环 ============ */
-const ROW_BTN_Y = STG.rowY + (STG.rowH - 24) / 2;
+/* ============ 焦点高亮环(锚点实测,pad 外扩) ============ */
 export const HIGHLIGHTS6 = [
-  { x: NOTICE.x - 4, y: NOTICE.y - 4, w: NOTICE.w + 8, h: NOTICE.h + 8, r: 8, from: STG_CLICK - 26, to: STG_CLICK - 2 },
-  { x: STG.btnDiff.x - 5, y: ROW_BTN_Y - 5, w: STG.btnDiff.w + 10, h: 34, r: 4, from: DIFF_CLICK - 26, to: DIFF_CLICK - 2 },
-  { x: STG.btnExport.x - 5, y: ROW_BTN_Y - 5, w: STG.btnExport.w + 10, h: 34, r: 4, from: EXP_CLICK - 26, to: EXP_CLICK - 2 },
-  { x: EXP_BTN.ok.x - 38, y: EXP_BTN.ok.y - 16, w: 76, h: 32, r: 4, from: EXP_OK - 24, to: EXP_OK - 2 },
-  { x: STG.btnRestore.x - 5, y: ROW_BTN_Y + STG.rowH - 5, w: STG.btnRestore.w + 10, h: 34, r: 4, from: RES_CLICK - 26, to: RES_CLICK - 2 },
-  { x: 1115 - 27, y: 656, w: 54, h: 32, r: 4, from: RES_OK - 24, to: RES_OK - 2 },
-  { x: STG.btnAccept.x - 5, y: ROW_BTN_Y - 5, w: STG.btnAccept.w + 10, h: 34, r: 4, from: ACC_CLICK - 26, to: ACC_CLICK - 2 },
-  { x: 1115 - 27, y: 656, w: 54, h: 32, r: 4, from: ACC_OK - 24, to: ACC_OK - 2 },
-  { x: SES_NEW.x - 4, y: SES_NEW.y - 4, w: SES_NEW.w + 8, h: SES_NEW.h + 8, r: 6, from: NEWSES_CLICK - 24, to: NEWSES_CLICK - 2 },
-  { x: SES_SELECT.x - 4, y: SES_SELECT.y - 4, w: SES_SELECT.w + 8, h: SES_SELECT.h + 8, r: 6, from: SES_MENU_CLICK - 24, to: SES_MENU_CLICK - 2 },
-  { x: 1592, y: 86, w: 282, h: 28, r: 4, from: BACKSES_CLICK - 24, to: BACKSES_CLICK - 2 },
-];
+  { target: 'w6-notice', pad: 4, r: 8, from: STG_CLICK - 26, to: STG_CLICK - 2 },
+  { target: 'w6-stg-diff-0', pad: 5, r: 4, from: DIFF_CLICK - 26, to: DIFF_CLICK - 2 },
+  { target: 'w6-stg-export-0', pad: 5, r: 4, from: EXP_CLICK - 26, to: EXP_CLICK - 2 },
+  { target: 'w6-exp-ok', pad: 0, r: 4, from: EXP_OK - 24, to: EXP_OK - 2 },
+  { target: 'w6-stg-restore-1', pad: 5, r: 4, from: RES_CLICK - 26, to: RES_CLICK - 2 },
+  { target: 'w6-dlg-ok', pad: 0, r: 4, from: RES_OK - 24, to: RES_OK - 2 },
+  { target: 'w6-stg-accept-0', pad: 5, r: 4, from: ACC_CLICK - 26, to: ACC_CLICK - 2 },
+  { target: 'w6-dlg-ok', pad: 0, r: 4, from: ACC_OK - 24, to: ACC_OK - 2 },
+  { target: 'w6-ses-new', pad: 4, r: 6, from: NEWSES_CLICK - 24, to: NEWSES_CLICK - 2 },
+  { target: 'w6-ses-select', pad: 4, r: 6, from: SES_MENU_CLICK - 24, to: SES_MENU_CLICK - 2 },
+  { target: 'w6-ses-item-0', pad: 4, r: 4, from: BACKSES_CLICK - 24, to: BACKSES_CLICK - 2 },
+] as const;
 
 /* ============ 工具 ============ */
 const typed = (frame: number, from: number, step: number, full: string): string =>

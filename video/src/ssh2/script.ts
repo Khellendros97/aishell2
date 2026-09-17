@@ -4,7 +4,8 @@
  * 锚点坐标全部来自 ./layout.ts(与组件 CSS 同源)。
  */
 import { interpolate } from 'remotion';
-import { Stop } from '../anim';
+import { Stop, track1 } from '../anim';
+import { AnchorStop } from '../components/anchors';
 import { Click } from '../components/Cursor';
 import { ChatMsg } from '../components/AiBits';
 import { WelcomeState } from './Welcome2';
@@ -68,77 +69,70 @@ export const CAM_Y: readonly Stop[] = [
 const cx = (r: { x: number; w: number }): number => r.x + r.w / 2;
 const cy = (r: { y: number; h: number }): number => r.y + r.h / 2;
 
-export const CUR_X: readonly Stop[] = [
-  { f: 60, v: 1200 }, { f: 118, v: cx(NEW_PROJ_BTN) }, { f: 132, v: cx(NEW_PROJ_BTN) }, { f: 140, v: cx(PM.nameInput) },
-  { f: 176, v: cx(PM.nameInput) }, { f: 200, v: cx(PM.serverAdd) }, { f: 212, v: cx(PM.miniName) }, { f: 250, v: cx(PM.miniHost) },
-  { f: 276, v: cx(PM.miniUser) }, { f: 292, v: cx(PM.miniSecret) }, { f: 310, v: cx(PM.miniSecret) }, { f: 330, v: cx(PM.miniSave) },
-  { f: 336, v: cx(PM.miniSave) }, { f: 388, v: cx(PM.footSave) }, { f: 400, v: cx(PM.footSave) }, { f: 430, v: cx(PROJ_CARD3) },
+/** 设计稿窗口坐标 → canvas 兜底坐标(按该帧相机;仅冷启动首帧兜底,实测就绪后即被替换) */
+const wfAt = (f: number, wx: number, wy: number): { x: number; y: number } => {
+  const s = track1(CAM_S, f);
+  const cxx = track1(CAM_X, f);
+  const cyy = track1(CAM_Y, f);
+  return { x: wx * s + (960 - cxx * s), y: wy * s + (540 - cyy * s) };
+};
+
+/** 轨道原始定义:wx/wy 为设计稿兜底坐标,at 为锚点 id(命中元素中心,实测优先) */
+const CUR_DEF: readonly { f: number; wx: number; wy: number; at?: string }[] = [
+  { f: 60, wx: 1200, wy: 800 }, { f: 118, wx: cx(NEW_PROJ_BTN), wy: cy(NEW_PROJ_BTN), at: 'w2-new-proj' }, { f: 132, wx: cx(NEW_PROJ_BTN), wy: cy(NEW_PROJ_BTN), at: 'w2-new-proj' }, { f: 140, wx: cx(PM.nameInput), wy: cy(PM.nameInput), at: 'w2-name-input' },
+  { f: 176, wx: cx(PM.nameInput), wy: cy(PM.nameInput), at: 'w2-name-input' }, { f: 200, wx: cx(PM.serverAdd), wy: cy(PM.serverAdd), at: 'w2-server-add' }, { f: 212, wx: cx(PM.miniName), wy: cy(PM.miniName), at: 'w2-mini-name' }, { f: 250, wx: cx(PM.miniHost), wy: cy(PM.miniHost), at: 'w2-mini-host' },
+  { f: 276, wx: cx(PM.miniUser), wy: cy(PM.miniUser), at: 'w2-mini-user' }, { f: 292, wx: cx(PM.miniSecret), wy: cy(PM.miniSecret), at: 'w2-mini-secret' }, { f: 310, wx: cx(PM.miniSecret), wy: cy(PM.miniSecret), at: 'w2-mini-secret' }, { f: 330, wx: cx(PM.miniSave), wy: cy(PM.miniSave), at: 'w2-mini-save' },
+  { f: 336, wx: cx(PM.miniSave), wy: cy(PM.miniSave), at: 'w2-mini-save' }, { f: 388, wx: cx(PM.footSave), wy: cy(PM.footSave), at: 'w2-foot-save' }, { f: 400, wx: cx(PM.footSave), wy: cy(PM.footSave), at: 'w2-foot-save' }, { f: 430, wx: cx(PROJ_CARD3), wy: cy(PROJ_CARD3), at: 'w2-card3' },
   /* 场景 B */
-  { f: 470, v: 1200 }, { f: 558, v: ACT.servers.x }, { f: 566, v: ACT.servers.x }, { f: 628, v: cx(SSH_BTN) },
-  { f: 640, v: cx(SSH_BTN) }, { f: 670, v: cx(WORKAREA_CHIP) }, { f: 735, v: cx(WORKAREA_CHIP) }, { f: 760, v: 600 },
+  { f: 470, wx: 1200, wy: 800 }, { f: 558, wx: ACT.servers.x, wy: ACT.servers.y, at: 'w2-act-servers' }, { f: 566, wx: ACT.servers.x, wy: ACT.servers.y, at: 'w2-act-servers' }, { f: 628, wx: cx(SSH_BTN), wy: cy(SSH_BTN), at: 'w2-ssh-btn' },
+  { f: 640, wx: cx(SSH_BTN), wy: cy(SSH_BTN), at: 'w2-ssh-btn' }, { f: 670, wx: cx(WORKAREA_CHIP), wy: cy(WORKAREA_CHIP), at: 'w2-workarea-chip' }, { f: 735, wx: cx(WORKAREA_CHIP), wy: cy(WORKAREA_CHIP), at: 'w2-workarea-chip' }, { f: 760, wx: 600, wy: 220 },
   /* 场景 C */
-  { f: 890, v: 600 }, { f: 905, v: 1450 }, { f: 915, v: HISTORY_ACTIONS.addchat.x }, { f: 935, v: HISTORY_ACTIONS.addchat.x },
-  { f: 958, v: cx(AI_INPUT2) }, { f: 1000, v: cx(AI_INPUT2) }, { f: 1010, v: 1865 },
+  { f: 890, wx: 600, wy: 220 }, { f: 905, wx: 1450, wy: 430 }, { f: 915, wx: HISTORY_ACTIONS.addchat.x, wy: HISTORY_ACTIONS.addchat.y, at: 'w2-addchat' }, { f: 935, wx: HISTORY_ACTIONS.addchat.x, wy: HISTORY_ACTIONS.addchat.y, at: 'w2-addchat' },
+  { f: 958, wx: cx(AI_INPUT2), wy: cy(AI_INPUT2), at: 'w2-ai-input' }, { f: 1000, wx: cx(AI_INPUT2), wy: cy(AI_INPUT2), at: 'w2-ai-input' }, { f: 1010, wx: 1865, wy: 985 },
   /* 场景 D */
-  { f: 1115, v: 1865 }, { f: 1142, v: CARD_PASTE.x }, { f: 1155, v: CARD_PASTE.x }, { f: 1180, v: 700 },
+  { f: 1115, wx: 1865, wy: 985 }, { f: 1142, wx: CARD_PASTE.x, wy: CARD_PASTE.y, at: 'w2-card-paste' }, { f: 1155, wx: CARD_PASTE.x, wy: CARD_PASTE.y, at: 'w2-card-paste' }, { f: 1180, wx: 700, wy: 562 },
   /* 场景 E */
-  { f: 1255, v: 700 }, { f: 1278, v: HISTORY_ACTIONS.pin.x }, { f: 1290, v: HISTORY_ACTIONS.pin.x }, { f: 1325, v: cx(FAV_SAVE) },
-  { f: 1350, v: cx(FAV_SAVE) }, { f: 1372, v: ACT.commands.x }, { f: 1410, v: ACT.commands.x }, { f: 1435, v: cx(FAV_COPY_BTN) },
-  { f: 1450, v: cx(FAV_COPY_BTN) }, { f: 1470, v: 700 },
+  { f: 1255, wx: 700, wy: 562 }, { f: 1278, wx: HISTORY_ACTIONS.pin.x, wy: HISTORY_ACTIONS.pin.y, at: 'w2-pin' }, { f: 1290, wx: HISTORY_ACTIONS.pin.x, wy: HISTORY_ACTIONS.pin.y, at: 'w2-pin' }, { f: 1325, wx: cx(FAV_SAVE), wy: cy(FAV_SAVE), at: 'w2-fav-save' },
+  { f: 1350, wx: cx(FAV_SAVE), wy: cy(FAV_SAVE), at: 'w2-fav-save' }, { f: 1372, wx: ACT.commands.x, wy: ACT.commands.y, at: 'w2-act-commands' }, { f: 1410, wx: ACT.commands.x, wy: ACT.commands.y, at: 'w2-act-commands' }, { f: 1435, wx: cx(FAV_COPY_BTN), wy: cy(FAV_COPY_BTN), at: 'w2-fav-copy' },
+  { f: 1450, wx: cx(FAV_COPY_BTN), wy: cy(FAV_COPY_BTN), at: 'w2-fav-copy' }, { f: 1470, wx: 700, wy: 590 },
   /* 场景 F */
-  { f: 1545, v: 700 }, { f: 1585, v: 344 }, { f: 1605, v: 459 }, { f: 1615, v: 459 }, { f: 1640, v: 694 },
-  { f: 1690, v: 694 }, { f: 1710, v: 900 },
+  { f: 1545, wx: 700, wy: 590 }, { f: 1585, wx: 344, wy: 382 }, { f: 1605, wx: 459, wy: 382 }, { f: 1615, wx: 459, wy: 382 }, { f: 1640, wx: 694, wy: 700 },
+  { f: 1690, wx: 694, wy: 700 }, { f: 1710, wx: 900, wy: 700 },
 ];
-export const CUR_Y: readonly Stop[] = [
-  { f: 60, v: 800 }, { f: 118, v: cy(NEW_PROJ_BTN) }, { f: 132, v: cy(NEW_PROJ_BTN) }, { f: 140, v: cy(PM.nameInput) },
-  { f: 176, v: cy(PM.nameInput) }, { f: 200, v: cy(PM.serverAdd) }, { f: 212, v: cy(PM.miniName) }, { f: 250, v: cy(PM.miniHost) },
-  { f: 276, v: cy(PM.miniUser) }, { f: 292, v: cy(PM.miniSecret) }, { f: 310, v: cy(PM.miniSecret) }, { f: 330, v: cy(PM.miniSave) },
-  { f: 336, v: cy(PM.miniSave) }, { f: 388, v: cy(PM.footSave) }, { f: 400, v: cy(PM.footSave) }, { f: 430, v: cy(PROJ_CARD3) },
-  /* 场景 B */
-  { f: 470, v: 800 }, { f: 558, v: ACT.servers.y }, { f: 566, v: ACT.servers.y }, { f: 628, v: cy(SSH_BTN) },
-  { f: 640, v: cy(SSH_BTN) }, { f: 670, v: cy(WORKAREA_CHIP) }, { f: 735, v: cy(WORKAREA_CHIP) }, { f: 760, v: 220 },
-  /* 场景 C */
-  { f: 890, v: 220 }, { f: 905, v: 430 }, { f: 915, v: HISTORY_ACTIONS.addchat.y }, { f: 935, v: HISTORY_ACTIONS.addchat.y },
-  { f: 958, v: cy(AI_INPUT2) }, { f: 1000, v: cy(AI_INPUT2) }, { f: 1010, v: 985 },
-  /* 场景 D */
-  { f: 1115, v: 985 }, { f: 1142, v: CARD_PASTE.y }, { f: 1155, v: CARD_PASTE.y }, { f: 1180, v: 562 },
-  /* 场景 E */
-  { f: 1255, v: 562 }, { f: 1278, v: HISTORY_ACTIONS.pin.y }, { f: 1290, v: HISTORY_ACTIONS.pin.y }, { f: 1325, v: cy(FAV_SAVE) },
-  { f: 1350, v: cy(FAV_SAVE) }, { f: 1372, v: ACT.commands.y }, { f: 1410, v: ACT.commands.y }, { f: 1435, v: cy(FAV_COPY_BTN) },
-  { f: 1450, v: cy(FAV_COPY_BTN) }, { f: 1470, v: 590 },
-  /* 场景 F */
-  { f: 1545, v: 590 }, { f: 1585, v: 382 }, { f: 1605, v: 382 }, { f: 1615, v: 382 }, { f: 1640, v: 700 },
-  { f: 1690, v: 700 }, { f: 1710, v: 700 },
-];
+
+export const CUR_PATH: readonly AnchorStop[] = CUR_DEF.map(({ f, wx, wy, at }) => ({ f, at, ...wfAt(f, wx, wy) }));
 
 /* ============ 点击(含两次中键) ============ */
 export interface Click2 extends Click {
   /** 中键点击(显示「中键」徽标) */
   mid?: boolean;
 }
+const click = (f: number, wx: number, wy: number, target: Click2['target'], anchor?: string, mid?: boolean): Click2 => ({
+  f, target, anchor, mid, ...wfAt(f, wx, wy),
+});
 export const CLICKS: readonly Click2[] = [
-  { f: 126, x: cx(NEW_PROJ_BTN), y: cy(NEW_PROJ_BTN), target: 'browse' },
-  { f: 140, x: cx(PM.nameInput), y: cy(PM.nameInput), target: 'input' },
-  { f: 202, x: cx(PM.serverAdd), y: cy(PM.serverAdd), target: 'browse' },
-  { f: 214, x: cx(PM.miniName), y: cy(PM.miniName), target: 'input' },
-  { f: 250, x: cx(PM.miniHost), y: cy(PM.miniHost), target: 'input' },
-  { f: 276, x: cx(PM.miniUser), y: cy(PM.miniUser), target: 'input' },
-  { f: 292, x: cx(PM.miniSecret), y: cy(PM.miniSecret), target: 'input' },
-  { f: 332, x: cx(PM.miniSave), y: cy(PM.miniSave), target: 'save' },
-  { f: 392, x: cx(PM.footSave), y: cy(PM.footSave), target: 'save' },
-  { f: 432, x: cx(PROJ_CARD3), y: cy(PROJ_CARD3), target: 'browse' },
-  { f: 560, x: ACT.servers.x, y: ACT.servers.y, target: 'browse' },
-  { f: 632, x: cx(SSH_BTN), y: cy(SSH_BTN), target: 'browse' },
-  { f: 760, x: 600, y: 220, target: 'input' },
-  { f: 925, x: HISTORY_ACTIONS.addchat.x, y: HISTORY_ACTIONS.addchat.y, target: 'confirm' },
-  { f: 960, x: cx(AI_INPUT2), y: cy(AI_INPUT2), target: 'input' },
-  { f: 1145, x: CARD_PASTE.x, y: CARD_PASTE.y, target: 'confirm' },
-  { f: 1280, x: HISTORY_ACTIONS.pin.x, y: HISTORY_ACTIONS.pin.y, target: 'save' },
-  { f: 1330, x: cx(FAV_SAVE), y: cy(FAV_SAVE), target: 'save' },
-  { f: 1375, x: ACT.commands.x, y: ACT.commands.y, target: 'browse' },
-  { f: 1438, x: cx(FAV_COPY_BTN), y: cy(FAV_COPY_BTN), target: 'confirm' },
-  { f: 1608, x: 459, y: 382, target: 'confirm', mid: true },
-  { f: 1680, x: 694, y: 700, target: 'input', mid: true },
+  click(126, cx(NEW_PROJ_BTN), cy(NEW_PROJ_BTN), 'browse', 'w2-new-proj'),
+  click(140, cx(PM.nameInput), cy(PM.nameInput), 'input', 'w2-name-input'),
+  click(202, cx(PM.serverAdd), cy(PM.serverAdd), 'browse', 'w2-server-add'),
+  click(214, cx(PM.miniName), cy(PM.miniName), 'input', 'w2-mini-name'),
+  click(250, cx(PM.miniHost), cy(PM.miniHost), 'input', 'w2-mini-host'),
+  click(276, cx(PM.miniUser), cy(PM.miniUser), 'input', 'w2-mini-user'),
+  click(292, cx(PM.miniSecret), cy(PM.miniSecret), 'input', 'w2-mini-secret'),
+  click(332, cx(PM.miniSave), cy(PM.miniSave), 'save', 'w2-mini-save'),
+  click(392, cx(PM.footSave), cy(PM.footSave), 'save', 'w2-foot-save'),
+  click(432, cx(PROJ_CARD3), cy(PROJ_CARD3), 'browse', 'w2-card3'),
+  click(560, ACT.servers.x, ACT.servers.y, 'browse', 'w2-act-servers'),
+  click(632, cx(SSH_BTN), cy(SSH_BTN), 'browse', 'w2-ssh-btn'),
+  click(760, 600, 220, 'input'),
+  click(925, HISTORY_ACTIONS.addchat.x, HISTORY_ACTIONS.addchat.y, 'confirm', 'w2-addchat'),
+  click(960, cx(AI_INPUT2), cy(AI_INPUT2), 'input', 'w2-ai-input'),
+  click(1145, CARD_PASTE.x, CARD_PASTE.y, 'confirm', 'w2-card-paste'),
+  click(1280, HISTORY_ACTIONS.pin.x, HISTORY_ACTIONS.pin.y, 'save', 'w2-pin'),
+  click(1330, cx(FAV_SAVE), cy(FAV_SAVE), 'save', 'w2-fav-save'),
+  click(1375, ACT.commands.x, ACT.commands.y, 'browse', 'w2-act-commands'),
+  click(1438, cx(FAV_COPY_BTN), cy(FAV_COPY_BTN), 'confirm', 'w2-fav-copy'),
+  click(1608, 459, 382, 'confirm', undefined, true),
+  click(1680, 694, 700, 'input', undefined, true),
 ];
 
 /* ============ 字幕(全局,间隔 ≥16 帧) ============ */

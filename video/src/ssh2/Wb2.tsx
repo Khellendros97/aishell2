@@ -181,6 +181,7 @@ export const Wb2: React.FC<{ state: Wb2State; frame: number }> = ({ state, frame
               <div
                 key={it.id}
                 title={it.label}
+                data-anchor={it.id === 'servers' ? 'w2-act-servers' : it.id === 'commands' ? 'w2-act-commands' : undefined}
                 style={{
                   width: 40,
                   height: 36,
@@ -289,6 +290,7 @@ export const Wb2: React.FC<{ state: Wb2State; frame: number }> = ({ state, frame
                     </div>
                     <div
                       title="SSH 连接"
+                      data-anchor="w2-ssh-btn"
                       style={{
                         width: SSH_BTN.w,
                         height: SSH_BTN.h,
@@ -340,7 +342,7 @@ export const Wb2: React.FC<{ state: Wb2State; frame: number }> = ({ state, frame
                       {favCmd}
                     </div>
                     <div style={{ display: 'flex', gap: 6 }}>
-                      <div style={{ ...btnSmall(hover === 'favCopy', press === 'favCopy'), color: hover === 'favCopy' ? C.accent : C.text0 }}>复制到终端</div>
+                      <div data-anchor="w2-fav-copy" style={{ ...btnSmall(hover === 'favCopy', press === 'favCopy'), color: hover === 'favCopy' ? C.accent : C.text0 }}>复制到终端</div>
                       <div style={btnSmall(false, false)}>立即执行</div>
                     </div>
                   </div>
@@ -468,11 +470,11 @@ export const Wb2: React.FC<{ state: Wb2State; frame: number }> = ({ state, frame
                         {b.out.slice(0, 3).map((line, i) => <div key={i}>{line.text}</div>)}
                       </div>
                       <div style={{ display: 'flex', gap: 6 }}>
-                        <div style={btnSmall(false, b.pressAction === 'pin')}>
+                      <div data-anchor={bi === 3 ? 'w2-pin' : undefined} style={btnSmall(false, b.pressAction === 'pin')}>
                           <Icon name="star" size={12} color={b.pressAction === 'pin' ? C.yellow : C.text1} />
                           命令收藏
                         </div>
-                        <div style={btnSmall(hover === 'addchat' && bi === 2, b.pressAction === 'addchat')}>
+                        <div data-anchor={bi === 2 ? 'w2-addchat' : undefined} style={btnSmall(hover === 'addchat' && bi === 2, b.pressAction === 'addchat')}>
                           <Icon name="chatPlus" size={12} />
                           添加到chat
                         </div>
@@ -537,6 +539,7 @@ export const Wb2: React.FC<{ state: Wb2State; frame: number }> = ({ state, frame
             {/* chip 行:工作区 chip(随激活终端切换) */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <span
+                data-anchor="w2-workarea-chip"
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -557,6 +560,7 @@ export const Wb2: React.FC<{ state: Wb2State; frame: number }> = ({ state, frame
             </div>
             {/* 输入盒(可内嵌 @term chip) */}
             <div
+              data-anchor="w2-ai-input"
               style={{
                 position: 'relative',
                 minHeight: 70,
@@ -669,6 +673,7 @@ export const Wb2: React.FC<{ state: Wb2State; frame: number }> = ({ state, frame
             <div style={{ height: 56, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 20px', borderTop: `1px solid ${C.border}` }}>
               <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13 }}>取消</div>
               <div
+                data-anchor="w2-fav-save"
                 style={{
                   height: 32,
                   padding: '0 14px',

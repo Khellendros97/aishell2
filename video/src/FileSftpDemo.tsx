@@ -6,19 +6,20 @@
 import React from 'react';
 import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
 import { track1 } from './anim';
+import { AnchorRoot, useAnchorTrack } from './components/anchors';
 import { Caption } from './components/Caption';
 import { Cursor } from './components/Cursor';
 import { Highlight } from './components/Highlight';
 import { C, FONT_UI } from './theme';
-import { CAM_S, CAM_X, CAM_Y, CAPTIONS3, CLICKS, CUR_X, CUR_Y, HIGHLIGHTS3, KBD3, NOTES3, DURATION, wbAt } from './sftp3/script';
+import { CAM_S, CAM_X, CAM_Y, CAPTIONS3, CLICKS, CUR_PATH, HIGHLIGHTS3, KBD3, NOTES3, DURATION, wbAt } from './sftp3/script';
 import { Wb3 } from './sftp3/Wb3';
 import { OsWindow } from './sftp3/OsWindow';
 
-export const FileSftpDemo: React.FC = () => {
+const Body: React.FC = () => {
   const frame = useCurrentFrame();
 
   const cam = { s: track1(CAM_S, frame), cx: track1(CAM_X, frame), cy: track1(CAM_Y, frame) };
-  const cur = { x: track1(CUR_X, frame), y: track1(CUR_Y, frame) };
+  const cur = useAnchorTrack(CUR_PATH, frame);
   const state = wbAt(frame);
 
   const fadeIn = interpolate(frame, [0, 8], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' });
@@ -46,39 +47,6 @@ export const FileSftpDemo: React.FC = () => {
         >
           <Wb3 state={state} frame={frame} />
           <OsWindow opacity={osOpacity} offsetY={osOffsetY} dragRow={osDragRow} />
-
-          {HIGHLIGHTS3.map((h, i) => (
-            <Highlight key={i} {...h} />
-          ))}
-
-          {/* 指针与拖拽幽灵置于最上层(右键菜单 zIndex 40 / 模态 50 之上) */}
-          <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
-            {state.ghost && state.ghost.fade > 0 && (
-              <div
-                style={{
-                  position: 'absolute',
-                  left: cur.x + 12 + (state.ghost.reject ? Math.sin(frame / 2) * 3 : 0),
-                  top: cur.y + 18,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 7,
-                  padding: '7px 12px',
-                  borderRadius: 8,
-                  background: 'rgba(28,32,40,0.96)',
-                  border: `1px solid ${state.ghost.reject ? C.red : C.borderStrong}`,
-                  boxShadow: '0 10px 26px rgba(0,0,0,0.5)',
-                  fontSize: 12.5,
-                  color: C.text0,
-                  opacity: state.ghost.fade,
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {state.ghost.reject && <RejectDot />}
-                {state.ghost.name}
-              </div>
-            )}
-            <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
-          </div>
 
           {/* 教学说明卡 */}
           {NOTES3.map((n) => {
@@ -139,6 +107,41 @@ export const FileSftpDemo: React.FC = () => {
         </AbsoluteFill>
       </AbsoluteFill>
 
+      {/* 高亮环(锚点实测画布坐标,不随相机变换) */}
+      <div style={{ position: 'absolute', inset: 0, zIndex: 55, pointerEvents: 'none' }}>
+        {HIGHLIGHTS3.map((h) => (
+          <Highlight key={h.target + h.from} target={h.target} pad={h.pad} r={h.r} from={h.from} to={h.to} />
+        ))}
+      </div>
+      {/* 指针与拖拽幽灵(同源实测坐标;右键菜单 zIndex 40 / 模态 50 之上) */}
+      <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
+        {state.ghost && state.ghost.fade > 0 && (
+          <div
+            style={{
+              position: 'absolute',
+              left: cur.x + 12 + (state.ghost.reject ? Math.sin(frame / 2) * 3 : 0),
+              top: cur.y + 18,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 7,
+              padding: '7px 12px',
+              borderRadius: 8,
+              background: 'rgba(28,32,40,0.96)',
+              border: `1px solid ${state.ghost.reject ? C.red : C.borderStrong}`,
+              boxShadow: '0 10px 26px rgba(0,0,0,0.5)',
+              fontSize: 12.5,
+              color: C.text0,
+              opacity: state.ghost.fade,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {state.ghost.reject && <RejectDot />}
+            {state.ghost.name}
+          </div>
+        )}
+        <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
+      </div>
+
       {/* 暗角 + 字幕 + 总淡出 */}
       <AbsoluteFill style={{ background: 'radial-gradient(ellipse at center, transparent 58%, rgba(0,0,0,0.26) 100%)', pointerEvents: 'none' }} />
       {CAPTIONS3.map((c) => (
@@ -148,6 +151,12 @@ export const FileSftpDemo: React.FC = () => {
     </AbsoluteFill>
   );
 };
+
+export const FileSftpDemo: React.FC = () => (
+  <AnchorRoot>
+    <Body />
+  </AnchorRoot>
+);
 
 const OS_IN0 = 80;
 

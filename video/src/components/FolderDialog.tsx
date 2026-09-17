@@ -102,12 +102,13 @@ export const FolderDialog: React.FC<{
 
       {/* 文件夹列表 */}
       <div style={{ flex: 1, padding: 6 }}>
-        {FOLDERS.map((f, i) => {
-          const isSel = i === 0 && selected;
-          const isHover = i === 0 && hoverRow && !selected;
-          return (
-            <div
-              key={f.name}
+          {FOLDERS.map((f, i) => {
+            const isSel = i === 0 && selected;
+            const isHover = i === 0 && hoverRow && !selected;
+            return (
+              <div
+                key={f.name}
+                data-anchor={i === 0 ? 'init-folder-row' : undefined}
               style={{
                 height: DLG_ROW1.h,
                 display: 'flex',
@@ -158,6 +159,7 @@ export const FolderDialog: React.FC<{
           取消
         </div>
         <div
+          data-anchor="init-folder-confirm"
           style={{
             width: DLG_CONFIRM.w,
             height: DLG_CONFIRM.h,

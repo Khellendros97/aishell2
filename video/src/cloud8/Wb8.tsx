@@ -143,6 +143,7 @@ const ExplorerPanel: React.FC<{ st: Wb8State }> = ({ st }) => (
         return (
           <div
             key={node.name}
+            data-anchor={target ? 'w8-dataset' : undefined}
             style={{
               position: 'absolute', left: 0, right: 0, top: explRowY(i) - EXPL.top, height: EXPL.rowH,
               display: 'flex', alignItems: 'center', gap: 6, paddingLeft: 10 + node.depth * EXPL.indent,
@@ -169,6 +170,7 @@ const ExplorerPanel: React.FC<{ st: Wb8State }> = ({ st }) => (
             return (
               <div
                 key={it.label}
+                data-anchor={backup ? 'w8-menu-backup' : undefined}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 7, height: EXPL_MENU.itemH, padding: '0 10px', borderRadius: 4,
                   fontSize: 12.5, color: st.menu!.hover === i ? C.text0 : backup ? C.accent : C.text1,
@@ -439,22 +441,24 @@ const AccountPage: React.FC<{ st: Wb8State; frame: number }> = ({ st, frame }) =
           </span>
           {!st.initialized ? (
             <span
+              data-anchor="w8-setpwd"
               style={{ position: 'absolute', left: ACC.btnUnlock.x, top: ACC.btnUnlock.y, width: ACC.btnUnlock.w, boxSizing: 'border-box', justifyContent: 'center', ...btnSmall(true, { hovered: st.hover === 'setPwd' }) }}
             >
               设置同步密码
             </span>
           ) : st.locked ? (
             <span
+              data-anchor="w8-setpwd"
               style={{ position: 'absolute', left: ACC.btnUnlock.x, top: ACC.btnUnlock.y, width: ACC.btnUnlock.w, boxSizing: 'border-box', justifyContent: 'center', ...btnSmall(true, { hovered: st.hover === 'unlock' }) }}
             >
               解锁云同步
             </span>
           ) : (
             <>
-              <span style={{ position: 'absolute', left: ACC.btnSync.x, top: ACC.btnSync.y, ...btnSmall(true, { hovered: st.hover === 'sync' }) }}>
+              <span data-anchor="w8-sync" style={{ position: 'absolute', left: ACC.btnSync.x, top: ACC.btnSync.y, ...btnSmall(true, { hovered: st.hover === 'sync' }) }}>
                 <Icon name="sync" size={12} /> 立即同步
               </span>
-              <span style={{ position: 'absolute', left: ACC.btnLock.x, top: ACC.btnLock.y, ...btnSmall(false, { hovered: st.hover === 'lock' }) }}>
+              <span data-anchor="w8-lock" style={{ position: 'absolute', left: ACC.btnLock.x, top: ACC.btnLock.y, ...btnSmall(false, { hovered: st.hover === 'lock' }) }}>
                 <Icon name="lock" size={12} /> 锁定
               </span>
             </>
@@ -529,6 +533,7 @@ const AccountPage: React.FC<{ st: Wb8State; frame: number }> = ({ st, frame }) =
                 <div style={{ fontSize: 11, color: C.text2, marginTop: 3, whiteSpace: 'nowrap' }}>{DEMO.backupMeta}</div>
               </div>
               <span
+                data-anchor="w8-restore"
                 style={{
                   ...btnSmall(true, { hovered: st.hover === 'restore' }),
                   opacity: st.backupLocked ? 0.45 : 1,
@@ -587,6 +592,7 @@ const PasswordModal: React.FC<{ st: Wb8State }> = ({ st }) => {
           <div style={{ position: 'absolute', left: -PWD8.x, top: -(PWD8.y + 48), width: PWD8.w, height: PWD8.h - 48 }}>
           <div style={{ position: 'absolute', left: PWD8_F.input.x, top: PWD8_F.labelCy - 9, fontSize: 12.5, color: C.text1, whiteSpace: 'nowrap' }}>同步密码</div>
           <div
+            data-anchor="w8-pwd-input"
             style={{
               position: 'absolute', left: PWD8_F.input.x, top: PWD8_F.input.y, width: PWD8_F.input.w, height: PWD8_F.input.h, boxSizing: 'border-box',
               display: 'flex', alignItems: 'center', padding: '0 10px', background: C.bg0, border: `1px solid ${C.accent}`,
@@ -603,7 +609,7 @@ const PasswordModal: React.FC<{ st: Wb8State }> = ({ st }) => {
         </div>
         <div style={{ height: 52, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
           <div style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 12.5, color: C.text1 }}>取消</div>
-          <div style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', borderRadius: 4, fontSize: 12.5, color: '#fff', background: st.hover === 'pwdOk' ? C.accentHover : C.accent }}>
+          <div data-anchor="w8-pwd-ok" style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', borderRadius: 4, fontSize: 12.5, color: '#fff', background: st.hover === 'pwdOk' ? C.accentHover : C.accent }}>
             确定
           </div>
         </div>
@@ -636,7 +642,7 @@ const BackupConfirmDialog: React.FC<{ t: number; hover: T8 }> = ({ t, hover }) =
       </div>
       <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
         <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, color: C.text1 }}>取消</div>
-        <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', borderRadius: 4, fontSize: 13, color: '#fff', background: hover === 'cfmOk' ? C.accentHover : C.accent }}>
+        <div data-anchor="w8-cfm-ok" style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', borderRadius: 4, fontSize: 13, color: '#fff', background: hover === 'cfmOk' ? C.accentHover : C.accent }}>
           开始备份
         </div>
       </div>
@@ -697,7 +703,7 @@ const RestoreModal: React.FC<{ st: Wb8State }> = ({ st }) => {
         </div>
         <div style={{ height: 52, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
           <div style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 12.5, color: C.text1 }}>取消</div>
-          <div style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 12.5, color: '#fff', background: st.hover === 'rstOk' ? C.accentHover : C.accent }}>
+          <div data-anchor="w8-rst-ok" style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 12.5, color: '#fff', background: st.hover === 'rstOk' ? C.accentHover : C.accent }}>
             <Icon name="cloudBackup" size={12} /> 开始恢复
           </div>
         </div>
@@ -719,7 +725,7 @@ export const Wb8: React.FC<{ state: Wb8State; frame: number }> = ({ state, frame
         overflow: 'hidden', boxShadow: '0 40px 120px rgba(0,0,0,0.55)',
       }}
     >
-      <TopBar active={st.page === 'workbench' ? '项目' : '账号'} project={st.page === 'workbench' ? DEMO.projectName : undefined} />
+      <TopBar active={st.page === 'workbench' ? '项目' : '账号'} project={st.page === 'workbench' ? DEMO.projectName : undefined} anchors={{ project: 'w8-proj-nav', account: 'w8-acc-nav' }} />
 
       {/* 工作台页面 */}
       <div style={{ position: 'absolute', left: 0, right: 0, top: 40, bottom: 26, display: 'flex', opacity: 1 - st.pageT, pointerEvents: st.page === 'workbench' ? 'auto' : 'none' }}>

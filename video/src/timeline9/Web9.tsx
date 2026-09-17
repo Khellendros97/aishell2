@@ -213,11 +213,11 @@ const CloudApp: React.FC<{ st: Web9State; frame: number; rows: { row: WebRow; id
         {filterLabel(WEB.tagSel.x, '标签')}
         {filterLabel(WEB.kwInput.x, '关键词')}
         {filterLabel(WEB.rangeSel.x, '时间范围')}
-        <div style={{ ...selectBox(st.hover === 'projSel' || st.dropOpen), left: WEB.projSel.x, top: WEB.projSel.y, width: WEB.projSel.w }}>
+        <div data-anchor="w9w-proj-sel" style={{ ...selectBox(st.hover === 'projSel' || st.dropOpen), left: WEB.projSel.x, top: WEB.projSel.y, width: WEB.projSel.w }}>
           {projLabel}
           <Icon name="chevronDown" size={12} color={LC.faint} />
         </div>
-        <div style={{ ...selectBox(st.tagOn), left: WEB.tagSel.x, top: WEB.tagSel.y, width: WEB.tagSel.w, color: st.tagOn ? LC.accent : LC.text }}>
+        <div data-anchor="w9w-tag-sel" style={{ ...selectBox(st.tagOn), left: WEB.tagSel.x, top: WEB.tagSel.y, width: WEB.tagSel.w, color: st.tagOn ? LC.accent : LC.text }}>
           {tagLabel}
           <Icon name="chevronDown" size={12} color={LC.faint} />
         </div>
@@ -265,6 +265,7 @@ const CloudApp: React.FC<{ st: Web9State; frame: number; rows: { row: WebRow; id
             {DROP_OPTS.map((o, i) => (
               <div
                 key={o}
+                data-anchor={i === 1 ? 'w9w-drop-opt' : undefined}
                 style={{
                   height: WEB.drop.optH, display: 'flex', alignItems: 'center', gap: 6, padding: '0 10px', borderRadius: 6,
                   fontSize: 12.5, color: st.dropHover === i ? LC.text : LC.muted,
@@ -284,6 +285,7 @@ const CloudApp: React.FC<{ st: Web9State; frame: number; rows: { row: WebRow; id
           return (
             <div
               key={k.key}
+              data-anchor={k.key === 'command' ? 'w9w-kind-cmd' : k.key === 'upload' ? 'w9w-kind-up' : undefined}
               style={{
                 position: 'absolute', left: webChipX(i), top: WEB.chipsY, width: k.w, height: WEB.chipH, boxSizing: 'border-box',
                 display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 999, fontSize: 11,
@@ -315,6 +317,7 @@ const CloudApp: React.FC<{ st: Web9State; frame: number; rows: { row: WebRow; id
           return (
             <div key={row.id} style={{ position: 'absolute', left: 0, right: 0, top: y, opacity: ot, transform: `translateY(${dy}px)` }}>
               <div
+                data-anchor={row.id === WEB_EXPAND_ID ? 'w9w-row-0' : undefined}
                 style={{
                   position: 'absolute', left: WEB.rowX, top: 0, width: WEB.rowW, height: WEB.rowH - 4, boxSizing: 'border-box',
                   borderRadius: 8,
@@ -391,6 +394,7 @@ const CloudApp: React.FC<{ st: Web9State; frame: number; rows: { row: WebRow; id
             <div style={{ fontSize: 12, color: LC.muted, marginTop: 2 }}>删除后本机时间线不受影响，后续上报会重新累积</div>
           </div>
           <span
+            data-anchor="w9w-purge"
             style={{
               marginLeft: 'auto', height: 30, padding: '0 12px', display: 'inline-flex', alignItems: 'center',
               borderRadius: 8, border: `1px solid ${LC.redBorder}`, color: LC.red, background: LC.surface, fontSize: 12.5, whiteSpace: 'nowrap',

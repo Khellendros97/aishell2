@@ -105,10 +105,11 @@ export const AppWindow: React.FC<{ state: WinState }> = ({ state }) => {
       }}
     >
       {/* ===== 顶栏(对照 Topbar.tsx) ===== */}
-      <TopBar active="设置" accountHover={hover === 'account'} />
+      <TopBar active="设置" accountHover={hover === 'account'} anchors={{ account: 'init-account' }} />
 
       {/* ===== 缺少配置警告条(对照 #warn-banner) ===== */}
       <div
+        data-anchor="init-banner"
         style={{
           height: BANNER_H * (1 - bannerT),
           opacity: 1 - bannerT,
@@ -160,7 +161,7 @@ export const AppWindow: React.FC<{ state: WinState }> = ({ state }) => {
               <FieldLabel>
                 Workspace 目录<span style={{ color: C.red }}> *</span>
               </FieldLabel>
-              <div style={{ height: 34, display: 'flex', gap: 8, alignItems: 'center' }}>
+              <div data-anchor="init-ws-row" style={{ height: 34, display: 'flex', gap: 8, alignItems: 'center' }}>
                 <div
                   style={{
                     flex: 1,
@@ -188,6 +189,7 @@ export const AppWindow: React.FC<{ state: WinState }> = ({ state }) => {
                   )}
                 </div>
                 <div
+                  data-anchor="init-browse"
                   style={{
                     width: BROWSE_BTN.w,
                     height: 32,
@@ -278,6 +280,7 @@ export const AppWindow: React.FC<{ state: WinState }> = ({ state }) => {
             {/* 保存按钮(对照 .form-actions #btn-save-system) */}
             <div style={{ marginTop: 12, height: 34, display: 'flex', justifyContent: 'flex-end', alignItems: 'center' }}>
               <div
+                data-anchor="init-save"
                 style={{
                   width: SAVE_BTN.w,
                   height: 32,

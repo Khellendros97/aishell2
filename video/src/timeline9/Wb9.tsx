@@ -123,6 +123,7 @@ const ActivityBar: React.FC<{ st: Wb9State }> = ({ st }) => (
       return (
         <div
           key={it.id}
+          data-anchor={it.id === 'timeline' ? 'w9-act-tl' : undefined}
           style={{
             width: 40, height: 40, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center',
             borderRadius: '0 8px 8px 0', borderLeft: `2px solid ${active ? C.accent : 'transparent'}`,
@@ -250,6 +251,7 @@ const TlRow: React.FC<{ i: number; y: number; opacity: number; tag?: string; reg
   const bg = direct ? 'rgba(79,142,247,0.18)' : region > 0.01 ? `rgba(79,142,247,${(0.16 * region).toFixed(3)})` : 'transparent';
   return (
     <div
+      data-anchor={i === 1 ? 'w9-tl-row-1' : i === 5 ? 'w9-tl-row-5' : undefined}
       style={{
         position: 'absolute', left: TL.rowX - CENTER.x, top: y - 76, width: TL.rowW, height: TL.rowH - 2, boxSizing: 'border-box',
         borderRadius: 4, background: bg, opacity,
@@ -303,6 +305,7 @@ const TimelinePanel: React.FC<{ st: Wb9State; rowsA: TlRowStateA[]; rowsB: TlRow
         <Icon name="refresh" size={12} /> 刷新
       </span>
       <span
+        data-anchor="w9-ai-btn"
         style={{
           position: 'absolute', left: TL.aiBtn.x - CENTER.x, top: TL.aiBtn.y - 76, width: TL.aiBtn.w, boxSizing: 'border-box',
           ...btnSmall({ hovered: st.hover === 'aiBtn' }),
@@ -319,6 +322,7 @@ const TimelinePanel: React.FC<{ st: Wb9State; rowsA: TlRowStateA[]; rowsB: TlRow
       ].filter((t) => t.show).map((t) => (
         <span
           key={t.name}
+          data-anchor={t.name === DEMO.tag1Name ? 'w9-tag-chip' : undefined}
           style={{
             display: 'inline-flex', alignItems: 'center', gap: 3, height: 24, padding: '0 10px', borderRadius: 12,
             fontSize: 12, background: t.active ? 'rgba(79,142,247,0.18)' : C.bg1,
@@ -458,6 +462,7 @@ const AiAnalysis: React.FC<{ st: Wb9State }> = ({ st }) => {
                   width: AI2.saveBtn.w, height: AI2.saveBtn.h, display: 'flex', alignItems: 'center', justifyContent: 'center',
                   borderRadius: 4, fontSize: 12, color: '#fff', background: st.hover === 'askSave' ? C.accentHover : C.accent,
                 }}
+                data-anchor="w9-ask-save"
               >
                 保存选中
               </div>
@@ -609,6 +614,7 @@ const SettingsPanel: React.FC<{ st: Wb9State }> = ({ st }) => (
     <FieldsetBox y={SET.fsTl.y} h={SET.fsTl.h} legend="时间线云同步">
       <span style={{ position: 'absolute', left: SET.label.x, top: SET.label.y, fontSize: 13, color: C.text0 }}>同步项目时间线到云端</span>
       <span
+        data-anchor="w9-set-ckb"
         style={{
           position: 'absolute', left: SET.checkbox.x, top: SET.checkbox.y, width: SET.checkbox.w, height: SET.checkbox.h,
           borderRadius: 4, background: C.accent, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
@@ -619,11 +625,11 @@ const SettingsPanel: React.FC<{ st: Wb9State }> = ({ st }) => (
       <div style={{ position: 'absolute', left: SET.hint.x, top: SET.hint.y, width: SET.hint.w, fontSize: 11.5, lineHeight: 1.7, color: C.text2 }}>
         {SET_HINT}
       </div>
-      <div style={{ position: 'absolute', left: SET.status.x, top: SET.status.y, display: 'flex', alignItems: 'center', gap: 7, fontSize: 12.5, color: C.green }}>
+      <div data-anchor="w9-set-status" style={{ position: 'absolute', left: SET.status.x, top: SET.status.y, display: 'flex', alignItems: 'center', gap: 7, fontSize: 12.5, color: C.green }}>
         <span style={{ width: 8, height: 8, borderRadius: '50%', background: C.green, flex: 'none' }} />
         {DEMO.chipText}
       </div>
-      <span style={{ position: 'absolute', left: SET.purgeBtn.x, top: SET.purgeBtn.y, ...btnSmall({ hovered: st.hover === 'purgeBtn' }) }}>
+      <span data-anchor="w9-purge-btn" style={{ position: 'absolute', left: SET.purgeBtn.x, top: SET.purgeBtn.y, ...btnSmall({ hovered: st.hover === 'purgeBtn' }) }}>
         删除云端时间线…
       </span>
     </FieldsetBox>
@@ -650,6 +656,7 @@ const ContextMenu: React.FC<{ st: Wb9State }> = ({ st }) => {
       }}
     >
       <div
+        data-anchor="w9-menu-tag"
         style={{
           display: 'flex', alignItems: 'center', gap: 7, height: MENU9.itemH, padding: '0 10px', borderRadius: 4,
           fontSize: 12.5, color: st.menu.hover ? C.text0 : C.text1,
@@ -720,6 +727,7 @@ const TagDialog: React.FC<{ st: Wb9State }> = ({ st }) => {
           取消
         </div>
         <div
+          data-anchor="w9-dlg-ok"
           style={{
             ...L(DLG9_F.btnOk.x, DLG9_F.btnOk.y), width: DLG9_F.btnOk.w, height: DLG9_F.btnOk.h,
             display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 4, fontSize: 12.5, color: '#fff',
@@ -760,6 +768,7 @@ const AnalyzeDialog: React.FC<{ st: Wb9State }> = ({ st }) => {
           return (
             <div
               key={tag.name}
+              data-anchor={i === 0 ? 'w9-ana-check' : undefined}
               style={{
                 ...L(ADLG9_F.checkboxX - 10, ADLG9_F.itemY(i)), width: 424, height: 36, display: 'flex', alignItems: 'center', gap: 9,
                 padding: '0 10px', boxSizing: 'border-box', borderRadius: 6, background: hovered ? C.bgHover : 'transparent',
@@ -792,6 +801,7 @@ const AnalyzeDialog: React.FC<{ st: Wb9State }> = ({ st }) => {
           取消
         </div>
         <div
+          data-anchor="w9-ana-ok"
           style={{
             ...L(ADLG9_F.btnOk.x, ADLG9_F.btnOk.y), width: ADLG9_F.btnOk.w, height: ADLG9_F.btnOk.h,
             display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 4, fontSize: 12.5,
@@ -840,6 +850,7 @@ const PurgeConfirm: React.FC<{ st: Wb9State }> = ({ st }) => {
           取消
         </div>
         <div
+          data-anchor="w9-cfm-ok"
           style={{
             position: 'absolute', left: CFM9_BTN.ok.x - CFM9.x, top: CFM9_BTN.ok.y - CFM9.y,
             width: CFM9_BTN.ok.w, height: CFM9_BTN.ok.h, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -865,7 +876,7 @@ export const Wb9: React.FC<{ state: Wb9State; frame: number; rowsA: TlRowStateA[
         overflow: 'hidden', boxShadow: '0 40px 120px rgba(0,0,0,0.55)',
       }}
     >
-      <TopBar active={st.page === 'workbench' ? '项目' : '设置'} project={st.page === 'workbench' ? DEMO.projectName : undefined} />
+      <TopBar active={st.page === 'workbench' ? '项目' : '设置'} project={st.page === 'workbench' ? DEMO.projectName : undefined} anchors={{ settings: 'w9-set-nav' }} />
 
       {/* 工作台骨架 */}
       <div style={{ position: 'absolute', left: 0, right: 0, top: 40, bottom: 26, display: 'flex', opacity: 1 - st.pageT, pointerEvents: st.page === 'workbench' ? 'auto' : 'none' }}>

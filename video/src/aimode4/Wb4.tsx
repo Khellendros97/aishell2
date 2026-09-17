@@ -128,6 +128,7 @@ const ActivityBar: React.FC<{ panel: string; hover: T4; press: T4 }> = ({ panel,
         <div
           key={it.id}
           title={it.label}
+          data-anchor={it.id === 'servers' ? 'w4-act-servers' : undefined}
           style={{
             width: 40,
             height: 40,
@@ -195,6 +196,7 @@ const ServersPanel: React.FC<{ expanded: boolean; hover: T4; press: T4 }> = ({ e
     </div>
     {/* 服务器卡(可展开;展开后操作行 4 按钮,more 最右,锚点 MORE_BTN) */}
     <div
+      data-anchor="w4-srv-card"
       style={{
         padding: '8px 12px',
         background: C.bg2,
@@ -228,7 +230,7 @@ const ServersPanel: React.FC<{ expanded: boolean; hover: T4; press: T4 }> = ({ e
                 { icon: 'more', title: '更多操作', target: 'more' },
               ] as const
             ).map((b) => (
-              <div key={b.title} title={b.title} style={iconBtnStyle({ hovered: hover === b.target, pressed: press === b.target })}>
+              <div key={b.title} title={b.title} data-anchor={b.target === 'more' ? 'w4-more' : undefined} style={iconBtnStyle({ hovered: hover === b.target, pressed: press === b.target })}>
                 <Icon name={b.icon as IconName} size={13} />
               </div>
             ))}
@@ -388,6 +390,7 @@ const AiBubble: React.FC<{ item: ChatItem; frame: number; hover: T4 }> = ({ item
         )}
         {item.card && (
           <div
+            data-anchor="w4-cmd-card"
             style={{
               marginTop: 6,
               padding: '8px 10px',
@@ -494,11 +497,11 @@ const ActionCard: React.FC<{ item: ChatItem; hover: T4; press: T4; frame: number
         <div style={{ display: 'flex', gap: 6, height: 26, alignItems: 'center' }}>
           {spec.btn === 'approve' ? (
             <>
-              <span style={btnSmall(true, hoveredBtn, pressedBtn)}>批准</span>
+              <span data-anchor={`w4-approve-${item.id}`} style={btnSmall(true, hoveredBtn, pressedBtn)}>批准</span>
               <span style={btnSmall(false, false, false)}>拒绝</span>
             </>
           ) : (
-            <span style={btnSmall(true, hoveredBtn, pressedBtn)}>审批</span>
+            <span data-anchor={`w4-approve-${item.id}`} style={btnSmall(true, hoveredBtn, pressedBtn)}>审批</span>
           )}
         </div>
       )}
@@ -564,6 +567,7 @@ const ConfirmDialog: React.FC<{ kind: 'agent' | 'yolo'; t: number }> = ({ kind, 
         <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
           <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13 }}>取消</div>
           <div
+            data-anchor="w4-dlg-ok"
             style={{
               height: 32,
               padding: '0 14px',
@@ -650,8 +654,9 @@ const Field: React.FC<{
   disabled?: boolean;
   focus?: boolean;
   caret?: boolean;
-}> = ({ label, value, x, y, w, mono, disabled, focus, caret }) => (
-  <div style={{ position: 'absolute', left: x, top: y, width: w, height: 56 }}>
+  anchor?: string;
+}> = ({ label, value, x, y, w, mono, disabled, focus, caret, anchor }) => (
+  <div data-anchor={anchor} style={{ position: 'absolute', left: x, top: y, width: w, height: 56 }}>
     <div style={{ fontSize: 12, color: C.text1, height: 17, lineHeight: '17px', whiteSpace: 'nowrap' }}>{label}</div>
     <div
       style={{
@@ -711,6 +716,7 @@ const DbModal: React.FC<{ st: Wb4State }> = ({ st }) => {
           </span>
           <span
             title="关闭"
+            data-anchor="w4-db-close"
             style={{ width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.text1, background: st.hover === 'dbClose' ? C.bgHover : 'transparent', borderRadius: 4 }}
           >
             <Icon name="x" size={14} />
@@ -750,12 +756,12 @@ const DbModal: React.FC<{ st: Wb4State }> = ({ st }) => {
             form && (
               <>
                 <Field label="类型" value="MySQL" disabled x={18} y={DBM_FIELD_REL.r1} w={276} />
-                <Field label="名称" value={form.name} x={306} y={DBM_FIELD_REL.r1} w={276} focus={st.hover === 'dbName'} caret={st.hover === 'dbName'} />
-                <Field label="主机" value={form.host} mono x={18} y={DBM_FIELD_REL.r2} w={276} focus={st.hover === 'dbHost'} caret={st.hover === 'dbHost'} />
+                <Field label="名称" value={form.name} x={306} y={DBM_FIELD_REL.r1} w={276} focus={st.hover === 'dbName'} caret={st.hover === 'dbName'} anchor="w4-db-name" />
+                <Field label="主机" value={form.host} mono x={18} y={DBM_FIELD_REL.r2} w={276} focus={st.hover === 'dbHost'} caret={st.hover === 'dbHost'} anchor="w4-db-host" />
                 <Field label="端口" value="3306" mono disabled x={306} y={DBM_FIELD_REL.r2} w={276} />
-                <Field label="用户名" value={form.user} mono x={18} y={DBM_FIELD_REL.r3} w={276} focus={st.hover === 'dbUser'} caret={st.hover === 'dbUser'} />
-                <Field label="密码" value={form.pwd} mono x={306} y={DBM_FIELD_REL.r3} w={276} focus={st.hover === 'dbPwd'} caret={st.hover === 'dbPwd'} />
-                <Field label="默认库" value={form.database} mono x={18} y={DBM_FIELD_REL.r4} w={276} focus={st.hover === 'dbDb'} caret={st.hover === 'dbDb'} />
+                <Field label="用户名" value={form.user} mono x={18} y={DBM_FIELD_REL.r3} w={276} focus={st.hover === 'dbUser'} caret={st.hover === 'dbUser'} anchor="w4-db-user" />
+                <Field label="密码" value={form.pwd} mono x={306} y={DBM_FIELD_REL.r3} w={276} focus={st.hover === 'dbPwd'} caret={st.hover === 'dbPwd'} anchor="w4-db-pwd" />
+                <Field label="默认库" value={form.database} mono x={18} y={DBM_FIELD_REL.r4} w={276} focus={st.hover === 'dbDb'} caret={st.hover === 'dbDb'} anchor="w4-db-db" />
                 <div style={{ position: 'absolute', left: 18, top: DBM_FIELD_REL.cmds, width: 564 }}>
                   <div style={{ fontSize: 12, color: C.text1, height: 17, lineHeight: '17px', marginBottom: 5 }}>AI 可用命令</div>
                   <CmdGroups />
@@ -767,6 +773,7 @@ const DbModal: React.FC<{ st: Wb4State }> = ({ st }) => {
         <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
           {view === 'list' ? (
             <div
+              data-anchor="w4-db-add"
               style={{
                 height: 32,
                 padding: '0 14px',
@@ -783,6 +790,7 @@ const DbModal: React.FC<{ st: Wb4State }> = ({ st }) => {
             </div>
           ) : (
             <div
+              data-anchor="w4-db-save"
               style={{
                 height: 32,
                 padding: '0 14px',
@@ -848,7 +856,7 @@ const DbApprovalModal: React.FC<{ st: Wb4State }> = ({ st }) => {
           <Field label="用户名" value={DEMO.dbUser} mono disabled x={18} y={DBA_FIELD_REL.r3} w={W} />
           <Field label="默认库" value={DEMO.dbName} mono disabled x={276} y={DBA_FIELD_REL.r3} w={W} />
           <Field label="目标服务器" value={`${DEMO.serverName}（${DEMO.serverId}）`} disabled x={18} y={DBA_FIELD_REL.r4} w={504} />
-          <div style={{ position: 'absolute', left: 18, top: DBA_FIELD_REL.pwd, width: 504, height: 56 }}>
+          <div data-anchor="w4-dba-pwd" style={{ position: 'absolute', left: 18, top: DBA_FIELD_REL.pwd, width: 504, height: 56 }}>
             <div style={{ fontSize: 12, color: C.text1, height: 17, lineHeight: '17px' }}>
               密码<span style={{ color: C.red, marginLeft: 2 }}>*</span>
             </div>
@@ -882,6 +890,7 @@ const DbApprovalModal: React.FC<{ st: Wb4State }> = ({ st }) => {
         <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
           <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13 }}>拒绝</div>
           <div
+            data-anchor="w4-dba-ok"
             style={{
               height: 32,
               padding: '0 14px',
@@ -928,6 +937,7 @@ const ModeMenu: React.FC<{ st: Wb4State }> = ({ st }) => {
         return (
           <div
             key={m}
+            data-anchor={`w4-mode-item-${i}`}
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -981,6 +991,7 @@ const AiPanel: React.FC<{ st: Wb4State; frame: number }> = ({ st, frame }) => (
           <Icon name="bot" size={12} /> AI 模式
         </span>
         <div
+          data-anchor="w4-mode-sel"
           style={{
             width: MODE_SEL.w,
             height: MODE_SEL.h,
@@ -1031,6 +1042,7 @@ const AiPanel: React.FC<{ st: Wb4State; frame: number }> = ({ st, frame }) => (
         </span>
       </div>
       <div
+        data-anchor="w4-ai-input"
         style={{
           position: 'relative',
           flex: 1,
@@ -1099,6 +1111,7 @@ const MoreMenu: React.FC<{ st: Wb4State }> = ({ st }) => {
       {MORE_ITEMS.map((it, i) => (
         <div
           key={it.label}
+          data-anchor={`w4-more-item-${i}`}
           style={{
             display: 'flex',
             alignItems: 'center',

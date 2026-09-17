@@ -135,8 +135,10 @@ const BoxInput: React.FC<{
   focus?: boolean;
   caret?: boolean;
   chevron?: boolean;
-}> = ({ box, value, placeholder, mono, focus, caret, chevron }) => (
+  anchor?: string;
+}> = ({ box, value, placeholder, mono, focus, caret, chevron, anchor }) => (
   <div
+    data-anchor={anchor}
     style={{
       position: 'absolute', left: box.x, top: box.y, width: box.w, height: box.h, boxSizing: 'border-box',
       display: 'flex', alignItems: 'center', padding: '0 10px',
@@ -234,6 +236,7 @@ const ServersPanel: React.FC<{ st: Wb7State }> = ({ st }) => (
         {(['chatPlus', 'folder', 'terminal', 'more'] as IconName[]).map((n) => (
           <div
             key={n}
+            data-anchor={n === 'more' ? 'w7-more' : undefined}
             style={{
               width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 4,
               border: `1px solid ${n === 'more' && (st.hover === 'more' || st.press === 'more' || st.srvMenu?.open) ? C.accent : C.border}`,
@@ -259,6 +262,7 @@ const ServersPanel: React.FC<{ st: Wb7State }> = ({ st }) => (
           return (
             <div
               key={it.label}
+              data-anchor={i === SRV_ITEM_TUNNEL ? 'w7-srv-menu-tunnel' : undefined}
               style={{
                 display: 'flex', alignItems: 'center', gap: 7, height: SRV_MENU.itemH, padding: '0 10px', borderRadius: 4,
                 fontSize: 12.5, color: st.srvMenu!.hover === i ? C.text0 : current ? C.accent : C.text1,
@@ -280,8 +284,9 @@ const ServersPanel: React.FC<{ st: Wb7State }> = ({ st }) => (
 
 /* ---------- 中央标签栏 ---------- */
 
-const WbTab: React.FC<{ icon: IconName; title: string; active: boolean; w?: number; opacity?: number }> = ({ icon, title, active, w = TAB_W, opacity = 1 }) => (
+const WbTab: React.FC<{ icon: IconName; title: string; active: boolean; w?: number; opacity?: number; anchor?: string }> = ({ icon, title, active, w = TAB_W, opacity = 1, anchor }) => (
   <div
+    data-anchor={anchor}
     style={{
       display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px 0 12px', width: w, flex: 'none',
       borderRight: `1px solid ${C.border}`, borderTop: `2px solid ${active ? C.accent : 'transparent'}`,
@@ -417,6 +422,7 @@ const BrowserPane7: React.FC<{ st: Wb7State; frame: number }> = ({ st, frame }) 
         </div>
       ))}
       <div
+        data-anchor="w7-address"
         style={{
           flex: 1, height: 28, display: 'flex', alignItems: 'center', padding: '0 10px', borderRadius: 4,
           border: `1px solid ${st.addrFocus ? C.accent : C.border}`, background: C.bg2, fontSize: 13,
@@ -487,7 +493,8 @@ const TunnelRow: React.FC<{
   t: number;
   hover: T7;
   toggleTarget: T7;
-}> = ({ row, name, route, running, present, t, hover, toggleTarget }) => {
+  toggleAnchor?: string;
+}> = ({ row, name, route, running, present, t, hover, toggleTarget, toggleAnchor }) => {
   if (!present) return null;
   return (
     <div
@@ -506,7 +513,7 @@ const TunnelRow: React.FC<{
       </div>
       {/* 按钮组:右内缘 12,与 layout 的 btnStop/btnEdit/btnDel 窗口锚点严格一致 */}
       <div style={{ position: 'absolute', right: 12, top: (TUN.rowH - 24) / 2, display: 'flex', gap: 6 }}>
-        <span style={{ width: TUN.btnStop.w, ...btnSmall(false, { hovered: hover === toggleTarget }), justifyContent: 'center' }}>
+        <span data-anchor={toggleAnchor} style={{ width: TUN.btnStop.w, ...btnSmall(false, { hovered: hover === toggleTarget }), justifyContent: 'center' }}>
           {running ? '停止' : '启动'}
         </span>
         <span style={{ width: TUN.btnEdit.w, ...btnSmall(false, {}), justifyContent: 'center' }}>编辑</span>
@@ -530,6 +537,7 @@ const TunnelPanel: React.FC<{ st: Wb7State }> = ({ st }) => {
           <div style={{ fontSize: 11.5, color: C.text2, marginTop: 5 }}>本地端口 → 远端目标端口（经服务器 SSH 连接转发）；关闭本标签页不停止隧道。</div>
         </div>
         <span
+          data-anchor="w7-tun-new"
           style={{
             height: 24, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 4, borderRadius: 4,
             border: `1px solid ${C.accent}`, background: st.hover === 'newTunnel' || st.press === 'newTunnel' ? C.accentHover : C.accent,
@@ -550,6 +558,7 @@ const TunnelPanel: React.FC<{ st: Wb7State }> = ({ st }) => {
           t={st.row1.t}
           hover={st.hover}
           toggleTarget="row1Toggle"
+          toggleAnchor="w7-row1-stop"
         />
         <TunnelRow
           row={1}
@@ -560,6 +569,7 @@ const TunnelPanel: React.FC<{ st: Wb7State }> = ({ st }) => {
           t={st.row2.t}
           hover={st.hover}
           toggleTarget="row2Toggle"
+          toggleAnchor="w7-row2-stop"
         />
         {empty && (
           <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: C.text2 }}>
@@ -606,22 +616,22 @@ const TunnelModal: React.FC<{ st: Wb7State; frame: number }> = ({ st, frame }) =
           {/* 坐标校正层:字段常量是窗口坐标,平移回模态局部原点(head 48 之下) */}
           <div style={{ position: 'absolute', left: -TDIA.x, top: -(TDIA.y + 48), width: TDIA.w, height: TDIA.h - 48 }}>
             <FieldLabel x={TDIA_F.nameInput.x} cy={TDIA_F.nameLabelCy} text="名称" req />
-            <BoxInput box={TDIA_F.nameInput} value={nameValue} placeholder="例如：内网数据库" focus={nameFocus} caret={nameFocus} />
+            <BoxInput box={TDIA_F.nameInput} value={nameValue} placeholder="例如：内网数据库" focus={nameFocus} caret={nameFocus} anchor="w7-tdia-name" />
             <FieldLabel x={TDIA_F.kindSel.x} cy={TDIA_F.kindLabelCy} text="类型" />
-            <BoxInput box={TDIA_F.kindSel} value={kindText} chevron focus={st.hover === 'kindSel' || st.kindMenuOpen} />
+            <BoxInput box={TDIA_F.kindSel} value={kindText} chevron focus={st.hover === 'kindSel' || st.kindMenuOpen} anchor="w7-tdia-kind" />
             <FieldLabel x={TDIA_F.bindInput.x} cy={TDIA_F.bindLabelCy} text="本地绑定地址" />
             <BoxInput box={TDIA_F.bindInput} value="127.0.0.1" mono />
             <div style={{ position: 'absolute', left: TDIA_F.bindInput.x, top: TDIA_F.bindHintY, width: 484, fontSize: 11, color: C.text2, lineHeight: 1.5 }}>
               默认 127.0.0.1 仅本机可访问；改 0.0.0.0 会暴露给局域网，请谨慎。
             </div>
             <FieldLabel x={TDIA_F.portInput.x} cy={TDIA_F.rowLabelCy} text="本地端口" req />
-            <BoxInput box={TDIA_F.portInput} value={portValue} placeholder="3307" mono focus={st.hover === 'portInput'} caret={portValue.length > 0 && st.hover === 'portInput'} />
+            <BoxInput box={TDIA_F.portInput} value={portValue} placeholder="3307" mono focus={st.hover === 'portInput'} caret={portValue.length > 0 && st.hover === 'portInput'} anchor="w7-tdia-port" />
             {kindLocal ? (
               <>
                 <FieldLabel x={TDIA_F.hostInput.x} cy={TDIA_F.rowLabelCy} text="目标主机" />
                 <BoxInput box={TDIA_F.hostInput} value="" placeholder="localhost（服务器自身）" mono />
                 <FieldLabel x={TDIA_F.targetInput.x} cy={TDIA_F.rowLabelCy} text="目标端口" req />
-                <BoxInput box={TDIA_F.targetInput} value={st.f2Target} placeholder="3306" mono focus={st.hover === 'targetInput'} caret={st.f2Target.length > 0 && st.hover === 'targetInput'} />
+                <BoxInput box={TDIA_F.targetInput} value={st.f2Target} placeholder="3306" mono focus={st.hover === 'targetInput'} caret={st.f2Target.length > 0 && st.hover === 'targetInput'} anchor="w7-tdia-target" />
               </>
             ) : (
               <div style={{ position: 'absolute', left: TDIA_F.hostInput.x, width: 318, top: TDIA_F.dynHintY, fontSize: 11, color: C.text2, lineHeight: 1.6 }}>
@@ -632,7 +642,7 @@ const TunnelModal: React.FC<{ st: Wb7State; frame: number }> = ({ st, frame }) =
         </div>
         <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
           <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, color: C.text1 }}>取消</div>
-          <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 13, color: '#fff', background: st.hover === 'saveOk' ? C.accentHover : C.accent }}>
+          <div data-anchor="w7-tdia-ok" style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 13, color: '#fff', background: st.hover === 'saveOk' ? C.accentHover : C.accent }}>
             <Icon name="plus" size={13} />保存并启动
           </div>
         </div>
@@ -650,6 +660,7 @@ const TunnelModal: React.FC<{ st: Wb7State; frame: number }> = ({ st, frame }) =
               return (
                 <div
                   key={label}
+                  data-anchor={`w7-kind-opt-${i}`}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 6, height: TDIA_MENU.itemH, padding: '0 10px', borderRadius: 4,
                     fontSize: 12.5, color: st.kindHover === i ? C.text0 : current ? C.accent : C.text1,
@@ -690,7 +701,7 @@ const ConflictDialog: React.FC<{ t: number; hover: T7 }> = ({ t, hover }) => (
       </div>
       <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
         <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13, color: C.text1 }}>取消</div>
-        <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', borderRadius: 4, fontSize: 13, color: '#fff', background: hover === 'cfmOk' ? C.accentHover : C.accent }}>
+        <div data-anchor="w7-cfm-ok" style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', borderRadius: 4, fontSize: 13, color: '#fff', background: hover === 'cfmOk' ? C.accentHover : C.accent }}>
           关闭并启动
         </div>
       </div>
@@ -724,6 +735,7 @@ const SettingsPage: React.FC<{ st: Wb7State }> = ({ st }) => {
           return (
             <div
               key={it.label}
+              data-anchor={i === NAV_BROWSER ? 'w7-nav-browser' : undefined}
               style={{
                 height: 30, display: 'flex', alignItems: 'center', gap: 8, padding: '0 10px', borderRadius: 6,
                 fontSize: 12.5, color: active ? C.accent : C.text1,
@@ -778,7 +790,7 @@ const SettingsPage: React.FC<{ st: Wb7State }> = ({ st }) => {
               <div style={{ position: 'absolute', left: 204, top: PANEL7.brEnableLabelY - 9, fontSize: 12.5, color: C.text1, whiteSpace: 'nowrap' }}>
                 启用 SOCKS5 代理
               </div>
-              <div style={{ position: 'absolute', left: PANEL7.brEnableBox.x, top: PANEL7.brEnableBox.y }}>
+              <div data-anchor="w7-ckb" style={{ position: 'absolute', left: PANEL7.brEnableBox.x, top: PANEL7.brEnableBox.y }}>
                 <Checkbox size={15} checked={st.proxyEnabled} />
               </div>
               {st.proxyEnabled && (
@@ -798,7 +810,7 @@ const SettingsPage: React.FC<{ st: Wb7State }> = ({ st }) => {
                     SSH 隧道(SOCKS5 动态代理)
                   </div>
                   <div style={{ position: 'absolute', left: 204, top: PANEL7.brSel.y, width: PANEL7.brSel.w }}>
-                    <BoxInput box={{ x: 0, y: 0, w: PANEL7.brSel.w, h: PANEL7.brSel.h }} value={st.selValue ? `内网代理（127.0.0.1:${DEMO.tun1Port}）` : ''} placeholder="请选择隧道…" chevron focus={st.selOpen || st.hover === 'selBox'} />
+                    <BoxInput box={{ x: 0, y: 0, w: PANEL7.brSel.w, h: PANEL7.brSel.h }} value={st.selValue ? `内网代理（127.0.0.1:${DEMO.tun1Port}）` : ''} placeholder="请选择隧道…" chevron focus={st.selOpen || st.hover === 'selBox'} anchor="w7-sel" />
                     {st.selOpen && (
                       <div
                         style={{
@@ -808,6 +820,7 @@ const SettingsPage: React.FC<{ st: Wb7State }> = ({ st }) => {
                         }}
                       >
                         <div
+                          data-anchor="w7-sel-opt"
                           style={{
                             display: 'flex', alignItems: 'center', gap: 6, height: 30, padding: '0 10px', borderRadius: 4,
                             color: st.selHover ? C.text0 : C.text1, background: st.selHover ? C.bgHover : 'transparent',
@@ -838,7 +851,7 @@ const SettingsPage: React.FC<{ st: Wb7State }> = ({ st }) => {
                     : '未生效:所选隧道未在运行,当前回落直连'}
               </div>
               <div style={{ position: 'absolute', left: PANEL7.brSave.x, top: PANEL7.brSave.y, whiteSpace: 'nowrap' }}>
-                <span style={{ height: 32, padding: '0 16px', display: 'inline-flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 13, color: '#fff', background: st.hover === 'psave' ? C.accentHover : C.accent }}>
+                <span data-anchor="w7-psave" style={{ height: 32, padding: '0 16px', display: 'inline-flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 13, color: '#fff', background: st.hover === 'psave' ? C.accentHover : C.accent }}>
                   保存
                 </span>
               </div>
@@ -921,7 +934,7 @@ const Statusbar: React.FC<{ badge: number }> = ({ badge }) => (
     </span>
     <div style={{ flex: 1 }} />
     {badge > 0 && (
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginRight: 12, color: C.green }} title={`运行中的 SSH 隧道（${badge}）`}>
+      <span data-anchor="w7-badge" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginRight: 12, color: C.green }} title={`运行中的 SSH 隧道（${badge}）`}>
         <Icon name="tunnel" size={12} />
         {badge}
       </span>
@@ -945,7 +958,7 @@ export const Wb7: React.FC<{ state: Wb7State; frame: number }> = ({ state, frame
         overflow: 'hidden', boxShadow: '0 40px 120px rgba(0,0,0,0.55)',
       }}
     >
-      <TopBar active={st.page === 'workbench' ? '项目' : '设置'} project={DEMO.projectName} />
+      <TopBar active={st.page === 'workbench' ? '项目' : '设置'} project={DEMO.projectName} anchors={{ project: 'w7-proj-nav', settings: 'w7-set-nav' }} />
 
       {/* 工作台页面 */}
       <div style={{ position: 'absolute', left: 0, right: 0, top: 40, bottom: 26, display: 'flex', opacity: 1 - st.pageT, pointerEvents: st.page === 'workbench' ? 'auto' : 'none' }}>
@@ -964,7 +977,7 @@ export const Wb7: React.FC<{ state: Wb7State; frame: number }> = ({ state, frame
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: C.bg0 }}>
           <div style={{ height: 36, flex: 'none', display: 'flex', alignItems: 'stretch', background: C.bg1, borderBottom: `1px solid ${C.border}`, overflow: 'hidden' }}>
             <WbTab icon="terminal" title="本地终端" active={st.centerTab === 'terminal'} />
-            <WbTab icon="globe" title="浏览器" active={st.centerTab === 'browser'} />
+            <WbTab icon="globe" title="浏览器" active={st.centerTab === 'browser'} anchor="w7-btab" />
             {st.tunnelTabT > 0 && (
               <div style={{ width: TAB_W * st.tunnelTabT, opacity: st.tunnelTabT, overflow: 'hidden', display: 'flex' }}>
                 <WbTab icon="tunnel" title="SSH 隧道" active={st.centerTab === 'tunnel'} w={TAB_W} />

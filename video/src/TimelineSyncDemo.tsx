@@ -6,6 +6,7 @@
 import React from 'react';
 import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
 import { track1 } from './anim';
+import { AnchorRoot, useAnchorTrack } from './components/anchors';
 import { Caption } from './components/Caption';
 import { Cursor } from './components/Cursor';
 import { Highlight } from './components/Highlight';
@@ -13,7 +14,7 @@ import { Note } from './components/Note';
 import { C } from './theme';
 import { Icon } from './ui';
 import {
-  CAM_S, CAM_X, CAM_Y, CAPTIONS9, CLICKS, CUR_X, CUR_Y, DURATION, HIGHLIGHTS9, NOTES9, SPLIT_AT,
+  CAM_S, CAM_X, CAM_Y, CAPTIONS9, CLICKS, CUR_PATH, DURATION, HIGHLIGHTS9, NOTES9, SPLIT_AT,
   WEB_BACK, WEB_IN, finaleWb, finaleWeb, tlRowsAt, wbAt, webAt, webVisibleRows,
 } from './timeline9/script';
 import { Wb9 } from './timeline9/Wb9';
@@ -48,11 +49,11 @@ const MiniPane: React.FC<{ x: number; label: string; children: React.ReactNode; 
   </div>
 );
 
-export const TimelineSyncDemo: React.FC = () => {
+const Body: React.FC = () => {
   const frame = useCurrentFrame();
 
   const cam = { s: track1(CAM_S, frame), cx: track1(CAM_X, frame), cy: track1(CAM_Y, frame) };
-  const cur = { x: track1(CUR_X, frame), y: track1(CUR_Y, frame) };
+  const cur = useAnchorTrack(CUR_PATH, frame);
   const state = wbAt(frame);
   const web = webAt(frame);
   const { rowsA, rowsB } = tlRowsAt(frame, state);
@@ -97,24 +98,26 @@ export const TimelineSyncDemo: React.FC = () => {
               <Web9 state={web} frame={frame} rows={webRows} />
             </AbsoluteFill>
 
-            {/* 焦点高亮环:zIndex 55 压过菜单(45)/模态遮罩(50),低于指针(60) */}
-            <div style={{ position: 'absolute', inset: 0, zIndex: 55, pointerEvents: 'none' }}>
-              {HIGHLIGHTS9.map((h, i) => (
-                <Highlight key={i} {...h} />
-              ))}
-            </div>
-
-            {/* 指针置于最上层 */}
-            <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
-              <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
-            </div>
-
             {/* 教学说明卡 */}
             {NOTES9.map((n) => (
               <Note key={n.from} note={n} />
             ))}
           </AbsoluteFill>
         </AbsoluteFill>
+      )}
+
+      {/* 焦点高亮环 + 指针(锚点实测画布坐标,不随相机变换;zIndex 55 压过菜单 45/模态 50) */}
+      {!inSplit && (
+        <>
+          <div style={{ position: 'absolute', inset: 0, zIndex: 55, pointerEvents: 'none' }}>
+            {HIGHLIGHTS9.map((h) => (
+              <Highlight key={`${h.target}:${h.from}`} target={h.target} pad={h.pad} r={h.r} from={h.from} to={h.to} />
+            ))}
+          </div>
+          <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
+            <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressing ? 0.84 : 1} clicks={CLICKS} />
+          </div>
+        </>
       )}
 
       {/* 收尾分屏:客户端 ⇄ 网页端 + 同步徽标 + 特性卡 */}
@@ -171,3 +174,9 @@ export const TimelineSyncDemo: React.FC = () => {
     </AbsoluteFill>
   );
 };
+
+export const TimelineSyncDemo: React.FC = () => (
+  <AnchorRoot>
+    <Body />
+  </AnchorRoot>
+);

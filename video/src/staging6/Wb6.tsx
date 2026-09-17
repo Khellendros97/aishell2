@@ -180,8 +180,9 @@ const ServersPanel: React.FC = () => (
 
 /* ---------- 中央标签栏 ---------- */
 
-const WbTab: React.FC<{ icon: IconName; title: string; active: boolean; w?: number; opacity?: number }> = ({ icon, title, active, w = TAB_W, opacity = 1 }) => (
+const WbTab: React.FC<{ icon: IconName; title: string; active: boolean; w?: number; opacity?: number; anchor?: string }> = ({ icon, title, active, w = TAB_W, opacity = 1, anchor }) => (
   <div
+    data-anchor={anchor}
     style={{
       display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px 0 12px', width: w, flex: 'none',
       borderRight: `1px solid ${C.border}`, borderTop: `2px solid ${active ? C.accent : 'transparent'}`,
@@ -261,7 +262,8 @@ const BrowserPaneStatic: React.FC = () => (
 const StagingRow: React.FC<{
   y: number; server: string; name: string; path: string; time: string; size: string;
   hover: T6; press: T6; targets: { diff: T6; accept: T6; restore: T6; export: T6 };
-}> = ({ y, server, name, path, time, size, hover, press, targets }) => {
+  anchors?: Partial<Record<Exclude<T6, null>, string>>;
+}> = ({ y, server, name, path, time, size, hover, press, targets, anchors }) => {
   const cy = y + STG.rowH / 2;
   const cell: React.CSSProperties = { padding: '6px 8px', borderBottom: `1px solid ${C.border}`, verticalAlign: 'middle', height: STG.rowH };
   return (
@@ -286,6 +288,7 @@ const StagingRow: React.FC<{
           <span
             key={b.label}
             title={b.label}
+            data-anchor={b.key ? anchors?.[b.key] : undefined}
             style={{
               width: b.w,
               ...btnSmall(b.primary, { hovered: hover === b.key, danger: false }),
@@ -373,6 +376,7 @@ const StagingPanel: React.FC<{ st: Wb6State }> = ({ st }) => {
             hover={st.hover}
             press={st.press}
             targets={{ diff: 'stgDiff1', accept: 'stgAccept1', restore: null, export: 'stgExport1' }}
+            anchors={{ stgDiff1: 'w6-stg-diff-0', stgAccept1: 'w6-stg-accept-0', stgExport1: 'w6-stg-export-0' }}
           />
         )}
         {st.rowTheme && (
@@ -386,6 +390,7 @@ const StagingPanel: React.FC<{ st: Wb6State }> = ({ st }) => {
             hover={st.hover}
             press={st.press}
             targets={{ diff: null, accept: null, restore: 'stgRestore2', export: null }}
+            anchors={{ stgRestore2: 'w6-stg-restore-1' }}
           />
         )}
         {count === 0 && (
@@ -579,6 +584,7 @@ const AiPanel: React.FC<{ st: Wb6State; frame: number }> = ({ st, frame }) => (
     {/* 会话栏 */}
     <div style={{ height: 40, flex: 'none', display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px', borderBottom: `1px solid ${C.border}` }}>
       <div
+        data-anchor="w6-ses-select"
         style={{
           flex: 1, height: SES_SELECT.h, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6,
           padding: '0 8px', background: C.bg2, border: `1px solid ${st.hover === 'sesSelect' || st.sessionMenu?.open ? C.accent : C.border}`,
@@ -591,6 +597,7 @@ const AiPanel: React.FC<{ st: Wb6State; frame: number }> = ({ st, frame }) => (
         <Icon name="chevronDown" size={12} color={C.text2} />
       </div>
       <div
+        data-anchor="w6-ses-new"
         style={{
           width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.text1,
           borderRadius: 4, background: st.hover === 'sesNew' || st.press === 'sesNew' ? C.bg3 : 'transparent',
@@ -621,6 +628,7 @@ const AiPanel: React.FC<{ st: Wb6State; frame: number }> = ({ st, frame }) => (
     {/* 「已暂存」提示条 */}
     {st.noticeVisible && (
       <div
+        data-anchor="w6-notice"
         style={{
           minHeight: NOTICE.h, margin: '0 10px 8px', padding: '5px 9px', display: 'flex', alignItems: 'center', gap: 6,
           border: `1px solid ${st.hover === 'notice' ? C.accent : C.border}`, borderRadius: 6,
@@ -662,6 +670,7 @@ const AiPanel: React.FC<{ st: Wb6State; frame: number }> = ({ st, frame }) => (
         </span>
       </div>
       <div
+        data-anchor="w6-ai-input"
         style={{
           position: 'relative', flex: 1, minHeight: 0, padding: '8px 10px', background: C.bg2,
           border: `1px solid ${st.inputFocus ? C.accent : C.border}`, borderRadius: 6, fontSize: 12.5, lineHeight: '20px',
@@ -692,6 +701,7 @@ const AiPanel: React.FC<{ st: Wb6State; frame: number }> = ({ st, frame }) => (
           return (
             <div
               key={label}
+              data-anchor={i === 0 ? 'w6-ses-item-0' : undefined}
               style={{
                 display: 'flex', alignItems: 'center', gap: 6, height: SES_MENU.itemH, padding: '0 10px', borderRadius: 4,
                 fontSize: 12.5, color: st.sessionMenu!.hover === i ? C.text0 : current ? C.accent : C.text1,
@@ -739,6 +749,7 @@ const ConfirmDialog: React.FC<{ kind: 'accept' | 'restore'; t: number; hover: T6
         <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
           <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13 }}>取消</div>
           <div
+            data-anchor="w6-dlg-ok"
             style={{
               height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', borderRadius: 4, fontSize: 13, color: '#fff',
               background: accept ? (hover === 'accOk' ? C.accentHover : C.accent) : hover === 'resOk' ? '#f0777e' : C.red,
@@ -805,7 +816,7 @@ const ExportDialog: React.FC<{ t: number; hover: T6 }> = ({ t, hover }) => (
       </div>
       <div style={{ height: 56, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', borderTop: `1px solid ${C.border}` }}>
         <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13 }}>取消</div>
-        <div style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 13, color: '#fff', background: hover === 'expOk' ? C.accentHover : C.accent }}>
+        <div data-anchor="w6-exp-ok" style={{ height: 32, padding: '0 14px', display: 'flex', alignItems: 'center', gap: 6, borderRadius: 4, fontSize: 13, color: '#fff', background: hover === 'expOk' ? C.accentHover : C.accent }}>
           <Icon name="download" size={13} /> 导出
         </div>
         <span style={{ display: 'none' }}>{`${EXP_ACCEPT.x},${EXP_BTN.ok.x}`}</span>
@@ -864,7 +875,7 @@ export const Wb6: React.FC<{ state: Wb6State; frame: number }> = ({ state, frame
           <WbTab icon="globe" title="浏览器" active={state.centerTab === 'browser'} />
           {state.stagingTabT > 0 && (
             <div style={{ width: TAB_W * state.stagingTabT, opacity: state.stagingTabT, overflow: 'hidden', display: 'flex' }}>
-              <WbTab icon="history" title="文件暂存区" active={state.centerTab === 'staging'} w={TAB_W} />
+              <WbTab icon="history" title="文件暂存区" active={state.centerTab === 'staging'} w={TAB_W} anchor="w6-tab-staging" />
             </div>
           )}
           {state.diffTabT > 0 && (

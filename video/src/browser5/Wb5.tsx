@@ -111,6 +111,7 @@ const ActivityBar: React.FC<{ hover: T5; press: T5 }> = ({ hover, press }) => (
         <div
           key={it.id}
           title={it.label}
+          data-anchor={it.id === 'browser' ? 'w5-act-browser' : undefined}
           style={{
             width: ACT_BOX.w,
             height: ACT_BOX.h,
@@ -290,6 +291,7 @@ export const Site1: React.FC<{ styled: number }> = ({ styled }) => {
       </div>
       {/* hero 标题(改样式目标:品牌蓝 64px) */}
       <div
+        data-anchor="w5-hero"
         style={{
           position: 'absolute', left: hero.x, top: hero.y, width: hero.w, height: hero.h,
           fontSize: 48 + 16 * styled, fontWeight: 700, lineHeight: `${hero.h}px`,
@@ -430,6 +432,7 @@ const BrowserPane: React.FC<{ st: Wb5State; frame: number }> = ({ st, frame }) =
         <div style={iconBtn(28, {})} title="刷新"><Icon name="refresh" size={15} /></div>
         <div style={{ position: 'relative', flex: 1, minWidth: 0, display: 'flex' }}>
           <div
+            data-anchor="w5-address"
             style={{
               width: '100%', height: 28, display: 'flex', alignItems: 'center', padding: '0 10px',
               borderRadius: 4, border: `1px solid ${st.addressFocus ? C.accent : C.border}`,
@@ -448,7 +451,7 @@ const BrowserPane: React.FC<{ st: Wb5State; frame: number }> = ({ st, frame }) =
           </div>
         </div>
         <div style={iconBtn(28, {})} title="打开本地 HTML 文件"><Icon name="folderOpen" size={15} /></div>
-        <div style={iconBtn(28, { hovered: st.hover === 'inspect', active: st.inspectOn })} title="检查元素:点击页面元素加入 AI 对话">
+        <div data-anchor="w5-inspect" style={iconBtn(28, { hovered: st.hover === 'inspect', active: st.inspectOn })} title="检查元素:点击页面元素加入 AI 对话">
           <Icon name="inspect" size={15} />
         </div>
         <div style={iconBtn(28, {})} title="开发者工具(该视图的 F12)"><Icon name="wrench" size={15} /></div>
@@ -514,8 +517,9 @@ const BrowserPane: React.FC<{ st: Wb5State; frame: number }> = ({ st, frame }) =
 
 /* ---------- 聊天条目 ---------- */
 
-const Chip: React.FC<{ label: string }> = ({ label }) => (
+const Chip: React.FC<{ label: string; anchor?: string }> = ({ label, anchor }) => (
   <span
+    data-anchor={anchor}
     style={{
       display: 'inline-flex',
       alignItems: 'center',
@@ -674,7 +678,7 @@ const SuggestCard: React.FC<{ text: string; url: boolean; hover: T5 }> = ({ text
       </span>
       <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         {url && (
-          <span style={iconBtn(24, { hovered: hover === 'globe' })} title="在内置浏览器中打开">
+          <span data-anchor="w5-globe" style={iconBtn(24, { hovered: hover === 'globe' })} title="在内置浏览器中打开">
             <Icon name="globe" size={13} />
           </span>
         )}
@@ -814,6 +818,7 @@ const AiPanel: React.FC<{ st: Wb5State; frame: number }> = ({ st, frame }) => (
         </span>
       </div>
       <div
+        data-anchor="w5-ai-input"
         style={{
           position: 'relative',
           flex: 1,
@@ -828,7 +833,7 @@ const AiPanel: React.FC<{ st: Wb5State; frame: number }> = ({ st, frame }) => (
       >
         {st.inputText || st.inputChip ? (
           <span style={{ color: C.text0, wordBreak: 'break-all' }}>
-            {st.inputChip && <Chip label="@browser:#hero-title" />}
+            {st.inputChip && <Chip label="@browser:#hero-title" anchor="w5-input-chip" />}
             {st.inputText}
             {st.inputCaret && <span style={{ display: 'inline-block', width: 1.5, height: 14, background: C.accent, verticalAlign: '-2px', marginLeft: 1 }} />}
           </span>

@@ -1,7 +1,7 @@
 /**
  * 场景一:初始化配置(系统设置窗口)。
  * 时间线 0–570;540–570 淡出到黑场,由 Video.tsx 的场景二接续。
- * 运镜与指针共用 scene.ts 锚点,所有运动曲线在此一处编排。
+ * 运镜仍走 scene.ts 常量;指针/高亮/涟漪改锚点实测(components/anchors.tsx),目标元素打 data-anchor。
  *
  * 段落:
  *   0–72    全景开场,警告条高亮          72–105 推镜 → Workspace 输入行
@@ -13,10 +13,11 @@
 import React from 'react';
 import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
 import { EASE, Stop, track1 } from './anim';
+import { AnchorStop, useAnchorTrack } from './components/anchors';
 import { AppWindow, HoverTarget, WinState } from './components/AppWindow';
 import { Click, ClickTarget, Cursor } from './components/Cursor';
 import { Highlight } from './components/Highlight';
-import { ACCOUNT_BTN, ANCHOR, BANNER_H, TOPBAR_H, BROWSE_BTN, PANEL, SAVE_BTN, WIN_H, WIN_W } from './scene';
+import { ANCHOR, WIN_H, WIN_W } from './scene';
 
 /* ---------- 摄像机轨道(scale + 设计稿焦点) ---------- */
 const CAM_S: readonly Stop[] = [
@@ -71,41 +72,38 @@ const CAM_Y: readonly Stop[] = [
   { f: 482, v: 240 },
 ];
 
-/* ---------- 指针轨道(设计稿坐标) ---------- */
-const CUR_X: readonly Stop[] = [
-  { f: 95, v: ANCHOR.cursorStart.x },
-  { f: 128, v: ANCHOR.browse.x },
-  { f: 160, v: ANCHOR.browse.x },
-  { f: 186, v: ANCHOR.folderRow.x },
-  { f: 198, v: ANCHOR.folderRow.x },
-  { f: 222, v: ANCHOR.confirm.x },
-  { f: 246, v: ANCHOR.confirm.x },
-  { f: 320, v: ANCHOR.save.x },
-  { f: 350, v: ANCHOR.save.x },
-  { f: 380, v: ANCHOR.saveLifted.x },
-  { f: 436, v: ANCHOR.saveLifted.x },
-  { f: 470, v: ANCHOR.account.x },
-];
-const CUR_Y: readonly Stop[] = [
-  { f: 95, v: ANCHOR.cursorStart.y },
-  { f: 128, v: ANCHOR.browse.y },
-  { f: 160, v: ANCHOR.browse.y },
-  { f: 186, v: ANCHOR.folderRow.y },
-  { f: 198, v: ANCHOR.folderRow.y },
-  { f: 222, v: ANCHOR.confirm.y },
-  { f: 246, v: ANCHOR.confirm.y },
-  { f: 320, v: ANCHOR.save.y },
-  { f: 350, v: ANCHOR.save.y },
-  { f: 380, v: ANCHOR.saveLifted.y },
-  { f: 436, v: ANCHOR.saveLifted.y },
-  { f: 470, v: ANCHOR.account.y },
+/* ---------- 指针轨道(锚点实测优先;x/y 为冷启动首帧兜底,按该段相机换算) ---------- */
+/** 设计稿窗口坐标 → canvas 兜底坐标(按某帧相机;仅冷启动首帧兜底,实测就绪后即被替换) */
+const wf = (wx: number, wy: number, s: number, cx: number, cy: number): { x: number; y: number } => ({
+  x: wx * s + (960 - cx * s),
+  y: wy * s + (540 - cy * s),
+});
+
+const CUR_PATH: readonly AnchorStop[] = [
+  /* 入场起点(推镜途中,取 f95 附近相机近似换算) */
+  { f: 95, ...wf(1450, 760, 1.15, 810, 425) },
+  /* Workspace 行特写相机 (1.55,660,250) */
+  { f: 128, at: 'init-browse', ...wf(ANCHOR.browse.x, ANCHOR.browse.y, 1.55, 660, 250) },
+  { f: 160, at: 'init-browse', ...wf(ANCHOR.browse.x, ANCHOR.browse.y, 1.55, 660, 250) },
+  /* 对话框期间相机 (1.35,960,600) */
+  { f: 186, at: 'init-folder-row', ...wf(ANCHOR.folderRow.x, ANCHOR.folderRow.y, 1.35, 960, 600) },
+  { f: 198, at: 'init-folder-row', ...wf(ANCHOR.folderRow.x, ANCHOR.folderRow.y, 1.35, 960, 600) },
+  { f: 222, at: 'init-folder-confirm', ...wf(ANCHOR.confirm.x, ANCHOR.confirm.y, 1.35, 960, 600) },
+  { f: 246, at: 'init-folder-confirm', ...wf(ANCHOR.confirm.x, ANCHOR.confirm.y, 1.35, 960, 600) },
+  /* 保存段相机 (1.5,980,930);380 起警告条收起按钮上移 40,改用收起后位置 + (1.35,1210,1000) 相机 */
+  { f: 320, at: 'init-save', ...wf(ANCHOR.save.x, ANCHOR.save.y, 1.5, 980, 930) },
+  { f: 350, at: 'init-save', ...wf(ANCHOR.save.x, ANCHOR.save.y, 1.5, 980, 930) },
+  { f: 380, at: 'init-save', ...wf(ANCHOR.saveLifted.x, ANCHOR.saveLifted.y, 1.35, 1210, 1000) },
+  { f: 436, at: 'init-save', ...wf(ANCHOR.saveLifted.x, ANCHOR.saveLifted.y, 1.35, 1210, 1000) },
+  /* 收尾推向顶栏「账号」相机 (1.12,1500,240) */
+  { f: 470, at: 'init-account', ...wf(ANCHOR.account.x, ANCHOR.account.y, 1.12, 1500, 240) },
 ];
 
 const CLICKS: readonly Click[] = [
-  { f: 140, ...ANCHOR.browse, target: 'browse' },
-  { f: 192, ...ANCHOR.folderRow, target: 'row' },
-  { f: 228, ...ANCHOR.confirm, target: 'confirm' },
-  { f: 330, ...ANCHOR.save, target: 'save' },
+  { f: 140, ...wf(ANCHOR.browse.x, ANCHOR.browse.y, 1.55, 660, 250), anchor: 'init-browse', target: 'browse' },
+  { f: 192, ...wf(ANCHOR.folderRow.x, ANCHOR.folderRow.y, 1.35, 960, 600), anchor: 'init-folder-row', target: 'row' },
+  { f: 228, ...wf(ANCHOR.confirm.x, ANCHOR.confirm.y, 1.35, 960, 600), anchor: 'init-folder-confirm', target: 'confirm' },
+  { f: 330, ...wf(ANCHOR.save.x, ANCHOR.save.y, 1.5, 980, 930), anchor: 'init-save', target: 'save' },
 ];
 
 const FULL_PATH = 'D:\\AIShellDemo\\workspace';
@@ -124,7 +122,7 @@ export const InitSetup: React.FC = () => {
   const frame = useCurrentFrame();
 
   const cam = { s: track1(CAM_S, frame), cx: track1(CAM_X, frame), cy: track1(CAM_Y, frame) };
-  const cur = { x: track1(CUR_X, frame), y: track1(CUR_Y, frame) };
+  const cur = useAnchorTrack(CUR_PATH, frame);
 
   /* 窗口状态推进 */
   const dialogT = interpolate(frame, [142, 158, 228, 242], [0, 1, 1, 0], {
@@ -178,15 +176,18 @@ export const InitSetup: React.FC = () => {
         }}
       >
         <AppWindow state={winState} />
-
-        {/* 焦点高亮环(设计稿坐标) */}
-        <Highlight x={6} y={TOPBAR_H + 5} w={WIN_W - 12} h={BANNER_H - 10} r={6} from={10} to={70} />
-        <Highlight x={PANEL.x - 6} y={BROWSE_BTN.y - 6} w={PANEL.w + 12} h={46} r={8} from={80} to={140} />
-        <Highlight x={SAVE_BTN.x - 8} y={SAVE_BTN.y - 8} w={SAVE_BTN.w + 16} h={SAVE_BTN.h + 16} r={8} from={302} to={330} />
-        <Highlight x={ACCOUNT_BTN.x - 4} y={ACCOUNT_BTN.y - 4} w={ACCOUNT_BTN.w + 8} h={ACCOUNT_BTN.h + 8} r={6} from={474} to={534} />
-
-        <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressScale} clicks={CLICKS} />
       </AbsoluteFill>
+
+      {/* 焦点高亮环 + 指针(锚点实测画布坐标,不随相机变换,放相机容器外) */}
+      <div style={{ position: 'absolute', inset: 0, zIndex: 55, pointerEvents: 'none' }}>
+        <Highlight target="init-banner" pad={5} r={6} from={10} to={70} />
+        <Highlight target="init-ws-row" pad={6} r={8} from={80} to={140} />
+        <Highlight target="init-save" pad={8} r={8} from={302} to={330} />
+        <Highlight target="init-account" pad={4} r={6} from={474} to={534} />
+      </div>
+      <div style={{ position: 'absolute', inset: 0, zIndex: 60, pointerEvents: 'none' }}>
+        <Cursor x={cur.x} y={cur.y} opacity={cursorOpacity} pressScale={pressScale} clicks={CLICKS} />
+      </div>
     </AbsoluteFill>
   );
 };

@@ -7,11 +7,15 @@ import React from 'react';
 import { C, FONT_UI } from '../theme';
 import { Icon, Logo } from '../ui';
 
-export const TopBar: React.FC<{ active: '项目' | '设置' | '账号'; project?: string; accountHover?: boolean }> = ({
-  active,
-  project,
-  accountHover,
-}) => (
+export const TopBar: React.FC<{
+  active: '项目' | '设置' | '账号';
+  project?: string;
+  accountHover?: boolean;
+  /** 版本号文案(缺省 v0.7.4;新视频可传当前真实版本) */
+  version?: string;
+  /** 顶部导航锚点 id(锚点实测:高亮/指针用;不传则不打 data-anchor) */
+  anchors?: { project?: string; settings?: string; account?: string };
+}> = ({ active, project, accountHover, version = 'v0.7.4', anchors }) => (
   <div
     style={{
       height: 40,
@@ -26,7 +30,7 @@ export const TopBar: React.FC<{ active: '项目' | '设置' | '账号'; project?
   >
     <Logo size={22} />
     <span style={{ fontWeight: 600, fontSize: 14, color: C.text0 }}>AIShell</span>
-    <span style={{ fontSize: 11, color: C.text2, marginTop: 2 }}>v0.7.4</span>
+    <span style={{ fontSize: 11, color: C.text2, marginTop: 2 }}>{version}</span>
     {project && (
       <>
         <span style={{ color: C.borderStrong }}>/</span>
@@ -34,12 +38,14 @@ export const TopBar: React.FC<{ active: '项目' | '设置' | '账号'; project?
       </>
     )}
     <div style={{ flex: 1 }} />
-    {(['项目', '设置', '账号'] as const).map((label) => {
+    {(['项目', '设置', '账号'] as const).map((label, i) => {
       const isActive = label === active;
       const hovered = label === '账号' && accountHover;
+      const anchorId = anchors && (['project', 'settings', 'account'] as const)[i];
       return (
         <div
           key={label}
+          data-anchor={anchorId ? anchors![anchorId] : undefined}
           style={{
             padding: '5px 12px',
             borderRadius: 6,

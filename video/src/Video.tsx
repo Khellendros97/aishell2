@@ -5,6 +5,7 @@
 import React from 'react';
 import { AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
 import { AiDemo } from './AiDemo';
+import { AnchorRoot } from './components/anchors';
 import { Caption } from './components/Caption';
 import { FeatureCard } from './components/FeatureCard';
 import { InitSetup } from './InitSetup';
@@ -29,7 +30,8 @@ export const Video: React.FC = () => {
   const masterFade = interpolate(frame, [1210, 1240], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' });
 
   return (
-    <AbsoluteFill style={{ background: '#0a0b0e' }}>
+    <AnchorRoot>
+      <AbsoluteFill style={{ background: '#0a0b0e' }}>
       {frame < 575 && <InitSetup />}
       {frame >= 570 && <AiDemo />}
 
@@ -49,6 +51,7 @@ export const Video: React.FC = () => {
 
       {/* 结尾淡出 */}
       <AbsoluteFill style={{ background: '#000', opacity: masterFade, pointerEvents: 'none' }} />
-    </AbsoluteFill>
+      </AbsoluteFill>
+    </AnchorRoot>
   );
 };

@@ -163,6 +163,7 @@ const ActivityBar: React.FC<{ panel: string; hover: Wb3Target; press: Wb3Target 
         <div
           key={it.id}
           title={it.label}
+          data-anchor={it.id === 'servers' ? 'w3-act-servers' : it.id === 'explorer' ? 'w3-act-explorer' : undefined}
           style={{
             width: 40,
             height: 40,
@@ -221,6 +222,7 @@ const ExplorerTree: React.FC<{ files: string[]; highlight: string | null; dropZo
       return (
         <div
           key={f}
+          data-anchor={`w3-tree-${f}`}
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -262,6 +264,7 @@ const ServersPanel: React.FC<{ expanded: boolean; hover: Wb3Target; press: Wb3Ta
     </div>
     {/* 服务器卡(可展开) */}
     <div
+      data-anchor="w3-card"
       style={{
         padding: '8px 12px',
         background: C.bg2,
@@ -302,6 +305,7 @@ const ServersPanel: React.FC<{ expanded: boolean; hover: Wb3Target; press: Wb3Ta
                 <div
                   key={b.title}
                   title={b.title}
+                  data-anchor={b.target === 'sftpBtn' ? 'w3-sftp-btn' : undefined}
                   style={{
                     width: 26,
                     height: 26,
@@ -337,6 +341,7 @@ const TabBar: React.FC<{ tabs: Wb3Tab[]; activeId: string; hover: Wb3Target }> =
       return (
         <div
           key={t.id}
+          data-anchor={t.id === 'sftp' ? 'w3-tab-sftp' : undefined}
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -425,7 +430,7 @@ const SftpToolbar: React.FC<{ st: NonNullable<Wb3State['sftp']>; hover: Wb3Targe
           }}
         >
           {st.cwd}
-          <div title="收藏当前路径" style={{ ...iconBtnStyle({ active: st.starActive, hovered: hover === 'sfStar', pressed: press === 'sfStar' }), position: 'absolute', right: 3, top: 2, width: 24, height: 24 }}>
+          <div data-anchor="w3-sf-star" title="收藏当前路径" style={{ ...iconBtnStyle({ active: st.starActive, hovered: hover === 'sfStar', pressed: press === 'sfStar' }), position: 'absolute', right: 3, top: 2, width: 24, height: 24 }}>
             <Icon name="star" size={13} />
           </div>
         </div>
@@ -436,13 +441,13 @@ const SftpToolbar: React.FC<{ st: NonNullable<Wb3State['sftp']>; hover: Wb3Targe
       <div title="平铺视图" style={{ ...iconBtnStyle({ active: st.view === 'grid' }), position: 'absolute', left: SF.gridBtn.x - CENTER.x - 14 + shift, top: 6 }}>
         <Icon name="grid" size={14} />
       </div>
-      <div title="列表视图" style={{ ...iconBtnStyle({ active: st.view === 'list', hovered: hover === 'sfListBtn', pressed: press === 'sfListBtn' }), position: 'absolute', left: SF.listBtn.x - CENTER.x - 14 + shift, top: 6 }}>
+      <div data-anchor="w3-sf-list" title="列表视图" style={{ ...iconBtnStyle({ active: st.view === 'list', hovered: hover === 'sfListBtn', pressed: press === 'sfListBtn' }), position: 'absolute', left: SF.listBtn.x - CENTER.x - 14 + shift, top: 6 }}>
         <Icon name="list" size={14} />
       </div>
-      <div title="收藏夹" style={{ ...iconBtnStyle({ active: st.favOpen, hovered: hover === 'sfFavBtn', pressed: press === 'sfFavBtn' }), position: 'absolute', left: SF.favBtn.x - CENTER.x - 14 + shift, top: 6 }}>
+      <div data-anchor="w3-sf-fav" title="收藏夹" style={{ ...iconBtnStyle({ active: st.favOpen, hovered: hover === 'sfFavBtn', pressed: press === 'sfFavBtn' }), position: 'absolute', left: SF.favBtn.x - CENTER.x - 14 + shift, top: 6 }}>
         <Icon name="star" size={14} />
       </div>
-      <div title="搜索当前目录" style={{ ...iconBtnStyle({ active: st.searchOpen, hovered: hover === 'sfSearchBtn' }), position: 'absolute', left: SF.searchBtn.x - CENTER.x - 14 + shift, top: 6 }}>
+      <div data-anchor="w3-sf-search" title="搜索当前目录" style={{ ...iconBtnStyle({ active: st.searchOpen, hovered: hover === 'sfSearchBtn' }), position: 'absolute', left: SF.searchBtn.x - CENTER.x - 14 + shift, top: 6 }}>
         <Icon name="search" size={14} />
       </div>
       {st.searchOpen && (
@@ -493,6 +498,7 @@ const btnGo: React.CSSProperties = {
 
 const GridItem: React.FC<{ e: EntryDef; cx: number; cy: number; sel: boolean }> = ({ e, cx, cy, sel }) => (
   <div
+    data-anchor={`w3-entry-${e.name}`}
     style={{
       position: 'absolute',
       left: cx - 46,
@@ -610,6 +616,7 @@ const ListView: React.FC<{ st: NonNullable<Wb3State['sftp']>; shown: EntryDef[];
           <th style={{ ...th, width: colw.name }}>名称</th>
           <th style={{ ...th, width: colw.size, textAlign: 'right' }}>大小</th>
           <th
+            data-anchor="w3-sort-th"
             style={{
               ...th,
               width: colw.time,
@@ -662,6 +669,7 @@ const FavSidebar: React.FC<{ st: NonNullable<Wb3State['sftp']>; hover: Wb3Target
           <div
             key={f.path}
             title={f.path}
+            data-anchor={i === 0 ? 'w3-fav-item' : undefined}
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -830,8 +838,7 @@ const CtxMenu: React.FC<{ ctx: CtxState }> = ({ ctx }) => (
       it === 'sep' ? (
         <div key={`sep${i}`} style={{ height: 1, margin: '4px 6px', background: C.border }} />
       ) : (
-        <div
-          key={it}
+        <div key={it} data-anchor={`w3-menu-${i}`}
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -888,7 +895,7 @@ const FavModal: React.FC<{ t: number }> = ({ t }) => (
       </div>
       <div style={{ height: 54, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, padding: '0 18px', marginTop: 10, borderTop: `1px solid ${C.border}` }}>
         <div style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 13 }}>取消</div>
-        <div style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.accent, borderRadius: 4, color: '#fff', fontSize: 13 }}>收藏</div>
+        <div data-anchor="w3-fav-ok" style={{ height: 30, padding: '0 14px', display: 'flex', alignItems: 'center', background: C.accent, borderRadius: 4, color: '#fff', fontSize: 13 }}>收藏</div>
       </div>
     </div>
   </div>

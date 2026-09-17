@@ -9,7 +9,8 @@
  *   F  3260–3600 设备管理 + 收尾全景
  */
 import { interpolate } from 'remotion';
-import { Stop } from '../anim';
+import { Stop, track1 } from '../anim';
+import { AnchorStop } from '../components/anchors';
 import { Click } from '../components/Cursor';
 import {
   ACC, CHAT_HISTORY, CFM8_BTN, ChatItem, ChatSpec, DEMO, EXPL_MENU, MENU_BACKUP, PWD8_F, RST8_F,
@@ -107,69 +108,80 @@ const CFM_OK_C = { ...CFM8_BTN.ok };
 const RST_BTN_C = { x: 1352, y: ACC.bkRow + ACC.bkRowH / 2 };
 const RST_OK_C = { x: RST8_F.btnOk.x + RST8_F.btnOk.w / 2, y: RST8_F.btnOk.y + RST8_F.btnOk.h / 2 };
 
-/* ============ 指针轨道 ============ */
-const CURVE: readonly (readonly [number, number, number])[] = [
-  [30, 1500, 900],
-  [ACC_CLICK - 10, ACCOUNT_C.x, ACCOUNT_C.y],
-  [ACC_CLICK, ACCOUNT_C.x, ACCOUNT_C.y],
-  [440, SETPWD_C.x, SETPWD_C.y],
-  [PWD_CLICK, SETPWD_C.x, SETPWD_C.y],
-  [PWD_TYPE - 10, PWD_INPUT_C.x, PWD_INPUT_C.y],
-  [PWD_OK - 20, PWD_INPUT_C.x, PWD_INPUT_C.y],
-  [PWD_OK - 10, PWD_OK_C.x, PWD_OK_C.y],
-  [PWD_OK, PWD_OK_C.x, PWD_OK_C.y],
-  [SYNC_CLICK - 10, SYNC_C.x, SYNC_C.y],
-  [SYNC_CLICK, SYNC_C.x, SYNC_C.y],
-  [1150, 1100, 320],
-  [PROJ_CLICK - 10, PROJ_C.x, PROJ_C.y],
-  [PROJ_CLICK, PROJ_C.x, PROJ_C.y],
-  [1510, DATASET_C.x, DATASET_C.y],
-  [RCT_CLICK, DATASET_C.x, DATASET_C.y],
-  [BK_CLICK - 10, MENU_BK_C.x, MENU_BK_C.y],
-  [BK_CLICK, MENU_BK_C.x, MENU_BK_C.y],
-  [CFM_OK - 10, CFM_OK_C.x, CFM_OK_C.y],
-  [CFM_OK, CFM_OK_C.x, CFM_OK_C.y],
-  [1930, 1150, 900],
-  [ACC2_CLICK - 10, ACCOUNT_C.x, ACCOUNT_C.y],
-  [ACC2_CLICK, ACCOUNT_C.x, ACCOUNT_C.y],
-  [LOCK_CLICK - 10, LOCK_C.x, LOCK_C.y],
-  [LOCK_CLICK, LOCK_C.x, LOCK_C.y],
-  [2560, 900, 480],
-  [UNLOCK_CLICK - 10, SETPWD_C.x, SETPWD_C.y],
-  [UNLOCK_CLICK, SETPWD_C.x, SETPWD_C.y],
-  [PWD2_TYPE - 10, PWD_INPUT_C.x, PWD_INPUT_C.y],
-  [UNLOCK_OK - 20, PWD_INPUT_C.x, PWD_INPUT_C.y],
-  [UNLOCK_OK - 10, PWD_OK_C.x, PWD_OK_C.y],
-  [UNLOCK_OK, PWD_OK_C.x, PWD_OK_C.y],
-  [RST_CLICK - 10, RST_BTN_C.x, RST_BTN_C.y],
-  [RST_CLICK, RST_BTN_C.x, RST_BTN_C.y],
-  [RST_OK - 10, RST_OK_C.x, RST_OK_C.y],
-  [RST_OK, RST_OK_C.x, RST_OK_C.y],
-  [3350, 500, 470],
-  [3560, 1300, 800],
-  [DURATION, 1300, 800],
-];
-export const CUR_X: readonly Stop[] = CURVE.map(([f, x]) => ({ f, v: x }));
-export const CUR_Y: readonly Stop[] = CURVE.map(([f, , y]) => ({ f, v: y }));
+/* ============ 指针轨道(wx/wy 为设计稿兜底坐标,at 为锚点 id 实测优先) ============ */
+/** 设计稿窗口坐标 → canvas 兜底坐标(按该帧相机;仅冷启动首帧兜底,实测就绪后即被替换) */
+const wfAt = (f: number, wx: number, wy: number): { x: number; y: number } => {
+  const s = track1(CAM_S, f);
+  const cx0 = track1(CAM_X, f);
+  const cy0 = track1(CAM_Y, f);
+  return { x: wx * s + (960 - cx0 * s), y: wy * s + (540 - cy0 * s) };
+};
 
-/* ============ 点击(涟漪) ============ */
+const CUR_DEF: readonly { f: number; wx: number; wy: number; at?: string }[] = [
+  { f: 30, wx: 1500, wy: 900 },
+  { f: ACC_CLICK - 10, wx: ACCOUNT_C.x, wy: ACCOUNT_C.y, at: 'w8-acc-nav' },
+  { f: ACC_CLICK, wx: ACCOUNT_C.x, wy: ACCOUNT_C.y, at: 'w8-acc-nav' },
+  { f: 440, wx: SETPWD_C.x, wy: SETPWD_C.y, at: 'w8-setpwd' },
+  { f: PWD_CLICK, wx: SETPWD_C.x, wy: SETPWD_C.y, at: 'w8-setpwd' },
+  { f: PWD_TYPE - 10, wx: PWD_INPUT_C.x, wy: PWD_INPUT_C.y, at: 'w8-pwd-input' },
+  { f: PWD_OK - 20, wx: PWD_INPUT_C.x, wy: PWD_INPUT_C.y, at: 'w8-pwd-input' },
+  { f: PWD_OK - 10, wx: PWD_OK_C.x, wy: PWD_OK_C.y, at: 'w8-pwd-ok' },
+  { f: PWD_OK, wx: PWD_OK_C.x, wy: PWD_OK_C.y, at: 'w8-pwd-ok' },
+  { f: SYNC_CLICK - 10, wx: SYNC_C.x, wy: SYNC_C.y, at: 'w8-sync' },
+  { f: SYNC_CLICK, wx: SYNC_C.x, wy: SYNC_C.y, at: 'w8-sync' },
+  { f: 1150, wx: 1100, wy: 320 },
+  { f: PROJ_CLICK - 10, wx: PROJ_C.x, wy: PROJ_C.y, at: 'w8-proj-nav' },
+  { f: PROJ_CLICK, wx: PROJ_C.x, wy: PROJ_C.y, at: 'w8-proj-nav' },
+  { f: 1510, wx: DATASET_C.x, wy: DATASET_C.y, at: 'w8-dataset' },
+  { f: RCT_CLICK, wx: DATASET_C.x, wy: DATASET_C.y, at: 'w8-dataset' },
+  { f: BK_CLICK - 10, wx: MENU_BK_C.x, wy: MENU_BK_C.y, at: 'w8-menu-backup' },
+  { f: BK_CLICK, wx: MENU_BK_C.x, wy: MENU_BK_C.y, at: 'w8-menu-backup' },
+  { f: CFM_OK - 10, wx: CFM_OK_C.x, wy: CFM_OK_C.y, at: 'w8-cfm-ok' },
+  { f: CFM_OK, wx: CFM_OK_C.x, wy: CFM_OK_C.y, at: 'w8-cfm-ok' },
+  { f: 1930, wx: 1150, wy: 900 },
+  { f: ACC2_CLICK - 10, wx: ACCOUNT_C.x, wy: ACCOUNT_C.y, at: 'w8-acc-nav' },
+  { f: ACC2_CLICK, wx: ACCOUNT_C.x, wy: ACCOUNT_C.y, at: 'w8-acc-nav' },
+  { f: LOCK_CLICK - 10, wx: LOCK_C.x, wy: LOCK_C.y, at: 'w8-lock' },
+  { f: LOCK_CLICK, wx: LOCK_C.x, wy: LOCK_C.y, at: 'w8-lock' },
+  { f: 2560, wx: 900, wy: 480 },
+  { f: UNLOCK_CLICK - 10, wx: SETPWD_C.x, wy: SETPWD_C.y, at: 'w8-setpwd' },
+  { f: UNLOCK_CLICK, wx: SETPWD_C.x, wy: SETPWD_C.y, at: 'w8-setpwd' },
+  { f: PWD2_TYPE - 10, wx: PWD_INPUT_C.x, wy: PWD_INPUT_C.y, at: 'w8-pwd-input' },
+  { f: UNLOCK_OK - 20, wx: PWD_INPUT_C.x, wy: PWD_INPUT_C.y, at: 'w8-pwd-input' },
+  { f: UNLOCK_OK - 10, wx: PWD_OK_C.x, wy: PWD_OK_C.y, at: 'w8-pwd-ok' },
+  { f: UNLOCK_OK, wx: PWD_OK_C.x, wy: PWD_OK_C.y, at: 'w8-pwd-ok' },
+  { f: RST_CLICK - 10, wx: RST_BTN_C.x, wy: RST_BTN_C.y, at: 'w8-restore' },
+  { f: RST_CLICK, wx: RST_BTN_C.x, wy: RST_BTN_C.y, at: 'w8-restore' },
+  { f: RST_OK - 10, wx: RST_OK_C.x, wy: RST_OK_C.y, at: 'w8-rst-ok' },
+  { f: RST_OK, wx: RST_OK_C.x, wy: RST_OK_C.y, at: 'w8-rst-ok' },
+  { f: 3350, wx: 500, wy: 470 },
+  { f: 3560, wx: 1300, wy: 800 },
+  { f: DURATION, wx: 1300, wy: 800 },
+];
+
+export const CUR_PATH: readonly AnchorStop[] = CUR_DEF.map(({ f, wx, wy, at }) => ({ f, at, ...wfAt(f, wx, wy) }));
+
+/* ============ 点击(涟漪;anchor 命中实测中心) ============ */
+const click = (f: number, wx: number, wy: number, target: Click['target'], anchor?: string): Click => ({
+  f, target, anchor, ...wfAt(f, wx, wy),
+});
 export const CLICKS: readonly Click[] = [
-  { f: ACC_CLICK, x: ACCOUNT_C.x, y: ACCOUNT_C.y, target: 'browse' },
-  { f: PWD_CLICK, x: SETPWD_C.x, y: SETPWD_C.y, target: 'browse' },
-  { f: PWD_CLICK + 4, x: PWD_INPUT_C.x, y: PWD_INPUT_C.y, target: 'input' },
-  { f: PWD_OK, x: PWD_OK_C.x, y: PWD_OK_C.y, target: 'confirm' },
-  { f: SYNC_CLICK, x: SYNC_C.x, y: SYNC_C.y, target: 'save' },
-  { f: PROJ_CLICK, x: PROJ_C.x, y: PROJ_C.y, target: 'browse' },
-  { f: RCT_CLICK, x: DATASET_C.x, y: DATASET_C.y, target: 'row' },
-  { f: BK_CLICK, x: MENU_BK_C.x, y: MENU_BK_C.y, target: 'browse' },
-  { f: CFM_OK, x: CFM_OK_C.x, y: CFM_OK_C.y, target: 'confirm' },
-  { f: ACC2_CLICK, x: ACCOUNT_C.x, y: ACCOUNT_C.y, target: 'browse' },
-  { f: LOCK_CLICK, x: LOCK_C.x, y: LOCK_C.y, target: 'browse' },
-  { f: UNLOCK_CLICK, x: SETPWD_C.x, y: SETPWD_C.y, target: 'browse' },
-  { f: UNLOCK_CLICK + 4, x: PWD_INPUT_C.x, y: PWD_INPUT_C.y, target: 'input' },
-  { f: UNLOCK_OK, x: PWD_OK_C.x, y: PWD_OK_C.y, target: 'confirm' },
-  { f: RST_CLICK, x: RST_BTN_C.x, y: RST_BTN_C.y, target: 'row' },
-  { f: RST_OK, x: RST_OK_C.x, y: RST_OK_C.y, target: 'confirm' },
+  click(ACC_CLICK, ACCOUNT_C.x, ACCOUNT_C.y, 'browse', 'w8-acc-nav'),
+  click(PWD_CLICK, SETPWD_C.x, SETPWD_C.y, 'browse', 'w8-setpwd'),
+  click(PWD_CLICK + 4, PWD_INPUT_C.x, PWD_INPUT_C.y, 'input', 'w8-pwd-input'),
+  click(PWD_OK, PWD_OK_C.x, PWD_OK_C.y, 'confirm', 'w8-pwd-ok'),
+  click(SYNC_CLICK, SYNC_C.x, SYNC_C.y, 'save', 'w8-sync'),
+  click(PROJ_CLICK, PROJ_C.x, PROJ_C.y, 'browse', 'w8-proj-nav'),
+  click(RCT_CLICK, DATASET_C.x, DATASET_C.y, 'row', 'w8-dataset'),
+  click(BK_CLICK, MENU_BK_C.x, MENU_BK_C.y, 'browse', 'w8-menu-backup'),
+  click(CFM_OK, CFM_OK_C.x, CFM_OK_C.y, 'confirm', 'w8-cfm-ok'),
+  click(ACC2_CLICK, ACCOUNT_C.x, ACCOUNT_C.y, 'browse', 'w8-acc-nav'),
+  click(LOCK_CLICK, LOCK_C.x, LOCK_C.y, 'browse', 'w8-lock'),
+  click(UNLOCK_CLICK, SETPWD_C.x, SETPWD_C.y, 'browse', 'w8-setpwd'),
+  click(UNLOCK_CLICK + 4, PWD_INPUT_C.x, PWD_INPUT_C.y, 'input', 'w8-pwd-input'),
+  click(UNLOCK_OK, PWD_OK_C.x, PWD_OK_C.y, 'confirm', 'w8-pwd-ok'),
+  click(RST_CLICK, RST_BTN_C.x, RST_BTN_C.y, 'row', 'w8-restore'),
+  click(RST_OK, RST_OK_C.x, RST_OK_C.y, 'confirm', 'w8-rst-ok'),
 ];
 
 /* ============ 字幕 ============ */
@@ -220,23 +232,23 @@ export const NOTES8: readonly Note8[] = [
 
 export const KBD8: readonly { from: number; to: number; x: number; y: number; label: string }[] = [];
 
-/* ============ 焦点高亮环 ============ */
+/* ============ 焦点高亮环(锚点实测,pad 外扩) ============ */
 export const HIGHLIGHTS8 = [
-  { x: 1711, y: 7, w: 48, h: 26, r: 6, from: ACC_CLICK - 22, to: ACC_CLICK - 2 },
-  { x: ACC.btnUnlock.x - 4, y: ACC.btnUnlock.y - 4, w: ACC.btnUnlock.w + 8, h: ACC.btnUnlock.h + 8, r: 4, from: PWD_CLICK - 22, to: PWD_CLICK - 2 },
-  { x: PWD8_F.btnOk.x - 6, y: PWD8_F.btnOk.y - 6, w: PWD8_F.btnOk.w + 12, h: PWD8_F.btnOk.h + 12, r: 4, from: PWD_OK - 22, to: PWD_OK - 2 },
-  { x: ACC.btnSync.x - 4, y: ACC.btnSync.y - 4, w: ACC.btnSync.w + 8, h: ACC.btnSync.h + 8, r: 4, from: SYNC_CLICK - 22, to: SYNC_CLICK - 2 },
-  { x: 1591, y: 7, w: 48, h: 26, r: 6, from: PROJ_CLICK - 22, to: PROJ_CLICK - 2 },
-  { x: 60, y: explRowY(3) - 2, w: 230, h: 30, r: 4, from: RCT_CLICK - 30, to: RCT_CLICK - 2 },
-  { x: 100, y: explMenuItemCy(MENU_BACKUP) - 15, w: 172, h: 30, r: 4, from: BK_CLICK - 22, to: BK_CLICK - 2 },
-  { x: CFM8_BTN.ok.x - 41, y: CFM8_BTN.ok.y - 16, w: 82, h: 32, r: 4, from: CFM_OK - 22, to: CFM_OK - 2 },
-  { x: 1711, y: 7, w: 48, h: 26, r: 6, from: ACC2_CLICK - 22, to: ACC2_CLICK - 2 },
-  { x: ACC.btnLock.x - 4, y: ACC.btnLock.y - 4, w: ACC.btnLock.w + 8, h: ACC.btnLock.h + 8, r: 4, from: LOCK_CLICK - 22, to: LOCK_CLICK - 2 },
-  { x: ACC.btnUnlock.x - 4, y: ACC.btnUnlock.y - 4, w: ACC.btnUnlock.w + 8, h: ACC.btnUnlock.h + 8, r: 4, from: UNLOCK_CLICK - 22, to: UNLOCK_CLICK - 2 },
-  { x: PWD8_F.btnOk.x - 6, y: PWD8_F.btnOk.y - 6, w: PWD8_F.btnOk.w + 12, h: PWD8_F.btnOk.h + 12, r: 4, from: UNLOCK_OK - 22, to: UNLOCK_OK - 2 },
-  { x: 1318, y: ACC.bkRow + 4, w: 72, h: 36, r: 4, from: RST_CLICK - 22, to: RST_CLICK - 2 },
-  { x: RST8_F.btnOk.x - 6, y: RST8_F.btnOk.y - 6, w: RST8_F.btnOk.w + 12, h: RST8_F.btnOk.h + 12, r: 4, from: RST_OK - 22, to: RST_OK - 2 },
-];
+  { target: 'w8-acc-nav', pad: 0, r: 6, from: ACC_CLICK - 22, to: ACC_CLICK - 2 },
+  { target: 'w8-setpwd', pad: 4, r: 4, from: PWD_CLICK - 22, to: PWD_CLICK - 2 },
+  { target: 'w8-pwd-ok', pad: 6, r: 4, from: PWD_OK - 22, to: PWD_OK - 2 },
+  { target: 'w8-sync', pad: 4, r: 4, from: SYNC_CLICK - 22, to: SYNC_CLICK - 2 },
+  { target: 'w8-proj-nav', pad: 0, r: 6, from: PROJ_CLICK - 22, to: PROJ_CLICK - 2 },
+  { target: 'w8-dataset', pad: 0, r: 4, from: RCT_CLICK - 30, to: RCT_CLICK - 2 },
+  { target: 'w8-menu-backup', pad: 0, r: 4, from: BK_CLICK - 22, to: BK_CLICK - 2 },
+  { target: 'w8-cfm-ok', pad: 0, r: 4, from: CFM_OK - 22, to: CFM_OK - 2 },
+  { target: 'w8-acc-nav', pad: 0, r: 6, from: ACC2_CLICK - 22, to: ACC2_CLICK - 2 },
+  { target: 'w8-lock', pad: 4, r: 4, from: LOCK_CLICK - 22, to: LOCK_CLICK - 2 },
+  { target: 'w8-setpwd', pad: 4, r: 4, from: UNLOCK_CLICK - 22, to: UNLOCK_CLICK - 2 },
+  { target: 'w8-pwd-ok', pad: 6, r: 4, from: UNLOCK_OK - 22, to: UNLOCK_OK - 2 },
+  { target: 'w8-restore', pad: 4, r: 4, from: RST_CLICK - 22, to: RST_CLICK - 2 },
+  { target: 'w8-rst-ok', pad: 6, r: 4, from: RST_OK - 22, to: RST_OK - 2 },
+] as const;
 
 /* ============ 工具 ============ */
 const typed = (frame: number, from: number, step: number, full: string): string =>

@@ -14,7 +14,8 @@
  *   G  2990–3160 收尾全景
  */
 import { interpolate } from 'remotion';
-import { Stop } from '../anim';
+import { Stop, track1 } from '../anim';
+import { AnchorStop } from '../components/anchors';
 import { Click } from '../components/Cursor';
 import {
   CHAT, ChatItem, DEMO, ITEM_W, Q1, Q2, SITE1, suggestGlobeAnchor, stackChat, toWin,
@@ -177,53 +178,64 @@ export function suggestGlobeAnchorAt(frame: number): { x: number; y: number } {
 }
 const GLOBE_ANCHOR = suggestGlobeAnchorAt(GLOBE_CLICK + 6);
 
-/* ============ 指针轨道(点位表 → x/y 双轨) ============ */
-const CURVE: readonly (readonly [number, number, number])[] = [
-  [60, 1450, 900],
-  [176, 24, 276],
-  [240, 420, 220],
-  [330, 900, 96],
-  [500, 900, 96],
-  [524, 927, 470],
-  [810, 927, 470],
-  [830, 1522, 96],
-  [884, 1522, 96],
-  [902, 870, 342],
-  [940, 927, 346],
-  [972, 1000, 350],
-  [1002, 935, 344],
-  [1028, 927, 345],
-  [1076, 1750, 1130],
-  [1240, 1750, 1130],
-  [1262, 1850, 960],
-  [1856, 1850, 960],
-  [1888, 927, 470],
-  [2066, 927, 470],
-  [2098, 1750, 1130],
-  [2250, 1750, 1130],
-  [2272, 1850, 960],
-  [2624, GLOBE_ANCHOR.x, GLOBE_ANCHOR.y],
-  [2688, GLOBE_ANCHOR.x, GLOBE_ANCHOR.y],
-  [2716, 927, 470],
-  [2990, 927, 600],
-  [3050, 1500, 940],
-  [3140, 1500, 940],
-];
-export const CUR_X: readonly Stop[] = CURVE.map(([f, x]) => ({ f, v: x }));
-export const CUR_Y: readonly Stop[] = CURVE.map(([f, , y]) => ({ f, v: y }));
+/* ============ 指针轨道(点位表;wx/wy 为设计稿兜底坐标,at 为锚点 id 实测优先) ============ */
+/** 设计稿窗口坐标 → canvas 兜底坐标(按该帧相机;仅冷启动首帧兜底,实测就绪后即被替换) */
+const wfAt = (f: number, wx: number, wy: number): { x: number; y: number } => {
+  const s = track1(CAM_S, f);
+  const cx0 = track1(CAM_X, f);
+  const cy0 = track1(CAM_Y, f);
+  return { x: wx * s + (960 - cx0 * s), y: wy * s + (540 - cy0 * s) };
+};
 
-/* ============ 点击(涟漪) ============ */
+const CUR_DEF: readonly { f: number; wx: number; wy: number; at?: string }[] = [
+  { f: 60, wx: 1450, wy: 900 },
+  { f: 176, wx: 24, wy: 276, at: 'w5-act-browser' },
+  { f: 240, wx: 420, wy: 220 },
+  { f: 330, wx: 900, wy: 96, at: 'w5-address' },
+  { f: 500, wx: 900, wy: 96, at: 'w5-address' },
+  { f: 524, wx: 927, wy: 470 },
+  { f: 810, wx: 927, wy: 470 },
+  { f: 830, wx: 1522, wy: 96, at: 'w5-inspect' },
+  { f: 884, wx: 1522, wy: 96, at: 'w5-inspect' },
+  { f: 902, wx: 870, wy: 342 },
+  { f: 940, wx: 927, wy: 346 },
+  { f: 972, wx: 1000, wy: 350 },
+  { f: 1002, wx: 935, wy: 344 },
+  { f: 1028, wx: 927, wy: 345, at: 'w5-hero' },
+  { f: 1076, wx: 1750, wy: 1130, at: 'w5-ai-input' },
+  { f: 1240, wx: 1750, wy: 1130, at: 'w5-ai-input' },
+  { f: 1262, wx: 1850, wy: 960 },
+  { f: 1856, wx: 1850, wy: 960 },
+  { f: 1888, wx: 927, wy: 470 },
+  { f: 2066, wx: 927, wy: 470 },
+  { f: 2098, wx: 1750, wy: 1130, at: 'w5-ai-input' },
+  { f: 2250, wx: 1750, wy: 1130, at: 'w5-ai-input' },
+  { f: 2272, wx: 1850, wy: 960 },
+  { f: 2624, wx: GLOBE_ANCHOR.x, wy: GLOBE_ANCHOR.y, at: 'w5-globe' },
+  { f: 2688, wx: GLOBE_ANCHOR.x, wy: GLOBE_ANCHOR.y, at: 'w5-globe' },
+  { f: 2716, wx: 927, wy: 470 },
+  { f: 2990, wx: 927, wy: 600 },
+  { f: 3050, wx: 1500, wy: 940 },
+  { f: 3140, wx: 1500, wy: 940 },
+];
+
+export const CUR_PATH: readonly AnchorStop[] = CUR_DEF.map(({ f, wx, wy, at }) => ({ f, at, ...wfAt(f, wx, wy) }));
+
+/* ============ 点击(涟漪;anchor 命中实测中心) ============ */
+const click = (f: number, wx: number, wy: number, target: Click['target'], anchor?: string): Click => ({
+  f, target, anchor, ...wfAt(f, wx, wy),
+});
 export const CLICKS: readonly Click[] = [
-  { f: B_OPEN_CLICK, x: 24, y: 276, target: 'browse' },
-  { f: ADDR_CLICK, x: 900, y: 96, target: 'input' },
-  { f: URL_ENTER, x: 900, y: 96, target: 'input' },
-  { f: INSPECT_CLICK, x: 1522, y: 96, target: 'browse' },
-  { f: PICK_CLICK, x: 927, y: 345, target: 'row' },
-  { f: Q1_CLICK, x: 1750, y: 1130, target: 'input' },
-  { f: Q1_ENTER, x: 1750, y: 1130, target: 'input' },
-  { f: Q2_CLICK, x: 1750, y: 1130, target: 'input' },
-  { f: Q2_ENTER, x: 1750, y: 1130, target: 'input' },
-  { f: GLOBE_CLICK, x: GLOBE_ANCHOR.x, y: GLOBE_ANCHOR.y, target: 'browse' },
+  click(B_OPEN_CLICK, 24, 276, 'browse', 'w5-act-browser'),
+  click(ADDR_CLICK, 900, 96, 'input', 'w5-address'),
+  click(URL_ENTER, 900, 96, 'input', 'w5-address'),
+  click(INSPECT_CLICK, 1522, 96, 'browse', 'w5-inspect'),
+  click(PICK_CLICK, 927, 345, 'row', 'w5-hero'),
+  click(Q1_CLICK, 1750, 1130, 'input', 'w5-ai-input'),
+  click(Q1_ENTER, 1750, 1130, 'input', 'w5-ai-input'),
+  click(Q2_CLICK, 1750, 1130, 'input', 'w5-ai-input'),
+  click(Q2_ENTER, 1750, 1130, 'input', 'w5-ai-input'),
+  click(GLOBE_CLICK, GLOBE_ANCHOR.x, GLOBE_ANCHOR.y, 'browse', 'w5-globe'),
 ];
 
 /* ============ 字幕 ============ */
@@ -277,16 +289,15 @@ export const KBD5: readonly { from: number; to: number; x: number; y: number; la
   { from: 610, to: 780, x: 980, y: 500, label: 'Ctrl + 滚轮' },
 ];
 
-/** 焦点高亮环 */
-const HERO_WIN = toWin(SITE1.heroTitleStyled);
+/** 焦点高亮环(锚点实测,pad 外扩) */
 export const HIGHLIGHTS5 = [
-  { x: 4, y: 256, w: 40, h: 40, r: 6, from: 176, to: 198 },
-  { x: 420, y: 82, w: 1048, h: 28, r: 4, from: 312, to: 498 },
-  { x: 1508, y: 82, w: 28, h: 28, r: 4, from: 816, to: 838 },
-  { x: 1596, y: 1098, w: 162, h: 24, r: 4, from: 1064, to: 1126 },
-  { x: HERO_WIN.x, y: HERO_WIN.y, w: HERO_WIN.w, h: HERO_WIN.h, r: 4, from: 1950, to: 2060 },
-  { x: GLOBE_ANCHOR.x - 14, y: GLOBE_ANCHOR.y - 14, w: 28, h: 28, r: 4, from: 2600, to: 2656 },
-];
+  { target: 'w5-act-browser', pad: 0, r: 6, from: 176, to: 198 },
+  { target: 'w5-address', pad: 0, r: 4, from: 312, to: 498 },
+  { target: 'w5-inspect', pad: 0, r: 4, from: 816, to: 838 },
+  { target: 'w5-input-chip', pad: 0, r: 4, from: 1066, to: 1126 },
+  { target: 'w5-hero', pad: 0, r: 4, from: 1950, to: 2060 },
+  { target: 'w5-globe', pad: 2, r: 4, from: 2600, to: 2656 },
+] as const;
 
 /* ============ 工具 ============ */
 const typed = (frame: number, from: number, step: number, full: string): string =>

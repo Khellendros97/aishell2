@@ -123,6 +123,7 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
             <div style={{ flex: 1 }} />
             <div style={{ padding: '5px 12px', borderRadius: 4, fontSize: 12.5, color: C.text1 }}>重置演示数据</div>
             <div
+              data-anchor="w2-new-proj"
               style={{
                 width: NEW_PROJ_BTN.w,
                 height: 32,
@@ -148,6 +149,7 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
             {(projectSaved ? [...EXISTING, NEW_CARD] : EXISTING).map((p, i) => (
               <div
                 key={p.name}
+                data-anchor={i === 2 ? 'w2-card3' : undefined}
                 style={{
                   background: hover === 'card3' && i === 2 ? C.bg3 : C.bg1,
                   border: `1px solid ${C.border}`,
@@ -210,7 +212,7 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
             </div>
             <div style={{ padding: '16px 20px 4px' }}>
               <Field label="项目名称" req>
-                <div style={{ ...inputStyle(focus === 'name') }}>
+                <div data-anchor="w2-name-input" style={{ ...inputStyle(focus === 'name') }}>
                   {projName}
                   {focus === 'name' && <Caret />}
                   {!projName && <span style={{ color: C.text2 }}>例如：数据中台 ETL</span>}
@@ -244,6 +246,7 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
                 {!serverSaved && !miniOpen && <div style={{ fontSize: 12, color: C.text2, padding: '6px 2px' }}>暂无服务器，可在下方新建</div>}
                 {serverSaved && (
                   <div
+                    data-anchor="w2-server-card"
                     style={{
                       padding: '10px 12px',
                       background: C.bg2,
@@ -263,6 +266,7 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
                 {/* 新建服务器 toggle / mini 表单 */}
                 {!miniOpen && !serverSaved && (
                   <div
+                    data-anchor="w2-server-add"
                     style={{
                       marginTop: 10,
                       padding: '10px 12px',
@@ -290,14 +294,14 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
                   >
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 12 }}>
                       <Field label="名称" req mb={12}>
-                        <div style={{ ...inputStyle(focus === 'miniName') }}>
+                        <div data-anchor="w2-mini-name" style={{ ...inputStyle(focus === 'miniName') }}>
                           {miniName}
                           {focus === 'miniName' && <Caret />}
                           {!miniName && <span style={{ color: C.text2 }}>例如：测试服务器</span>}
                         </div>
                       </Field>
                       <Field label="IP 地址" req mb={12}>
-                        <div style={{ ...inputStyle(focus === 'miniHost'), fontFamily: FONT_MONO }}>
+                        <div data-anchor="w2-mini-host" style={{ ...inputStyle(focus === 'miniHost'), fontFamily: FONT_MONO }}>
                           {miniHost}
                           {focus === 'miniHost' && <Caret />}
                           {!miniHost && <span style={{ color: C.text2 }}>例如：192.168.1.10</span>}
@@ -313,14 +317,14 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
                         </div>
                       </Field>
                       <Field label="账号" mb={12}>
-                        <div style={{ ...inputStyle(focus === 'miniUser'), fontFamily: FONT_MONO }}>
+                        <div data-anchor="w2-mini-user" style={{ ...inputStyle(focus === 'miniUser'), fontFamily: FONT_MONO }}>
                           {miniUser}
                           {focus === 'miniUser' && <Caret />}
                           {!miniUser && <span style={{ color: C.text2 }}>例如：root</span>}
                         </div>
                       </Field>
                       <Field label="密码" mb={12}>
-                        <div style={{ ...inputStyle(focus === 'miniSecret'), fontFamily: FONT_MONO }}>
+                        <div data-anchor="w2-mini-secret" style={{ ...inputStyle(focus === 'miniSecret'), fontFamily: FONT_MONO }}>
                           {'•'.repeat(miniSecretLen)}
                           {focus === 'miniSecret' && <Caret />}
                           {!miniSecretLen && <span style={{ color: C.text2 }}>输入服务器密码</span>}
@@ -343,6 +347,7 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
                         收起
                       </div>
                       <div
+                        data-anchor="w2-mini-save"
                         style={{
                           height: 30,
                           padding: '0 14px',
@@ -378,6 +383,7 @@ export const Welcome2: React.FC<{ state: WelcomeState; frame: number }> = ({ sta
                 取消
               </div>
               <div
+                data-anchor="w2-foot-save"
                 style={{
                   height: 32,
                   padding: '0 14px',
