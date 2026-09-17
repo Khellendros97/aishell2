@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod mcp;
 pub mod notes;
 pub mod notify;
+pub mod pcap;
 pub mod redact;
 pub mod session_title;
 pub mod smart_approval;
@@ -309,6 +310,7 @@ pub fn run() {
             fsops::fs_copy,
             fsops::fs_reveal,
             fsops::fs_stat,
+            pcap::pcap_read,
             sftp::sftp_home,
             sftp::sftp_list,
             sftp::sftp_stat,

@@ -289,6 +289,12 @@ export interface ReadImageOut {
   data: string;
 }
 
+/** pcap_read 返回：data 为不带 dataURL 前缀的 base64（pcap/pcapng 原始字节，前端解析） */
+export interface PcapReadOut {
+  data: string;
+  size: number;
+}
+
 /** browser:event 事件 payload（Rust browser.rs 发射）；viewId 标记来源页面（多页面模型） */
 export interface BrowserEvent {
   /** kind=favicon 时 url 为站点图标地址（页面注入脚本探测 link[rel~=icon] 的结果） */

@@ -129,6 +129,18 @@ export const PATHS = {  folder:
   /** AI 助手窗口聚合（lucide square-arrow-down-left：方框 + 内指箭头，分离的逆操作） */
   combine:
     '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="m16 8-8 8"/><path d="M16 16H8V8"/>',
+  /** 抓包/网络活动（lucide activity：脉冲线；pcap 查看器入口与标签图标） */
+  activity:
+    '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+  /** 过滤器（lucide funnel；pcap 显示过滤器输入框前缀） */
+  filter:
+    '<path d="M3 4h18l-7 8v6l-4 2v-8L3 4z"/>',
+  /** 折线统计（lucide chart-line；pcap 统计条开关） */
+  chartLine:
+    '<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m19 9-5 5-4-4-3 3"/>',
+  /** 双向流（lucide arrow-left-right；pcap 流追踪） */
+  arrowLeftRight:
+    '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

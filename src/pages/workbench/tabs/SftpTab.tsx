@@ -51,6 +51,7 @@ import {
 } from '../../../stores/workbench';
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
+import { isPcapName, openRemotePcap } from './PcapTab';
 import { revealLocalPath } from '../sidebar/ExplorerPanel';
 import { completeProgress, hideProgress, showProgress } from '../statusbar-progress';
 
@@ -433,6 +434,7 @@ const BINARY_EXT = new Set([
   'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
   'woff', 'woff2', 'ttf', 'otf', 'eot',
   'db', 'sqlite', 'mdb',
+  'pcap', 'pcapng', 'cap',
 ]);
 
 /** 目录恒可打开(进入);文件须文本且 ≤5MB */
@@ -975,6 +977,13 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
       disabledTip: multi ? '多选时不可用' : (first.isDir ? undefined : '二进制文件或超过 5MB，无法在编辑器中打开'),
       action: () => { if (first.isDir) goTo(st, first.path, true); else openRemoteInEditor(st, first); },
     },
+    // 抓包文件进 pcap 查看器（双击同样走此入口，见行 dblclick 处理）
+    ...(!multi && !first.isDir && isPcapName(first.name)
+      ? [{
+          label: '在抓包查看器中打开', iconName: 'activity' as const,
+          action: () => { openRemotePcap(st.serverId, first.path, first.name); },
+        }]
+      : []),
     // 把远端文件/目录路径引用加入 AI 输入框(@file:文件名 / @path:目录名 标签,发送时带服务器上下文)
     {
       label: '添加到对话', iconName: 'chatPlus', disabled: multi, disabledTip: '多选时不可用',
@@ -1387,6 +1396,7 @@ function buildGrid(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[]):
     });
     el.addEventListener('dblclick', () => {
       if (it.isDir) goTo(st, it.path, true);
+      else if (isPcapName(it.name)) openRemotePcap(st.serverId, it.path, it.name);
       else if (isTextEditable(it)) openRemoteInEditor(st, it);
       else toast('二进制文件或超过 5MB，无法在编辑器中打开', 'error');
     });
@@ -1566,6 +1576,7 @@ function buildTable(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[])
     });
     tr.addEventListener('dblclick', () => {
       if (it.isDir) goTo(st, it.path, true);
+      else if (isPcapName(it.name)) openRemotePcap(st.serverId, it.path, it.name);
       else if (isTextEditable(it)) openRemoteInEditor(st, it);
       else toast('二进制文件或超过 5MB，无法在编辑器中打开', 'error');
     });
