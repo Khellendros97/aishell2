@@ -60,6 +60,7 @@
 }
 
 .pcap-stats-btn .ic,
+.pcap-chat-btn .ic,
 .pcap-stream-close .ic {
   width: 13px;
   height: 13px;
@@ -95,6 +96,37 @@
   color: var(--text-2);
   flex-shrink: 0;
   font-family: Consolas, 'Courier New', monospace;
+}
+
+/* 表头单元格：点击排序 */
+.pcap-th {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  user-select: none;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.pcap-th i {
+  font-style: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pcap-th:hover {
+  color: var(--text-0);
+}
+
+.pcap-th.sorted {
+  color: var(--accent);
+}
+
+.pcap-sort-arrow {
+  font-weight: normal;
+  font-size: 9px;
+  flex-shrink: 0;
 }
 
 .pcap-list-body {
@@ -148,6 +180,7 @@
 .pcap-p-dns { background: rgba(150, 108, 190, 0.12); }
 .pcap-p-http { background: rgba(190, 160, 70, 0.10); }
 .pcap-p-tls { background: rgba(120, 120, 128, 0.12); }
+.pcap-p-radius { background: rgba(190, 120, 160, 0.12); }
 .pcap-p-icmp { background: rgba(190, 110, 110, 0.10); }
 .pcap-p-arp { background: rgba(110, 150, 160, 0.12); }
 
@@ -156,6 +189,7 @@
 .pcap-p-dns:hover,
 .pcap-p-http:hover,
 .pcap-p-tls:hover,
+.pcap-p-radius:hover,
 .pcap-p-icmp:hover,
 .pcap-p-arp:hover { filter: brightness(1.35); }
 

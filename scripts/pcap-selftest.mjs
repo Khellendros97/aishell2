@@ -54,6 +54,24 @@ function dnsPacket() {
   b.push(0xd0, 0x15, 0x00, 0x35, udpLen >> 8, udpLen & 0xff, 0, 0);
   return Uint8Array.from([...b, ...dns]);
 }
+// Ethernet + IPv4 + UDP + RADIUS Access-Request: 10.0.0.1:40000 → 10.0.0.2:1812, User-Name=alice
+function radiusPacket() {
+  const radius = [
+    0x01, 0x1a, 0x00, 0x00, // code=Access-Request id=0x1a length 占位
+    ...new Array(16).fill(0x5a), // authenticator
+    0x01, 0x07, ...[...'alice'].map((c) => c.charCodeAt(0)), // AVP User-Name
+    0x04, 0x06, 10, 0, 0, 1, // AVP NAS-IP-Address
+  ];
+  radius[2] = (radius.length >> 8) & 0xff;
+  radius[3] = radius.length & 0xff;
+  const udpLen = 8 + radius.length;
+  const total = 20 + udpLen;
+  const b = [];
+  b.push(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x08, 0x00);
+  b.push(0x45, 0x00, total >> 8, total & 0xff, 0, 4, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2);
+  b.push(0x9c, 0x40, 0x07, 0x14, udpLen >> 8, udpLen & 0xff, 0, 0); // 40000 → 1812
+  return Uint8Array.from([...b, ...radius]);
+}
 
 /* ---- pcap 封装（小端 µs，linktype 1） ---- */
 function wrapPcap(pkts) {
@@ -114,12 +132,12 @@ function wrapPcapNg(pkts) {
 }
 
 /* ---- 测试 ---- */
-const pkts = [tcpSynPacket(), tcpDataPacket(), dnsPacket()];
+const pkts = [tcpSynPacket(), tcpDataPacket(), dnsPacket(), radiusPacket()];
 
 console.log('pcap:');
 const f1 = parseCapture(wrapPcap(pkts));
 ok(f1.format === 'pcap', 'format=pcap');
-ok(f1.packets.length === 3, '3 个包');
+ok(f1.packets.length === 4, '4 个包');
 const d0 = decodePacket(f1.packets[0]);
 ok(d0.proto === 'TCP', `SYN 包 proto=TCP（实际 ${d0.proto}）`);
 ok(d0.srcIp === '10.0.0.1' && d0.dstIp === '10.0.0.2', 'IP 地址解析');
@@ -132,6 +150,15 @@ ok(d1.streamDir === 1, 'HTTP 包方向 dir=1');
 const d2 = decodePacket(f1.packets[2]);
 ok(d2.proto === 'DNS' && d2.hasDns, 'DNS 解析');
 ok(d2.info.includes('www.example.com') && d2.info.includes('A '), `DNS info（实际 ${d2.info}）`);
+const d3 = decodePacket(f1.packets[3]);
+ok(d3.proto === 'RADIUS' && d3.appProto === 'RADIUS', `RADIUS 识别（实际 ${d3.proto}）`);
+ok(d3.info.includes('Access-Request(1)') && d3.info.includes('alice'), `RADIUS info（实际 ${d3.info}）`);
+ok(d3.layers.some((l) => l.name === 'RADIUS Protocol'), 'RADIUS 协议树层');
+const avp = d3.layers.find((l) => l.name === 'RADIUS Protocol');
+ok(avp && avp.fields.some((f) => f.name.includes('User-Name') && f.value === 'alice'), 'RADIUS AVP User-Name');
+ok(avp && avp.fields.some((f) => f.name.includes('NAS-IP-Address') && f.value === '10.0.0.1'), 'RADIUS AVP NAS-IP-Address');
+ok(d0.frameNumber === 1 && d3.frameNumber === 4, 'frameNumber');
+ok(d0.srcMac === '11:22:33:44:55:66' && d0.dstMac === 'aa:bb:cc:dd:ee:ff', 'MAC 字段');
 
 console.log('filter:');
 const fTcp = compileFilter('tcp && port 443');
@@ -146,6 +173,21 @@ let threw = false;
 try { compileFilter('tcp &&'); } catch { threw = true; }
 ok(threw, '语法错误抛错');
 
+console.log('filter（Wireshark 语法）:');
+ok(compileFilter('radius')(d3) && !compileFilter('radius')(d2), 'radius 协议名');
+ok(compileFilter('_ws.col.protocol == "RADIUS"')(d3), '_ws.col.protocol == "RADIUS"');
+ok(compileFilter('_ws.col.protocol == "radius"')(d3), '_ws.col.protocol 大小写不敏感');
+ok(!compileFilter('_ws.col.protocol == "RADIUS"')(d2), '_ws.col.protocol 不误中 DNS');
+ok(compileFilter('_ws.col.protocol != "tcp"')(d2) && !compileFilter('_ws.col.protocol != "tcp"')(d0), '_ws.col.protocol !=');
+ok(compileFilter('_ws.col.info contains "example.com"')(d2), '_ws.col.info contains');
+ok(compileFilter('frame.number == 4')(d3) && !compileFilter('frame.number == 4')(d0), 'frame.number ==');
+ok(compileFilter('frame.len >= 60')(d3), 'frame.len >=');
+ok(compileFilter('tcp.port eq 443')(d0), 'tcp.port eq');
+ok(compileFilter('udp.port ne 53')(d3) && !compileFilter('udp.port ne 53')(d2), 'udp.port ne');
+ok(compileFilter('eth.src == "11:22:33:44:55:66"')(d0), 'eth.src');
+ok(compileFilter('eth.addr == aa:bb:cc:dd:ee:ff')(d2) && compileFilter('eth.dst == aa:bb:cc:dd:ee:ff')(d2), 'eth.addr / eth.dst');
+ok(compileFilter('!(radius || dns)')(d0) && !compileFilter('!(radius || dns)')(d3), 'radius 组合');
+
 console.log('stream:');
 const decoded = f1.packets.map((p) => decodePacket(p));
 const s = buildStream(f1.packets, decoded, d0.streamKey);
@@ -156,7 +198,7 @@ ok(s && s.endpoints[0] === '10.0.0.1:51234', '端点顺序');
 console.log('pcapng:');
 const f2 = parseCapture(wrapPcapNg(pkts));
 ok(f2.format === 'pcapng', 'format=pcapng');
-ok(f2.packets.length === 3, 'pcapng 3 个包');
+ok(f2.packets.length === 4, 'pcapng 4 个包');
 const n0 = decodePacket(f2.packets[0]);
 ok(n0.proto === 'TCP' && n0.dstPort === 443, 'pcapng 包解码');
 ok(f2.packets[0].tsSec === 1758000000, 'pcapng 时间戳');

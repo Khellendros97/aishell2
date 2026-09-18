@@ -208,6 +208,25 @@ export interface PathRef {
   serverId?: string | null;
 }
 
+/** pcap 抓包查看器「添加到对话」引用：发送时展开为文件信息 + 过滤表达式 + 过滤后包摘要行 */
+export interface PcapRef {
+  /** 文件名（显示用） */
+  name: string;
+  /** 本地路径或远端路径 */
+  path: string;
+  /** 远端服务器 ID；本地抓包文件为空 */
+  serverId?: string | null;
+  /** 生成引用时的显示过滤器表达式（空 = 未过滤） */
+  filter: string;
+  /** 过滤后包数 / 总包数 */
+  filtered: number;
+  total: number;
+  /** tshark 风格摘要行（No 时间 源 → 目的 协议 长度 Info；已在查看器侧截断） */
+  lines: string[];
+  /** 因条数上限被截掉的包数 */
+  truncated: number;
+}
+
 /** 内置浏览器元素引用：UI 以 @browser:#id 或标签名 标签呈现，发送时展开为页面信息 + 元素 HTML */
 export interface BrowserRef {
   /** 显示名：有 id 为 #id，否则小写标签名 */
@@ -357,6 +376,8 @@ export interface ChatMsg {
   skillRefs: SkillRef[];
   /** 笔记引用（@note:名称 标签，发送时展开为笔记路径）；旧会话为空 */
   noteRefs: NoteRef[];
+  /** pcap 抓包引用（@pcap:文件名 标签，发送时展开文件信息 + 过滤后包摘要）；旧会话为空 */
+  pcapRefs?: PcapRef[];
   /** 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话为空 */
   imageRefs?: ImageRef[];
   /** AI 动作审计（本轮回复中工具动作的意图/目标/最终状态，不含完整输出）；旧会话为空 */
