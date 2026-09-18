@@ -12,6 +12,7 @@ pub mod fsops;
 pub mod mcp;
 pub mod notes;
 pub mod notify;
+pub mod pcap;
 pub mod redact;
 pub mod session_title;
 pub mod pythoninstall;
@@ -355,6 +356,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             fsops::fs_copy,
             fsops::fs_reveal,
             fsops::fs_stat,
+            pcap::pcap_read,
             sftp::sftp_home,
             sftp::sftp_list,
             sftp::sftp_stat,

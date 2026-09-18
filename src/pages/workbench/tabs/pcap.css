@@ -1,0 +1,414 @@
+/* pcap 抓包查看器（PcapTab.tsx / pcap-engine.ts，全新实现）：
+   顶栏（过滤器）→ 统计条（可折叠，两图表）→ 包列表（窗口化渲染）→ 分隔条 →
+   详情区（左协议树 / 右 hex）或流视图。
+   行配色按协议（暗色基调，照 Wireshark 配色习惯的低饱和变体）。 */
+
+.pcap-tab-root,
+.pcap-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-0);
+  color: var(--text-0);
+  font-size: 12px;
+  position: relative;
+}
+
+/* ---------------- 顶栏 ---------------- */
+
+.pcap-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+
+.pcap-filter-ic {
+  display: flex;
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.pcap-filter-input {
+  flex: 0 1 460px;
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.pcap-filter-input.error {
+  border-color: var(--red, #e05555);
+}
+
+.pcap-filter-err {
+  color: var(--red, #e05555);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.pcap-spacer {
+  flex: 1;
+}
+
+.pcap-count {
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.pcap-stats-btn .ic,
+.pcap-stream-close .ic {
+  width: 13px;
+  height: 13px;
+  vertical-align: -2px;
+}
+
+/* ---------------- 统计条 ---------------- */
+
+.pcap-stats {
+  display: flex;
+  gap: 8px;
+  height: 180px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+
+.pcap-chart {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ---------------- 包列表 ---------------- */
+
+.pcap-list-head {
+  display: grid;
+  grid-template-columns: 60px 150px 1fr 1fr 76px 60px 2.2fr;
+  gap: 8px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-2);
+  flex-shrink: 0;
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.pcap-list-body {
+  flex: 1 1 55%;
+  min-height: 96px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+}
+
+.pcap-list-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.pcap-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 24px;
+  display: grid;
+  grid-template-columns: 60px 150px 1fr 1fr 76px 60px 2.2fr;
+  gap: 8px;
+  align-items: center;
+  padding: 0 10px;
+  font-family: Consolas, 'Courier New', monospace;
+  cursor: default;
+  user-select: none;
+  border-left: 2px solid transparent;
+}
+
+.pcap-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pcap-row:hover {
+  background: var(--bg-hover);
+}
+
+.pcap-row.sel {
+  background: var(--bg-active, var(--bg-hover));
+  border-left-color: var(--accent);
+}
+
+/* 协议行底色（低饱和暗色变体） */
+.pcap-p-tcp { background: rgba(88, 118, 190, 0.10); }
+.pcap-p-udp { background: rgba(86, 160, 120, 0.10); }
+.pcap-p-dns { background: rgba(150, 108, 190, 0.12); }
+.pcap-p-http { background: rgba(190, 160, 70, 0.10); }
+.pcap-p-tls { background: rgba(120, 120, 128, 0.12); }
+.pcap-p-icmp { background: rgba(190, 110, 110, 0.10); }
+.pcap-p-arp { background: rgba(110, 150, 160, 0.12); }
+
+.pcap-p-tcp:hover,
+.pcap-p-udp:hover,
+.pcap-p-dns:hover,
+.pcap-p-http:hover,
+.pcap-p-tls:hover,
+.pcap-p-icmp:hover,
+.pcap-p-arp:hover { filter: brightness(1.35); }
+
+.pcap-row.sel { filter: none; }
+
+/* ---------------- 分隔条 ---------------- */
+
+.pcap-hsplit {
+  height: 4px;
+  flex-shrink: 0;
+  cursor: row-resize;
+  background: var(--border);
+}
+
+.pcap-hsplit:hover {
+  background: var(--accent);
+}
+
+/* ---------------- 详情区 ---------------- */
+
+.pcap-detail {
+  flex: 1 1 45%;
+  min-height: 96px;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  border-top: 1px solid var(--border);
+}
+
+.pcap-detail-panes {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.pcap-tree {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 4px 0;
+  border-right: 1px solid var(--border);
+}
+
+.pcap-hex {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 4px 8px;
+}
+
+.pcap-hint {
+  color: var(--text-2);
+  padding: 12px;
+}
+
+.pcap-error-text {
+  color: var(--red, #e05555);
+  white-space: pre-wrap;
+}
+
+.pcap-layer-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pcap-layer-head:hover {
+  background: var(--bg-hover);
+}
+
+.pcap-layer-head .ic {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  transition: transform 0.1s;
+}
+
+.pcap-layer-head.collapsed .ic {
+  transform: rotate(-90deg);
+}
+
+.pcap-layer-fields.collapsed {
+  display: none;
+}
+
+.pcap-field {
+  display: flex;
+  gap: 8px;
+  padding: 1px 10px 1px 28px;
+  cursor: pointer;
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.pcap-field:hover {
+  background: var(--bg-hover);
+}
+
+.pcap-field-name {
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+
+.pcap-field-name::after {
+  content: ':';
+}
+
+.pcap-field-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pcap-hex-pre {
+  margin: 0;
+  font-family: Consolas, 'Courier New', monospace;
+  line-height: 1.5;
+  user-select: text;
+}
+
+.pcap-hex-off {
+  color: var(--text-2);
+}
+
+.pcap-hex-ascii {
+  color: var(--text-1);
+}
+
+.pcap-hex-pre .hb.hl {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-radius: 2px;
+}
+
+/* ---------------- 流视图 ---------------- */
+
+.pcap-stream {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-0);
+}
+
+.pcap-stream-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex-shrink: 0;
+}
+
+.pcap-stream-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pcap-stream-meta {
+  color: var(--text-2);
+  font-family: Consolas, 'Courier New', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pcap-stream-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 10px;
+}
+
+.pcap-chunk {
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.pcap-chunk-head {
+  padding: 3px 8px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11px;
+}
+
+.pcap-chunk.dir0 .pcap-chunk-head {
+  background: rgba(88, 118, 190, 0.22);
+}
+
+.pcap-chunk.dir1 .pcap-chunk-head {
+  background: rgba(86, 160, 120, 0.22);
+}
+
+.pcap-chunk-data {
+  margin: 0;
+  padding: 6px 8px;
+  font-family: Consolas, 'Courier New', monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.pcap-chunk.dir0 .pcap-chunk-data {
+  color: #b9ccf5;
+}
+
+.pcap-chunk.dir1 .pcap-chunk-data {
+  color: #b5e0c8;
+}
+
+/* ---------------- 状态栏与加载 ---------------- */
+
+.pcap-statusbar {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pcap-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--bg-0);
+  color: var(--text-1);
+  z-index: 2;
+}
+
+.pcap-spinner .ic {
+  width: 16px;
+  height: 16px;
+  animation: pcap-spin 1s linear infinite;
+  vertical-align: -3px;
+}
+
+@keyframes pcap-spin {
+  to { transform: rotate(360deg); }
+}
+
+.hidden {
+  display: none !important;
+}

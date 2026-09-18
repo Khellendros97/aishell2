@@ -44,6 +44,7 @@ import {
 } from '../../../../stores/workbench';
 import { clearClip, getClip, setClip } from '../../clipboard';
 import { openLocalFile } from '../../tabs/EditorTab';
+import { isPcapName, openLocalPcap } from '../../tabs/PcapTab';
 import {
   blockedByEditor, collapse, depthOf, editingPaths, expand, findNode, getRoot, getRootPath,
   invalidateLoads, isExpanded, joinPath, loadDir, normPath, refreshAll, refreshDir,
@@ -254,6 +255,8 @@ async function openNode(node: TreeNode): Promise<void> {
     return;
   }
   try {
+    // 抓包文件优先进 pcap 查看器（魔数由后端 pcap_read 兜底校验）
+    if (isPcapName(node.name)) { openLocalPcap(node.path, node.name); return; }
     if (await fsIsText(node.path)) openLocalFile(node.path, node.name);
     else await fsReveal(node.path);
   } catch (err) {
@@ -572,6 +575,9 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
   const uploadItems = sftpUploadItems(node.path, node.name);
   showContextMenu(x, y, [
     { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => void openNode(node) },
+    ...(!node.isDir && isPcapName(node.name)
+      ? [{ label: '在抓包查看器中打开', iconName: 'activity' as const, action: () => { openLocalPcap(node.path, node.name); } }]
+      : []),
     ...(newItems.length ? ['sep' as const, ...newItems] : []),
     'sep',
     { label: '复制', iconName: 'copy', action: () => { setClip({ source: 'local', items: [{ path: node.path, name: node.name, isDir: node.isDir }], mode: 'copy' }); render(); } },

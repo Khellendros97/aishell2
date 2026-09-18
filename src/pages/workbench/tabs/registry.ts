@@ -18,6 +18,7 @@ import { TraceTab } from './TraceTab';
 import { TimelineTab } from './TimelineTab';
 import { NoteTab } from './NoteTab';
 import { TunnelTab } from './TunnelTab';
+import { PcapTab } from './PcapTab';
 
 export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   terminal: TerminalTab,
@@ -31,4 +32,5 @@ export const TAB_TYPES: Record<string, ComponentType<TabProps>> = {
   timeline: TimelineTab,
   note: NoteTab,
   tunnel: TunnelTab,
+  pcap: PcapTab,
 };

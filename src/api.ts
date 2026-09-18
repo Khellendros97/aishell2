@@ -6,8 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, DashboardSpec, DashboardRender, AiWindowChangedEvent, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
-
+  AiMode, DashboardSpec, DashboardRender, AiWindowChangedEvent, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, PcapReadOut, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -155,6 +154,12 @@ export const fsCopy = (from: string, toDir: string) => call<string>('fs_copy', {
 export const fsReveal = (path: string) => call<void>('fs_reveal', { path });
 /** 读取单项属性（属性对话框用）：mode 仅 Unix 有值（本地 Windows 为 null），linkTarget 仅符号链接有值 */
 export const fsStat = (path: string) => call<FsStat>('fs_stat', { path });
+
+/* ---------------- pcap ---------------- */
+/** 读取抓包文件（pcap/pcapng）为 base64：本地传 path；远端加传 serverId（path 为远端路径）。
+ *  >128MB 或非抓包魔数会 reject 中文错误 */
+export const pcapRead = (path: string, serverId?: string) =>
+  call<PcapReadOut>('pcap_read', { path, serverId: serverId ?? null });
 
 /* ---------------- sftp ---------------- */
 /** 解析远端会话 home 目录（canonicalize(".")） */

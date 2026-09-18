@@ -60,22 +60,98 @@
   box-sizing: border-box;
 }
 
+/* 文本组件(markdown)排版 —— 照 tabs/note.css 的 .note-md(AI 消息 .ai-text 的文档预览变体)补齐:
+   全局 reset 把列表缩进清零,不补的话圆点/序号被 .dash-card 的 overflow:hidden 裁掉;表格也需自绘边框 */
 .dash-md {
   padding: 8px 10px;
   font-size: 12.5px;
   line-height: 1.6;
   color: var(--text-1, #e6edf3);
   word-break: break-word;
+  /* 宽表格/长代码行在侧栏(可拖宽)内横向滚动,不被卡片圆角裁掉 */
+  overflow-x: auto;
 }
 
-.dash-md p { margin: 0 0 6px; }
-.dash-md p:last-child { margin-bottom: 0; }
-.dash-md code {
-  background: var(--bg-3, #21262d);
-  border-radius: 4px;
-  padding: 1px 4px;
-  font-size: 11.5px;
+.dash-md h1, .dash-md h2, .dash-md h3, .dash-md h4 {
+  margin: 10px 0 6px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-0, #e8eaf0);
 }
+
+.dash-md h1 { font-size: 16px; }
+.dash-md h2 { font-size: 14.5px; }
+.dash-md h3 { font-size: 13.5px; }
+.dash-md h4 { font-size: 13px; }
+.dash-md h1:first-child, .dash-md h2:first-child, .dash-md h3:first-child, .dash-md h4:first-child { margin-top: 0; }
+.dash-md p { margin: 0 0 6px; }
+.dash-md p:last-child,
+.dash-md ul:last-child,
+.dash-md ol:last-child,
+.dash-md blockquote:last-child,
+.dash-md pre:last-child,
+.dash-md table:last-child { margin-bottom: 0; }
+
+/* 列表:缩进留在块内(marker outside),圆点/序号才不会溢出到卡片外被裁剪;嵌套层级叠加缩进 */
+.dash-md ul, .dash-md ol { margin: 0 0 6px; padding-left: 1.4em; }
+.dash-md li { margin: 2px 0; }
+.dash-md li > ul, .dash-md li > ol { margin-top: 2px; margin-bottom: 0; }
+
+.dash-md blockquote {
+  margin: 6px 0;
+  padding: 2px 10px;
+  border-left: 3px solid var(--border-strong, #454c5a);
+  border-radius: 0 4px 4px 0;
+  color: var(--text-1, #a8adbb);
+  background: var(--bg-3, #2e3440);
+}
+
+.dash-md hr { border: none; border-top: 1px solid var(--border, #363c48); margin: 10px 0; }
+.dash-md a { color: var(--link, #8db9ff); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.dash-md strong { font-weight: 600; }
+.dash-md img { max-width: 100%; }
+
+/* 行内代码(排除代码块内的 code,否则代码块会叠一层行内底色) */
+.dash-md :not(pre) > code {
+  background: var(--inline-code-bg, rgba(0, 0, 0, 0.35));
+  border: 1px solid var(--border, #363c48);
+  border-radius: 3px;
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--yellow, #e5c07b);
+}
+
+/* 围栏代码块:深底独立成块(卡片本身就是 --bg-2,不能再用它当底色) */
+.dash-md pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: var(--code-bg, #0d0f14);
+  border: 1px solid var(--border, #363c48);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.dash-md pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-0, #e8eaf0);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: pre;
+}
+
+/* 表格:全局 reset 无边框,须自绘;表头用 --bg-3 与卡片底区分 */
+.dash-md table { border-collapse: collapse; margin: 6px 0; }
+.dash-md th, .dash-md td {
+  border: 1px solid var(--border, #363c48);
+  padding: 4px 8px;
+  font-size: 12px;
+  text-align: left;
+  vertical-align: top;
+}
+.dash-md th { background: var(--bg-3, #2e3440); color: var(--text-0, #e8eaf0); font-weight: 600; }
 
 .dash-table-wrap {
   overflow-x: auto;
