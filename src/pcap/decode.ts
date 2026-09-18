@@ -26,10 +26,17 @@ export interface DecodedPacket {
   layers: ProtoLayer[];
   src: string;
   dst: string;
-  /** 列表协议列（最高层识别协议，如 DNS/HTTP/TLS/TCP） */
+  /** 列表协议列（最高层识别协议，如 DNS/HTTP/TLS/RADIUS） */
   proto: string;
   /** 列表 Info 列摘要 */
   info: string;
+  /** 帧编号（1 起始，过滤器 frame.number 用） */
+  frameNumber: number;
+  /** 线上原始长度（过滤器 frame.len 用） */
+  frameLen: number;
+  /** 链路层 MAC（仅 Ethernet 链路有值，过滤器 eth.src/dst/addr 用） */
+  srcMac?: string;
+  dstMac?: string;
   transport?: 'TCP' | 'UDP' | 'ICMP' | 'ICMPv6';
   ipVersion?: 4 | 6;
   srcIp?: string;
@@ -88,7 +95,8 @@ const PORT_PROTO: Record<number, string> = {
   20: 'FTP', 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS',
   67: 'DHCP', 68: 'DHCP', 69: 'TFTP', 80: 'HTTP', 110: 'POP3', 123: 'NTP',
   143: 'IMAP', 161: 'SNMP', 389: 'LDAP', 443: 'TLS', 445: 'SMB',
-  587: 'SMTP', 993: 'IMAPS', 995: 'POP3S', 2375: 'Docker', 3306: 'MySQL',
+  587: 'SMTP', 993: 'IMAPS', 995: 'POP3S', 1812: 'RADIUS', 1813: 'RADIUS',
+  2375: 'Docker', 3306: 'MySQL',
   3389: 'RDP', 5432: 'PostgreSQL', 6379: 'Redis', 8080: 'HTTP', 8443: 'TLS',
   27017: 'MongoDB',
 };
@@ -205,6 +213,103 @@ function decodeDns(
   return { layer: { name: 'Domain Name System', offset: layerOff, len, fields }, info };
 }
 
+/* ---------------- RADIUS ---------------- */
+
+const RADIUS_PORTS = new Set([1645, 1646, 1812, 1813]);
+
+const RADIUS_CODES: Record<number, string> = {
+  1: 'Access-Request', 2: 'Access-Accept', 3: 'Access-Reject',
+  4: 'Accounting-Request', 5: 'Accounting-Response', 11: 'Access-Challenge',
+  12: 'Status-Server', 13: 'Status-Client',
+  40: 'Disconnect-Request', 41: 'Disconnect-ACK', 42: 'Disconnect-NAK',
+  43: 'CoA-Request', 44: 'CoA-ACK', 45: 'CoA-NAK',
+};
+
+/** 常见 AVP：类型 → 名称与值解析方式 */
+const RADIUS_AVP: Record<number, { name: string; kind: 'text' | 'ipv4' | 'int' | 'hex' }> = {
+  1: { name: 'User-Name', kind: 'text' },
+  2: { name: 'User-Password', kind: 'hex' },
+  4: { name: 'NAS-IP-Address', kind: 'ipv4' },
+  5: { name: 'NAS-Port', kind: 'int' },
+  8: { name: 'Framed-IP-Address', kind: 'ipv4' },
+  18: { name: 'Reply-Message', kind: 'text' },
+  26: { name: 'Vendor-Specific', kind: 'hex' },
+  30: { name: 'Called-Station-Id', kind: 'text' },
+  31: { name: 'Calling-Station-Id', kind: 'text' },
+  40: { name: 'Acct-Status-Type', kind: 'int' },
+  44: { name: 'Acct-Session-Id', kind: 'text' },
+  61: { name: 'NAS-Port-Type', kind: 'int' },
+  79: { name: 'EAP-Message', kind: 'hex' },
+  80: { name: 'Message-Authenticator', kind: 'hex' },
+  87: { name: 'NAS-Port-Id', kind: 'text' },
+};
+
+const RADIUS_ACCT_STATUS: Record<number, string> = {
+  1: 'Start', 2: 'Stop', 3: 'Interim-Update', 7: 'Accounting-On', 8: 'Accounting-Off',
+};
+
+function hexBytes(b: Uint8Array, off: number, len: number): string {
+  const p: string[] = [];
+  for (let i = 0; i < len && off + i < b.length; i++) p.push(b[off + i].toString(16).padStart(2, '0'));
+  return p.join('');
+}
+
+/** RADIUS 解码：端口命中（1645/1646/1812/1813）后按结构校验——code 已知且 Length 字段自洽才算数 */
+function decodeRadius(
+  b: Uint8Array, off: number, len: number, layerOff: number,
+): { layer: ProtoLayer; info: string } | null {
+  if (len < 20 || off + 20 > b.length) return null;
+  const code = b[off];
+  const codeName = RADIUS_CODES[code];
+  if (!codeName) return null;
+  const declared = (b[off + 2] << 8) | b[off + 3];
+  if (declared < 20 || declared > len || off + declared > b.length) return null;
+  const id = b[off + 1];
+  const fields: ProtoField[] = [
+    { name: 'Code', value: `${codeName} (${code})`, offset: layerOff, len: 1 },
+    { name: 'Identifier', value: `0x${id.toString(16).padStart(2, '0')}`, offset: layerOff + 1, len: 1 },
+    { name: 'Length', value: String(declared), offset: layerOff + 2, len: 2 },
+    { name: 'Authenticator', value: hexBytes(b, off + 4, 16), offset: layerOff + 4, len: 16 },
+  ];
+  let userName = '';
+  let acctStatus = '';
+  let pos = off + 20;
+  const end = off + declared;
+  while (pos + 2 <= end) {
+    const atype = b[pos];
+    const alen = b[pos + 1];
+    if (alen < 2 || pos + alen > end) break; // AVP 损坏即停，已解析部分仍展示
+    const vlen = alen - 2;
+    const meta = RADIUS_AVP[atype];
+    let value: string;
+    switch (meta?.kind) {
+      case 'text': value = ascii(b, pos + 2, vlen); break;
+      case 'ipv4': value = vlen === 4 ? ipv4(b, pos + 2) : hexBytes(b, pos + 2, vlen); break;
+      case 'int': {
+        let v = 0;
+        for (let i = 0; i < vlen && i < 4; i++) v = v * 256 + b[pos + 2 + i];
+        value = atype === 40 ? `${RADIUS_ACCT_STATUS[v] ?? v} (${v})` : String(v);
+        break;
+      }
+      default: value = hexBytes(b, pos + 2, vlen); break;
+    }
+    fields.push({
+      name: `AVP: ${meta?.name ?? `Type ${atype}`}`,
+      value,
+      offset: layerOff + (pos - off),
+      len: alen,
+    });
+    if (atype === 1) userName = value;
+    if (atype === 40) acctStatus = value;
+    pos += alen;
+  }
+  const extra = userName ? ` ${userName}` : acctStatus ? ` ${acctStatus}` : '';
+  return {
+    layer: { name: 'RADIUS Protocol', offset: layerOff, len: declared, fields },
+    info: `${codeName}(${code}) id=0x${id.toString(16).padStart(2, '0')}${extra}`,
+  };
+}
+
 /* ---------------- 传输层 ---------------- */
 
 const TCP_FLAG_BITS: Array<[number, string]> = [
@@ -237,6 +342,7 @@ export function decodePacket(pkt: PcapPacket): DecodedPacket {
   const layers: ProtoLayer[] = [];
   const out: DecodedPacket = {
     layers, src: '', dst: '', proto: 'DATA', info: '',
+    frameNumber: pkt.index + 1, frameLen: pkt.origLen,
     payloadOffset: 0, payloadLen: 0,
   };
 
@@ -267,6 +373,8 @@ export function decodePacket(pkt: PcapPacket): DecodedPacket {
       });
       out.src = srcMac;
       out.dst = dstMac;
+      out.srcMac = srcMac;
+      out.dstMac = dstMac;
       off = hdrLen;
       break;
     }
@@ -534,7 +642,16 @@ export function decodePacket(pkt: PcapPacket): DecodedPacket {
     out.payloadOffset = payloadOff;
     out.payloadLen = payloadLen;
     let appInfo = '';
-    if ((sport === 53 || dport === 53) && payloadLen >= 12) {
+    // RADIUS：端口命中 1645/1646/1812/1813 时先试 RADIUS（结构校验不通过则落空继续其它识别）
+    if ((RADIUS_PORTS.has(sport) || RADIUS_PORTS.has(dport)) && payloadLen >= 20) {
+      const radius = decodeRadius(b, payloadOff, payloadLen, payloadOff);
+      if (radius) {
+        layers.push(radius.layer);
+        out.appProto = 'RADIUS';
+        appInfo = radius.info;
+      }
+    }
+    if (!out.appProto && (sport === 53 || dport === 53) && payloadLen >= 12) {
       const dns = decodeDns(b, payloadOff, payloadLen, payloadOff);
       if (dns) {
         layers.push(dns.layer);

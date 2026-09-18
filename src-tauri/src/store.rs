@@ -907,6 +907,34 @@ pub struct PathRef {
     pub server_id: Option<String>,
 }
 
+/// pcap 抓包查看器「添加到对话」引用（@pcap:文件名 标签）：发送时展开为
+/// 文件信息 + 过滤表达式 + 过滤后包摘要行（lines 已在查看器侧截断，truncated 为被截条数）。
+/// server_id 非空 = 远端服务器上的抓包文件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PcapRef {
+    /// 文件名（显示用）
+    pub name: String,
+    /// 本地路径或远端路径
+    pub path: String,
+    #[serde(default)]
+    pub server_id: Option<String>,
+    /// 生成引用时的显示过滤器表达式（空 = 未过滤）
+    #[serde(default)]
+    pub filter: String,
+    /// 过滤后包数 / 总包数
+    #[serde(default)]
+    pub filtered: u64,
+    #[serde(default)]
+    pub total: u64,
+    /// tshark 风格摘要行（No 时间 源 → 目的 协议 长度 Info）
+    #[serde(default)]
+    pub lines: Vec<String>,
+    /// 因条数上限被截掉的包数
+    #[serde(default)]
+    pub truncated: u64,
+}
+
 /// 内置浏览器元素引用：UI 以 @browser:{#id 或标签名} 标签呈现，发送时展开为页面信息 + 元素 HTML。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1014,6 +1042,9 @@ pub struct ChatMsg {
     /// 笔记引用（@note:名称 标签，发送时展开为笔记路径）；旧会话无此字段时按空处理
     #[serde(default)]
     pub note_refs: Vec<NoteRef>,
+    /// pcap 抓包引用（@pcap:文件名 标签，发送时展开文件信息 + 过滤后包摘要）；旧会话无此字段时按空处理
+    #[serde(default)]
+    pub pcap_refs: Vec<PcapRef>,
     /// 图片附件（缩略图展示，发送时经 pi RPC images 字段传图）；旧会话无此字段时按空处理
     #[serde(default)]
     pub image_refs: Vec<ImageRef>,
@@ -3973,6 +4004,7 @@ mod tests {
             browser_page_refs: vec![],
             skill_refs: vec![],
             note_refs: vec![],
+            pcap_refs: vec![],
             image_refs: vec![],
             actions: vec![],
             ts: 1,
@@ -4126,6 +4158,7 @@ mod tests {
                                     .to_string(),
                                 name: "deploy".to_string(),
                             }],
+                            pcap_refs: vec![],
                             image_refs: vec![ImageRef {
                                 id: "img-1".to_string(),
                                 source: "clipboard".to_string(),
@@ -6849,6 +6882,7 @@ mod tests {
             browser_page_refs: vec![],
             skill_refs: vec![],
             note_refs: vec![],
+            pcap_refs: vec![],
             image_refs: vec![],
             actions: vec![],
             ts: 1,
@@ -6872,6 +6906,7 @@ mod tests {
                     browser_page_refs: vec![],
                     skill_refs: vec![],
                     note_refs: vec![],
+            pcap_refs: vec![],
                     image_refs: vec![],
                     actions: vec![AiActionRecord {
                         tool_call_id: "call-1".to_string(),

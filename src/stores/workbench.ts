@@ -10,7 +10,7 @@
  * 与后端的接口点:无(纯前端状态);项目数据事实源仍在 Rust 端 aishell.json。
  */
 import { create } from 'zustand';
-import type { BrowserRef, FileRef, NoteRef, PathRef, Project, ServerRef, SkillRef, TermSnapshot } from '../types';
+import type { BrowserRef, FileRef, NoteRef, PathRef, PcapRef, Project, ServerRef, SkillRef, TermSnapshot } from '../types';
 import type { IconName } from '../icons';
 import { toast } from '../ui';
 
@@ -65,6 +65,8 @@ export interface AiHandle {
   addServerRef?(ref: ServerRef): void;
   /** 文件/目录路径引用(@file:文件名 / @path:目录名 标签,发送时只带路径不带内容) */
   addPathRef?(ref: PathRef): void;
+  /** pcap 抓包引用(@pcap:文件名 标签,发送时展开文件信息 + 过滤后包摘要;pcap 查看器「添加到对话」入口) */
+  addPcapRef?(ref: PcapRef): void;
   /** 内置浏览器元素引用(@browser:#id 或标签名 标签,发送时展开页面信息 + 元素 HTML) */
   addBrowserRef?(ref: BrowserRef): void;
   /** 技能引用(@skill:名称 标签,发送时展开名/来源/scope/描述) */

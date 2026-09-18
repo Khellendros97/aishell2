@@ -17,6 +17,8 @@ import { CanvasRenderer } from 'echarts/renderers';
 import { pcapRead } from '../../../api';
 import { icon } from '../../../icons';
 import { showContextMenu, toast } from '../../../ui';
+import { wbHandles } from '../../../stores/workbench';
+import type { PcapRef } from '../../../types';
 import { base64ToBytes, parseCapture, type PcapFile, type PcapPacket } from '../../../pcap/parser';
 import { decodePacket, type DecodedPacket, type ProtoLayer } from '../../../pcap/decode';
 import { compileFilter, type PacketPredicate } from '../../../pcap/filter';
@@ -45,6 +47,7 @@ function protoClass(proto: string): string {
     case 'DNS': return 'pcap-p-dns';
     case 'HTTP': return 'pcap-p-http';
     case 'TLS': return 'pcap-p-tls';
+    case 'RADIUS': return 'pcap-p-radius';
     case 'ICMP': case 'ICMPv6': return 'pcap-p-icmp';
     case 'ARP': return 'pcap-p-arp';
     default: return '';
@@ -85,15 +88,14 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
       <span class="pcap-filter-err hidden"></span>
       <span class="pcap-spacer"></span>
       <span class="pcap-count"></span>
+      <button class="btn small ghost pcap-chat-btn" title="把当前过滤结果（前 200 条摘要）作为引用加入 AI 对话">${icon('chatPlus')} 添加到对话</button>
       <button class="btn small ghost pcap-stats-btn" title="协议分布与流量曲线">${icon('chartLine')} 统计</button>
     </div>
     <div class="pcap-stats hidden">
       <div class="pcap-chart pcap-chart-proto"></div>
       <div class="pcap-chart pcap-chart-time"></div>
     </div>
-    <div class="pcap-list-head">
-      <span>No.</span><span>时间</span><span>源</span><span>目的</span><span>协议</span><span>长度</span><span>Info</span>
-    </div>
+    <div class="pcap-list-head"></div>
     <div class="pcap-list-body"><div class="pcap-list-spacer"></div></div>
     <div class="pcap-hsplit" title="拖动调整列表/详情比例"></div>
     <div class="pcap-detail">
@@ -140,7 +142,8 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
   let decoded: (DecodedPacket | null)[] = [];
   let filtered: number[] = [];
   let predicate: PacketPredicate | null = null;
-  let selected = -1; // filtered 下标
+  /** 选中的包序号（packets 下标，-1 = 无；排序/过滤变化不受影响） */
+  let selected = -1;
   let rowPool: HTMLDivElement[] = [];
   let stream: FollowStream | null = null;
   let streamHex = false;
@@ -150,6 +153,20 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
   /** 时间列是否带日期（抓包跨天时） */
   let timeWithDate = false;
   let disposed = false;
+
+  /* ---- 表头排序状态 ---- */
+  type SortCol = 'no' | 'time' | 'src' | 'dst' | 'proto' | 'len' | 'info';
+  let sortState: { col: SortCol; dir: 'asc' | 'desc' } | null = null;
+
+  const HEAD_COLS: Array<{ key: SortCol; label: string }> = [
+    { key: 'no', label: 'No.' },
+    { key: 'time', label: '时间' },
+    { key: 'src', label: '源' },
+    { key: 'dst', label: '目的' },
+    { key: 'proto', label: '协议' },
+    { key: 'len', label: '长度' },
+    { key: 'info', label: 'Info' },
+  ];
 
   const packets = (): PcapPacket[] => capture?.packets ?? [];
 
@@ -175,6 +192,141 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
     return timeWithDate ? `${z(d.getMonth() + 1)}-${z(d.getDate())} ${t}` : t;
   }
 
+  /* ---------------- 表头排序 ---------------- */
+
+  /** 排序比较器：src/dst/proto/info 需要解码（调用前 ensureDecodedAll） */
+  function comparePackets(a: number, b: number): number {
+    const st = sortState;
+    if (!st) return a - b;
+    const pa = packets()[a];
+    const pb = packets()[b];
+    let c = 0;
+    switch (st.col) {
+      case 'no': c = a - b; break;
+      case 'time': c = pa.tsSec - pb.tsSec || pa.tsNs - pb.tsNs; break;
+      case 'len': c = pa.origLen - pb.origLen; break;
+      case 'src': c = ensureDecoded(a).src.localeCompare(ensureDecoded(b).src); break;
+      case 'dst': c = ensureDecoded(a).dst.localeCompare(ensureDecoded(b).dst); break;
+      case 'proto': c = ensureDecoded(a).proto.localeCompare(ensureDecoded(b).proto); break;
+      case 'info': c = ensureDecoded(a).info.localeCompare(ensureDecoded(b).info); break;
+    }
+    return (st.dir === 'asc' ? c : -c) || (a - b); // 末位按序号稳定次序
+  }
+
+  function applySort(): void {
+    if (!sortState) return;
+    if (sortState.col !== 'no' && sortState.col !== 'time' && sortState.col !== 'len') {
+      ensureDecodedAll();
+    }
+    filtered.sort(comparePackets);
+    renderWindow();
+  }
+
+  function renderHeadArrows(): void {
+    const st = sortState;
+    for (const cell of listHead.querySelectorAll<HTMLElement>('.pcap-th')) {
+      const key = cell.dataset.col;
+      const arrow = cell.querySelector('.pcap-sort-arrow');
+      if (arrow) arrow.textContent = st && st.col === key ? (st.dir === 'asc' ? '▲' : '▼') : '';
+      cell.classList.toggle('sorted', st?.col === key);
+    }
+  }
+
+  // 表头单元格：点击排序（同列再点切换升/降序）
+  HEAD_COLS.forEach(({ key, label }) => {
+    const cell = document.createElement('span');
+    cell.className = 'pcap-th';
+    cell.dataset.col = key;
+    cell.title = '点击排序（再点切换升/降序）';
+    const text = document.createElement('i');
+    text.textContent = label;
+    const arrow = document.createElement('b');
+    arrow.className = 'pcap-sort-arrow';
+    cell.append(text, arrow);
+    cell.addEventListener('click', () => {
+      if (!capture || filtered.length === 0) return;
+      if (sortState?.col === key) {
+        sortState = { col: key, dir: sortState.dir === 'asc' ? 'desc' : 'asc' };
+      } else {
+        sortState = { col: key, dir: 'asc' };
+      }
+      renderHeadArrows();
+      applySort();
+    });
+    listHead.appendChild(cell);
+  });
+
+  /* ---------------- 单元格「作为过滤器」 ---------------- */
+
+  /** 单元格列 → 过滤表达式（时间/Info 列返回 null，菜单禁用） */
+  function cellFilterExpr(p: PcapPacket, d: DecodedPacket, col: number): { expr: string; display: string } | null {
+    switch (col) {
+      case 0: return { expr: `frame.number == ${p.index + 1}`, display: `编号 ${p.index + 1}` };
+      case 2:
+        if (d.srcIp) return { expr: `ip.src == "${d.srcIp}"`, display: d.srcIp };
+        if (d.srcMac) return { expr: `eth.src == "${d.srcMac}"`, display: d.srcMac };
+        return null;
+      case 3:
+        if (d.dstIp) return { expr: `ip.dst == "${d.dstIp}"`, display: d.dstIp };
+        if (d.dstMac) return { expr: `eth.dst == "${d.dstMac}"`, display: d.dstMac };
+        return null;
+      case 4: return { expr: `_ws.col.protocol == "${d.proto}"`, display: d.proto };
+      case 5: return { expr: `frame.len == ${p.origLen}`, display: `长度 ${p.origLen}` };
+      default: return null;
+    }
+  }
+
+  /** 组合当前过滤器与单元格表达式（照 Wireshark Apply as Filter 的 6 种组合） */
+  function combineFilter(mode: 'set' | 'and' | 'or', expr: string, negate: boolean): string {
+    const e = negate ? `!(${expr})` : expr;
+    const cur = filterInput.value.trim();
+    if (mode === 'set' || !cur) return e;
+    return `${cur} ${mode === 'and' ? '&&' : '||'} (${e})`;
+  }
+
+  function applyFilterText(text: string): void {
+    filterInput.value = text;
+    applyFilter();
+  }
+
+  /** 「作为过滤器」二级菜单（ui.showContextMenu 无子菜单能力，本地实现一层悬浮菜单） */
+  let subMenuEl: HTMLElement | null = null;
+  function closeSubMenu(): void {
+    subMenuEl?.remove();
+    subMenuEl = null;
+    document.removeEventListener('mousedown', onSubMenuOutside, true);
+  }
+  function onSubMenuOutside(e: MouseEvent): void {
+    if (subMenuEl && !subMenuEl.contains(e.target as Node)) closeSubMenu();
+  }
+  function showFilterSubMenu(x: number, y: number, expr: string, display: string): void {
+    closeSubMenu();
+    const el = document.createElement('div');
+    el.className = 'ctx-menu';
+    const items: Array<[string, string]> = [
+      [`筛选 ${display}`, combineFilter('set', expr, false)],
+      [`排除 ${display}`, combineFilter('set', expr, true)],
+      [`…且筛选 ${display}`, combineFilter('and', expr, false)],
+      [`…且排除 ${display}`, combineFilter('and', expr, true)],
+      [`…或筛选 ${display}`, combineFilter('or', expr, false)],
+      [`…或排除 ${display}`, combineFilter('or', expr, true)],
+    ];
+    for (const [label, next] of items) {
+      const btn = document.createElement('button');
+      btn.className = 'ctx-menu-item';
+      btn.innerHTML = `<span>${label}</span>`;
+      btn.title = next;
+      btn.onclick = () => { closeSubMenu(); applyFilterText(next); };
+      el.appendChild(btn);
+    }
+    document.body.appendChild(el);
+    const rect = el.getBoundingClientRect();
+    el.style.left = `${Math.max(4, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+    el.style.top = `${Math.max(4, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+    subMenuEl = el;
+    document.addEventListener('mousedown', onSubMenuOutside, true);
+  }
+
   /* ---------------- 虚拟列表 ---------------- */
 
   function makeRow(): HTMLDivElement {
@@ -190,8 +342,21 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
       const idx = Number(row.dataset.fidx ?? -1);
       if (idx < 0) return;
       selectRow(idx);
+      const p = packets()[filtered[idx]];
       const d = ensureDecoded(filtered[idx]);
+      // 命中的单元格列（作为过滤器的取值来源；点在行空白处则视为行级菜单）
+      const cell = (e.target as HTMLElement).closest('span');
+      const col = cell && row.contains(cell) ? Array.prototype.indexOf.call(row.children, cell) : -1;
+      const cf = col >= 0 ? cellFilterExpr(p, d, col) : null;
       showContextMenu(e.clientX, e.clientY, [
+        {
+          label: '作为过滤器',
+          iconName: 'filter',
+          disabled: !cf,
+          disabledTip: '该列不支持作为过滤条件',
+          action: () => { if (cf) showFilterSubMenu(e.clientX, e.clientY, cf.expr, cf.display); },
+        },
+        'sep',
         {
           label: d?.transport === 'UDP' ? '追踪 UDP 流' : '追踪 TCP 流',
           iconName: 'arrowLeftRight',
@@ -203,10 +368,8 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
           label: '复制行摘要',
           iconName: 'copy',
           action: () => {
-            const p = packets()[filtered[idx]];
-            if (!d) return;
             void navigator.clipboard.writeText(
-              `${filtered[idx] + 1} ${fmtTime(p)} ${d.src} → ${d.dst} ${d.proto} ${p.origLen} ${d.info}`,
+              `${p.index + 1} ${fmtTime(p)} ${d.src} → ${d.dst} ${d.proto} ${p.origLen} ${d.info}`,
             );
           },
         },
@@ -237,7 +400,7 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
       row.style.display = '';
       row.style.transform = `translateY(${fidx * ROW_H}px)`;
       row.dataset.fidx = String(fidx);
-      row.className = `pcap-row ${protoClass(d.proto)}${fidx === selected ? ' sel' : ''}`;
+      row.className = `pcap-row ${protoClass(d.proto)}${pidx === selected ? ' sel' : ''}`;
       const cells = row.children;
       cells[0].textContent = String(pidx + 1);
       cells[1].textContent = fmtTime(p);
@@ -262,10 +425,12 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
   }
 
   function selectRow(fidx: number): void {
-    if (fidx === selected) return;
-    selected = fidx;
+    const pidx = filtered[fidx];
+    if (pidx === undefined || pidx === selected) return;
+    selected = pidx;
     for (const row of rowPool) {
-      row.classList.toggle('sel', Number(row.dataset.fidx ?? -1) === fidx);
+      const i = Number(row.dataset.fidx ?? -1);
+      row.classList.toggle('sel', i >= 0 && filtered[i] === selected);
     }
     if (stream) closeStream();
     renderDetail();
@@ -375,13 +540,13 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
   }
 
   function renderDetail(): void {
-    if (selected < 0 || selected >= filtered.length) {
+    if (selected < 0 || selected >= packets().length) {
       treeEl.innerHTML = '<div class="pcap-hint">在列表中选择数据包查看协议详情</div>';
       hexEl.innerHTML = '';
       return;
     }
-    const p = packets()[filtered[selected]];
-    const d = ensureDecoded(filtered[selected]);
+    const p = packets()[selected];
+    const d = ensureDecoded(selected);
     clearHighlight();
     renderTree(d);
     renderHex(p.bytes);
@@ -488,6 +653,11 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
     }
     selected = -1;
     closeStream();
+    // 过滤器变化后保持当前排序（排序键需要解码的列先全量解码）
+    if (sortState) {
+      if (sortState.col !== 'no' && sortState.col !== 'time' && sortState.col !== 'len') ensureDecodedAll();
+      filtered.sort(comparePackets);
+    }
     relayoutList();
     updateCount();
     renderDetail();
@@ -581,6 +751,44 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
     }
   });
 
+  /* ---------------- 添加到对话（PcapRef：过滤后包摘要快照，AI 侧展开见 ai-engine buildPrompt） ---------------- */
+
+  /** 摘要行数上限：够 AI 看清构成，又不至于撑爆 prompt */
+  const REF_MAX_LINES = 200;
+
+  function buildPcapRef(): PcapRef | null {
+    if (!capture) return null;
+    ensureDecodedAll();
+    const lines: string[] = [];
+    for (let i = 0; i < Math.min(filtered.length, REF_MAX_LINES); i++) {
+      const pidx = filtered[i];
+      const p = packets()[pidx];
+      const d = decoded[pidx]!;
+      lines.push(`${pidx + 1}  ${fmtTime(p)}  ${d.src} → ${d.dst}  ${d.proto}  ${p.origLen}  ${d.info}`);
+    }
+    return {
+      name: params.name,
+      path: params.path,
+      serverId: params.serverId ?? null,
+      filter: filterInput.value.trim(),
+      filtered: filtered.length,
+      total: packets().length,
+      lines,
+      truncated: Math.max(0, filtered.length - lines.length),
+    };
+  }
+
+  $<HTMLButtonElement>('.pcap-chat-btn').addEventListener('click', () => {
+    const ref = buildPcapRef();
+    if (!ref) { toast('抓包尚未加载完成', 'info'); return; }
+    if (ref.filtered === 0) { toast('当前过滤结果为空，无可引用的报文', 'info'); return; }
+    if (wbHandles.ai?.addPcapRef) {
+      wbHandles.ai.addPcapRef(ref);
+    } else {
+      toast('AI 面板尚未就绪');
+    }
+  });
+
   /* ---------------- 分隔条拖拽 ---------------- */
 
   const hsplit = $('.pcap-hsplit');
@@ -668,6 +876,7 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
   return () => {
     disposed = true;
     if (scrollRaf) cancelAnimationFrame(scrollRaf);
+    closeSubMenu();
     ro.disconnect();
     protoChart?.dispose();
     timeChart?.dispose();

@@ -65,7 +65,7 @@
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import MarkdownIt from 'markdown-it';
-import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, NoteRef, PathRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
+import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, NoteRef, PathRef, PcapRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon, type IconName } from '../../../icons';
 import {
   aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiForwardRef, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, aiWindowClose, aiWindowOpen, getState, kbSearch, onAiEvent, onAiForwardRef, onAiSessionTitle, onAiWindowChanged, saveDbConnection, saveSettings,
@@ -639,6 +639,7 @@ function cloneChatSession(s: ChatSession): ChatSession {
       fileRefs: m.fileRefs.map((ref) => ({ ...ref })),
       serverRefs: m.serverRefs.map((ref) => ({ ...ref })),
       pathRefs: m.pathRefs.map((ref) => ({ ...ref })),
+      pcapRefs: (m.pcapRefs ?? []).map((ref) => ({ ...ref, lines: [...ref.lines] })),
       browserRefs: m.browserRefs.map((ref) => ({ ...ref })),
       browserPageRefs: (m.browserPageRefs ?? []).map((ref) => ({ ...ref })),
       skillRefs: m.skillRefs.map((ref) => ({ ...ref, scope: [...ref.scope] })),
@@ -761,6 +762,7 @@ const browserRefs = new Map<string, BrowserRef>(); // 浏览器元素引用 key 
 const pageRefs = new Map<string, BrowserPageRef>(); // 浏览器页面引用 id -> 引用（@page:页面标题 标签，@ 补全插入）
 const skillRefs = new Map<string, SkillRef>(); // 技能引用 key -> 引用（key = `${origin}:${name}`，@skill:名称 标签）
 const noteRefs = new Map<string, NoteRef>(); // 笔记引用 id -> 引用（@note:名称 标签，notes 面板「添加到对话」入口）
+const pcapRefs = new Map<string, PcapRef>(); // 抓包引用 key -> 引用（key = 服务器:路径:过滤器，@pcap:文件名 标签，pcap 查看器「添加到对话」入口）
 /* 图片附件拆两个 Map：
    - historyImageRefs  历史消息缩略图/预览查找（renderMessage 灌入，跨会话累积）；
    - inputImageRefs    输入区待发图片（attachImages 写入、chip ✕ 删除、clearChips/挂面板清空）。
@@ -1009,6 +1011,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   fileRefs.clear();
   serverRefs.clear();
   pathRefs.clear();
+  pcapRefs.clear();
   browserRefs.clear();
   pageRefs.clear();
   skillRefs.clear();
@@ -1287,6 +1290,7 @@ function createForwardingHandle(projectId: string): AiHandle {
     addFileRef: (ref) => { if (ref) forward('file', { ref }); },
     addServerRef: (ref) => { if (ref) forward('server', { ref }); },
     addPathRef: (ref) => { if (ref) forward('path', { ref }); },
+    addPcapRef: (ref) => { if (ref) forward('pcap', { ref }); },
     addBrowserRef: (ref) => { if (ref) forward('browser', { ref }); },
     addSkillRef: (ref) => { if (ref) forward('skill', { ref }); },
     addNoteRef: (ref) => { if (ref) forward('note', { ref }); },
@@ -1318,6 +1322,7 @@ function dispatchForwardRef(payload: Record<string, unknown>): void {
     case 'file': h.addFileRef?.(ref); break;
     case 'server': h.addServerRef?.(ref); break;
     case 'path': h.addPathRef?.(ref); break;
+    case 'pcap': h.addPcapRef?.(ref); break;
     case 'browser': h.addBrowserRef?.(ref); break;
     case 'skill': h.addSkillRef?.(ref); break;
     case 'note': h.addNoteRef?.(ref); break;
@@ -1370,6 +1375,18 @@ function createAiHandle() {
     }
     pathRefs.set(key, ref);
     insertPathChip(ref);
+  },
+  /** 抓包引用（@pcap:文件名 标签，发送时展开文件信息 + 过滤后包摘要行）；
+   *  pcap 查看器「添加到对话」入口；同文件同过滤表达式重复添加时提示 */
+  addPcapRef(ref: PcapRef): void {
+    if (!ref || typeof ref.path !== 'string' || !ref.path.trim()) return;
+    const key = pcapRefKey(ref);
+    if (pcapRefs.has(key)) {
+      toast('该抓包引用已在输入框中');
+      return;
+    }
+    pcapRefs.set(key, ref);
+    insertPcapChip(ref);
   },
   /** 浏览器元素引用（@browser:#id 或标签名 标签，发送时展开页面信息 + 元素 HTML）；
    *  同名元素（如多个 button）允许重复添加——chip 各自携带完整快照数据 */
@@ -2717,6 +2734,9 @@ function buildMessageTokens(m: ChatMsg): MessageToken[] {
     const name = r.path.split('/').filter(Boolean).pop() || r.path;
     push(r.isDir ? `@path:${name}` : `@file:${name}`, pathRefKey(r), 'path', `引用路径${r.serverId ? `（服务器 ${r.serverId}）` : ''} ${r.path}`);
   });
+  (m.pcapRefs ?? []).forEach((r) =>
+    push(`@pcap:${r.name}`, pcapRefKey(r), 'pcap',
+      `抓包引用 ${r.path}${r.filter ? ` · 过滤器 ${r.filter}` : ''} · ${r.filtered}/${r.total} 包`));
   (m.browserRefs ?? []).forEach((r) =>
     push(`@browser:${r.name}`, `${r.name}:${r.ts}`, 'browser', `点击查看元素引用（${r.url}）`));
   (m.browserPageRefs ?? []).forEach((r) =>
@@ -3366,6 +3386,11 @@ function pathRefKey(r: PathRef): string {
   return r.serverId ? `${r.serverId}:${r.path}` : r.path;
 }
 
+/** 抓包引用 key：服务器 + 路径 + 过滤表达式（同文件换过滤器允许重复添加，各自携带当时的包摘要快照） */
+function pcapRefKey(r: PcapRef): string {
+  return `${r.serverId ?? ''}:${r.path}:${r.filter}`;
+}
+
 /** 技能引用 key：来源 + 名称（全局/项目同名技能并存） */
 function skillRefKey(r: SkillRef): string {
   return `${r.origin}:${r.name}`;
@@ -3403,6 +3428,10 @@ function chipToken(kind: string, id: string): string {
       if (!r) return '';
       const n = r.path.split('/').filter(Boolean).pop() || r.path;
       return r.isDir ? `@path:${n}` : `@file:${n}`;
+    }
+    case 'pcap': {
+      const r = pcapRefs.get(id);
+      return r ? `@pcap:${r.name}` : '';
     }
     case 'browser': {
       const r = browserRefs.get(id);
@@ -3498,6 +3527,13 @@ function insertPathChip(ref: PathRef): void {
     `${ref.serverId ? `[服务器 ${ref.serverId}] ` : ''}${ref.path}，✕ 移除`));
 }
 
+/** 抓包引用 chip：@pcap:文件名，title 带路径/过滤器/包数 */
+function insertPcapChip(ref: PcapRef): void {
+  insertChipEl(makeInlineChip('pcap', pcapRefKey(ref), `@pcap:${ref.name}`,
+    `抓包引用 ${ref.path}${ref.serverId ? `（服务器 ${ref.serverId}）` : ''}`
+    + `${ref.filter ? `\n过滤器: ${ref.filter}` : ''}\n过滤后 ${ref.filtered} / 共 ${ref.total} 包，✕ 移除`));
+}
+
 /** 浏览器元素引用 chip：@browser:#id 或标签名，title 带页面地址，点击查看元素详情 */
 function insertBrowserChip(ref: BrowserRef, key: string): void {
   insertChipEl(makeInlineChip('browser', key, `@browser:${ref.name || ref.tagName}`,
@@ -3538,6 +3574,7 @@ function onInlineChipClick(e: MouseEvent): void {
     else if (kind === 'file') fileRefs.delete(id);
     else if (kind === 'server') serverRefs.delete(id);
     else if (kind === 'path') pathRefs.delete(id);
+    else if (kind === 'pcap') pcapRefs.delete(id);
     else if (kind === 'browser') browserRefs.delete(id);
     else if (kind === 'page') pageRefs.delete(id);
     else if (kind === 'skill') skillRefs.delete(id);
@@ -3636,6 +3673,7 @@ const clearChips = (): void => {
   fileRefs.clear();
   serverRefs.clear();
   pathRefs.clear();
+  pcapRefs.clear();
   browserRefs.clear();
   pageRefs.clear();
   skillRefs.clear();
@@ -4267,6 +4305,7 @@ type ChipDatum =
   | { kind: 'file'; ref: FileRef }
   | { kind: 'server'; ref: ServerRef }
   | { kind: 'path'; ref: PathRef }
+  | { kind: 'pcap'; ref: PcapRef }
   | { kind: 'browser'; ref: BrowserRef }
   | { kind: 'page'; ref: BrowserPageRef }
   | { kind: 'skill'; ref: SkillRef }
@@ -4367,6 +4406,7 @@ async function send(textOverride?: string): Promise<void> {
   const refs: FileRef[] = [];
   const srefs: ServerRef[] = [];
   const prefs: PathRef[] = [];
+  const pcrefs: PcapRef[] = [];
   const brefs: BrowserRef[] = [];
   const pgrefs: BrowserPageRef[] = [];
   const skrefs: SkillRef[] = [];
@@ -4398,6 +4438,12 @@ async function send(textOverride?: string): Promise<void> {
       seenIds.add(seg.id);
       chipData.set(seg.id, { kind: 'path', ref: p });
       prefs.push(p);
+    } else if (seg.chipKind === 'pcap') {
+      const p = pcapRefs.get(seg.id);
+      if (!p) continue;
+      seenIds.add(seg.id);
+      chipData.set(seg.id, { kind: 'pcap', ref: p });
+      pcrefs.push(p);
     } else if (seg.chipKind === 'browser') {
       const b = browserRefs.get(seg.id);
       if (!b) continue;
@@ -4426,7 +4472,7 @@ async function send(textOverride?: string): Promise<void> {
   }
   inputImageRefs.forEach((r) => imgs.push(r));
   const text = segmentsToText(segments).trim();
-  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && brefs.length === 0 && pgrefs.length === 0 && skrefs.length === 0 && nrefs.length === 0 && imgs.length === 0) return;
+  if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && pcrefs.length === 0 && brefs.length === 0 && pgrefs.length === 0 && skrefs.length === 0 && nrefs.length === 0 && imgs.length === 0) return;
 
   // 只有新会话的第一条用户消息触发一次标题任务；后续消息永不自动改名。
   const shouldGenerateTitle = s.messages.length === 0 && !s.autoTitleTriggered;
@@ -4454,7 +4500,7 @@ async function send(textOverride?: string): Promise<void> {
     void persistSession(s, ctx);
   }
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, noteRefs: nrefs, imageRefs: imgs, actions: [], ts: Date.now() });
+  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, pcapRefs: pcrefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, noteRefs: nrefs, imageRefs: imgs, actions: [], ts: Date.now() });
   if (shouldGenerateTitle) s.autoTitleTriggered = true;
   clearChips();
   pendingBy.set(sid, emptyPending());
@@ -4551,6 +4597,17 @@ async function buildPrompt(segments: InputSegment[], imgs: ImageRef[], chipData:
         const sv = servers.find((s) => s.id === r.serverId);
         const where = sv ? `${sv.name} (${sv.username}@${sv.host}:${sv.port})` : r.serverId;
         return `\n\n[${r.isDir ? '远程目录路径' : '远程文件路径'}（服务器 ${where}）: ${r.path}]`;
+      }
+      case 'pcap': {
+        const r = d.ref;
+        const sv = r.serverId ? servers.find((s) => s.id === r.serverId) : undefined;
+        const where = r.serverId
+          ? `远程服务器 ${sv ? `${sv.name} (${sv.username}@${sv.host}:${sv.port})` : r.serverId}`
+          : '本地';
+        const head = `\n\n[抓包引用 @pcap:${r.name}]\n文件: ${r.path}（${where}）`
+          + `\n显示过滤器: ${r.filter || '（无）'} · 过滤后 ${r.filtered} / 共 ${r.total} 包`
+          + (r.truncated > 0 ? `（摘要已截断，以下仅前 ${r.lines.length} 条，另有 ${r.truncated} 条未列出）` : '');
+        return `${head}\nNo  时间  源 → 目的  协议  长度  Info\n${r.lines.join('\n')}`;
       }
       case 'browser':
         return `\n\n[浏览器元素引用 @browser:${d.ref.name}]\n页面: ${d.ref.title || '（无标题）'} (${d.ref.url})\n元素 HTML:\n${d.ref.outerHTML.slice(0, 8000)}`;
