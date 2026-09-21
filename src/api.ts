@@ -152,6 +152,8 @@ export const fsMove = (from: string, to: string) => call<void>('fs_move', { from
 export const fsCopy = (from: string, toDir: string) => call<string>('fs_copy', { from, toDir });
 /** 在系统文件资源管理器中定位 */
 export const fsReveal = (path: string) => call<void>('fs_reveal', { path });
+/** 用系统默认应用打开本地文件；无关联程序/失败会 reject（调用方回退 fsReveal） */
+export const fsOpenDefault = (path: string) => call<void>('fs_open_default', { path });
 /** 读取单项属性（属性对话框用）：mode 仅 Unix 有值（本地 Windows 为 null），linkTarget 仅符号链接有值 */
 export const fsStat = (path: string) => call<FsStat>('fs_stat', { path });
 
@@ -183,6 +185,10 @@ export const sftpUpload = (serverId: string, localPath: string, remoteDir: strin
 /** 下载远端文件/目录到本地目录（重名自动改名）；返回最终落地的完整本地路径 */
 export const sftpDownload = (serverId: string, remotePath: string, localDir: string) =>
   call<string>('sftp_download', { serverId, remotePath, localDir });
+/** 远端文件「系统方式打开」：先下载到临时目录，action=open 系统默认应用打开 / reveal 资源管理器定位；
+ *  返回落地本地路径；无默认应用时 reject（调用方回退 reveal） */
+export const sftpOpen = (serverId: string, remotePath: string, action: 'open' | 'reveal') =>
+  call<string>('sftp_open', { serverId, remotePath, action });
 /** 远端移动/重命名：to 为完整目标路径；目标已存在会 reject */
 export const sftpRename = (serverId: string, from: string, to: string) =>
   call<void>('sftp_rename', { serverId, from, to });

@@ -159,6 +159,9 @@ export const PATHS = {  folder:
   /** 双向流（lucide arrow-left-right；pcap 流追踪） */
   arrowLeftRight:
     '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>',
+  /** 应用窗口（lucide app-window；「使用系统默认应用打开」） */
+  appWindow:
+    '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M2 12h20"/>',
 } as const;
 
 export type IconName = keyof typeof PATHS;

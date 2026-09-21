@@ -27,6 +27,14 @@ import { useWorkbench } from '../../stores/workbench';
 import { Statusbar } from '../../components/Statusbar';
 import '../settings.css';
 
+/** 模型输入模式选项（设置-大模型配置「输入模式」多选；值与后端 InputMode 对齐） */
+type LlmInputMode = LlmConfig['inputModes'][number];
+/** 输入模式候选（文本恒可用，图片由模型能力决定） */
+const INPUT_MODE_OPTIONS: Array<{ value: LlmInputMode; label: string }> = [
+  { value: 'text', label: '文本' },
+  { value: 'image', label: '图片' },
+];
+
 /** 表单字段（与旧版 f-* 元素一一对应；apiKey / braveKey 只存本次输入，加载时恒为空串） */
 interface SysFields {
   theme: Theme;
@@ -35,6 +43,7 @@ interface SysFields {
   baseUrl: string;
   apiKey: string;
   effort: LlmConfig['effort'];
+  inputModes: LlmConfig['inputModes'];
   searchEnabled: boolean;
   braveKey: string;
   aiWorkdir: boolean;
@@ -50,17 +59,19 @@ interface SysFields {
   notifyLongTasks: boolean;
   timelineSync: boolean;
   autoRecordTerminal: boolean;
+  fileOpenMode: AppSettings['fileOpenMode'];
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
 const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
-  effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
+  effort: 'low', inputModes: ['text'], searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '',
   kbAutoInject: false, kbInjectCount: '5', compactServerList: false,
   sidebarDefault: 'explorer',
   tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true, autoRecordTerminal: false,
   timelineSync: true,
+  fileOpenMode: 'editor-first',
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -226,6 +237,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       baseUrl: s.settings.llm.baseUrl || '',
       apiKey: '', // 已保存的 key 永不回传，留空 = 不修改
       effort: s.settings.llm.effort || 'low',
+      inputModes: s.settings.llm.inputModes?.length ? s.settings.llm.inputModes : ['text'],
       searchEnabled: s.settings.search?.enabled ?? false,
       braveKey: '', // 同上：Brave key 永不回传
       aiWorkdir: s.settings.autoSwitchAiWorkdir ?? true,
@@ -241,6 +253,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       notifyLongTasks: s.settings.notifyLongTasks ?? true,
       timelineSync: s.settings.timelineSyncEnabled ?? true,
       autoRecordTerminal: s.settings.autoRecordTerminal ?? false,
+      fileOpenMode: s.settings.fileOpenMode ?? 'editor-first',
     });
     void refreshMcpStatus();
   };
@@ -320,6 +333,21 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     setTheme(t).catch((err) => toast(`主题保存失败: ${String(err)}`, 'error'));
   };
 
+  /* 输入模式多选：至少保留一项（取消最后一项时提示并保持原状） */
+  const toggleInputMode = (mode: LlmInputMode, on: boolean): void => {
+    setFields((f) => {
+      if (on) {
+        return f.inputModes.includes(mode) ? f : { ...f, inputModes: [...f.inputModes, mode] };
+      }
+      const next = f.inputModes.filter((m) => m !== mode);
+      if (!next.length) {
+        toast('至少保留一种输入模式', 'error');
+        return f;
+      }
+      return { ...f, inputModes: next };
+    });
+  };
+
   const save = async (): Promise<void> => {
     const workspaceDir = fields.workspace.trim();
     if (!workspaceDir) {
@@ -349,6 +377,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       /* 托管模式：baseUrl 由服务器接管，此处保持原值不覆盖 */
       baseUrl: hosted ? (dbRef.current?.settings.llm.baseUrl || '') : fields.baseUrl.trim(),
       effort: fields.effort,
+      inputModes: fields.inputModes.length ? fields.inputModes : ['text'],
     };
     /* 托管模式：密钥输入区隐藏，不修改 keyring（传 null） */
     const apiKey = hosted ? null : (fields.apiKey.trim() || null);
@@ -372,6 +401,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       notifyLongTasks: fields.notifyLongTasks,
       timelineSyncEnabled: fields.timelineSync,
       autoRecordTerminal: fields.autoRecordTerminal,
+      fileOpenMode: fields.fileOpenMode,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -647,6 +677,24 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
               )}
             </fieldset>
             <fieldset className="llm-group">
+              <legend>文件</legend>
+              <div className="field">
+                <label>文件打开方式</label>
+                <select
+                  id="f-file-open-mode"
+                  className="select"
+                  value={fields.fileOpenMode}
+                  onChange={(e) => { const v = e.currentTarget.value as AppSettings['fileOpenMode']; setFields((f) => ({ ...f, fileOpenMode: v })); }}
+                >
+                  <option value="editor-first">内置编辑器优先</option>
+                  <option value="system-first">系统默认应用优先</option>
+                  <option value="explorer">文件资源管理器中打开</option>
+                  <option value="ask">让我选择</option>
+                </select>
+                <div className="hint">双击文件管理器/SFTP 中的文件时生效。内置编辑器优先：文本进内置编辑器、抓包文件进抓包查看器，不支持的类型回退系统默认应用，仍不行则在文件资源管理器中定位；系统默认应用优先同理跳过内置；让我选择：每次双击弹出打开方式选择（内置编辑器不支持的文件只提供系统默认应用/文件资源管理器两个选项）。SFTP 远端文件选系统方式时先下载到临时目录再打开</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
               <legend>SSH 隧道</legend>
               <div className="field">
                 <label>AIShell 启动时自动启动隧道</label>
@@ -728,7 +776,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
             <fieldset className="llm-group">
               <legend>大模型配置</legend>
               {hosted ? (
-                <div className="hint" id="cloud-hosted-llm-note">托管模式下模型与密钥由公司服务器统一管理（<a href="#/account" onClick={(e) => { e.preventDefault(); navigate('#/account'); }}>前往账号页</a>）</div>
+                <div className="hint" id="cloud-hosted-llm-note">托管模式下模型与密钥由公司服务器统一管理，输入模式恒支持文本与图片（<a href="#/account" onClick={(e) => { e.preventDefault(); navigate('#/account'); }}>前往账号页</a>）</div>
               ) : null}
               <div className="field" id="llm-model-field">
                 <label>模型 ID</label>
@@ -803,6 +851,24 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   <option value="max">最高</option>
                 </select>
               </div>
+              {!hosted ? (
+              <div className="field">
+                <label>输入模式</label>
+                <div className="input-mode-row">
+                  {INPUT_MODE_OPTIONS.map((opt) => (
+                    <label key={opt.value}>
+                      <input
+                        type="checkbox"
+                        checked={fields.inputModes.includes(opt.value)}
+                        onChange={(e) => { const on = e.currentTarget.checked; toggleInputMode(opt.value, on); }}
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+                <div className="hint">仅勾选模型实际支持的输入模式；勾选「图片」后才能在 AI 对话中附加图片</div>
+              </div>
+              ) : null}
             </fieldset>
             <fieldset className="llm-group">
               <legend>联网搜索</legend>

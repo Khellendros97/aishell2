@@ -437,6 +437,45 @@ pub async fn sftp_download(
     result
 }
 
+/// 远端文件「系统方式打开」：先下载到临时目录（<temp>/aishell-open/，重名自动改名），
+/// 再按 action 处理——open = 系统默认应用打开（无关联程序时 Err，前端回退 reveal）；
+/// reveal = 在系统文件资源管理器中定位。返回落地本地路径（前端提示用）。
+/// 不发 sftp:progress（临时打开不是传输任务）；目录不适用（SFTP 侧入口已挡目录）。
+#[tauri::command]
+pub async fn sftp_open(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+    remote_path: String,
+    action: String,
+) -> Result<String, String> {
+    if remote_path.trim().is_empty() {
+        return Err("远端路径不能为空".to_string());
+    }
+    let sftp = ssh.inner().open_sftp(&server_id).await?;
+    let md = sftp
+        .metadata(&remote_path)
+        .await
+        .map_err(|e| format!("读取远端 {remote_path} 失败: {e}"))?;
+    if md.is_dir() {
+        return Err("目录不能用系统方式打开".to_string());
+    }
+    let dir = std::env::temp_dir().join("aishell-open");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建临时目录 {} 失败: {e}", dir.display()))?;
+    let local = download_one(&sftp, &remote_path, &dir, None).await?;
+    match action.as_str() {
+        "open" => tauri_plugin_opener::open_path(&local, None::<&str>).map_err(|e| {
+            format!(
+                "没有能打开「{}」的默认应用：{e}",
+                remote_path.rsplit('/').next().unwrap_or(&remote_path)
+            )
+        })?,
+        "reveal" => crate::fsops::fs_reveal(local.clone())?,
+        other => return Err(format!("未知的打开动作「{other}」（支持 open / reveal）")),
+    }
+    Ok(local)
+}
+
 /// 递归下载一个远端文件或目录（async 递归需装箱，见 inner），返回落地完整路径。
 /// progress 为可选进度回调：目录递归内每个文件均上报（FileDone），文件流式拷贝报 Bytes。
 /// pub(crate)：ai_actions 的 AI 下载复用（不改变手动 sftp_download 语义）。

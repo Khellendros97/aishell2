@@ -420,25 +420,26 @@ fn hosted_llm_base(server_url: &str) -> String {
 }
 
 /// 构造 pi 的 models.json 内容（providers.deepseek + 单模型）。
-/// reasoning：v4 系列与 reasoner 支持思考档位，deepseek-chat 等旧模型不支持（pi 会强制 thinking off）。
-/// input：vision 模型声明图片输入能力（pi 默认 input=["text"]，不声明时 RPC images 会被拒）；
-/// 启发式与前端 ai-engine.ts supportsVision 保持一致（模型 id 小写含 "vision"；
-/// 云分支补充：托管代理的 deepseek-v4-flash 上游已切换为多模态模型、对外 id 未变，同样视为支持图片）。
+/// reasoning：v4 系列、reasoner 与 deepseek-flash 支持思考档位，deepseek-chat 等旧模型不支持（pi 会强制 thinking off）。
+/// input：设置-大模型配置「输入模式」勾选「图片」时声明图片输入（pi 默认 input=["text"]，不声明时 RPC images 会被拒）；
+/// 判定看 LlmConfig.input_modes，与前端 ai-engine.ts supportsImageInput 同源，不再按模型 id 猜测。
+/// 云分支：托管模式上游模型恒支持文本+图片，无论配置如何都声明双模式（个人模式按配置）。
 /// hosted_base：托管模式传云服务器地址（Some），baseUrl/apiKey/compat 走公司代理；
 /// 个人模式传 None，维持本地 baseUrl + $DEEPSEEK_API_KEY。
 fn models_json_for(cfg: &crate::store::LlmConfig, hosted_base: Option<&str>) -> serde_json::Value {
     let model_id = &cfg.model_id;
     let id_lower = model_id.to_lowercase();
-    let reasoning = id_lower.contains("reasoner") || id_lower.contains("v4");
+    let reasoning = id_lower.contains("deepseek-flash")
+        || id_lower.contains("reasoner")
+        || id_lower.contains("v4");
     let hosted = hosted_base.is_some();
-    let input_images = id_lower.contains("vision") || (hosted && id_lower == "deepseek-v4-flash");
     let mut model = json!({
         "id": model_id,
         "name": model_id,
         "reasoning": reasoning,
         "contextWindow": 64000,
     });
-    if input_images {
+    if hosted || cfg.supports_image_input() {
         model["input"] = json!(["text", "image"]);
     }
     let (base_url, api_key_env) = match hosted_base {
@@ -3797,64 +3798,49 @@ mod tests {
         assert_eq!(s2, "default");
     }
 
-    /// models.json：vision 模型声明 input=["text","image"]，非 vision 模型不带该字段；
-    /// apiKey 永远是 $DEEPSEEK_API_KEY 占位（真实密钥只经环境变量进 pi）。
+    /// models.json：输入模式勾选「图片」才声明 input=["text","image"]（配置驱动，非模型 id 猜测）；
+    /// 托管模式恒声明双模式（上游模型支持识图）；apiKey 永远是占位（真实密钥只经环境变量进 pi）。
     #[test]
-    fn models_json_declares_image_input_for_vision_models() {
-        let vision = models_json_for(
-            &crate::store::LlmConfig {
-                model_id: "deepseek-v4-flash-vision-exp".to_string(),
-                base_url: "https://api.deepseek.com/v1/".to_string(),
-                effort: crate::store::Effort::Low,
-            },
+    fn models_json_declares_image_input_per_config() {
+        use crate::store::InputMode;
+        let llm = |model_id: &str, input_modes: Vec<InputMode>| crate::store::LlmConfig {
+            model_id: model_id.to_string(),
+            base_url: "https://api.deepseek.com/v1/".to_string(),
+            effort: crate::store::Effort::Low,
+            input_modes,
+        };
+        let with_image = models_json_for(
+            &llm("deepseek-flash", vec![InputMode::Text, InputMode::Image]),
             None,
         );
-        let model = &vision["providers"]["deepseek"]["models"][0];
-        assert_eq!(model["input"], json!(["text", "image"]), "vision 模型应声明图片输入");
-        assert_eq!(model["id"], "deepseek-v4-flash-vision-exp");
-        assert_eq!(vision["providers"]["deepseek"]["baseUrl"], "https://api.deepseek.com/v1", "尾部斜杠应去除");
-        assert_eq!(vision["providers"]["deepseek"]["apiKey"], "$DEEPSEEK_API_KEY");
+        let model = &with_image["providers"]["deepseek"]["models"][0];
+        assert_eq!(model["input"], json!(["text", "image"]), "勾选图片应声明图片输入");
+        assert_eq!(model["id"], "deepseek-flash");
+        assert_eq!(model["reasoning"], true, "deepseek-flash 支持思考档位");
+        assert_eq!(with_image["providers"]["deepseek"]["baseUrl"], "https://api.deepseek.com/v1", "尾部斜杠应去除");
+        assert_eq!(with_image["providers"]["deepseek"]["apiKey"], "$DEEPSEEK_API_KEY");
 
-        let text_only = models_json_for(
-            &crate::store::LlmConfig {
-                model_id: "deepseek-chat".to_string(),
-                base_url: "https://api.deepseek.com/v1".to_string(),
-                effort: crate::store::Effort::Low,
-            },
-            None,
-        );
+        let text_only = models_json_for(&llm("deepseek-chat", vec![InputMode::Text]), None);
         let model = &text_only["providers"]["deepseek"]["models"][0];
-        assert!(model.get("input").is_none(), "非 vision 模型不应带 input 字段");
+        assert!(model.get("input").is_none(), "未勾选图片不应带 input 字段");
         assert_eq!(model["reasoning"], false, "deepseek-chat 不支持思考档位");
-        assert_eq!(vision["providers"]["deepseek"]["models"][0]["reasoning"], true, "v4 系列支持思考档位");
 
-        // 云分支：托管代理的 deepseek-v4-flash（对外 id 未变，上游已支持识图）应声明图片输入；
-        // 同名模型在个人模式直连官方 API 时仍视为纯文本。
+        // 云分支：托管模式恒声明双模式（即使配置为纯文本）；个人模式按配置。
         let hosted = models_json_for(
-            &crate::store::LlmConfig {
-                model_id: "deepseek-v4-flash".to_string(),
-                base_url: "https://api.deepseek.com/v1".to_string(),
-                effort: crate::store::Effort::Low,
-            },
+            &llm("deepseek-v4-flash", vec![InputMode::Text]),
             Some("https://cloud.example.com/"),
         );
         let model = &hosted["providers"]["deepseek"]["models"][0];
-        assert_eq!(model["input"], json!(["text", "image"]), "托管默认模型应声明图片输入");
+        assert_eq!(model["input"], json!(["text", "image"]), "托管模式应声明图片输入");
+        assert_eq!(model["reasoning"], true, "v4 系列支持思考档位");
         assert_eq!(hosted["providers"]["deepseek"]["baseUrl"], "https://cloud.example.com/api/proxy/llm/v1");
         assert_eq!(hosted["providers"]["deepseek"]["apiKey"], "$AISHELL_CLOUD_TOKEN");
         assert_eq!(hosted["providers"]["deepseek"]["compat"]["supportsDeveloperRole"], false);
 
-        let personal = models_json_for(
-            &crate::store::LlmConfig {
-                model_id: "deepseek-v4-flash".to_string(),
-                base_url: "https://api.deepseek.com/v1".to_string(),
-                effort: crate::store::Effort::Low,
-            },
-            None,
-        );
+        let personal = models_json_for(&llm("deepseek-v4-flash", vec![InputMode::Text]), None);
         assert!(
             personal["providers"]["deepseek"]["models"][0].get("input").is_none(),
-            "个人模式 deepseek-v4-flash（官方上游）不应声明图片输入"
+            "个人模式未勾选图片不应声明图片输入"
         );
     }
 

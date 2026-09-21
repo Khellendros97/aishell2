@@ -60,7 +60,7 @@ const welcomeLogoUrl = new URL('../../assets/logo.svg', import.meta.url).href;
 const EMPTY_STATE: AppState = {
   settings: {
     workspaceDir: null,
-    llm: { modelId: '', baseUrl: '', effort: 'low' },
+    llm: { modelId: '', baseUrl: '', effort: 'low', inputModes: ['text'] },
     search: { enabled: false },
     theme: 'dark',
     autoSwitchAiWorkdir: true,
@@ -75,6 +75,7 @@ const EMPTY_STATE: AppState = {
     notifyLongTasks: true,
     timelineSyncEnabled: true,
     autoRecordTerminal: false, sidebarDefault: 'explorer',
+    fileOpenMode: 'editor-first',
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},

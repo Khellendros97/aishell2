@@ -13,6 +13,8 @@ export interface LlmConfig {
   baseUrl: string;
   /** v4 系列思考档位；旧配置的 medium 后端已兼容映射为 low */
   effort: 'low' | 'high' | 'max';
+  /** 输入模式（多选，至少「文本」）：勾选「图片」才允许发送图片附件；旧配置由后端按模型 id 推导补齐 */
+  inputModes: Array<'text' | 'image'>;
 }
 
 export interface SearchConfig {
@@ -76,6 +78,8 @@ export interface Settings {
   timelineSyncEnabled: boolean;
   /** 自动录制终端：开启后每个终端会话建立时自动开始录制日志（可手动停止）；旧配置无此字段按关闭 */
   autoRecordTerminal: boolean;
+  /** 文件打开方式（双击 explorer/SFTP 文件时生效）；旧配置无此字段按内置编辑器优先 */
+  fileOpenMode: 'editor-first' | 'system-first' | 'explorer' | 'ask';
 }
 
 /** 云服务接入模式（与 store.rs CloudMode serde lowercase 对齐） */

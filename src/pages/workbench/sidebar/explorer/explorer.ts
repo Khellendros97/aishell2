@@ -32,7 +32,7 @@
 import { icon } from '../../../../icons';
 import {
   cloudBackupStart, cloudStatus, cloudSyncStatus,
-  fsCopy, fsCreate, fsDelete, fsImport, fsIsText, fsList, fsMove, fsReveal, fsStat,
+  fsCopy, fsCreate, fsDelete, fsImport, fsIsText, fsList, fsMove, fsOpenDefault, fsReveal, fsStat,
   sftpDelete, sftpDownload, sftpUpload,
 } from '../../../../api';
 import type { FsStat } from '../../../../types';
@@ -42,6 +42,7 @@ import {
 import {
   DND_MIME, getActiveTab, tabApis, useWorkbench, wbEvents, wbHandles,
 } from '../../../../stores/workbench';
+import { runWithOpenMode } from '../../../../shared/openWithMode';
 import { clearClip, getClip, setClip } from '../../clipboard';
 import { openLocalFile } from '../../tabs/EditorTab';
 import { isPcapName, openLocalPcap } from '../../tabs/PcapTab';
@@ -255,10 +256,19 @@ async function openNode(node: TreeNode): Promise<void> {
     return;
   }
   try {
-    // 抓包文件优先进 pcap 查看器（魔数由后端 pcap_read 兜底校验）
-    if (isPcapName(node.name)) { openLocalPcap(node.path, node.name); return; }
-    if (await fsIsText(node.path)) openLocalFile(node.path, node.name);
-    else await fsReveal(node.path);
+    /* 文件打开方式（设置-功能特性）：内置处理器（pcap 查看器 / 编辑器）→ 系统默认应用 →
+       资源管理器的回退链或「让我选择」弹窗，统一走 runWithOpenMode（shared/openWithMode.ts） */
+    const pcap = isPcapName(node.name);
+    await runWithOpenMode(node.name, {
+      builtinSupported: pcap || fsIsText(node.path).catch(() => false),
+      builtinLabel: pcap ? '抓包查看器' : '内置编辑器',
+      openBuiltin: () => {
+        if (pcap) openLocalPcap(node.path, node.name);
+        else openLocalFile(node.path, node.name);
+      },
+      openSystem: () => fsOpenDefault(node.path),
+      openExplorer: () => fsReveal(node.path),
+    });
   } catch (err) {
     toast(String(err), 'error');
   }
@@ -575,6 +585,12 @@ function showNodeMenu(x: number, y: number, node: TreeNode, row: HTMLElement): v
   const uploadItems = sftpUploadItems(node.path, node.name);
   showContextMenu(x, y, [
     { label: '打开', iconName: node.isDir ? 'folder' : 'file', action: () => void openNode(node) },
+    ...(!node.isDir
+      ? [{
+          label: '使用系统默认应用打开', iconName: 'appWindow' as const,
+          action: () => void fsOpenDefault(node.path).catch((err) => toast(String(err), 'error')),
+        }]
+      : []),
     ...(!node.isDir && isPcapName(node.name)
       ? [{ label: '在抓包查看器中打开', iconName: 'activity' as const, action: () => { openLocalPcap(node.path, node.name); } }]
       : []),

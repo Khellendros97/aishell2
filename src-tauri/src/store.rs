@@ -50,22 +50,59 @@ impl<'de> Deserialize<'de> for Effort {
     }
 }
 
+/// 模型输入模式（多选）；文本恒可用，图片由模型能力决定——
+/// 勾选「图片」时 pi 的 models.json 才声明 input=["text","image"]，前端才放行图片附件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputMode {
+    Text,
+    Image,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmConfig {
     pub model_id: String,
     pub base_url: String,
     pub effort: Effort,
+    /// 输入模式（多选，至少文本）；旧配置无此字段时启动按模型 id 推导补齐（见 normalize_input_modes）
+    #[serde(default)]
+    pub input_modes: Vec<InputMode>,
 }
 
-/// 云端分支：对外模型 id 保持 deepseek-v4-flash 不变（上游已切换为支持识图的模型，
-/// 见 ai.rs models_json_for 的 vision 声明），因此不引入 main 的 vision-exp 默认值迁移。
+/// 云端分支：对外模型 id 保持 deepseek-v4-flash 不变（托管上游已切换为支持识图的模型），
+/// 因此不引入 main 的 deepseek-flash 默认值与旧默认迁移；输入模式机制沿用 main 的
+/// input_modes：个人模式按配置声明，托管模式恒支持文本+图片（见 ai.rs models_json_for）。
+impl LlmConfig {
+    /// 是否支持图片输入（设置-大模型配置「输入模式」勾选了「图片」）。
+    pub fn supports_image_input(&self) -> bool {
+        self.input_modes.contains(&InputMode::Image)
+    }
+
+    /// 输入模式归一化：空列表（旧配置缺省字段）按模型 id 推导补齐，返回是否发生变更。
+    /// 推导规则沿用旧启发式：id 含 vision / deepseek-flash 视为支持图片，否则纯文本。
+    pub fn normalize_input_modes(&mut self) -> bool {
+        if !self.input_modes.is_empty() {
+            return false;
+        }
+        let id = self.model_id.to_lowercase();
+        self.input_modes = if id.contains("vision") || id.contains("deepseek-flash") {
+            vec![InputMode::Text, InputMode::Image]
+        } else {
+            vec![InputMode::Text]
+        };
+        true
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             model_id: "deepseek-v4-flash".to_string(),
             base_url: "https://api.deepseek.com/v1".to_string(),
             effort: Effort::Low,
+            // 默认按个人模式纯文本；托管模式由 models_json_for 强制声明双模式
+            input_modes: vec![InputMode::Text],
         }
     }
 }
@@ -261,6 +298,10 @@ pub struct Settings {
     /// 旧配置无此字段时按本地文件处理（保持原行为）。
     #[serde(default)]
     pub sidebar_default: SidebarDefault,
+    /// 文件打开方式（内置编辑器优先/系统默认应用优先/文件资源管理器/让我选择）；
+    /// 旧配置无此字段时按内置编辑器优先处理（保持原行为）。
+    #[serde(default)]
+    pub file_open_mode: FileOpenMode,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -288,6 +329,7 @@ impl Default for Settings {
             timeline_sync_enabled: true,
             auto_record_terminal: false,
             sidebar_default: SidebarDefault::default(),
+            file_open_mode: FileOpenMode::default(),
         }
     }
 }
@@ -325,6 +367,21 @@ pub enum ApprovalMode {
     #[default]
     Smart,
     All,
+}
+
+/// 文件打开方式（全局设置，双击 explorer/SFTP 里的文件时生效）：
+/// - EditorFirst（默认）：内置编辑器/查看器优先 → 不支持回退系统默认应用 → 再回退文件资源管理器；
+/// - SystemFirst：系统默认应用优先 → 不支持回退文件资源管理器；
+/// - Explorer：直接在系统文件资源管理器中定位（远端文件先下载到临时目录）；
+/// - Ask：双击时弹窗让用户选（内置编辑器不支持的文件不显示该选项）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileOpenMode {
+    #[default]
+    EditorFirst,
+    SystemFirst,
+    Explorer,
+    Ask,
 }
 
 impl ApprovalMode {
@@ -1672,6 +1729,7 @@ impl Store {
         // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
         // 加载时按现行规则清洗，有变更立即原子写回。
         // （云分支不做默认模型迁移：对外模型 id 仍是 deepseek-v4-flash，无需升级。）
+        // 沿用 main 的输入模式机制：补齐旧配置缺失的 inputModes（按模型 id 推导，见 normalize_input_modes）。
         let known = store.known_secrets();
         let dirty = {
             let mut guard = store
@@ -1679,6 +1737,7 @@ impl Store {
                 .lock()
                 .map_err(|_| "store 状态锁损坏".to_string())?;
             let mut dirty = false;
+            dirty |= guard.settings.llm.normalize_input_modes();
             for sess in guard.sessions.values_mut().flatten() {
                 if redact_session(sess, &known) {
                     dirty = true;
@@ -1870,6 +1929,11 @@ impl Store {
         }
         if let Some(key) = brave_key {
             self.secrets.set(KEYRING_ACCOUNT_BRAVE, key)?;
+        }
+        let mut settings = settings;
+        // 输入模式空列表兜底：至少保留文本（前端已拦，防御其他调用方）
+        if settings.llm.input_modes.is_empty() {
+            settings.llm.input_modes = vec![InputMode::Text];
         }
         self.with_state(|s| {
             // 先播种（失败 → 闭包返回 Err，s.settings 与播种记录均未变更，整体回滚）
@@ -4035,6 +4099,7 @@ mod tests {
                 timeline_sync_enabled: true,
                 auto_record_terminal: false,
                 sidebar_default: crate::store::SidebarDefault::default(),
+                file_open_mode: crate::store::FileOpenMode::default(),
             },
             credentials: vec![
                 Credential {
@@ -4271,6 +4336,11 @@ mod tests {
         assert_eq!(guard.settings.llm.model_id, "deepseek-v4-flash");
         assert_eq!(guard.settings.llm.base_url, "https://api.deepseek.com/v1");
         assert_eq!(guard.settings.llm.effort, Effort::Low);
+        assert_eq!(
+            guard.settings.llm.input_modes,
+            vec![InputMode::Text],
+            "默认配置按个人模式纯文本；托管模式由 models_json_for 强制双模式"
+        );
         assert!(guard.servers.is_empty());
         assert!(guard.projects.is_empty());
         assert!(guard.sessions.is_empty());
@@ -7130,6 +7200,7 @@ mod tests {
                         model_id: "deepseek-reasoner".to_string(),
                         base_url: "https://api.deepseek.com/v1".to_string(),
                         effort: Effort::High,
+                        input_modes: vec![InputMode::Text],
                     },
                     search: SearchConfig { enabled: false },
                     theme: Theme::Dark,
@@ -7150,6 +7221,7 @@ mod tests {
                     timeline_sync_enabled: true,
                     auto_record_terminal: false,
                     sidebar_default: crate::store::SidebarDefault::default(),
+                    file_open_mode: crate::store::FileOpenMode::default(),
                 },
                 Some("sk-test-key"),
                 None,
@@ -7355,6 +7427,7 @@ mod tests {
                     timeline_sync_enabled: true,
                     auto_record_terminal: false,
                     sidebar_default: crate::store::SidebarDefault::default(),
+                    file_open_mode: crate::store::FileOpenMode::default(),
                 },
                 None,
                 Some("bsk-1"),
@@ -7392,6 +7465,8 @@ mod tests {
         let old = r#"{"workspaceDir":"C:\\ws","llm":{"modelId":"deepseek-chat","baseUrl":"https://api.deepseek.com/v1","effort":"medium"},"theme":"dark"}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
         assert!(!s.search.enabled);
+        // 旧配置无 inputModes 字段 → 反序列化为空，启动时由 normalize_input_modes 按模型 id 推导补齐
+        assert!(s.llm.input_modes.is_empty());
         // 旧配置无 autoSwitchAiWorkdir 字段 → 默认开启（无感升级）
         assert!(s.auto_switch_ai_workdir);
         // 旧配置无 approvalMode 字段 → 默认智能审批（无感升级，且默认不扩大打扰）
@@ -8367,6 +8442,45 @@ mod tests {
         // 中文清单
         let labels = on.enabled_labels();
         assert_eq!(labels, vec!["执行命令", "数据库查询"]);
+    }
+
+    /// 旧配置缺 inputModes 字段：加载时按模型 id 推导补齐（云分支不做默认模型迁移，
+    /// 模型 id 一律保持原值；deepseek-v4-flash 在个人模式推导为纯文本）。
+    #[test]
+    fn legacy_config_input_modes_inferred() {
+        let dir = temp_config_dir("input-modes-infer");
+        let llm = |id: &str| {
+            format!(
+                r#"{{"modelId":"{id}","baseUrl":"https://api.deepseek.com/v1","effort":"low"}}"#
+            )
+        };
+        let wrap = |body: &str| {
+            format!(r#"{{"settings":{{"workspaceDir":null,"llm":{body},"search":{{"enabled":false}},"theme":"dark"}},"servers":[],"projects":[],"sessions":{{}},"projectFolders":[],"commandFolders":[],"uiExpanded":{{}},"sftpHistory":{{}},"sftpFavorites":{{}},"dbConnections":{{}}}}"#)
+        };
+        // 自定义模型名 → 模型名不动；输入模式按旧启发式推导
+        fs::write(dir.join("aishell.json"), wrap(&llm("deepseek-reasoner"))).unwrap();
+        let store = test_store(dir.clone());
+        assert_eq!(
+            store.settings().llm.model_id,
+            "deepseek-reasoner",
+            "自定义模型名不应被迁移"
+        );
+        assert_eq!(store.settings().llm.input_modes, vec![InputMode::Text]);
+        drop(store);
+        fs::write(dir.join("aishell.json"), wrap(&llm("My-Vision-Model"))).unwrap();
+        let store = test_store(dir.clone());
+        assert_eq!(store.settings().llm.model_id, "My-Vision-Model");
+        assert_eq!(
+            store.settings().llm.input_modes,
+            vec![InputMode::Text, InputMode::Image],
+            "自定义 vision 模型应推导出图片输入"
+        );
+        drop(store);
+        // 云分支默认模型 deepseek-v4-flash：不迁移，个人模式推导为纯文本
+        fs::write(dir.join("aishell.json"), wrap(&llm("deepseek-v4-flash"))).unwrap();
+        let store = test_store(dir);
+        assert_eq!(store.settings().llm.model_id, "deepseek-v4-flash");
+        assert_eq!(store.settings().llm.input_modes, vec![InputMode::Text]);
     }
 
     /// 旧会话消息无 imageRefs 字段按空解析；带 imageRefs 的消息往返不丢字段。
