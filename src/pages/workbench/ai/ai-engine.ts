@@ -794,9 +794,9 @@ async function loadImageData(path: string): Promise<{ mime: string; data: string
   return out;
 }
 
-/** 模型是否支持图片输入（启发式与 Rust ai.rs models_json_for 一致：模型 id 小写含 "vision"）。 */
-function supportsVisionModel(modelId: string): boolean {
-  return modelId.toLowerCase().includes('vision');
+/** 模型是否支持图片输入：按设置-大模型配置「输入模式」是否勾选「图片」（与后端 LlmConfig.input_modes 同源，不再按模型 id 猜测）。 */
+function supportsImageInput(llm: LlmConfig): boolean {
+  return Array.isArray(llm.inputModes) && llm.inputModes.includes('image');
 }
 /** 自动切换 AI 工作区域（Settings.autoSwitchAiWorkdir）：开启时输入区固定显示工作区域标签 */
 let autoSwitchAiWorkdir = false;
@@ -1422,7 +1422,7 @@ function createAiHandle() {
     void analyzeTimeline(scope);
   },
   /** 图片附件（explorer/SFTP 右键「添加到对话」对图片文件的入口）：
-   *  物化由 attachImages 统一完成（vision 门槛 / 数量上限 / 后端嗅探都在那里） */
+   *  物化由 attachImages 统一完成（输入模式门槛 / 数量上限 / 后端嗅探都在那里） */
   addImageRef(ref: { source: 'local' | 'remote'; path: string; serverId?: string }): void {
     if (!ref || typeof ref.path !== 'string' || !ref.path.trim()) return;
     void attachImages([
@@ -3841,7 +3841,7 @@ function openBrowserRefModal(ref: BrowserRef | undefined): void {
 
 /* ---------- 输入区 ---------- */
 
-/** 图片附件统一入口：数量上限 → vision 模型门槛 → 后端物化（嗅探+落盘）→ 输入区出 chip。
+/** 图片附件统一入口：数量上限 → 输入模式门槛 → 后端物化（嗅探+落盘）→ 输入区出 chip。
  *  粘贴剪贴板 / explorer、SFTP 拖拽与右键添加共用；失败整批 toast（后端任一项失败即报错）。 */
 async function attachImages(items: AttachImageItem[]): Promise<void> {
   if (!items.length) return;
@@ -3857,8 +3857,8 @@ async function attachImages(items: AttachImageItem[]): Promise<void> {
   }
   try {
     const st = await getState();
-    if (!supportsVisionModel(st.settings.llm.modelId)) {
-      toast('当前模型不支持图片，请先在设置中切换为 vision 模型', 'error');
+    if (!supportsImageInput(st.settings.llm)) {
+      toast('当前模型未启用图片输入，请在设置-大模型配置的「输入模式」中勾选图片', 'error');
       return;
     }
   } catch {

@@ -24,6 +24,14 @@ import { applyTheme, currentTheme, onThemeChange } from '../../theme';
 import { Statusbar } from '../../components/Statusbar';
 import '../settings.css';
 
+/** 模型输入模式选项（设置-大模型配置「输入模式」多选；值与后端 InputMode 对齐） */
+type LlmInputMode = LlmConfig['inputModes'][number];
+/** 输入模式候选（文本恒可用，图片由模型能力决定） */
+const INPUT_MODE_OPTIONS: Array<{ value: LlmInputMode; label: string }> = [
+  { value: 'text', label: '文本' },
+  { value: 'image', label: '图片' },
+];
+
 /** 表单字段（与旧版 f-* 元素一一对应；apiKey / braveKey 只存本次输入，加载时恒为空串） */
 interface SysFields {
   theme: Theme;
@@ -32,6 +40,7 @@ interface SysFields {
   baseUrl: string;
   apiKey: string;
   effort: LlmConfig['effort'];
+  inputModes: LlmConfig['inputModes'];
   searchEnabled: boolean;
   braveKey: string;
   aiWorkdir: boolean;
@@ -49,7 +58,7 @@ interface SysFields {
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
 const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
-  effort: 'low', searchEnabled: false, braveKey: '', aiWorkdir: false,
+  effort: 'low', inputModes: ['text'], searchEnabled: false, braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '', compactServerList: false,
   sidebarDefault: 'explorer',
   tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true, autoRecordTerminal: false,
@@ -192,6 +201,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       baseUrl: s.settings.llm.baseUrl || '',
       apiKey: '', // 已保存的 key 永不回传，留空 = 不修改
       effort: s.settings.llm.effort || 'low',
+      inputModes: s.settings.llm.inputModes?.length ? s.settings.llm.inputModes : ['text'],
       searchEnabled: s.settings.search?.enabled ?? false,
       braveKey: '', // 同上：Brave key 永不回传
       aiWorkdir: s.settings.autoSwitchAiWorkdir ?? true,
@@ -257,6 +267,21 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     setTheme(t).catch((err) => toast(`主题保存失败: ${String(err)}`, 'error'));
   };
 
+  /* 输入模式多选：至少保留一项（取消最后一项时提示并保持原状） */
+  const toggleInputMode = (mode: LlmInputMode, on: boolean): void => {
+    setFields((f) => {
+      if (on) {
+        return f.inputModes.includes(mode) ? f : { ...f, inputModes: [...f.inputModes, mode] };
+      }
+      const next = f.inputModes.filter((m) => m !== mode);
+      if (!next.length) {
+        toast('至少保留一种输入模式', 'error');
+        return f;
+      }
+      return { ...f, inputModes: next };
+    });
+  };
+
   const save = async (): Promise<void> => {
     const workspaceDir = fields.workspace.trim();
     if (!workspaceDir) {
@@ -278,6 +303,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       modelId: fields.modelId.trim(),
       baseUrl: fields.baseUrl.trim(),
       effort: fields.effort,
+      inputModes: fields.inputModes.length ? fields.inputModes : ['text'],
     };
     const apiKey = fields.apiKey.trim();
     const braveKey = fields.braveKey.trim();
@@ -551,7 +577,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 <input
                   id="f-model-id"
                   className="input"
-                  placeholder="deepseek-v4-flash-vision-exp"
+                  placeholder="deepseek-flash"
                   value={fields.modelId}
                   onInput={(e) => { const v = e.currentTarget.value; setFields((f) => ({ ...f, modelId: v })); }}
                 />
@@ -602,6 +628,22 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   <option value="high">高</option>
                   <option value="max">最高</option>
                 </select>
+              </div>
+              <div className="field">
+                <label>输入模式</label>
+                <div className="input-mode-row">
+                  {INPUT_MODE_OPTIONS.map((opt) => (
+                    <label key={opt.value}>
+                      <input
+                        type="checkbox"
+                        checked={fields.inputModes.includes(opt.value)}
+                        onChange={(e) => { const on = e.currentTarget.checked; toggleInputMode(opt.value, on); }}
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+                <div className="hint">仅勾选模型实际支持的输入模式；勾选「图片」后才能在 AI 对话中附加图片</div>
               </div>
             </fieldset>
             <fieldset className="llm-group">

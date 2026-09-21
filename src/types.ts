@@ -13,6 +13,8 @@ export interface LlmConfig {
   baseUrl: string;
   /** v4 系列思考档位；旧配置的 medium 后端已兼容映射为 low */
   effort: 'low' | 'high' | 'max';
+  /** 输入模式（多选，至少「文本」）：勾选「图片」才允许发送图片附件；旧配置由后端按模型 id 推导补齐 */
+  inputModes: Array<'text' | 'image'>;
 }
 
 export interface SearchConfig {

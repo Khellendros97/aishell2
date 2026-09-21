@@ -50,23 +50,58 @@ impl<'de> Deserialize<'de> for Effort {
     }
 }
 
+/// 模型输入模式（多选）；文本恒可用，图片由模型能力决定——
+/// 勾选「图片」时 pi 的 models.json 才声明 input=["text","image"]，前端才放行图片附件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputMode {
+    Text,
+    Image,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmConfig {
     pub model_id: String,
     pub base_url: String,
     pub effort: Effort,
+    /// 输入模式（多选，至少文本）；旧配置无此字段时启动按模型 id 推导补齐（见 normalize_input_modes）
+    #[serde(default)]
+    pub input_modes: Vec<InputMode>,
 }
 
-/// 上一代默认模型；配置里仍为此值时加载迁移为当前默认（用户自定义模型名不动）。
-pub const LEGACY_DEFAULT_MODEL_ID: &str = "deepseek-v4-flash";
+/// 历代默认模型；配置里仍为其中之一时加载迁移为当前默认（用户自定义模型名不动）。
+pub const LEGACY_DEFAULT_MODEL_IDS: &[&str] = &["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"];
+
+impl LlmConfig {
+    /// 是否支持图片输入（设置-大模型配置「输入模式」勾选了「图片」）。
+    pub fn supports_image_input(&self) -> bool {
+        self.input_modes.contains(&InputMode::Image)
+    }
+
+    /// 输入模式归一化：空列表（旧配置缺省字段）按模型 id 推导补齐，返回是否发生变更。
+    /// 推导规则沿用旧启发式：id 含 vision / deepseek-flash 视为支持图片，否则纯文本。
+    pub fn normalize_input_modes(&mut self) -> bool {
+        if !self.input_modes.is_empty() {
+            return false;
+        }
+        let id = self.model_id.to_lowercase();
+        self.input_modes = if id.contains("vision") || id.contains("deepseek-flash") {
+            vec![InputMode::Text, InputMode::Image]
+        } else {
+            vec![InputMode::Text]
+        };
+        true
+    }
+}
 
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            model_id: "deepseek-v4-flash-vision-exp".to_string(),
+            model_id: "deepseek-flash".to_string(),
             base_url: "https://api.deepseek.com/v1".to_string(),
             effort: Effort::Low,
+            input_modes: vec![InputMode::Text, InputMode::Image],
         }
     }
 }
@@ -1451,8 +1486,9 @@ impl Store {
         }
         // 历史会话一次性脱敏迁移：旧版本可能把配置里的凭据明文落盘（违反硬约束）；
         // 加载时按现行规则清洗，有变更立即原子写回。
-        // 同时做默认模型迁移：配置里还是上一代默认值时升级为当前默认（vision 模型），
+        // 同时做默认模型迁移：配置里还是历代默认值时升级为当前默认，
         // 用户显式改过的其他模型名不受影响。
+        // 并补齐旧配置缺失的输入模式（按模型 id 推导，见 normalize_input_modes）。
         let known = store.known_secrets();
         let dirty = {
             let mut guard = store
@@ -1460,10 +1496,11 @@ impl Store {
                 .lock()
                 .map_err(|_| "store 状态锁损坏".to_string())?;
             let mut dirty = false;
-            if guard.settings.llm.model_id == LEGACY_DEFAULT_MODEL_ID {
+            if LEGACY_DEFAULT_MODEL_IDS.contains(&guard.settings.llm.model_id.as_str()) {
                 guard.settings.llm.model_id = LlmConfig::default().model_id;
                 dirty = true;
             }
+            dirty |= guard.settings.llm.normalize_input_modes();
             for sess in guard.sessions.values_mut().flatten() {
                 if redact_session(sess, &known) {
                     dirty = true;
@@ -1638,6 +1675,11 @@ impl Store {
         }
         if let Some(key) = brave_key {
             self.secrets.set(KEYRING_ACCOUNT_BRAVE, key)?;
+        }
+        let mut settings = settings;
+        // 输入模式空列表兜底：至少保留文本（前端已拦，防御其他调用方）
+        if settings.llm.input_modes.is_empty() {
+            settings.llm.input_modes = vec![InputMode::Text];
         }
         self.with_state(|s| {
             // 先播种（失败 → 闭包返回 Err，s.settings 与播种记录均未变更，整体回滚）
@@ -3879,9 +3921,14 @@ mod tests {
         let store = test_store(dir);
         let guard = store.state.lock().unwrap();
         assert_eq!(guard.settings.workspace_dir, None);
-        assert_eq!(guard.settings.llm.model_id, "deepseek-v4-flash-vision-exp");
+        assert_eq!(guard.settings.llm.model_id, "deepseek-flash");
         assert_eq!(guard.settings.llm.base_url, "https://api.deepseek.com/v1");
         assert_eq!(guard.settings.llm.effort, Effort::Low);
+        assert_eq!(
+            guard.settings.llm.input_modes,
+            vec![InputMode::Text, InputMode::Image],
+            "默认模型 deepseek-flash 支持图片输入"
+        );
         assert!(guard.servers.is_empty());
         assert!(guard.projects.is_empty());
         assert!(guard.sessions.is_empty());
@@ -6666,6 +6713,7 @@ mod tests {
                         model_id: "deepseek-reasoner".to_string(),
                         base_url: "https://api.deepseek.com/v1".to_string(),
                         effort: Effort::High,
+                        input_modes: vec![InputMode::Text],
                     },
                     search: SearchConfig { enabled: false },
                     theme: Theme::Dark,
@@ -6914,6 +6962,8 @@ mod tests {
         let old = r#"{"workspaceDir":"C:\\ws","llm":{"modelId":"deepseek-chat","baseUrl":"https://api.deepseek.com/v1","effort":"medium"},"theme":"dark"}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
         assert!(!s.search.enabled);
+        // 旧配置无 inputModes 字段 → 反序列化为空，启动时由 normalize_input_modes 按模型 id 推导补齐
+        assert!(s.llm.input_modes.is_empty());
         // 旧配置无 autoSwitchAiWorkdir 字段 → 默认开启（无感升级）
         assert!(s.auto_switch_ai_workdir);
         // 旧配置无 approvalMode 字段 → 默认智能审批（无感升级，且默认不扩大打扰）
@@ -7706,45 +7756,57 @@ mod tests {
         assert_eq!(labels, vec!["执行命令", "数据库查询"]);
     }
 
-    /// 默认模型迁移：配置里仍是上一代默认值时加载即升级；用户自定义模型名不动。
+    /// 默认模型迁移：配置里仍是历代默认值时加载即升级；用户自定义模型名不动。
     #[test]
-    fn legacy_default_model_migrates_to_vision() {
+    fn legacy_default_model_migrates_to_current() {
         let dir = temp_config_dir("model-migrate");
         let llm = |id: &str| {
             format!(
                 r#"{{"modelId":"{id}","baseUrl":"https://api.deepseek.com/v1","effort":"low"}}"#
             )
         };
-        // 旧默认 → 升级并写回
-        fs::write(
-            dir.join("aishell.json"),
-            format!(r#"{{"settings":{{"workspaceDir":null,"llm":{},"search":{{"enabled":false}},"theme":"dark"}},"servers":[],"projects":[],"sessions":{{}},"projectFolders":[],"commandFolders":[],"uiExpanded":{{}},"sftpHistory":{{}},"sftpFavorites":{{}},"dbConnections":{{}}}}"#, llm(LEGACY_DEFAULT_MODEL_ID)),
-        )
-        .unwrap();
-        let store = test_store(dir.clone());
-        assert_eq!(
-            store.settings().llm.model_id,
-            LlmConfig::default().model_id,
-            "旧默认值应升级为当前默认"
-        );
-        drop(store);
-        let raw = fs::read_to_string(dir.join("aishell.json")).unwrap();
-        assert!(
-            raw.contains("deepseek-v4-flash-vision-exp"),
-            "迁移应写回配置文件"
-        );
+        let wrap = |body: &str| {
+            format!(r#"{{"settings":{{"workspaceDir":null,"llm":{body},"search":{{"enabled":false}},"theme":"dark"}},"servers":[],"projects":[],"sessions":{{}},"projectFolders":[],"commandFolders":[],"uiExpanded":{{}},"sftpHistory":{{}},"sftpFavorites":{{}},"dbConnections":{{}}}}"#)
+        };
+        // 历代默认 → 升级并写回；旧配置无 inputModes，按推导规则随新默认模型补齐图片输入
+        for legacy in LEGACY_DEFAULT_MODEL_IDS {
+            fs::write(dir.join("aishell.json"), wrap(&llm(legacy))).unwrap();
+            let store = test_store(dir.clone());
+            assert_eq!(
+                store.settings().llm.model_id,
+                LlmConfig::default().model_id,
+                "旧默认值 {legacy} 应升级为当前默认"
+            );
+            assert_eq!(
+                store.settings().llm.input_modes,
+                vec![InputMode::Text, InputMode::Image],
+                "缺省输入模式应按当前默认模型推导为含图片"
+            );
+            drop(store);
+            let raw = fs::read_to_string(dir.join("aishell.json")).unwrap();
+            assert!(
+                raw.contains("deepseek-flash"),
+                "迁移应写回配置文件"
+            );
+        }
 
-        // 自定义模型名 → 不动
-        fs::write(
-            dir.join("aishell.json"),
-            format!(r#"{{"settings":{{"workspaceDir":null,"llm":{},"search":{{"enabled":false}},"theme":"dark"}},"servers":[],"projects":[],"sessions":{{}},"projectFolders":[],"commandFolders":[],"uiExpanded":{{}},"sftpHistory":{{}},"sftpFavorites":{{}},"dbConnections":{{}}}}"#, llm("deepseek-reasoner")),
-        )
-        .unwrap();
+        // 自定义模型名 → 模型名不动；输入模式按旧启发式推导（vision → 含图片）
+        fs::write(dir.join("aishell.json"), wrap(&llm("deepseek-reasoner"))).unwrap();
         let store = test_store(dir.clone());
         assert_eq!(
             store.settings().llm.model_id,
             "deepseek-reasoner",
             "自定义模型名不应被迁移"
+        );
+        assert_eq!(store.settings().llm.input_modes, vec![InputMode::Text]);
+        drop(store);
+        fs::write(dir.join("aishell.json"), wrap(&llm("My-Vision-Model"))).unwrap();
+        let store = test_store(dir);
+        assert_eq!(store.settings().llm.model_id, "My-Vision-Model");
+        assert_eq!(
+            store.settings().llm.input_modes,
+            vec![InputMode::Text, InputMode::Image],
+            "自定义 vision 模型应推导出图片输入"
         );
     }
 

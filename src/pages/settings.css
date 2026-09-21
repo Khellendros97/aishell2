@@ -57,6 +57,13 @@
 
 .settings-page .form-actions { margin-top: 18px; display: flex; justify-content: flex-end; }
 
+/* 输入模式多选（文本/图片）：行内排布，覆盖全局 .field label 的块级样式 */
+.settings-page .input-mode-row { display: flex; gap: 18px; align-items: center; }
+.settings-page .input-mode-row label {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin: 0; font-size: 13px; color: var(--text-1); cursor: pointer;
+}
+
 /* 快捷键只读说明页 */
 .settings-page .shortcuts-notice {
   display: flex; align-items: flex-start; gap: 10px;

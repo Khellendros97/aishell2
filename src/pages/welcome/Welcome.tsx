@@ -59,7 +59,7 @@ const welcomeLogoUrl = new URL('../../assets/logo.svg', import.meta.url).href;
 const EMPTY_STATE: AppState = {
   settings: {
     workspaceDir: null,
-    llm: { modelId: '', baseUrl: '', effort: 'low' },
+    llm: { modelId: '', baseUrl: '', effort: 'low', inputModes: ['text'] },
     search: { enabled: false },
     theme: 'dark',
     autoSwitchAiWorkdir: true,
