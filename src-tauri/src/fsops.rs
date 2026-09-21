@@ -329,8 +329,7 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 /// 在系统文件资源管理器中定位该文件/目录(Windows:explorer /select,)。
 /// explorer 退出码语义不可靠,spawn 成功即视为成功,不 wait。
 #[tauri::command]
-pub fn fs_reveal(path: String) -> Result<(), String> {
-    let p = non_empty(&path)?;
+pub fn fs_reveal(path: String) -> Result<(), String> {    let p = non_empty(&path)?;
     if !p.exists() {
         return Err(format!("「{}」不存在", p.display()));
     }
@@ -359,6 +358,25 @@ pub fn fs_reveal(path: String) -> Result<(), String> {
             .map_err(|e| format!("打开系统文件管理器失败:{e}"))?;
     }
     Ok(())
+}
+
+/// 用系统默认应用打开本地文件（tauri-plugin-opener open_path）。
+/// 无关联程序/打开失败时 Err —— 前端据此回退到「在文件资源管理器中打开」。
+#[tauri::command]
+pub fn fs_open_default(path: String) -> Result<(), String> {
+    let p = non_empty(&path)?;
+    if !p.exists() {
+        return Err(format!("「{}」不存在", p.display()));
+    }
+    if p.is_dir() {
+        return Err("目录不能用默认应用打开，请用「在文件资源管理器中打开」".to_string());
+    }
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.clone());
+    tauri_plugin_opener::open_path(&p, None::<&str>)
+        .map_err(|e| format!("没有能打开「{name}」的默认应用：{e}"))
 }
 
 /// 删除文件或目录（目录递归删除）。

@@ -39,7 +39,7 @@ import '../sftp.css';
 import type { FsEntry, FsStat, SftpFavorite, SshExecResult } from '../../../types';
 import {
   fsDelete, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
-  sftpHome, sftpList, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec, stagingAdd,
+  sftpHome, sftpList, sftpOpen, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec, stagingAdd,
   timelineBindServer,
 } from '../../../api';
 import { confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../../ui';
@@ -49,6 +49,7 @@ import { Icon } from '../../../shared/Icon';
 import {
   DND_MIME, getActiveTab, tabApis, useWorkbench, wbEvents, wbHandles, type TabProps,
 } from '../../../stores/workbench';
+import { runWithOpenMode } from '../../../shared/openWithMode';
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
 import { isPcapName, openRemotePcap } from './PcapTab';
@@ -452,6 +453,27 @@ function joinRemote(dir: string, name: string): string {
 /** 在文档编辑器中打开远端文本文件(保存走 sftp_write,见 EditorTab.tsx 的 openRemoteFile) */
 function openRemoteInEditor(st: SftpTabState, it: RemoteEntry): void {
   openRemoteFile(st.serverId, it.path, it.name, { size: it.size, mtime: it.mtime });
+}
+
+/** 双击打开远端文件：按设置-功能特性「文件打开方式」走内置/系统/资源管理器回退链或弹窗
+ * （系统方式 = sftp_open 先下载到临时目录再打开/定位，见 shared/openWithMode.ts） */
+async function openRemoteEntry(st: SftpTabState, it: RemoteEntry): Promise<void> {
+  const pcap = isPcapName(it.name);
+  const editable = !pcap && isTextEditable(it);
+  try {
+    await runWithOpenMode(it.name, {
+      builtinSupported: pcap || editable,
+      builtinLabel: pcap ? '抓包查看器' : '内置编辑器',
+      openBuiltin: () => {
+        if (pcap) openRemotePcap(st.serverId, it.path, it.name);
+        else openRemoteInEditor(st, it);
+      },
+      openSystem: () => sftpOpen(st.serverId, it.path, 'open'),
+      openExplorer: async () => { await sftpOpen(st.serverId, it.path, 'reveal'); },
+    });
+  } catch (err) {
+    toast(String(err), 'error');
+  }
 }
 
 /** 粘贴到当前目录:本地源 → 上传(剪切=上传+删本地);远端源同会话 → 复制/移动。多条目逐项处理。 */
@@ -969,19 +991,26 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
   const items = st.renderEntries.filter((e) => st.sel.has(e.path));
   const multi = items.length > 1;
   const first = items[0];
-  const editable = !multi && isTextEditable(first);
   showContextMenu(x, y, [
     {
       label: '打开', iconName: first.isDir ? 'folder' : 'file',
-      disabled: multi || !editable,
-      disabledTip: multi ? '多选时不可用' : (first.isDir ? undefined : '二进制文件或超过 5MB，无法在编辑器中打开'),
-      action: () => { if (first.isDir) goTo(st, first.path, true); else openRemoteInEditor(st, first); },
+      disabled: multi,
+      disabledTip: multi ? '多选时不可用' : undefined,
+      // 与双击同语义：按「文件打开方式」设置走内置/系统/资源管理器回退链（openRemoteEntry）
+      action: () => { if (first.isDir) goTo(st, first.path, true); else void openRemoteEntry(st, first); },
     },
     // 抓包文件进 pcap 查看器（双击同样走此入口，见行 dblclick 处理）
     ...(!multi && !first.isDir && isPcapName(first.name)
       ? [{
           label: '在抓包查看器中打开', iconName: 'activity' as const,
           action: () => { openRemotePcap(st.serverId, first.path, first.name); },
+        }]
+      : []),
+    // 系统默认应用打开（远端文件由后端先下载到临时目录再打开，见 sftp_open）
+    ...(!multi && !first.isDir
+      ? [{
+          label: '使用系统默认应用打开', iconName: 'appWindow' as const,
+          action: () => void sftpOpen(st.serverId, first.path, 'open').catch((err) => toast(String(err), 'error')),
         }]
       : []),
     // 把远端文件/目录路径引用加入 AI 输入框(@file:文件名 / @path:目录名 标签,发送时带服务器上下文)
@@ -1396,9 +1425,7 @@ function buildGrid(body: HTMLElement, st: SftpTabState, entries: RemoteEntry[]):
     });
     el.addEventListener('dblclick', () => {
       if (it.isDir) goTo(st, it.path, true);
-      else if (isPcapName(it.name)) openRemotePcap(st.serverId, it.path, it.name);
-      else if (isTextEditable(it)) openRemoteInEditor(st, it);
-      else toast('二进制文件或超过 5MB，无法在编辑器中打开', 'error');
+      else void openRemoteEntry(st, it);
     });
     el.addEventListener('contextmenu', (e) => {
       e.preventDefault();

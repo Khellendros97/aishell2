@@ -47,6 +47,8 @@ export interface Settings {
   notifyLongTasks: boolean;
   /** 自动录制终端：开启后每个终端会话建立时自动开始录制日志（可手动停止）；旧配置无此字段按关闭 */
   autoRecordTerminal: boolean;
+  /** 文件打开方式（双击 explorer/SFTP 文件时生效）；旧配置无此字段按内置编辑器优先 */
+  fileOpenMode: 'editor-first' | 'system-first' | 'explorer' | 'ask';
 }
 
 /** MCP 服务全局配置（AppState 顶层字段）—— 与 store.rs McpServiceConfig serde camelCase 对齐。

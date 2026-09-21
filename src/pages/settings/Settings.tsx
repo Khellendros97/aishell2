@@ -53,6 +53,7 @@ interface SysFields {
   notifyAi: boolean;
   notifyLongTasks: boolean;
   autoRecordTerminal: boolean;
+  fileOpenMode: AppSettings['fileOpenMode'];
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -62,6 +63,7 @@ const EMPTY_FIELDS: SysFields = {
   approvalMode: 'smart', autoBackup: false, mcpPort: '', compactServerList: false,
   sidebarDefault: 'explorer',
   tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true, autoRecordTerminal: false,
+  fileOpenMode: 'editor-first',
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -214,6 +216,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       notifyAi: s.settings.notifyAi ?? true,
       notifyLongTasks: s.settings.notifyLongTasks ?? true,
       autoRecordTerminal: s.settings.autoRecordTerminal ?? false,
+      fileOpenMode: s.settings.fileOpenMode ?? 'editor-first',
     });
     void refreshMcpStatus();
   };
@@ -320,6 +323,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       notifyAi: fields.notifyAi,
       notifyLongTasks: fields.notifyLongTasks,
       autoRecordTerminal: fields.autoRecordTerminal,
+      fileOpenMode: fields.fileOpenMode,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -489,6 +493,24 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, autoBackup: checked })); }}
                 />
                 <div className="hint">开启后，AI 会话第一次修改某个远程文件前自动保存原始快照（会话级暂存区）：同一会话后续修改不覆盖快照，可在 AI 对话区右键「打开文件暂存区」查看 diff、接受或还原。动态脚本/无法确定影响范围的命令无法保证完整备份，会提示后由你确认。关闭只停止新建快照，已有暂存仍可继续处理</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>文件</legend>
+              <div className="field">
+                <label>文件打开方式</label>
+                <select
+                  id="f-file-open-mode"
+                  className="select"
+                  value={fields.fileOpenMode}
+                  onChange={(e) => { const v = e.currentTarget.value as AppSettings['fileOpenMode']; setFields((f) => ({ ...f, fileOpenMode: v })); }}
+                >
+                  <option value="editor-first">内置编辑器优先</option>
+                  <option value="system-first">系统默认应用优先</option>
+                  <option value="explorer">文件资源管理器中打开</option>
+                  <option value="ask">让我选择</option>
+                </select>
+                <div className="hint">双击文件管理器/SFTP 中的文件时生效。内置编辑器优先：文本进内置编辑器、抓包文件进抓包查看器，不支持的类型回退系统默认应用，仍不行则在文件资源管理器中定位；系统默认应用优先同理跳过内置；让我选择：每次双击弹出打开方式选择（内置编辑器不支持的文件只提供系统默认应用/文件资源管理器两个选项）。SFTP 远端文件选系统方式时先下载到临时目录再打开</div>
               </div>
             </fieldset>
             <fieldset className="llm-group">

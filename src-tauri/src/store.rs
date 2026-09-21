@@ -194,6 +194,10 @@ pub struct Settings {
     /// 旧配置无此字段时按本地文件处理（保持原行为）。
     #[serde(default)]
     pub sidebar_default: SidebarDefault,
+    /// 文件打开方式（内置编辑器优先/系统默认应用优先/文件资源管理器/让我选择）；
+    /// 旧配置无此字段时按内置编辑器优先处理（保持原行为）。
+    #[serde(default)]
+    pub file_open_mode: FileOpenMode,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -214,6 +218,7 @@ impl Default for Settings {
             notify_long_tasks: true,
             auto_record_terminal: false,
             sidebar_default: SidebarDefault::default(),
+            file_open_mode: FileOpenMode::default(),
         }
     }
 }
@@ -251,6 +256,21 @@ pub enum ApprovalMode {
     #[default]
     Smart,
     All,
+}
+
+/// 文件打开方式（全局设置，双击 explorer/SFTP 里的文件时生效）：
+/// - EditorFirst（默认）：内置编辑器/查看器优先 → 不支持回退系统默认应用 → 再回退文件资源管理器；
+/// - SystemFirst：系统默认应用优先 → 不支持回退文件资源管理器；
+/// - Explorer：直接在系统文件资源管理器中定位（远端文件先下载到临时目录）；
+/// - Ask：双击时弹窗让用户选（内置编辑器不支持的文件不显示该选项）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileOpenMode {
+    #[default]
+    EditorFirst,
+    SystemFirst,
+    Explorer,
+    Ask,
 }
 
 impl ApprovalMode {
@@ -3688,6 +3708,7 @@ mod tests {
                 notify_long_tasks: true,
                 auto_record_terminal: false,
                 sidebar_default: crate::store::SidebarDefault::default(),
+                file_open_mode: crate::store::FileOpenMode::default(),
             },
             credentials: vec![
                 Credential {
@@ -6727,6 +6748,7 @@ mod tests {
                     notify_long_tasks: true,
                     auto_record_terminal: false,
                     sidebar_default: crate::store::SidebarDefault::default(),
+                    file_open_mode: crate::store::FileOpenMode::default(),
                 },
                 Some("sk-test-key"),
                 None,
@@ -6925,6 +6947,7 @@ mod tests {
                     notify_long_tasks: true,
                     auto_record_terminal: false,
                     sidebar_default: crate::store::SidebarDefault::default(),
+                    file_open_mode: crate::store::FileOpenMode::default(),
                 },
                 None,
                 Some("bsk-1"),
