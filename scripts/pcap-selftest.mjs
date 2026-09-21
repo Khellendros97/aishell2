@@ -188,6 +188,20 @@ ok(compileFilter('eth.src == "11:22:33:44:55:66"')(d0), 'eth.src');
 ok(compileFilter('eth.addr == aa:bb:cc:dd:ee:ff')(d2) && compileFilter('eth.dst == aa:bb:cc:dd:ee:ff')(d2), 'eth.addr / eth.dst');
 ok(compileFilter('!(radius || dns)')(d0) && !compileFilter('!(radius || dns)')(d3), 'radius 组合');
 
+console.log('filter（协议树字段）:');
+ok(compileFilter('dns.qry.name == "www.example.com"')(d2), 'dns.qry.name');
+ok(compileFilter('dns.qry.type == "A"')(d2), 'dns.qry.type');
+ok(compileFilter('radius.user_name == "alice"')(d3), 'radius.user_name');
+ok(compileFilter('radius.nas_ip_address == "10.0.0.1"')(d3), 'radius.nas_ip_address');
+ok(compileFilter('radius.code == 1')(d3) && !compileFilter('radius.code == 2')(d3), 'radius.code 数值');
+ok(compileFilter('tcp.seq == 1000')(d0) && !compileFilter('tcp.seq == 1000')(d1), 'tcp.seq');
+ok(compileFilter('tcp.flags == "0x02"')(d0), 'tcp.flags 十六进制');
+ok(compileFilter('eth.type == "0x0800"')(d0), 'eth.type');
+ok(compileFilter('ip.ttl == 64')(d0), 'ip.ttl');
+threw = false;
+try { compileFilter('foo.bar == 1'); } catch { threw = true; }
+ok(threw, '未知字段名报错');
+
 console.log('stream:');
 const decoded = f1.packets.map((p) => decodePacket(p));
 const s = buildStream(f1.packets, decoded, d0.streamKey);

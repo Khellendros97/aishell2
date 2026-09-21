@@ -483,6 +483,31 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
           hlRange = { off: f.offset, len: f.len };
           applyHighlight();
         });
+        // 可过滤字段（filterKey）：右键「作为过滤器」（与包列表单元格同一套 6 项组合菜单）
+        if (f.filterKey) {
+          row.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const rawValue = f.filterValue ?? f.value;
+            // 纯数值不加引号；其余按字符串字面量（引号内转义极少见，直接剔除）
+            const lit = /^\d+$/.test(rawValue) ? rawValue : `"${rawValue.replace(/"/g, '')}"`;
+            const expr = `${f.filterKey} == ${lit}`;
+            showContextMenu(e.clientX, e.clientY, [
+              {
+                label: '作为过滤器',
+                iconName: 'filter',
+                action: () => showFilterSubMenu(e.clientX, e.clientY, expr, `${f.name}: ${f.value}`),
+              },
+              {
+                label: '复制字段值',
+                iconName: 'copy',
+                action: () => { void navigator.clipboard.writeText(f.value); },
+              },
+            ]);
+          });
+          row.title = `${f.filterKey}（右键可作为过滤器）`;
+          row.classList.add('filterable');
+        }
         fields.appendChild(row);
       }
       head.addEventListener('click', () => {

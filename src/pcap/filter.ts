@@ -13,6 +13,7 @@
  * compileFilter 返回断言函数；语法错误抛带位置信息的中文错误（输入框行内展示，不清空列表）。
  */
 import type { DecodedPacket } from './decode';
+import { KNOWN_FILTER_FIELDS } from './decode';
 
 export type PacketPredicate = (p: DecodedPacket) => boolean;
 
@@ -264,7 +265,10 @@ class Parser {
       default: break;
     }
 
-    throw this.err(tok, `无法识别的条件「${tok.text}」（支持协议名 / host / port / _ws.col.* / frame.* / ip.* / eth.* 等）`);
+    // 通用字段（协议树里标注了 filterKey 的字段，如 dns.qry.name / radius.user_name / tcp.seq）
+    if (KNOWN_FILTER_FIELDS.has(word)) return this.anyField(word);
+
+    throw this.err(tok, `无法识别的条件「${tok.text}」（支持协议名 / host / port / _ws.col.* / frame.* / ip.* / eth.* / 协议字段名）`);
   }
 
   /** eth.addr：源或目的 MAC 任一侧命中（只支持 ==/!=） */
@@ -309,6 +313,40 @@ class Parser {
       }
     };
     return { t: 'pred', fn };
+  }
+
+  /** 通用字段：DecodedPacket.filterFields 查表；同名多值时任一命中（!= 为全部不等） */
+  private anyField(field: string): Ast {
+    const op = this.expectOp(field);
+    const valueTok = this.expectWord('比较符后需要一个值（字符串建议带双引号）');
+    const raw = valueTok.text;
+    // 数值比较符：值必须可解析为数值（字段值逐项 Number 转换，非数值实例跳过）
+    if (op !== 'contains' && op !== '==' && op !== '!=') {
+      const v = Number(raw);
+      if (!Number.isFinite(v)) throw this.err(valueTok, `「${raw}」不是数值（${field} 用 ${op} 比较需要数值）`);
+      const fn: PacketPredicate = (p) =>
+        (p.filterFields[field] ?? []).some((x) => {
+          const n = Number(x);
+          if (!Number.isFinite(n)) return false;
+          switch (op) {
+            case '>': return n > v;
+            case '<': return n < v;
+            case '>=': return n >= v;
+            case '<=': return n <= v;
+            default: return false;
+          }
+        });
+      return { t: 'pred', fn };
+    }
+    const v = raw.toLowerCase();
+    // 纯数值同时允许数值相等（"001" == 1 这类）；字符串一律小写不敏感
+    const num = Number(raw);
+    const isNum = /^\d+$/.test(raw) && Number.isFinite(num);
+    const base: PacketPredicate = (p) =>
+      (p.filterFields[field] ?? []).some((x) =>
+        x.toLowerCase() === v || (isNum && Number(x) === num)
+        || (op === 'contains' && x.toLowerCase().includes(v)));
+    return { t: 'pred', fn: op === '!=' ? (p) => !base(p) : base };
   }
 
   private expectPort(msg: string): number {
