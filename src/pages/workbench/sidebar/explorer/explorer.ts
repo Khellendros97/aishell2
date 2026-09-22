@@ -31,7 +31,7 @@
  */
 import { icon } from '../../../../icons';
 import {
-  fsCopy, fsCreate, fsDelete, fsImport, fsIsText, fsMove, fsOpenDefault, fsReveal, fsStat,
+  fsCopy, fsCreate, fsDelete, fsIsText, fsMove, fsOpenDefault, fsReveal, fsStat,
   sftpDelete, sftpDownload, sftpUpload,
 } from '../../../../api';
 import type { FsStat } from '../../../../types';
@@ -42,6 +42,7 @@ import {
   DND_MIME, getActiveTab, tabApis, useWorkbench, wbEvents, wbHandles,
 } from '../../../../stores/workbench';
 import { runWithOpenMode } from '../../../../shared/openWithMode';
+import { importOsFiles as importOsEntries } from '../../../../shared/osImport';
 import { clearClip, getClip, setClip } from '../../clipboard';
 import { openLocalFile } from '../../tabs/EditorTab';
 import { isPcapName, openLocalPcap } from '../../tabs/PcapTab';
@@ -199,7 +200,7 @@ function buildRow(node: TreeNode, depth: number, isRoot: boolean): HTMLElement {
         void downloadTo({ path: data.path, name: data.name, serverId }, node);
         return;
       }
-      // OS 文件拖入(dataTransfer.files):导入本地目录;SFTP 面板不接收(产品禁令)
+      // OS 文件拖入(dataTransfer.files):导入本地目录(SFTP 面板自 v1.3.x 起也接收,见 SftpTab bindDrop)
       if (e.dataTransfer.files.length > 0) {
         e.preventDefault();
         e.stopPropagation(); // 防止冒泡到树空白区 handler 重复导入
@@ -694,79 +695,18 @@ export async function revealLocalPath(path: string): Promise<void> {
   await doReveal(path);
 }
 
-/* ---------- OS 文件拖入导入 ---------- */
-/** 单文件上限 100MB(base64 传输,超大文件走系统拷贝更稳) */
-const OS_IMPORT_MAX_BYTES = 100 * 1024 * 1024;
-
+/* ---------- OS 文件拖入导入(机制抽在 shared/osImport,与 SftpTab 共用;此处只管导入后的树刷新) ---------- */
 async function importOsFiles(dt: DataTransfer, targetDir: TreeNode): Promise<void> {
-  const entries: FileSystemEntry[] = [];
-  for (const item of Array.from(dt.items)) {
-    if (item.kind !== 'file') continue;
-    const entry = item.webkitGetAsEntry();
-    if (entry) entries.push(entry);
-  }
-  if (!entries.length) {
-    toast('未识别到可导入的文件', 'error');
-    return;
-  }
   try {
-    let count = 0;
-    for (const entry of entries) count += await importEntry(entry, targetDir.path);
-    if (count > 0) {
-      toast(`已导入 ${count} 个项目到 ${targetDir.path}`, 'success');
+    const landed = await importOsEntries(dt, targetDir.path);
+    if (landed.length > 0) {
+      toast(`已导入 ${landed.length} 个项目到 ${targetDir.path}`, 'success');
       expand(targetDir.path);
       await refreshDir(targetDir);
     }
   } catch (err) {
     toast(String(err), 'error');
   }
-}
-
-/** 递归导入一个 entry(目录沿 webkitGetAsEntry 遍历),返回导入条目数。 */
-async function importEntry(entry: FileSystemEntry, destDir: string): Promise<number> {
-  if (entry.isDirectory) {
-    const dirEntry = entry as FileSystemDirectoryEntry;
-    const finalName = await fsImport(destDir, entry.name, true, null);
-    const children = await readAllEntries(dirEntry.createReader());
-    let n = 1;
-    for (const child of children) n += await importEntry(child, joinPath(destDir, finalName));
-    return n;
-  }
-  const file = await entryFile(entry as FileSystemFileEntry);
-  if (file.size > OS_IMPORT_MAX_BYTES) {
-    toast(`「${file.name}」超过 100MB,已跳过`, 'error');
-    return 0;
-  }
-  const b64 = await fileToBase64(file);
-  await fsImport(destDir, file.name, false, b64);
-  return 1;
-}
-
-/** readEntries 每批最多 100 条,循环取空为止。 */
-function readAllEntries(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
-  const all: FileSystemEntry[] = [];
-  const batch = (): Promise<FileSystemEntry[]> =>
-    new Promise((resolve, reject) => reader.readEntries(resolve, reject));
-  return (async () => {
-    for (;;) {
-      const chunk = await batch();
-      if (!chunk.length) return all;
-      all.push(...chunk);
-    }
-  })();
-}
-
-function entryFile(entry: FileSystemFileEntry): Promise<File> {
-  return new Promise((resolve, reject) => entry.file(resolve, reject));
-}
-
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '');
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
 }
 
 /* ---------- 渲染 ---------- */

@@ -24,7 +24,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 1. **单测绝不碰真实 keyring**:store.rs 密钥走 `SecretStore` trait,生产 `KeyringSecrets` / 测试 `MemorySecrets`。测试一律用 `test_store()` 构造,禁止 `Store::new()`(会写用户真实的 Windows 凭据管理器)。
 2. **密码 / API Key 永不进 JSON、永不返回前端**：只走 keyring(account:`server:<id>`、`llm:apikey`、`brave:apikey`)。表单留空提交 = 后端保持原值(前端传 `null`,不是空串)。
-3. **窗口 `dragDropEnabled: false`**(tauri.conf.json):wry 的 OLE DropTarget 会截杀页面内 HTML5 拖拽。OS 文件导入走 `webkitGetAsEntry` + `fs_import` 命令,不再用 `tauri://drag-drop` 事件。
+3. **窗口 `dragDropEnabled: false`**(tauri.conf.json):wry 的 OLE DropTarget 会截杀页面内 HTML5 拖拽。OS 文件导入走 `webkitGetAsEntry` + `fs_import` 命令,不再用 `tauri://drag-drop` 事件;导入机制抽在 `src/shared/osImport.ts`(explorer 与 SftpTab 共用,单文件 100MB 上限)。SFTP 面板同样接收 OS 拖入:文件先经 `fs_import` 落 `<项目>/.aishell/upload/` 留存副本(重名自动改名),再以副本为源 `sftp_upload` 到远端 cwd。
 4. **Git Bash 路径**写死逻辑里要排除 `C:\Windows\System32\bash.exe`(那是 WSL);正确路径 `C:\Program Files\Git\bin\bash.exe`。系统未装时回退捆绑 PortableGit(term.rs `find_shell` 探测 `resources/git-portable`,免安装免管理员)。
 5. **pi sidecar 与捆绑运行时**:`src-tauri/resources/` 下 pi/pi 侧车、git-portable(PortableGit 预解压)、python-embed(embeddable 预解压)均不入库,分别由 `scripts/fetch-pi*.mjs|sh`、`fetch-git.mjs`、`fetch-python.mjs` 拉取(后两个非 Windows 平台自动跳过,镜像回退 + SHA-256 锁定);只有 tauri.windows.conf.json 把 git-portable/python-embed 打进 Windows 包。python-embed 构建期删 `python313._pth`——留着会忽略 PYTHONPATH,py 工具的 pysdk 注入(ai_actions)就失效。ai.rs 按 `(projectId, sessionId)` 懒启动 `pi --mode rpc`,stdout 是 LF 分隔 JSONL(**不要用按行 readline 之外的假设,U+2028/29 不是行分隔**)。
 6. 前端状态事实源在 Rust 端 `aishell.json`;前端不写 localStorage(那是原型的做法,已废弃)。

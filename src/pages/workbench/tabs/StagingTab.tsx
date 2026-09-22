@@ -5,7 +5,7 @@
  *   接受 = 确认本次修改并清除暂存条目(不改远程内容);还原 = 恢复首次修改前内容;
  *   清理 = 远端现状与首次快照一致的条目一次性接受清除(有变更的保留,后端 staging_clear);
  *   导出 = 把首次快照落为备份文件(无 .proto 对照,新功能):本地 = 项目 .aishell/backup/,
- *   远程 = 条目原远程目录,文件名加 _bakYYYYMMDD-HHMM 后缀(与 SFTP 快速备份同规则,
+ *   远程 = 条目原远程目录,文件名加 _bakYYYYMMDD-HHMM 后缀(插在扩展名前,与 SFTP 快速备份同规则,
  *   重名自动 (n));多条目打包 zip(压缩包名用户指定,时间后缀自动追加);可选同时接受变更;
  * - 数据源 staging_list / staging_accept / staging_restore / staging_export(接口点见
  *   src/api.ts staging 段);服务器名从 getState().servers 查(找不到回退 id);
