@@ -8,6 +8,8 @@
  *   （列表行/选中/过滤器/统计/流追踪按需解码，全量解码只发生在过滤器应用、统计打开、流追踪时）。
  * 与后端的接口点：pcap_read（本地 path / 远端 serverId+path）。
  * keep-alive 契约：mountPcap 在标签 useEffect 挂载一次，返回清理函数（图表 dispose、 observer 断开）。
+ * 明细树展开/折叠：按「报文类型::层名」记忆（模块级 Map，应用生命周期内跨标签共享），
+ *   同类型报文共享状态；未记忆过的层默认折叠。
  */
 import * as echarts from 'echarts/core';
 import { LineChart, PieChart } from 'echarts/charts';
@@ -37,6 +39,11 @@ export interface PcapMountParams {
 
 const ROW_H = 24;
 const OVERSCAN = 6;
+
+/** 明细树层折叠状态：key = `报文类型::层名`（如 `RADIUS::UDP`），value = 是否折叠。
+ *  模块级共享：同类型报文（同一 proto）的同名层共用一份状态，跨标签/跨文件也保留；
+ *  未记录的层默认折叠（Map.get 缺省 ?? true）。 */
+const layerCollapseState = new Map<string, boolean>();
 
 /* ---------------- 协议 → 行配色类 ---------------- */
 
@@ -466,6 +473,12 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
       head.querySelector('span')!.textContent = layer.name;
       const fields = document.createElement('div');
       fields.className = 'pcap-layer-fields';
+      // 展开/折叠状态按报文类型记忆（layerCollapseState）：同类型报文共享，未记忆默认折叠
+      const collapseKey = `${d.proto}::${layer.name}`;
+      if (layerCollapseState.get(collapseKey) ?? true) {
+        fields.classList.add('collapsed');
+        head.classList.add('collapsed');
+      }
       for (const f of layer.fields) {
         const row = document.createElement('div');
         row.className = 'pcap-field';
@@ -511,15 +524,18 @@ export function mountPcap(root: HTMLElement, params: PcapMountParams): () => voi
         fields.appendChild(row);
       }
       head.addEventListener('click', () => {
-        if (!fields.classList.contains('collapsed')) {
+        // 折叠/展开状态按报文类型记忆（layerCollapseState），同类型报文共享
+        const nowCollapsed = !(layerCollapseState.get(collapseKey) ?? true);
+        layerCollapseState.set(collapseKey, nowCollapsed);
+        if (nowCollapsed) {
           clearHighlight();
           hlRange = { off: layer.offset, len: layer.len };
           applyHighlight();
         } else {
           clearHighlight();
         }
-        fields.classList.toggle('collapsed');
-        head.classList.toggle('collapsed');
+        fields.classList.toggle('collapsed', nowCollapsed);
+        head.classList.toggle('collapsed', nowCollapsed);
       });
       box.append(head, fields);
       treeEl.appendChild(box);
