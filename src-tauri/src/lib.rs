@@ -212,6 +212,13 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
                     let _ = app2.emit("config:changed", event);
                 }));
             }
+            {
+                // AI 通道 SFTP 上传/下载的传输进度 → 前端底栏进度区（与 sftp 命令同一事件流）
+                let app2 = app.handle().clone();
+                ai.set_sftp_progress_emitter(Arc::new(move |p| {
+                    let _ = app2.emit("sftp:progress", p);
+                }));
+            }
             // AI 空闲回收：周期清理长时间无交互的 pi 进程（会话历史在 session 文件，
             // 下次对话自动重生），避免多会话常驻累积内存
             ai.spawn_idle_reaper();
@@ -352,6 +359,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             fsops::fs_create,
             fsops::fs_delete,
             fsops::fs_import,
+            fsops::fs_ensure_dir,
             fsops::fs_move,
             fsops::fs_copy,
             fsops::fs_reveal,

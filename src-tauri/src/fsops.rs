@@ -274,6 +274,16 @@ pub(crate) fn fs_import_impl(
     Ok((target, final_name))
 }
 
+/// 确保目录存在（多级创建，幂等）；已存在但不是目录时报错。
+#[tauri::command]
+pub fn fs_ensure_dir(path: String) -> Result<(), String> {
+    let dir = non_empty(&path)?;
+    if dir.exists() && !dir.is_dir() {
+        return Err(format!("「{}」已存在且不是目录", dir.display()));
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("创建目录「{}」失败：{e}", dir.display()))
+}
+
 /// 本地重名改名：`name (1).ext`；无扩展名（如目录）为 `name (1)`。sftp 下载复用。
 pub(crate) fn unique_local_name(dir: &std::path::Path, name: &str) -> Result<String, String> {
     if !dir.join(name).exists() {
@@ -537,6 +547,20 @@ mod tests {
         assert!(dir.join("d/nested/g.txt").exists());
         // 目录禁止复制进自身子孙
         assert!(fs_copy_impl(&s("d"), &s("d/nested")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ensure_dir_creates_nested_and_is_idempotent() {
+        let dir = tmp_dir("ensure");
+        let target = dir.join(".aishell/upload");
+        // 多级创建 + 幂等
+        fs_ensure_dir(target.to_string_lossy().into_owned()).unwrap();
+        assert!(target.is_dir());
+        fs_ensure_dir(target.to_string_lossy().into_owned()).unwrap();
+        // 已存在但不是目录 → 报错
+        fs::write(dir.join("f.txt"), "x").unwrap();
+        assert!(fs_ensure_dir(dir.join("f.txt").to_string_lossy().into_owned()).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

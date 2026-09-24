@@ -17,8 +17,8 @@
 //! - [`RemoteStaging::accept`] 只删除本地条目，不改远程内容；[`RemoteStaging::restore`]
 //!   先比较暂存记录的 current hash/size/mtime，冲突时返回结构化冲突（force 仅前端用户命令传入）。
 //! - [`RemoteStaging::export`] 把快照导出为备份：本地 = `<项目>/.aishell/backup/`，
-//!   远程 = 原远程目录；文件名加 `_bakYYYYMMDD-HHMM` 后缀（与 SFTP 快速备份同规则，
-//!   重名自动 ` (n)`）；多条目打包 zip；accept=true 时导出成功的条目随后接受清除。
+//!   远程 = 原远程目录；文件名加 `_bakYYYYMMDD-HHMM` 后缀（插在扩展名前，
+//!   与 SFTP 快速备份同规则，重名自动 ` (n)`）；多条目打包 zip；accept=true 时导出成功的条目随后接受清除。
 //! - 快照/diff 输出统一经 [`crate::redact::redact_secrets`] 脱敏；二进制或超过编辑上限
 //!   只返回 hash/size/mtime 元数据，不把原文返回前端。
 //! - manifest 缺失视为空（从未暂存）；manifest 存在但损坏 → 带路径错误，不静默当作空列表。
@@ -991,8 +991,8 @@ impl RemoteStaging {
 
     /// 导出暂存备份（前端 staging_export 命令；与 staging_accept 同边界，绝不加入 AI 工具集）。
     ///
-    /// - local：快照写入 `<项目目录>/.aishell/backup/`；单条目 = 复制为 `文件名_bakYYYYMMDD-HHMM`
-    ///   （重名自动 ` (n)`），多条目 = 打包 `<名称>_bakYYYYMMDD-HHMM.zip`（单服务器按公共祖先
+    /// - local：快照写入 `<项目目录>/.aishell/backup/`；单条目 = 复制为 `文件名_bakYYYYMMDD-HHMM.扩展名`
+    ///   （`_bak` 后缀插在扩展名前，重名自动 ` (n)`），多条目 = 打包 `<名称>_bakYYYYMMDD-HHMM.zip`（单服务器按公共祖先
     ///   相对路径、多服务器加 `<serverId>/` 前缀保留归属并防同名冲突）；
     /// - remote：快照上传到条目原远程目录（同样后缀）；多条目按服务器分组打包，压缩包落在
     ///   该组远程路径的公共祖先目录；
@@ -1073,7 +1073,7 @@ impl RemoteStaging {
                 let blob = self.root.join("blobs").join(e.blob_ref.as_ref().unwrap());
                 let name = unique_local_name(
                     &backup_dir,
-                    &format!("{}_bak{stamp}", remote_basename(&e.remote_path)),
+                    &backup_name(remote_basename(&e.remote_path), stamp),
                 );
                 copy_atomic(&blob, &backup_dir.join(&name))?;
                 targets.push(backup_dir.join(&name).display().to_string());
@@ -1129,7 +1129,7 @@ impl RemoteStaging {
             let name = crate::sftp::unique_remote_name(
                 &sftp,
                 &parent,
-                &format!("{}_bak{stamp}", remote_basename(&e.remote_path)),
+                &backup_name(remote_basename(&e.remote_path), stamp),
             )
             .await?;
             let dest_path = remote_join(&parent, &name);
@@ -1527,7 +1527,17 @@ fn diff_lines(a: &[String], b: &[String]) -> (Vec<DiffLine>, Vec<DiffLine>) {
     (left, right)
 }
 
-/* ---------------- 导出备份辅助（命名规则与 SftpTab 快速备份对齐：`名称_bakYYYYMMDD-HHMM`） ---------------- */
+/* ---------------- 导出备份辅助（命名规则与 SftpTab 快速备份对齐：`_bakYYYYMMDD-HHMM` 插在扩展名前） ---------------- */
+
+/// 单条目备份名：`_bak<stamp>` 插在最后一个扩展名点之前
+/// （`app.conf` → `app_bak<stamp>.conf`；无扩展名或点开头（`.gitignore`）整体后加）。
+/// 与 SftpTab 快速备份的 backupName 同一规则。
+fn backup_name(name: &str, stamp: &str) -> String {
+    match name.rfind('.') {
+        Some(i) if i > 0 => format!("{}_bak{stamp}{}", &name[..i], &name[i..]),
+        _ => format!("{name}_bak{stamp}"),
+    }
+}
 
 /// 备份时间后缀校验：`YYYYMMDD-HHMM`（前端生成本地时间传入，避免后端解析时区）。
 fn validate_stamp(s: &str) -> Result<(), String> {
@@ -1622,7 +1632,7 @@ fn rel_to_ancestor(path: &str, ancestor: &str) -> String {
 }
 
 /// 本地重名自动 `name (1).ext`（与 sftp.rs unique_remote_name 同规则：
-/// 插在最后一个扩展名点之前，如 `app.conf_bak...` 冲突时得 `app (1).conf_bak...`）。
+/// 插在最后一个扩展名点之前，如 `app_bak....conf` 冲突时得 `app_bak... (1).conf`）。
 fn unique_local_name(dir: &Path, name: &str) -> String {
     if !dir.join(name).exists() {
         return name.to_string();
@@ -1711,8 +1721,8 @@ pub async fn staging_clear(
 }
 
 /// 导出暂存备份：local = 快照写入 `<项目>/.aishell/backup/`（单条目加 `_bak<stamp>` 后缀，
-/// 多条目打包 zip）；remote = 快照写回条目原远程目录（同样后缀）。accept=true 时导出成功
-/// 的条目随后接受清除。与 staging_accept 同边界：只注册为前端命令，绝不加入 pi 工具 / guard。
+/// 插在扩展名前；多条目打包 zip）；remote = 快照写回条目原远程目录（同样后缀）。accept=true
+/// 时导出成功的条目随后接受清除。与 staging_accept 同边界：只注册为前端命令，绝不加入 pi 工具 / guard。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn staging_export(
@@ -1819,6 +1829,15 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn backup_name_inserts_stamp_before_extension() {
+        assert_eq!(backup_name("app.conf", "20260922-1530"), "app_bak20260922-1530.conf");
+        assert_eq!(backup_name("a.tar.gz", "20260922-1530"), "a.tar_bak20260922-1530.gz");
+        // 无扩展名 / 点开头 → 整体后加
+        assert_eq!(backup_name("README", "20260922-1530"), "README_bak20260922-1530");
+        assert_eq!(backup_name(".gitignore", "20260922-1530"), ".gitignore_bak20260922-1530");
     }
 
     #[test]
@@ -2320,7 +2339,7 @@ mod tests {
         let dest = project_dir
             .join(".aishell")
             .join("backup")
-            .join("app.conf_bak20260821-2103");
+            .join("app_bak20260821-2103.conf");
         assert_eq!(out.targets, vec![dest.display().to_string()]);
         assert_eq!(std::fs::read(&dest).unwrap(), b"original-bytes");
         // 未勾选接受：条目保留
@@ -2338,15 +2357,15 @@ mod tests {
             .unwrap();
         let backup = project_dir.join(".aishell").join("backup");
         std::fs::create_dir_all(&backup).unwrap();
-        std::fs::write(backup.join("app.conf_bak20260821-2103"), "旧备份".as_bytes()).unwrap();
+        std::fs::write(backup.join("app_bak20260821-2103.conf"), "旧备份".as_bytes()).unwrap();
         let out = run_export(&staging, &["e1"], "local", None, false);
-        // 与 SFTP 同规则：插在最后一个扩展名点之前 → app (1).conf_bak...
-        let dest = backup.join("app (1).conf_bak20260821-2103");
+        // 重名经 unique_local_name 改名：插在最后一个扩展名点之前 → app_bak... (1).conf
+        let dest = backup.join("app_bak20260821-2103 (1).conf");
         assert!(dest.is_file(), "应落地 {:?}（实际 targets: {:?}）", dest, out.targets);
         assert_eq!(std::fs::read(&dest).unwrap(), b"x");
         // 原有备份不被覆盖
         assert_eq!(
-            std::fs::read(backup.join("app.conf_bak20260821-2103")).unwrap(),
+            std::fs::read(backup.join("app_bak20260821-2103.conf")).unwrap(),
             "旧备份".as_bytes()
         );
         let _ = std::fs::remove_dir_all(&root);

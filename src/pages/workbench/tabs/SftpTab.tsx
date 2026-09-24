@@ -4,7 +4,9 @@
  * 样式复用 src/pages/workbench/sftp.css(此处 import)。
  * 与后端的接口点(src/api.ts):sftp_home / sftp_list / sftp_stat / sftp_upload / sftp_download /
  *   sftp_rename / sftp_copy / sftp_delete / sftp_unique_name / sftp_create / ssh_exec / staging_add,
- *   持久化 set_sftp_history / set_sftp_favorites(路径历史与收藏事实源在 Rust aishell.json)。
+ *   持久化 set_sftp_history / set_sftp_favorites(路径历史与收藏事实源在 Rust aishell.json);
+ *   OS 文件拖入上传走 shared/osImport(fs_import 落 <项目>/.aishell/upload 留存副本)+
+ *   fs_ensure_dir + sftp_upload(以副本为源)。
  *
  * React 差异(语义对齐 legacy):
  * - keep-alive:组件常驻挂载,active 仅切显隐(由外壳 workbench.css 的 .tab-pane.active 承担);
@@ -38,11 +40,11 @@ import { useEffect, useRef } from 'react';
 import '../sftp.css';
 import type { FsEntry, FsStat, SftpFavorite, SshExecResult } from '../../../types';
 import {
-  fsDelete, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
+  fsDelete, fsEnsureDir, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
   sftpHome, sftpList, sftpOpen, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec, stagingAdd,
   timelineBindServer,
 } from '../../../api';
-import { confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../../ui';
+import { confirmCheckDialog, confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../../ui';
 import { dbg } from '../../../debug';
 import { icon } from '../../../icons';
 import { Icon } from '../../../shared/Icon';
@@ -50,6 +52,7 @@ import {
   DND_MIME, getActiveTab, tabApis, useWorkbench, wbEvents, wbHandles, type TabProps,
 } from '../../../stores/workbench';
 import { runWithOpenMode } from '../../../shared/openWithMode';
+import { importOsFiles } from '../../../shared/osImport';
 import { clearClip, getClip, setClip } from '../clipboard';
 import { openRemoteFile } from './EditorTab';
 import { isPcapName, openRemotePcap } from './PcapTab';
@@ -394,16 +397,22 @@ function bindDrag(el: HTMLElement, it: RemoteEntry, st: SftpTabState): void {
 
 function bindDrop(root: HTMLElement, st: SftpTabState): void {
   root.addEventListener('dragover', (e) => {
-    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes(DND_MIME)) {
+    if (!e.dataTransfer) return;
+    const types = Array.from(e.dataTransfer.types);
+    // 应用内拖拽(DND_MIME)与 OS 文件拖入('Files')都接收
+    if (types.includes(DND_MIME) || types.includes('Files')) {
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
     }
   });
   root.addEventListener('drop', async (e) => {
     e.preventDefault();
-    // 只收 DND_MIME(应用内拖拽);OS 文件拖入(无 DND_MIME)一律忽略——产品禁令
     const raw = e.dataTransfer ? e.dataTransfer.getData(DND_MIME) : '';
-    if (!raw) return;
+    if (!raw) {
+      // OS 文件拖入(无 DND_MIME):先落 项目/.aishell/upload 留存副本,再以副本为源上传
+      if (e.dataTransfer && e.dataTransfer.files.length > 0) await uploadOsFiles(e.dataTransfer, st);
+      return;
+    }
     let payload: DndPayload | null = null;
     try {
       payload = JSON.parse(raw) as DndPayload;
@@ -420,6 +429,39 @@ function bindDrop(root: HTMLElement, st: SftpTabState): void {
       toast(String(err), 'error');
     }
   });
+}
+
+/**
+ * OS 拖入上传:副本统一落 <项目目录>/.aishell/upload(重名自动 name (1).ext 保留历史,
+ * 机制与 explorer 的 OS 导入同路,见 shared/osImport),再逐个 sftp_upload 到远端 cwd。
+ * 单项失败只提示、不中断其余项。
+ */
+async function uploadOsFiles(dt: DataTransfer, st: SftpTabState): Promise<void> {
+  if (st.loading) return;
+  const projectPath = useWorkbench.getState().project?.path;
+  if (!projectPath) {
+    toast('项目未设置本地目录，无法保存上传副本', 'error');
+    return;
+  }
+  const uploadDir = projectPath.replace(/\\/g, '/').replace(/\/+$/, '') + '/.aishell/upload';
+  let names: string[];
+  try {
+    await fsEnsureDir(uploadDir);
+    names = await importOsFiles(dt, uploadDir);
+  } catch (err) {
+    toast(String(err), 'error');
+    return;
+  }
+  for (const name of names) {
+    if (st.loading) return;
+    try {
+      const landed = await sftpUpload(st.serverId, `${uploadDir}/${name}`, st.cwd);
+      toast('已上传 ' + name, 'success');
+      focusAfterRefresh(st, joinRemote(st.cwd, landed));
+    } catch (err) {
+      toast(String(err), 'error');
+    }
+  }
 }
 
 /* ---------- 右键菜单:打开 / 复制 / 剪切 / 粘贴 / 重命名 / 删除 / 下载 ---------- */
@@ -667,19 +709,48 @@ async function extractRemote(st: SftpTabState, it: RemoteEntry): Promise<void> {
   await runRemoteCommand(st, cmd, `已解压 ${it.name}`, joinRemote(parent, base), `正在解压 ${it.name}`);
 }
 
-/** 快速备份:目录压缩为 `名称_bakYYYYMMDD-HHMM.tgz`;文件复制为 `名称_bakYYYYMMDD-HHMM`(保留原扩展名)。
- *  重名经 sftpUniqueName 自动改名;完成后刷新并聚焦备份文件。 */
+/** 备份名：`_bak<stamp>` 插在最后一个扩展名点之前（`app.conf` → `app_bak20260922-1530.conf`）；
+ *  无扩展名或点开头（`.gitignore`）整体后加。与后端 staging 导出备份同一规则（staging.rs backup_name）。 */
+function backupName(name: string, stamp: string): string {
+  const i = name.lastIndexOf('.');
+  if (i <= 0) return `${name}_bak${stamp}`;
+  return `${name.slice(0, i)}_bak${stamp}${name.slice(i)}`;
+}
+
+/** 快速备份：先弹「保留原文件」对话框（默认勾选 = cp 复制备份，原文件保持在原路径；
+ *  不勾选 = mv 改名，原文件变为备份名、原路径释放）。
+ *  命名：后缀 `_bakYYYYMMDD-HHMM` 插在扩展名前；目录保留原文件时压缩为 `名称_bak<stamp>.tgz`，
+ *  不保留时直接 mv 为 `名称_bak<stamp>`。重名经 sftpUniqueName 自动改名；完成后刷新并聚焦备份文件。 */
 function backupRemote(st: SftpTabState, item: RemoteEntry): void {
-  const parent = parentOf(item.path);
-  const now = new Date();
-  const p = (v: number) => String(v).padStart(2, '0');
-  const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}`;
   void (async () => {
+    const choice = await confirmCheckDialog({
+      title: '快速备份',
+      message: `备份 ${item.isDir ? '目录' : '文件'}「${item.name}」`,
+      checkLabel: '保留原文件',
+      checkChecked: true,
+      okText: '开始备份',
+    });
+    if (!choice.ok) return;
+    const keepOriginal = choice.checked;
+    const parent = parentOf(item.path);
+    const now = new Date();
+    const p = (v: number) => String(v).padStart(2, '0');
+    const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}`;
     try {
-      const dest = await sftpUniqueName(st.serverId, parent, `${item.name}_bak${stamp}${item.isDir ? '.tgz' : ''}`);
-      const cmd = item.isDir
-        ? `tar czf ${shQuote(joinRemote(parent, dest))} -C ${shQuote(parent)} ${shQuote(item.name)}`
-        : `cp ${shQuote(item.path)} ${shQuote(joinRemote(parent, dest))}`;
+      let cmd: string;
+      let dest: string;
+      if (item.isDir) {
+        dest = keepOriginal ? `${item.name}_bak${stamp}.tgz` : backupName(item.name, stamp);
+        dest = await sftpUniqueName(st.serverId, parent, dest);
+        cmd = keepOriginal
+          ? `tar czf ${shQuote(joinRemote(parent, dest))} -C ${shQuote(parent)} ${shQuote(item.name)}`
+          : `mv ${shQuote(item.path)} ${shQuote(joinRemote(parent, dest))}`;
+      } else {
+        dest = await sftpUniqueName(st.serverId, parent, backupName(item.name, stamp));
+        cmd = keepOriginal
+          ? `cp ${shQuote(item.path)} ${shQuote(joinRemote(parent, dest))}`
+          : `mv ${shQuote(item.path)} ${shQuote(joinRemote(parent, dest))}`;
+      }
       await runRemoteCommand(st, cmd, `备份完成：${dest}`, joinRemote(parent, dest), `正在备份 ${item.name}`);
     } catch (err) {
       toast(String(err), 'error');
@@ -1055,7 +1126,7 @@ function showEntryMenu(x: number, y: number, st: SftpTabState, it: RemoteEntry, 
       label: '压缩为 tgz', iconName: 'package',
       action: () => void compressRemote(st, items),
     },
-    // 快速备份:目录压缩为 tgz、文件直接复制,完成后刷新并聚焦备份文件;多选时不可用
+    // 快速备份:弹「保留原文件」对话框(勾选=复制/压缩,不勾选=mv 改名),完成后刷新并聚焦备份文件;多选时不可用
     ...(!multi ? [
       {
         label: '快速备份', iconName: 'history',

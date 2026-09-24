@@ -250,6 +250,13 @@ svg.ic { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
   font-size: 12px; line-height: 1.8;
 }
 
+/* 确认弹窗的勾选框行（confirmCheckDialog，如快速备份「保留原文件」） */
+.confirm-check {
+  display: flex; align-items: center; gap: 6px; margin-top: 12px;
+  font-size: 12.5px; color: var(--text-0); cursor: pointer; user-select: none;
+}
+.confirm-check input { cursor: pointer; accent-color: var(--accent); }
+
 /* ---------- 右键菜单（共享，explorer / 编辑器通用） ---------- */
 .ctx-menu {
   position: fixed; z-index: 1500; min-width: 200px; padding: 4px;

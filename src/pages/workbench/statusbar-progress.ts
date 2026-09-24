@@ -4,8 +4,9 @@
  * 无 .proto 对照，全新功能；取代旧右下角弹窗 staging-progress.ts。
  *
  * 数据源：
- * - `sftp:progress`（src/api.ts onSftpProgress）：sftp_upload / sftp_download 命令的传输进度。
- *   bytes = 当前文件字节进度（totalBytes > 10MB 时显示确定进度条，小文件快速传输不打扰）；
+ * - `sftp:progress`（src/api.ts onSftpProgress）：sftp_upload / sftp_download 命令与 AI 通道
+ *   （ai_actions 批量上传/下载）的传输进度。
+ *   bytes = 当前文件字节进度（确定进度条，不分文件大小一律显示）；
  *   files = 一个文件已完成（显示已处理文件数）；done = 命令结束（隐藏对应任务）。
  * - `staging:progress`（src/api.ts onStagingProgress）：递归暂存目录 / 清理暂存区 / 导出备份的进度。
  *   walk = 枚举阶段（不确定条）；stage/clear/export = 逐文件/逐条目占比；done = 操作完成（隐藏）。
@@ -141,11 +142,9 @@ function ensureSubscribed(): void {
     const dir = p.direction === 'upload' ? '上传' : '下载';
     const name = p.current.split('/').filter(Boolean).pop() || p.current;
     if (p.phase === 'bytes') {
-      // 仅大文件（≥10MB）显示确定进度条；小文件静默（files 事件已保证任务槽存在）
-      if (p.totalBytes >= 10 * 1024 * 1024) {
-        const pct = p.totalBytes ? Math.min(100, Math.round((p.doneBytes / p.totalBytes) * 100)) : 0;
-        upsert(p.taskId, `${dir} ${name}`, pct, formatBytes(p.doneBytes) + ' / ' + formatBytes(p.totalBytes));
-      }
+      // 全部文件传输都显示确定进度条（不再按 10MB 门限区分大小文件）
+      const pct = p.totalBytes ? Math.min(100, Math.round((p.doneBytes / p.totalBytes) * 100)) : 0;
+      upsert(p.taskId, `${dir} ${name}`, pct, formatBytes(p.doneBytes) + ' / ' + formatBytes(p.totalBytes));
     } else {
       // files：任务槽先占位（无大文件时也显示「已处理 N 个文件」窗口）。
       // 若大文件正在传输（上一事件为 bytes 且未到 100%），保留其标题与百分比不被覆盖。

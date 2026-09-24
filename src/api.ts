@@ -143,6 +143,8 @@ export const fsDelete = (path: string) => call<void>('fs_delete', { path });
 /** OS 拖入导入：返回落地后的最终名称（重名自动改名）；文件内容 base64，目录传 null。 */
 export const fsImport = (dir: string, name: string, isDir: boolean, data: string | null) =>
   call<string>('fs_import', { dir, name, isDir, data });
+/** 确保目录存在（多级创建，幂等）；已存在但不是目录会 reject。 */
+export const fsEnsureDir = (path: string) => call<void>('fs_ensure_dir', { path });
 /** 本地文件被外部修改（AI write/edit 落盘）通知：path 为规范化绝对路径 */
 export const onFsChanged = (cb: (path: string) => void): Promise<UnlistenFn> =>
   listen<{ path: string }>('fs:changed', (e) => cb(e.payload.path));
@@ -604,8 +606,8 @@ export const stagingDiff = (projectId: string, sessionId: string, entryId: strin
 export const stagingClear = (projectId: string, sessionId: string) =>
   call<StagingClearOutcome>('staging_clear', { projectId, sessionId });
 /** 导出暂存备份：mode local = 快照复制到项目 .aishell/backup/（多条目打包 zip），remote =
- *  上传回条目原远程目录，文件名均加 _bak 后缀（stamp 为前端生成的本地时间 YYYYMMDD-HHMM，
- *  与 SFTP 快速备份同格式）；archiveName 仅多条目时需要（压缩包基础名，后缀后端追加）；
+ *  上传回条目原远程目录，文件名均加 _bak 后缀（插在扩展名前；stamp 为前端生成的本地时间
+ *  YYYYMMDD-HHMM，与 SFTP 快速备份同格式）；archiveName 仅多条目时需要（压缩包基础名，后缀后端追加）；
  *  accept=true 时导出成功的条目随后接受清除。与 staging_accept 同边界：绝不加入 pi 工具 / guard。 */
 export const stagingExport = (
   projectId: string,

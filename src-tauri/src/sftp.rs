@@ -41,8 +41,8 @@ pub struct SftpProgress {
     pub ok: bool,
 }
 
-/// upload_one / download_one 的进度回调事件（命令层转译为 `sftp:progress`）；
-/// AI / MCP 调用传 None（不做前端进度展示）。
+/// upload_one / download_one 的进度回调事件（progress_event_cb 转译为 `sftp:progress`）；
+/// MCP 调用传 None（不做前端进度展示），命令层与 AI 通道（ai_actions）都接进度。
 pub(crate) enum ProgressEvent {
     /// 当前文件流式字节进度
     Bytes { current: String, done: u64, total: u64 },
@@ -52,6 +52,74 @@ pub(crate) enum ProgressEvent {
 
 /// 传输进度回调类型。
 pub(crate) type ProgressCb = dyn Fn(ProgressEvent) + Send + Sync;
+
+/// 把 upload_one / download_one 的 ProgressEvent 转译为 SftpProgress 并交给 emit 的进度回调
+/// （sftp_upload / sftp_download 命令与 ai_actions 的 AI 通道共用；files_done 跨事件累计）。
+pub(crate) fn progress_event_cb(
+    task_id: &str,
+    server_id: &str,
+    direction: &str,
+    files_done: Arc<AtomicU64>,
+    emit: impl Fn(SftpProgress) + Send + Sync + 'static,
+) -> Box<ProgressCb> {
+    let task_id = task_id.to_string();
+    let server_id = server_id.to_string();
+    let direction = direction.to_string();
+    Box::new(move |ev: ProgressEvent| {
+        let p = match ev {
+            ProgressEvent::Bytes {
+                current,
+                done,
+                total,
+            } => SftpProgress {
+                task_id: task_id.clone(),
+                server_id: server_id.clone(),
+                direction: direction.clone(),
+                phase: "bytes".to_string(),
+                current,
+                done_bytes: done,
+                total_bytes: total,
+                files_done: 0,
+                files_total: 0,
+                ok: true,
+            },
+            ProgressEvent::FileDone { current } => SftpProgress {
+                task_id: task_id.clone(),
+                server_id: server_id.clone(),
+                direction: direction.clone(),
+                phase: "files".to_string(),
+                current,
+                done_bytes: 0,
+                total_bytes: 0,
+                files_done: files_done.fetch_add(1, Ordering::SeqCst) + 1,
+                files_total: 0,
+                ok: true,
+            },
+        };
+        emit(p);
+    })
+}
+
+/// done 阶段事件（传输结束收槽；ok=false 时前端不发完成通知）。
+pub(crate) fn progress_done_event(
+    task_id: String,
+    server_id: String,
+    direction: &str,
+    ok: bool,
+) -> SftpProgress {
+    SftpProgress {
+        task_id,
+        server_id,
+        direction: direction.to_string(),
+        phase: "done".to_string(),
+        current: String::new(),
+        done_bytes: 0,
+        total_bytes: 0,
+        files_done: 0,
+        files_total: 0,
+        ok,
+    }
+}
 
 /// sftp_write 结果：conflict=true 表示远端已被外部修改且未写入（actual_* 为远端当前属性）；
 /// conflict=false 表示已写入（actual_* 为落盘后属性，供前端重建下次保存的基线）。
@@ -158,8 +226,7 @@ pub async fn sftp_stat(
 
 /// 上传本地文件/目录到远端目录：目录递归（本地 walk + 远端逐层建目录），文件流式拷贝；
 /// 目标重名自动改 `name (1).ext`（目录同理 `name (1)`）；返回最终落地名称（前端聚焦用）。
-/// 进度：upload_one 经 `sftp:progress` 事件逐字节/逐文件上报，前端按 total_bytes 决定
-/// 是否显示确定进度条（<10MB 快速传输不打扰）。
+/// 进度：upload_one 经 `sftp:progress` 事件逐字节/逐文件上报，前端一律显示确定进度条。
 #[tauri::command]
 pub async fn sftp_upload(
     app: tauri::AppHandle,
@@ -184,42 +251,13 @@ pub async fn sftp_upload(
     let sftp = ssh.inner().open_sftp(&server_id).await?;
     let task_id = transfer_task_id("up");
     let files_done = Arc::new(AtomicU64::new(0));
-    let cb = {
+    let cb = progress_event_cb(&task_id, &server_id, "upload", Arc::clone(&files_done), {
         let app = app.clone();
-        let sid = server_id.clone();
-        let task_id = task_id.clone();
-        let files_done = Arc::clone(&files_done);
-        move |ev: ProgressEvent| {
-            let p = match ev {
-                ProgressEvent::Bytes { current, done, total } => SftpProgress {
-                    task_id: task_id.clone(),
-                    server_id: sid.clone(),
-                    direction: "upload".to_string(),
-                    phase: "bytes".to_string(),
-                    current,
-                    done_bytes: done,
-                    total_bytes: total,
-                    files_done: 0,
-                    files_total: 0,
-                    ok: true,
-                },
-                ProgressEvent::FileDone { current } => SftpProgress {
-                    task_id: task_id.clone(),
-                    server_id: sid.clone(),
-                    direction: "upload".to_string(),
-                    phase: "files".to_string(),
-                    current,
-                    done_bytes: 0,
-                    total_bytes: 0,
-                    files_done: files_done.fetch_add(1, Ordering::SeqCst) + 1,
-                    files_total: 0,
-                    ok: true,
-                },
-            };
+        move |p| {
             let _ = app.emit("sftp:progress", p);
         }
-    };
-    let result = upload_one(&sftp, Path::new(&local_path), &target, false, Some(&cb)).await;
+    });
+    let result = upload_one(&sftp, Path::new(&local_path), &target, false, Some(cb.as_ref())).await;
     // 时间线：文件上传完成/失败（files_done 计数含目录递归的每个文件）
     {
         let label = ssh
@@ -238,18 +276,7 @@ pub async fn sftp_upload(
     }
     let _ = app.emit(
         "sftp:progress",
-        SftpProgress {
-            task_id,
-            server_id,
-            direction: "upload".to_string(),
-            phase: "done".to_string(),
-            current: String::new(),
-            done_bytes: 0,
-            total_bytes: 0,
-            files_done: 0,
-            files_total: 0,
-            ok: result.is_ok(),
-        },
+        progress_done_event(task_id, server_id, "upload", result.is_ok()),
     );
     result
 }
@@ -348,8 +375,7 @@ pub(crate) async fn upload_one(
 
 /// 下载远端文件/目录到本地目录：对称递归，本地重名同样自动 `name (1).ext`。
 /// 返回最终落地的完整本地路径（前端下载后据此定位高亮）。
-/// 进度：download_one 经 `sftp:progress` 事件逐字节/逐文件上报，前端按 total_bytes 决定
-/// 是否显示确定进度条（<10MB 快速传输不打扰）。
+/// 进度：download_one 经 `sftp:progress` 事件逐字节/逐文件上报，前端一律显示确定进度条。
 #[tauri::command]
 pub async fn sftp_download(
     app: tauri::AppHandle,
@@ -367,42 +393,13 @@ pub async fn sftp_download(
     let sftp = ssh.inner().open_sftp(&server_id).await?;
     let task_id = transfer_task_id("down");
     let files_done = Arc::new(AtomicU64::new(0));
-    let cb = {
+    let cb = progress_event_cb(&task_id, &server_id, "download", Arc::clone(&files_done), {
         let app = app.clone();
-        let sid = server_id.clone();
-        let task_id = task_id.clone();
-        let files_done = Arc::clone(&files_done);
-        move |ev: ProgressEvent| {
-            let p = match ev {
-                ProgressEvent::Bytes { current, done, total } => SftpProgress {
-                    task_id: task_id.clone(),
-                    server_id: sid.clone(),
-                    direction: "download".to_string(),
-                    phase: "bytes".to_string(),
-                    current,
-                    done_bytes: done,
-                    total_bytes: total,
-                    files_done: 0,
-                    files_total: 0,
-                    ok: true,
-                },
-                ProgressEvent::FileDone { current } => SftpProgress {
-                    task_id: task_id.clone(),
-                    server_id: sid.clone(),
-                    direction: "download".to_string(),
-                    phase: "files".to_string(),
-                    current,
-                    done_bytes: 0,
-                    total_bytes: 0,
-                    files_done: files_done.fetch_add(1, Ordering::SeqCst) + 1,
-                    files_total: 0,
-                    ok: true,
-                },
-            };
+        move |p| {
             let _ = app.emit("sftp:progress", p);
         }
-    };
-    let result = download_one(&sftp, &remote_path, &local, Some(&cb)).await;
+    });
+    let result = download_one(&sftp, &remote_path, &local, Some(cb.as_ref())).await;
     // 时间线：文件下载完成/失败
     {
         let label = ssh
@@ -421,18 +418,7 @@ pub async fn sftp_download(
     }
     let _ = app.emit(
         "sftp:progress",
-        SftpProgress {
-            task_id,
-            server_id,
-            direction: "download".to_string(),
-            phase: "done".to_string(),
-            current: String::new(),
-            done_bytes: 0,
-            total_bytes: 0,
-            files_done: 0,
-            files_total: 0,
-            ok: result.is_ok(),
-        },
+        progress_done_event(task_id, server_id, "download", result.is_ok()),
     );
     result
 }
@@ -560,7 +546,7 @@ pub(crate) async fn download_one(
 }
 
 /// 生成单次传输命令的任务 id（同一命令内所有事件共用，前端按 key 归并；unix 毫秒 + 自增后缀）。
-fn transfer_task_id(prefix: &str) -> String {
+pub(crate) fn transfer_task_id(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let ts = SystemTime::now()

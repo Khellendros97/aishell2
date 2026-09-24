@@ -105,6 +105,64 @@ export function confirmDialog({
   return promise;
 }
 
+export interface ConfirmCheckOptions extends ConfirmOptions {
+  /** 勾选框文案（如快速备份的「保留原文件」） */
+  checkLabel: string;
+  /** 勾选框初始状态（缺省不勾选） */
+  checkChecked?: boolean;
+}
+
+/** 带勾选框的确认弹窗：确定 resolve { ok:true, checked }，取消/点遮罩 resolve { ok:false, checked }。
+ *  与 confirmDialog 同样式；勾选状态仅在 ok=true 时有语义。 */
+export function confirmCheckDialog({
+  title = '确认操作', message = '', danger = false, okText = '确定', list,
+  checkLabel, checkChecked = false,
+}: ConfirmCheckOptions): Promise<{ ok: boolean; checked: boolean }> {
+  const { promise, resolve } = Promise.withResolvers<{ ok: boolean; checked: boolean }>();
+  const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML = `
+      <div class="modal" style="width:400px">
+        <div class="modal-head"><h3></h3></div>
+        <div class="modal-body" style="color:var(--text-1);line-height:1.6"></div>
+        <div class="modal-foot">
+          <button class="btn" data-act="cancel">取消</button>
+          <button class="btn ${danger ? 'danger-solid' : 'primary'}" data-act="ok"></button>
+        </div>
+      </div>`;
+    mask.querySelector('h3')!.textContent = title;
+    mask.querySelector('.modal-body')!.textContent = message;
+    if (list && list.length > 0) {
+      const ul = document.createElement('ul');
+      ul.className = 'confirm-list';
+      for (const item of list) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        ul.appendChild(li);
+      }
+      mask.querySelector('.modal-body')!.appendChild(ul);
+    }
+    const row = document.createElement('label');
+    row.className = 'confirm-check';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = checkChecked;
+    row.append(box, document.createTextNode(checkLabel));
+    mask.querySelector('.modal-body')!.appendChild(row);
+    mask.querySelector('[data-act=ok]')!.textContent = okText;
+    document.body.appendChild(mask);
+    requestAnimationFrame(() => mask.classList.add('open'));
+    const close = (ok: boolean) => {
+      mask.classList.remove('open');
+      setTimeout(() => mask.remove(), 160);
+      resolve({ ok, checked: box.checked });
+    };
+    (mask.querySelector('[data-act=cancel]') as HTMLButtonElement).onclick = () => close(false);
+    (mask.querySelector('[data-act=ok]') as HTMLButtonElement).onclick = () => close(true);
+    mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(false); });
+  return promise;
+}
+
 /** 输入对话框（如压缩包命名）：确定返回 trim 后的值（空/含路径分隔符时拒绝并提示），取消返回 null。
  *  allowPath=true 时跳过「名称不能包含路径分隔符」校验（分类目录等按路径输入的场景）。
  *  multiline=true 时换成多行 textarea：Enter 换行，Ctrl/Cmd+Enter 确认（仪表盘定制需求等长文本场景）。 */

@@ -13,6 +13,7 @@
 //! run_command 默认 10 秒超时，模型可用 timeoutSeconds 覆盖（1–3600 秒）。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -63,6 +64,9 @@ pub enum ConfigChangedKind {
 
 pub(crate) type ConfigChangedEmitter = Arc<dyn Fn(&ConfigChanged) + Send + Sync>;
 
+/// SFTP 传输进度事件发射器（AI 通道上传/下载批次的进度经它发到前端底栏进度区）。
+pub(crate) type SftpProgressEmitter = Arc<dyn Fn(crate::sftp::SftpProgress) + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct SftpUploadItem {
     pub local_path: String,
@@ -102,6 +106,9 @@ pub struct AiActions {
     browser: Arc<crate::browser::BrowserManager>,
     /// SDK 配置成功持久化后的事件回调；测试/无 UI 环境不注入则静默。
     config_changed: StdMutex<Option<ConfigChangedEmitter>>,
+    /// SFTP 传输进度事件回调（lib.rs 注入 app.emit("sftp:progress", ...)）；
+    /// 与 config_changed 同模式：不注入则静默（仅少前端进度展示，传输本身不受影响）。
+    sftp_progress: StdMutex<Option<SftpProgressEmitter>>,
 }
 
 impl AiActions {
@@ -117,12 +124,26 @@ impl AiActions {
             staging,
             browser,
             config_changed: StdMutex::new(None),
+            sftp_progress: StdMutex::new(None),
         }
     }
 
     /// 注入 SDK 配置变更事件回调（lib.rs：emit `config:changed`）。
     pub(crate) fn set_config_changed_emitter(&self, f: ConfigChangedEmitter) {
         *self.config_changed.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+    }
+
+    /// 注入 SFTP 传输进度事件回调（lib.rs：emit `sftp:progress`）。
+    pub(crate) fn set_sftp_progress_emitter(&self, f: SftpProgressEmitter) {
+        *self.sftp_progress.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+    }
+
+    /// 取出进度发射器（Arc 克隆，供传输批次构造进度回调与 done 事件）。
+    fn sftp_progress_emitter(&self) -> Option<SftpProgressEmitter> {
+        self.sftp_progress
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn emit_config_changed(&self, kind: ConfigChangedKind, project_id: Option<String>) {
@@ -403,11 +424,34 @@ impl AiActions {
             }
         }
         let sftp = self.ssh.open_sftp(server_id).await?;
+        // 进度：整个批次共用一个任务槽（ai-up-*），逐字节/逐文件经 sftp:progress 上前端底栏
+        let task_id = crate::sftp::transfer_task_id("ai-up");
+        let progress_emit = self.sftp_progress_emitter();
+        let progress = progress_emit.as_ref().map(|emit| {
+            crate::sftp::progress_event_cb(
+                &task_id,
+                server_id,
+                "upload",
+                Arc::new(AtomicU64::new(0)),
+                {
+                    let emit = Arc::clone(emit);
+                    move |p| emit(p)
+                },
+            )
+        });
         let mut failures = Vec::new();
         for (index, item) in items.iter().enumerate() {
-            if let Err(error) = crate::sftp::upload_one(&sftp, &resolved[index], &remote_dirs[index], item.overwrite, None).await {
+            if let Err(error) = crate::sftp::upload_one(&sftp, &resolved[index], &remote_dirs[index], item.overwrite, progress.as_deref()).await {
                 failures.push(format!("第 {} 项失败：{}", index + 1, error));
             }
+        }
+        if let Some(emit) = &progress_emit {
+            emit(crate::sftp::progress_done_event(
+                task_id,
+                server_id.to_string(),
+                "upload",
+                failures.is_empty(),
+            ));
         }
         let succeeded = items.len() - failures.len();
         let label = self
@@ -473,11 +517,34 @@ impl AiActions {
             remote_paths.push(self.resolve_remote_path(server_id, &item.remote_path).await?);
         }
         let sftp = self.ssh.open_sftp(server_id).await?;
+        // 进度：整个批次共用一个任务槽（ai-down-*），逐字节/逐文件经 sftp:progress 上前端底栏
+        let task_id = crate::sftp::transfer_task_id("ai-down");
+        let progress_emit = self.sftp_progress_emitter();
+        let progress = progress_emit.as_ref().map(|emit| {
+            crate::sftp::progress_event_cb(
+                &task_id,
+                server_id,
+                "download",
+                Arc::new(AtomicU64::new(0)),
+                {
+                    let emit = Arc::clone(emit);
+                    move |p| emit(p)
+                },
+            )
+        });
         let mut failures = Vec::new();
         for (index, _item) in items.iter().enumerate() {
-            if let Err(error) = crate::sftp::download_one(&sftp, &remote_paths[index], &dirs[index], None).await {
+            if let Err(error) = crate::sftp::download_one(&sftp, &remote_paths[index], &dirs[index], progress.as_deref()).await {
                 failures.push(format!("第 {} 项失败：{}", index + 1, error));
             }
+        }
+        if let Some(emit) = &progress_emit {
+            emit(crate::sftp::progress_done_event(
+                task_id,
+                server_id.to_string(),
+                "download",
+                failures.is_empty(),
+            ));
         }
         let succeeded = items.len() - failures.len();
         let label = self
