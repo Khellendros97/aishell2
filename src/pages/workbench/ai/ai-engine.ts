@@ -1246,6 +1246,14 @@ function notifyOwnerOnly(title: string, body: string): void {
   notifyAi(title, body);
 }
 
+/** 宿主「分离」：先把本项目全部会话快照 flush 到 store 再建窗——独立窗口挂载后从
+ *  store 加载历史（只订阅建窗之后的增量事件），宿主内存里任何尚未落盘的定稿消息
+ *  （历史上单次落盘失败/队列滞留的残留）不 flush 就会在分离窗口里「消失」。
+ *  flush 失败不阻塞分离（快照写入有重试，尽力而为）。 */
+async function flushProjectSessions(ctx: ProjectContext): Promise<void> {
+  await Promise.allSettled([...ctx.sessions.values()].map((s) => persistSession(s, ctx)));
+}
+
 /** 宿主「分离」：后端建窗成功 → 置位触发面板卸载 → 句柄换转发桩。
  *  项目上下文保持在线（后台收流落盘），独立窗口自行挂载订阅同一事件流。
  *  失败（如已有其他项目的分离窗口）只 toast，宿主面板保持原状。 */
@@ -1253,6 +1261,8 @@ async function detachAiWindow(): Promise<void> {
   const detach = panelOptions.detach;
   if (!detach || detach.role !== 'host' || !project) return;
   const pid = project.id;
+  const ctx = projectContexts.get(pid);
+  if (ctx) await flushProjectSessions(ctx).catch(() => { /* 尽力 flush，失败不阻塞分离 */ });
   try {
     await aiWindowOpen(pid, activeSessionId || null, detach.host);
   } catch (err) {
@@ -2210,17 +2220,51 @@ function generateSessionNote(pid: string, sid: string): void {
   });
 }
 
+/** session_upsert 单次调用的超时上限：正常远小于 1s（keyring 读 + 全量 JSON 写盘），
+ *  超时视为失败进入重试；迟到的原调用即便最终完成也只是幂等重写同一快照，无副作用。 */
+const PERSIST_CALL_TIMEOUT_MS = 20_000;
+/** 失败重试次数（不含首次）：单次 IPC/文件写入抖动（杀软/索引器瞬时占用 aishell.json 等）
+ *  不应丢掉整轮对话——2026-09-28 实测单次失败后无重试，整轮回复只活在内存里，
+ *  分离窗口从 store 加载就只剩首条用户消息。 */
+const PERSIST_MAX_RETRIES = 3;
+
+/** 带 超时 的单次 session_upsert：invoke 永不返回（IPC 异常/后端阻塞）时不至于卡死整条串行队列 */
+function sessionUpsertBounded(projectId: string, snapshot: ChatSession): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`session_upsert 超时（${PERSIST_CALL_TIMEOUT_MS}ms 未返回）`)),
+      PERSIST_CALL_TIMEOUT_MS,
+    );
+    sessionUpsert(projectId, snapshot).then(
+      () => { clearTimeout(timer); resolve(); },
+      (err) => { clearTimeout(timer); reject(err instanceof Error ? err : new Error(String(err))); },
+    );
+  });
+}
+
 function enqueueSessionSnapshot(target: ProjectContext, snapshot: ChatSession): Promise<void> {
   const key = `${target.project.id}:${snapshot.id}`;
   const previous = target.persistQueues.get(key) ?? Promise.resolve();
+  const run = async (): Promise<void> => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await sessionUpsertBounded(target.project.id, snapshot);
+        return;
+      } catch (err) {
+        if (attempt >= PERSIST_MAX_RETRIES) {
+          /* 终态失败：控制台必留痕（toast 会自动消失，F12 排查依赖这行），再按上下文可见性补 toast */
+          console.error('[AI] 会话保存失败（含重试）:', key, err);
+          if (!unmounted && viewContext === target) toast(`会话保存失败：${String(err)}`, 'error');
+          throw err;
+        }
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+      }
+    }
+  };
   let current: Promise<void>;
   current = previous
     .catch(() => { /* 上一次失败不阻塞后续快照 */ })
-    .then(() => sessionUpsert(target.project.id, snapshot))
-    .catch((err) => {
-      if (!unmounted && viewContext === target) toast(`会话保存失败：${String(err)}`, 'error');
-      else console.error('[AI] 会话保存失败:', err);
-    })
+    .then(run)
     .finally(() => {
       if (target.persistQueues.get(key) === current) target.persistQueues.delete(key);
     });
@@ -4281,6 +4325,11 @@ export function anyAiBusy(): boolean {
 export function flushAiPendingOutput(): Promise<void> {
   const jobs: Promise<void>[] = [];
   for (const ctx of projectContexts.values()) {
+    /* 全量快照兜底：不仅覆盖未定稿正文，也把「已定稿但此前单次落盘失败」的整段历史
+       补写进 store（pending 已置空的会话按消息列表原样重写，幂等）。 */
+    for (const s of ctx.sessions.values()) {
+      if (s.messages.length > 0) jobs.push(persistSession(s, ctx));
+    }
     for (const [sid, p] of ctx.pendingBy.entries()) {
       if (!p || !p.text.trim()) continue;
       const s = ctx.sessions.get(sid);
