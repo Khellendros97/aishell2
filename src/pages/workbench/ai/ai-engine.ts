@@ -68,7 +68,7 @@ import MarkdownIt from 'markdown-it';
 import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, NoteRef, PathRef, PcapRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon, type IconName } from '../../../icons';
 import {
-  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiForwardRef, aiGenerateSessionTitle, aiReadImage, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, aiWindowClose, aiWindowOpen, getState, kbSearch, onAiEvent, onAiForwardRef, onAiSessionTitle, onAiWindowChanged, saveDbConnection, saveSettings,
+  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiForwardRef, aiGenerateSessionTitle, aiReadImage, aiRepairSession, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, aiWindowClose, aiWindowOpen, getState, kbSearch, onAiEvent, onAiForwardRef, onAiSessionTitle, onAiWindowChanged, saveDbConnection, saveSettings,
   sessionArchive, sessionNote, sessionUpsert, sessionsGet, setAiMode, stagingAccept, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
@@ -2194,6 +2194,38 @@ function archiveSession(pid: string, sid: string): void {
     }
     openModal();
   }).catch(() => openModal());
+}
+
+/** 修复会话入口(右键菜单「修复会话」):确认 → ai_repair_session(后端杀会话进程 + 校验修复
+ *  sessions jsonl 的孤儿/缺失工具结果配对)→ 报告反馈。修复的是模型上下文文件;显示历史在
+ *  aishell.json、与该文件独立,界面无需刷新;下一条消息自动按修复后文件懒重启 pi。 */
+function repairSession(pid: string, sid: string): void {
+  void confirmDialog({
+    title: '修复会话',
+    message: '将重启该会话的 AI 进程，并检查修复会话历史文件（清理孤儿工具结果、补齐缺失结果；修复前自动备份 .jsonl.bak）。不影响已显示的对话内容，也不影响其他会话。',
+    okText: '开始修复',
+  }).then(async (ok) => {
+    if (!ok) return;
+    try {
+      const r = await aiRepairSession(pid, sid);
+      if (!r.changed) {
+        toast('未发现结构问题，会话进程已重启', 'success');
+        return;
+      }
+      const fixes: string[] = [];
+      if (r.removedOrphanToolResults > 0) fixes.push(`清理孤儿工具结果 ${r.removedOrphanToolResults} 条`);
+      if (r.filledMissingToolResults > 0) fixes.push(`补齐缺失工具结果 ${r.filledMissingToolResults} 条`);
+      if (r.droppedMalformed > 0) fixes.push(`丢弃损坏行 ${r.droppedMalformed} 行`);
+      void confirmDialog({
+        title: '修复会话完成',
+        message: `会话进程已重启；历史文件共 ${r.totalLines} 行，修复内容如下（原文件已备份为 .jsonl.bak）：`,
+        list: fixes,
+        okText: '知道了',
+      });
+    } catch (err) {
+      toast(`修复会话失败：${String(err)}`, 'error');
+    }
+  });
 }
 
 /** 生成笔记入口(右键菜单「生成笔记」):与归档共用对话框/LLM 整理,但不归档、不动暂存区,会话保持活跃 */
@@ -4912,6 +4944,11 @@ function bindEvents(): void {
             label: '生成笔记', iconName: 'note' as const,
             disabled: generating, disabledTip: busyTip,
             action: () => generateSessionNote(pid, sid),
+          },
+          {
+            label: '修复会话', iconName: 'wrench' as const,
+            disabled: generating, disabledTip: busyTip,
+            action: () => repairSession(pid, sid),
           },
           {
             label: '归档会话', iconName: 'archive' as const,

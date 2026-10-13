@@ -784,6 +784,21 @@ export interface DwsSubmitResult {
   openUrl?: string | null;
 }
 
+/** ai_repair_session 会话历史修复报告（修复 pi 会话 jsonl 的孤儿/缺失工具结果配对，
+ *  与 Rust ai_repair.rs 的 AiRepairReport serde camelCase 对齐） */
+export interface AiRepairReport {
+  /** 原文件总行数（不含空行） */
+  totalLines: number;
+  /** 无法解析被丢弃的行数 */
+  droppedMalformed: number;
+  /** 删除的孤儿工具结果数（所属 assistant 不在有效上下文内） */
+  removedOrphanToolResults: number;
+  /** 补齐的缺失工具结果数（合成 isError 占位结果） */
+  filledMissingToolResults: number;
+  /** 是否发生了任何修改（false = 文件未动，仅重启了会话进程） */
+  changed: boolean;
+}
+
 /** AI 分离窗口最近一次几何（物理像素，ai_window.rs Destroyed 时写回；下次分离恢复） */
 export interface AiWindowGeometry {
   x: number;

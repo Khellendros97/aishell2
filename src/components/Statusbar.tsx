@@ -1,9 +1,10 @@
 /**
  * 应用底栏 —— 工作台 / 欢迎页 / 设置页共用（无 .proto 对照，样式自 workbench.css 迁入 statusbar.css）。
- * 结构：左侧信息区（调用方传入）+ 中部进度区 + 右侧（运行中隧道角标 + 可选 AI 助手开关）。
+ * 结构：左侧信息区（调用方传入）+ 中部进度区 + 右侧（运行中隧道角标 + MCP 角标 + 可选 AI 助手开关）。
  * - 进度区容器统一用 .statusbar-progress 类：工作台保活隐藏期间容器仍在 DOM，
  *   与当前页面的容器并存，statusbar-progress.ts 会向所有连接的容器同步渲染；
  * - 隧道角标为全局数据（不区分页面），拉取与 tunnels:changed 订阅由本组件自持；
+ * - MCP 角标（已启用服务器数 + 管理弹层）自持数据与刷新，见 components/StatusbarMcp.tsx；
  * - AI 开关仅当 onToggleAi 提供时渲染（工作台/欢迎页有 AI 面板；设置页没有则不传）。
  * 与后端接口点：tunnel_list / tunnels:changed（角标，见 src/api.ts）；
  * 进度区数据由 statusbar-progress.ts 订阅 sftp:progress / staging:progress，本组件只提供容器。
@@ -12,6 +13,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { onTunnelsChanged, tunnelList } from '../api';
 import type { TunnelState } from '../types';
 import { Icon } from '../shared/Icon';
+import { StatusbarMcp } from './StatusbarMcp';
 import { refreshProgress } from '../pages/workbench/statusbar-progress';
 import './statusbar.css';
 
@@ -62,6 +64,7 @@ export function Statusbar({ left, aiVisible, onToggleAi, aiControls, aiDisabled,
             <Icon name="tunnel" />{runningTunnels.length}
           </span>
         )}
+        <StatusbarMcp />
         {onToggleAi && (
           <button
             type="button"

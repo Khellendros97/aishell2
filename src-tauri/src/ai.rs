@@ -1402,6 +1402,14 @@ impl AiManager {
         procs.values().any(|p| p.busy.load(Ordering::SeqCst))
     }
 
+    /// 指定会话的 pi 进程是否处于生成/审批等待（进程不存在视为空闲）。
+    /// 会话修复（ai_repair_session）用它拒绝在途回合，避免杀进程截断转录。
+    pub fn session_busy(&self, project_id: &str, session_id: &str) -> bool {
+        let key = format!("{project_id}:{session_id}");
+        let procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
+        procs.get(&key).is_some_and(|p| p.busy.load(Ordering::SeqCst))
+    }
+
     fn kill_keys(&self, select: impl Fn(&str) -> bool) {
         let mut procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
         let dead: Vec<String> = procs.keys().filter(|k| select(k)).cloned().collect();

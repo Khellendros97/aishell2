@@ -18,6 +18,64 @@
 /* 运行中隧道角标：数量醒目，title 列明细 */
 .statusbar-tunnels { color: var(--green); flex: none; }
 .statusbar-tunnels .ic { color: inherit; }
+
+/* MCP 角标 + 管理弹层（components/StatusbarMcp.tsx）：三页共用，开关滑块自带
+   （照 servers.css .db-switch 抄制——底栏不依赖 ServersPanel 才加载的样式） */
+.statusbar-mcp { position: relative; flex: none; }
+.statusbar-mcp-badge {
+  height: 22px; padding: 0 6px; border: none; border-radius: var(--radius-s);
+  background: transparent; color: var(--accent); font: inherit; cursor: pointer;
+}
+.statusbar-mcp-badge:hover { background: var(--bg-hover); color: var(--text-0); }
+.statusbar-mcp-badge .ic { color: inherit; }
+.statusbar-mcp-panel {
+  position: fixed; z-index: 1250; /* 高于 debug 面板(1100，底栏区域重叠)、低于命令面板(1400)；齿轮入口先收起弹层再开模态，不与模态(1000)叠 */
+  width: 340px; max-height: min(380px, calc(100vh - 60px));
+  display: flex; flex-direction: column;
+  background: var(--bg-1); border: 1px solid var(--border-strong); border-radius: var(--radius-m);
+  box-shadow: var(--shadow-m); font-size: 12px; overflow: hidden;
+}
+.sb-mcp-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 12px; border-bottom: 1px solid var(--border); flex: none; min-width: 0;
+}
+.sb-mcp-title { color: var(--text-0); font-weight: 600; flex: none; }
+.sb-mcp-status {
+  display: inline-flex; align-items: center; gap: 4px; min-width: 0;
+  color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sb-mcp-status .ic { flex: none; }
+.sb-mcp-status.ok { color: var(--green); }
+.sb-mcp-status.err { color: var(--red); }
+.sb-mcp-list { overflow-y: auto; padding: 4px; }
+.sb-mcp-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-s); }
+.sb-mcp-row:hover { background: var(--bg-hover); }
+.sb-mcp-info { flex: 1; min-width: 0; }
+.sb-mcp-name {
+  display: flex; align-items: center; gap: 5px; color: var(--text-0); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sb-mcp-name .ic { flex: none; color: var(--text-3); }
+.sb-mcp-meta { color: var(--text-2); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sb-mcp-gear { flex: none; width: 24px; height: 24px; }
+.sb-mcp-switch { position: relative; width: 30px; height: 17px; flex: none; cursor: pointer; }
+.sb-mcp-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.sb-mcp-switch-track {
+  position: absolute; inset: 0; background: var(--bg-3, #3a3d46); border: 1px solid var(--border, #333);
+  border-radius: 9px; transition: background .12s, border-color .12s;
+}
+.sb-mcp-switch-track::after {
+  content: ''; position: absolute; left: 1px; top: 1px; width: 13px; height: 13px; border-radius: 50%;
+  background: var(--text-3, #888); transition: transform .12s, background .12s;
+}
+.sb-mcp-switch input:checked + .sb-mcp-switch-track { background: var(--accent-dim, rgba(74,158,255,.25)); border-color: var(--accent, #4a9eff); }
+.sb-mcp-switch input:checked + .sb-mcp-switch-track::after { transform: translateX(13px); background: var(--accent, #4a9eff); }
+.sb-mcp-switch input:disabled { cursor: not-allowed; }
+.sb-mcp-switch input:disabled + .sb-mcp-switch-track { opacity: 0.45; }
+.sb-mcp-foot {
+  padding: 8px 12px; border-top: 1px solid var(--border); flex: none;
+  color: var(--text-3); font-size: 11px; line-height: 1.5;
+}
 .statusbar-ai-toggle {
   height: 22px; padding: 0 8px; border: 1px solid transparent; border-radius: var(--radius-s);
   background: transparent; color: var(--text-1); cursor: pointer; font: inherit;
