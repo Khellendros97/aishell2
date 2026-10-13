@@ -2,6 +2,7 @@ pub mod ai;
 pub mod ai_actions;
 pub mod ai_images;
 pub mod ai_impact;
+pub mod ai_repair;
 pub mod ai_window;
 pub mod browser;
 pub mod dashboard;
@@ -361,6 +362,7 @@ pub fn run() {
             ai::ai_respond_ask,
             ai::ai_respond_confirm,
             session_title::ai_generate_session_title,
+            ai_repair::ai_repair_session,
             ai_window::ai_window_open,
             ai_window::ai_window_close,
             ai_window::ai_any_busy,

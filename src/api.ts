@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, DashboardRender, DashboardSpec, AiWindowChangedEvent, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, PcapReadOut, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
+  AiMode, DashboardRender, DashboardSpec, AiWindowChangedEvent, AiRepairReport, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, PcapReadOut, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -307,6 +307,11 @@ export const aiAbort = (key: string) => call<void>('ai_abort', { key });
 export const aiDebugInfo = () => call<string>('ai_debug_info');
 /** 工作台卸载/切项目时调用：kill 该项目全部 pi 进程 */
 export const aiKillProject = (projectId: string) => call<void>('ai_kill_project', { projectId });
+/** 修复会话历史（右键菜单「修复会话」）：杀会话 pi 进程后校验修复 sessions jsonl
+ *  （孤儿工具结果删除、缺失结果补齐；备份 .jsonl.bak 后原子写回），下一条消息按同一文件
+ *  懒重启加载修复后内容；文件无结构问题时仅完成进程重启（治愈 pi 内存态损坏）。 */
+export const aiRepairSession = (projectId: string, sessionId: string) =>
+  call<AiRepairReport>('ai_repair_session', { projectId, sessionId });
 /** 动态切换项目内 AI 进程的思考强度（立即生效；无存活进程时静默，下次提问按新档位 spawn） */
 export const aiSetThinking = (projectId: string, level: string) =>
   call<void>('ai_set_thinking', { projectId, level });
