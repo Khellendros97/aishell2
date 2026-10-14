@@ -38,8 +38,9 @@ function parsePort(raw: string): number | null {
  *  已被其它「正在运行」的隧道绑定（配置允许端口重复，冲突只在启动时按运行态判定）。 */
 const PORT_CONFLICT_PREFIX = '[隧道端口冲突]';
 
-/** 解析端口冲突错误：命中返回去掉前缀的冲突描述（「该端口已被「xxx」占用」），否则 null。 */
-function conflictDetail(err: unknown): string | null {
+/** 解析端口冲突错误：命中返回去掉前缀的冲突描述（「该端口已被「xxx」占用」），否则 null。
+ *  导出给底栏隧道角标面板（components/StatusbarTunnels.tsx）复用同一确认流程。 */
+export function conflictDetail(err: unknown): string | null {
   const msg = String(err);
   return msg.startsWith(PORT_CONFLICT_PREFIX) ? msg.slice(PORT_CONFLICT_PREFIX.length) : null;
 }
