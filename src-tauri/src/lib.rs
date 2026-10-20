@@ -272,6 +272,7 @@ pub fn run() {
             store::delete_credential,
             store::clear_unreferenced_credentials,
             store::delete_server,
+            store::delete_server_with_credentials,
             store::upsert_project,
             delete_project_with_ai,
             store::ensure_project_dirs,

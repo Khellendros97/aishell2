@@ -26,8 +26,11 @@
 #sidebar { width: var(--sidebar-w); flex: none; background: var(--bg-1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
 #sidebar-head {
   height: 34px; flex: none; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 10px 0 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-1); text-transform: uppercase;
+  gap: 8px; padding: 0 10px 0 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-1); text-transform: uppercase;
 }
+/* 标题可被压缩省略、操作区不换行：侧栏拖窄时（如 explorer 排序下拉框 + 三个按钮）不撑破头部 */
+#sidebar-head #sidebar-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#sidebar-actions { flex: none; display: inline-flex; align-items: center; gap: 2px; }
 /* flex column 布局：让面板内容（如 explorer 树）能用 flex:1 撑满可视高度，
    百分比 min-height 在此处无效（本元素无显式 height） */
 #sidebar-content { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }

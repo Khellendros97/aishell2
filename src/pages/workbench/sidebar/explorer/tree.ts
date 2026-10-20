@@ -20,9 +20,49 @@ export interface TreeNode {
   name: string;
   path: string;
   isDir: boolean;
+  /** 修改时间(unix 秒;fs_list 提供,排序用;根节点为 0) */
+  mtime: number;
   parent: TreeNode | null;
   children: TreeNode[] | null; // null = 尚未加载
   loading: boolean;
+}
+
+/** 目录排序方式:名称/修改时间 × 正序/倒序(目录始终排在文件之前,组内按所选方式) */
+export type SortMode = 'name' | 'name-desc' | 'mtime' | 'mtime-desc';
+
+/** 当前排序方式(模块级:跨面板切换保留;重启回到默认名称正序) */
+let sortMode: SortMode = 'name';
+
+/** 切换排序方式并请求重绘(不重建节点,只在渲染时按新顺序取子节点) */
+export function setSortMode(mode: SortMode): void {
+  if (sortMode === mode) return;
+  sortMode = mode;
+  notifyRender();
+}
+
+export function getSortMode(): SortMode {
+  return sortMode;
+}
+
+/** 按当前排序方式返回子节点视图(新数组,不回写 node.children——
+ *  reconcile 的节点复用不变式依赖 children 本身稳定) */
+export function sortedChildren(node: TreeNode): TreeNode[] {
+  const list = node.children ?? [];
+  if (sortMode === 'name') return list;
+  /* 名称比较与 fs_list 后端一致(小写后逐字比较),倒序即同序取反;目录固定在前 */
+  const byName = (a: TreeNode, b: TreeNode): number => {
+    const an = a.name.toLowerCase();
+    const bn = b.name.toLowerCase();
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  };
+  const sorted = [...list];
+  sorted.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1; // 目录固定在前
+    if (sortMode === 'name-desc') return byName(b, a);
+    if (sortMode === 'mtime') return a.mtime - b.mtime;
+    return b.mtime - a.mtime;
+  });
+  return sorted;
 }
 
 export const joinPath = (parent: string, name: string): string => `${parent}/${name}`;
@@ -134,7 +174,7 @@ export function getRoot(): TreeNode | null {
   if (!raw) return null;
   const path = normPath(raw);
   if (rootNode && rootNode.path === path) return rootNode;
-  rootNode = { name: path, path, isDir: true, parent: null, children: null, loading: false };
+  rootNode = { name: path, path, isDir: true, mtime: 0, parent: null, children: null, loading: false };
   clearExpanded();
   expand(path);
   return rootNode;
@@ -155,6 +195,7 @@ function makeChild(dir: TreeNode, e: FsEntry): TreeNode {
     name: e.name,
     path: joinPath(dir.path, e.name),
     isDir: e.isDir,
+    mtime: e.mtime,
     parent: dir,
     children: null,
     loading: false,
@@ -208,7 +249,12 @@ function reconcile(dir: TreeNode, entries: FsEntry[]): boolean {
   for (const e of entries) {
     const path = joinPath(dir.path, e.name);
     const prev = byPath.get(path);
-    if (prev && prev.isDir === e.isDir) { next.push(prev); continue; }
+    if (prev && prev.isDir === e.isDir) {
+      // 复用节点对象(行闭包依赖),但同步 mtime:修改时间排序要反映文件内容变化
+      if (prev.mtime !== e.mtime) { prev.mtime = e.mtime; changed = true; }
+      next.push(prev);
+      continue;
+    }
     changed = true;
     next.push(makeChild(dir, e));
   }

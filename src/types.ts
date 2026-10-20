@@ -119,6 +119,13 @@ export type ServerSaveResult =
   | { status: 'saved'; server: Server }
   | { status: 'needsChoice'; credentialName: string; referenceCount: number };
 
+/** delete_server_with_credentials 返回：deletedCredentials = 已随服务器删除的凭据名；
+ *  keptCredentials = 仍被其他服务器引用而保留的凭据名（只删服务器引用，不动凭据本体） */
+export interface ServerCredentialDeleteResult {
+  deletedCredentials: string[];
+  keptCredentials: string[];
+}
+
 export interface Server {
   id: string;
   name: string;

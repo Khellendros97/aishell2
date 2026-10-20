@@ -103,3 +103,18 @@
 .jump-target-addr { font-size: 11.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .jump-target-row .icon-btn { width: 26px; height: 26px; font-size: 14px; flex: none; }
 .jump-empty { color: var(--text-3); font-size: 12px; padding: 10px 4px; }
+
+/* ---------- 删除服务器对话框（三模式选项：解绑 / 删配置 / 删配置+凭据） ---------- */
+.wbs-del-options { display: flex; flex-direction: column; gap: 8px; }
+.wbs-del-option {
+  display: flex; align-items: flex-start; gap: 9px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-m); cursor: pointer;
+}
+.wbs-del-option:hover { background: var(--bg-2); }
+.wbs-del-option.active { border-color: var(--accent); background: var(--accent-dim); }
+.wbs-del-option.disabled { opacity: .5; cursor: not-allowed; }
+.wbs-del-option.disabled:hover { background: transparent; }
+.wbs-del-option input { accent-color: var(--accent, #4a9eff); margin: 2px 0 0; flex: none; }
+.wbs-del-option-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.wbs-del-option-title { font-size: 12.5px; font-weight: 600; color: var(--text-0); }
+.wbs-del-option-desc { font-size: 11px; color: var(--text-2); line-height: 1.55; }

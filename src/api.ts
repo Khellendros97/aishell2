@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, DashboardRender, DashboardSpec, AiWindowChangedEvent, AiRepairReport, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, PcapReadOut, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
+  AiMode, DashboardRender, DashboardSpec, AiWindowChangedEvent, AiRepairReport, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, FsEntry, FsStat, KeyPairInfo, McpDeviceConfig, McpStatus, NotesListing, PcapReadOut, Project, ReadImageOut, RestoreOutcome, Server, Settings, ServerCredentialDeleteResult, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, Theme, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -37,6 +37,9 @@ export const deleteCredential = (id: string) => call<void>('delete_credential', 
 /** 清除凭据库中未被任何服务器引用的凭据及其 keyring 密钥，返回清除数量。 */
 export const clearUnreferencedCredentials = () => call<number>('clear_unreferenced_credentials');
 export const deleteServer = (id: string) => call<void>('delete_server', { id });
+/** 删除服务器并尽量清理其关联凭据：凭据已无其他服务器引用时一并删除，否则保留。 */
+export const deleteServerWithCredentials = (id: string) =>
+  call<ServerCredentialDeleteResult>('delete_server_with_credentials', { id });
 /** 新建项目分类目录：name 规范化后入库；空名/重名返回后端中文错误 */
 export const createProjectFolder = (name: string) => call<void>('create_project_folder', { name });
 /** 重命名项目分类目录：级联改写所有项目 folder；new 与 old 相同为 no-op；未分类不可重命名 */

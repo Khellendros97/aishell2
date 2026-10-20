@@ -1,7 +1,7 @@
 /**
  * 工作台全局状态(zustand):标签页管理器 + 侧栏面板状态 + AI 面板开关 + 跨模块句柄。
  * 语义逐条对照旧版 src/pages/workbench/core.ts(React 迁移):
- * - openTab 同 id 去重(激活并返回既有标签)、终端同名自动编号(编号不复用);
+ * - openTab 同 id 去重(激活并返回既有标签)、终端/SFTP 同名自动编号(编号不复用);
  * - closeTab 触发 tab.onClose(后端清理入口)、邻居标签补位激活,最后一个关闭后 activeId=null;
  * - 旧 bus 的 'tab-activated'/'tab-closed' 由状态订阅推导(useWorkbench(s => s.activeId)),
  *   不再单独广播;'project-changed'/'staging-changed' 保留为 wbEvents 通知(数据刷新用);
@@ -151,11 +151,11 @@ export const wbHandles = {
     source='notes' 仅笔记树内部拖拽(目录行 drop 只接受该 source,explorer 收到自动忽略) */
 export const DND_MIME = 'application/x-aishell';
 
-/** 终端同名自动编号:同名「30.37」开第二个 → 「30.37 #2」;编号不复用(取现有最大后缀+1) */
-function uniqueTerminalTitle(base: string, tabs: readonly Tab[]): string {
+/** 同名标签自动编号（终端 / SFTP 多开；编号不复用，关闭中间标签后新开仍取最大值 +1） */
+function uniqueTabTitle(base: string, tabs: readonly Tab[], type: Tab['type']): string {
   let max = 0;
   for (const t of tabs) {
-    if (t.type !== 'terminal') continue;
+    if (t.type !== type) continue;
     const m = t.title.match(/^(.*?)(?:\s+#(\d+))?$/);
     if (m && m[1] === base) max = Math.max(max, Number(m[2] ?? 1));
   }
@@ -180,7 +180,9 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
     }
     // 未注册的标签类型不再像旧版 registerRenderer 一样拒绝:
     // 渲染层(registry)对未知类型显示占位提示,便于迁移期渐进接线
-    const finalTitle = type === 'terminal' ? uniqueTerminalTitle(title, s.tabs) : title;
+    const finalTitle = type === 'terminal' || type === 'sftp'
+      ? uniqueTabTitle(title, s.tabs, type)
+      : title;
     const tab: Tab = { id, type, title: finalTitle, icon: TYPE_ICONS[type] ?? 'file', data, onClose };
     set({
       tabs: [...s.tabs, tab],

@@ -48,11 +48,15 @@ import { openLocalFile } from '../../tabs/EditorTab';
 import { isPcapName, openLocalPcap } from '../../tabs/PcapTab';
 import {
   blockedByEditor, collapse, depthOf, editingPaths, expand, findNode, getRoot, getRootPath,
-  invalidateLoads, isExpanded, joinPath, loadDir, normPath, refreshAll, refreshDir,
-  relativePath, resetRoot, seedExpanded, setRenderHook, clearExpanded, type TreeNode,
+  getSortMode, invalidateLoads, isExpanded, joinPath, loadDir, normPath, refreshAll, refreshDir,
+  relativePath, resetRoot, seedExpanded, setRenderHook, setSortMode, sortedChildren, clearExpanded,
+  type SortMode, type TreeNode,
 } from './tree';
 /** 头按钮「刷新」与聚合入口共用(转出给 ExplorerPanel.tsx) */
 export { refreshAll } from './tree';
+/** 排序方式入口(聚合入口 ExplorerPanel.tsx 的标题栏下拉框使用) */
+export { getSortMode, setSortMode };
+export type { SortMode };
 
 /* ---------- 文件类型角标(照抄原型 FILE_STYLES) ---------- */
 const FILE_STYLES: Record<string, { label: string; color: string }> = {
@@ -726,7 +730,7 @@ function appendNode(parent: HTMLElement, node: TreeNode, depth: number, isRoot: 
     }
     return;
   }
-  node.children.forEach((c) => appendNode(parent, c, depth + 1, false));
+  sortedChildren(node).forEach((c) => appendNode(parent, c, depth + 1, false));
 }
 
 function render(): void {
@@ -788,6 +792,7 @@ function onKeyDown(e: KeyboardEvent): void {
   const ae = document.activeElement;
   const typing = ae instanceof HTMLInputElement
     || ae instanceof HTMLTextAreaElement
+    || ae instanceof HTMLSelectElement // 标题栏排序下拉框获得焦点时不劫持快捷键
     || (ae instanceof HTMLElement && ae.isContentEditable);
   if (typing) return;
   const root = getRoot();
