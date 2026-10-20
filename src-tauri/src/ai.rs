@@ -10,6 +10,12 @@
 //!     正文定稿落盘（无此信号则只活在内存流式气泡里，下一条消息即被吞）
 //!   - `{type:"approval",requestId,toolCallId,action,intent,summary}`
 //!   - `{type:"actionStart",toolCallId,tool,args}` / `{type:"actionEnd",toolCallId,tool,isError,result}`
+//!   - `{type:"notice",message}`：后端自愈提示（会话历史损坏已自动修复 / 检测到损坏待修复），
+//!     纯信息，不进对话历史，前端只弹 toast
+//!
+//! 会话自愈：发送前 `ai_repair::auto_repair_session` 校验 jsonl（第一层，发现结构性损坏则
+//! 杀进程→备份→原子写回，随后按修复后文件重生）；回合以 error 收尾时异步检测（第二层），
+//! 空闲则立即走同一套修复并提示重发，忙则交给之后的发送前预检完成。
 //!
 //! pi 对瞬时错误（限流/过载/5xx）默认自动重试（settings retry.enabled）：失败尝试的
 //! error 事件照常转发，重试以 `{type:"tool",tool:"自动重试"}` 瞬时行提示；重试成功后
@@ -572,7 +578,7 @@ impl AiManager {
     /// `cloud_token`：托管模式下的 access_token（ai_chat 在 spawn 前 async 续期保证未过期）；
     /// 个人模式传 None。
     fn spawn(
-        &self,
+        self: &Arc<Self>,
         app: &AppHandle,
         key: &str,
         project_id: &str,
@@ -840,6 +846,7 @@ impl AiManager {
         let store2 = Arc::clone(&self.store);
         let cloud2 = self.cloud.clone();
         let last_prompt2 = Arc::clone(&last_prompt);
+        let mgr2 = Arc::clone(self);
         thread::spawn(move || {
             // 影响计划跟踪：tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费
             let mut impact_tracker: HashMap<String, ImpactEntry> = HashMap::new();
@@ -860,6 +867,16 @@ impl AiManager {
             let mut turn_text = String::new();
             // 内部动作需要 async 执行：懒建 tokio runtime（进程内动作次数极少）
             let mut rt: Option<tokio::runtime::Runtime> = None;
+            // 终态错误后的会话健康检查（第二层兜底）：异步检测 + 空闲时自动修复 + notice
+            let notify_corruption = || {
+                notify_session_corruption(
+                    Arc::clone(&mgr2),
+                    app2.clone(),
+                    key2.clone(),
+                    project_id2.clone(),
+                    session_id2.clone(),
+                );
+            };
             let reader = BufReader::new(stdout);
             // LF 是 pi RPC 协议唯一分隔符；BufRead::lines 按 \n 切行（并剥离 \r），勿换 U+2028 类切行器
             for line in reader.lines() {
@@ -916,6 +933,7 @@ impl AiManager {
                                     .or_else(|| ae.get("error").and_then(serde_json::Value::as_str))
                                     .unwrap_or("AI 回复出错");
                                 let _ = app2.emit(&event, json!({"type": "error", "message": msg}));
+                                notify_corruption();
                             }
                             // thinking_delta / toolcall_* 等丢弃
                             _ => {}
@@ -1258,6 +1276,7 @@ impl AiManager {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("AI 回复出错");
                             let _ = app2.emit(&event, json!({"type": "error", "message": emsg}));
+                            notify_corruption();
                         }
                     }
                     // 生成级错误（如 401 认证失败）：错误在 message.stopReason/errorMessage 上，
@@ -1280,6 +1299,7 @@ impl AiManager {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("AI 回复出错");
                             let _ = app2.emit(&event, json!({"type": "error", "message": emsg}));
+                            notify_corruption();
                         }
                     }
                     // 命令响应失败：只有 prompt 被拒（消息未进模型）才算对话错误；后台命令
@@ -1299,6 +1319,7 @@ impl AiManager {
                                 &event,
                                 json!({"type": "error", "message": err_message(&ev)}),
                             );
+                            notify_corruption();
                         }
                     }
                     // 扩展 UI 请求：`AISHELL_APPROVAL:` confirm 转发前端审批；
@@ -1336,6 +1357,7 @@ impl AiManager {
                                     .or_else(|| ae.get("error").and_then(serde_json::Value::as_str))
                                     .unwrap_or("AI 回复出错");
                                 let _ = app2.emit(&event, json!({"type": "error", "message": msg}));
+                                notify_corruption();
                             }
                         }
                     }
@@ -1349,6 +1371,7 @@ impl AiManager {
                     &event,
                     json!({"type": "error", "message": "pi 进程异常退出"}),
                 );
+                notify_corruption();
                 // 进程崩溃不会再有 agent_settled：补发收尾信号，让前端把已流出的正文定稿落盘
                 let _ = app2.emit(&event, json!({"type": "settled"}));
             }
@@ -2714,6 +2737,57 @@ fn report_sediment(
     }
 }
 
+/// 终态错误后的会话健康检查（第二层兜底）：异步只读检测 jsonl，发现结构性损坏时
+/// 立即走一次自动修复（空闲窗口内杀进程→备份→原子写回），并给前端发 notice 提示重发。
+/// 若此刻会话已被新消息占用（busy），修复交给那一次 ai_chat 的发送前预检完成。
+/// 同一会话 10 分钟内只提示一次，避免连续失败刷屏（修复动作本身不受限）。
+fn notify_session_corruption(
+    mgr: Arc<AiManager>,
+    app: AppHandle,
+    key: String,
+    project_id: String,
+    session_id: String,
+) {
+    std::thread::spawn(move || {
+        // 等 pi 把终态条目写完；读到的是磁盘快照，早读只会少条目、不会伪造孤儿
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let path = crate::ai_repair::session_path(&mgr.agent_dir, &project_id, &session_id);
+        let Ok(Some(found)) = crate::ai_repair::detect_session_corruption(&path) else {
+            return;
+        };
+        let msg = match crate::ai_repair::auto_repair_session(&mgr, &project_id, &session_id) {
+            Ok(Some(report)) => format!(
+                "检测到会话历史损坏，已自动修复（{}）。请重新发送上一条消息",
+                crate::ai_repair::report_fixes(&report),
+            ),
+            Ok(None) => format!(
+                "检测到会话历史损坏（{}）。将在会话空闲后的下一次发送前自动修复",
+                crate::ai_repair::report_fixes(&found),
+            ),
+            Err(error) => format!(
+                "检测到会话历史损坏（{}），自动修复失败：{error}",
+                crate::ai_repair::report_fixes(&found),
+            ),
+        };
+        {
+            static LAST: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+            > = std::sync::OnceLock::new();
+            let map = LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+            if guard
+                .get(&key)
+                .is_some_and(|prev| prev.elapsed() < std::time::Duration::from_secs(600))
+            {
+                return;
+            }
+            guard.insert(key.clone(), std::time::Instant::now());
+        }
+        crate::trace::log(&key, "session_corruption_repaired", json!({"detail": msg, "report": found}));
+        let _ = app.emit(&format!("ai:event:{key}"), json!({"type": "notice", "message": msg}));
+    });
+}
+
 /// 随 prompt 一起发给 pi 的图片（pi RPC images 字段，pi 侧转 OpenAI image_url 块）。
 /// data 为不带 dataURL 前缀的 base64；mime 仅接受 image/png|jpeg|gif|webp（attach 时已嗅探）。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2738,6 +2812,33 @@ pub async fn ai_chat(
         .split_once(':')
         .map(|(p, _)| p.to_string())
         .ok_or_else(|| "key 格式错误，应为 <projectId>:<sessionId>".to_string())?;
+    let session_id = key
+        .split_once(':')
+        .map(|(_, s)| s)
+        .unwrap_or("default");
+
+    // 第一层兜底：发送前自动修复会话历史。损坏的 jsonl 会让 pi 构建出孤儿 tool 消息，
+    // 端点 400 且随文件持久化复现；这里在空闲窗口内「杀进程 → 备份 → 原子写回」，
+    // 随后的 spawn 流程按修复后的文件懒重启（pi 上下文来自内存态，只改文件不重启无效）。
+    // 修复失败不阻断发送（按原文件继续，保持原行为）。
+    match crate::ai_repair::auto_repair_session(mgr.inner(), &project_id, session_id) {
+        Ok(Some(report)) => {
+            let msg = format!(
+                "会话历史损坏已自动修复（{}），AI 进程已重启",
+                crate::ai_repair::report_fixes(&report),
+            );
+            crate::trace::log(&key, "session_auto_repaired", json!({"detail": msg, "report": report}));
+            let _ = app.emit(&format!("ai:event:{key}"), json!({"type": "notice", "message": msg}));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::trace::log(&key, "session_auto_repair_failed", json!({"error": error}));
+            let _ = app.emit(
+                &format!("ai:event:{key}"),
+                json!({"type": "notice", "message": format!("会话历史自动修复失败（本次仍按原文件发送）：{error}")}),
+            );
+        }
+    }
 
     // prompt 脱敏：终端快照/文件引用全文由前端拼入 prompt，可能含配置里读到的凭据；
     // 在进入 pi（及其会话落盘）前屏蔽，命中时附提示防模型误解为「密码为空」而换姿势重读。

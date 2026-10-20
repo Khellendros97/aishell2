@@ -16,6 +16,11 @@
 //!
 //! 修复必须先 `AiManager::kill_session` 等待 pi 进程退出（内存态独占写文件）；下次 ai_chat
 //! 按同一文件懒重启加载修复后内容。杀进程重启本身也能治愈 pi 进程内的内存态损坏。
+//!
+//! 三个入口共用本模块：右键「修复会话」（手动，报告全部变更）；`ai_chat` 发送前预检
+//! （自动，仅结构性损坏时杀进程+备份+写回，见 `auto_repair_session`）；回合终态错误后的
+//! 异步检测（`detect_session_corruption` —— 空闲时立即调用 `auto_repair_session` 修复，
+//! 生成中则留给下一次发送前预检）。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -447,6 +452,107 @@ fn collect_tail_pairing(tail: &[Value], call_names: &mut HashMap<String, String>
     }
 }
 
+/// 会话历史文件路径（ai_chat 的 spawn、手动修复、发送前自动修复共用同一规则）。
+pub(crate) fn session_path(
+    agent_dir: &std::path::Path,
+    project_id: &str,
+    session_id: &str,
+) -> std::path::PathBuf {
+    agent_dir
+        .join("sessions")
+        .join(format!("{project_id}__{session_id}.jsonl"))
+}
+
+/// 把修复结果落盘：原文件备份为 `.jsonl.bak`，再经 `.jsonl.tmp` 原子替换。
+/// 备份/写入失败均返回中文错误且不留下半截主文件。
+pub(crate) fn persist_repair(
+    path: &std::path::Path,
+    raw: &str,
+    fixed: &str,
+) -> Result<(), String> {
+    let bak = std::path::PathBuf::from(format!("{}.bak", path.display()));
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    std::fs::write(&bak, raw)
+        .map_err(|e| format!("备份会话历史失败（{}）: {e}", bak.display()))?;
+    std::fs::write(&tmp, fixed)
+        .map_err(|e| format!("写入临时文件失败（{}）: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换会话历史失败（{}）: {e}", path.display())
+    })
+}
+
+/// 是否属于「发给模型会被端点拒绝」的结构性损坏（孤儿/缺失工具结果）。
+/// 解析失败的半截行不算——生成中读文件可能读到未写完的最后一行。
+pub(crate) fn has_structural_issues(report: &AiRepairReport) -> bool {
+    report.removed_orphan_tool_results > 0 || report.filled_missing_tool_results > 0
+}
+
+/// 会话修复串行化：发送前预检、终态错误检测、手动修复命令可能同时读写同一文件。
+static REPAIR_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 只读检测：有结构性损坏时返回报告，否则 None。
+/// 终态错误后的第二层检测用它判断是否调用 `auto_repair_session`；不杀进程、不写文件。
+pub(crate) fn detect_session_corruption(
+    path: &std::path::Path,
+) -> Result<Option<AiRepairReport>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("读取会话历史失败（{}）: {e}", path.display()))?;
+    let (_, report) = repair_session_lines(&raw);
+    Ok(has_structural_issues(&report).then_some(report))
+}
+
+/// 发送前自动修复（第一层兜底）：会话空闲时校验 jsonl，发现结构性损坏则
+/// 杀 pi 进程（内存态是上下文来源，必须重启）→ 备份 + 原子写回。
+/// 返回 Some(report) 表示确实修过；None = 无文件/已干净/生成中（生成中不动文件）。
+pub(crate) fn auto_repair_session(
+    mgr: &AiManager,
+    project_id: &str,
+    session_id: &str,
+) -> Result<Option<AiRepairReport>, String> {
+    let _gate = REPAIR_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    if mgr.session_busy(project_id, session_id) {
+        return Ok(None);
+    }
+    let path = session_path(&mgr.agent_dir, project_id, session_id);
+    if detect_session_corruption(&path)?.is_none() {
+        return Ok(None);
+    }
+    // 先杀进程再重读：杀之前 pi 可能还有收尾写入，以最终落盘内容为准
+    mgr.kill_session(project_id, session_id);
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取会话历史失败（{}）: {e}", path.display()))?;
+    let (fixed, report) = repair_session_lines(&raw);
+    if !has_structural_issues(&report) {
+        // 第一次读到的损坏是半截写入等瞬时态：不落盘
+        return Ok(None);
+    }
+    persist_repair(&path, &raw, &fixed)?;
+    Ok(Some(report))
+}
+
+/// 修复内容摘要（中文，供前端提示与 trace 使用）。
+pub(crate) fn report_fixes(report: &AiRepairReport) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if report.removed_orphan_tool_results > 0 {
+        parts.push(format!("清理孤儿工具结果 {} 条", report.removed_orphan_tool_results));
+    }
+    if report.filled_missing_tool_results > 0 {
+        parts.push(format!("补齐缺失工具结果 {} 条", report.filled_missing_tool_results));
+    }
+    if report.dropped_malformed > 0 {
+        parts.push(format!("丢弃损坏行 {} 行", report.dropped_malformed));
+    }
+    if parts.is_empty() {
+        "无结构问题".to_string()
+    } else {
+        parts.join("、")
+    }
+}
+
 /// 修复会话历史（右键菜单「修复会话」）：busy 拒绝 → 杀会话 pi 进程（等退出，文件无并发
 /// 写者）→ 校验修复 jsonl（备份 .jsonl.bak + 原子写回）。下次 ai_chat 按同一文件懒重启。
 #[tauri::command]
@@ -455,15 +561,11 @@ pub async fn ai_repair_session(
     project_id: String,
     session_id: String,
 ) -> Result<AiRepairReport, String> {
-    {
-        if mgr.session_busy(&project_id, &session_id) {
-            return Err("会话正在生成中，请先停止或等待完成".to_string());
-        }
+    let _gate = REPAIR_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    if mgr.session_busy(&project_id, &session_id) {
+        return Err("会话正在生成中，请先停止或等待完成".to_string());
     }
-    let path = mgr
-        .agent_dir
-        .join("sessions")
-        .join(format!("{project_id}__{session_id}.jsonl"));
+    let path = session_path(&mgr.agent_dir, &project_id, &session_id);
     if !path.exists() {
         return Err("未找到会话历史文件（该会话可能还没有发过消息）".to_string());
     }
@@ -474,16 +576,7 @@ pub async fn ai_repair_session(
     if !report.changed {
         return Ok(report);
     }
-    let bak = path.with_file_name(format!("{project_id}__{session_id}.jsonl.bak"));
-    std::fs::write(&bak, &raw)
-        .map_err(|e| format!("备份会话历史失败（{}）: {e}", bak.display()))?;
-    let tmp = path.with_file_name(format!("{project_id}__{session_id}.jsonl.tmp"));
-    std::fs::write(&tmp, &fixed)
-        .map_err(|e| format!("写入临时文件失败（{}）: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("替换会话历史失败（{}）: {e}", path.display())
-    })?;
+    persist_repair(&path, &raw, &fixed)?;
     Ok(report)
 }
 
@@ -722,5 +815,59 @@ mod tests {
         let (body, report) = repair_session_lines(&raw);
         assert!(!report.changed);
         assert_eq!(body, format!("{raw}\n"));
+    }
+
+    fn temp_session_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-ai-repair-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("sessions").join(format!("{tag}.jsonl"))
+    }
+
+    #[test]
+    fn detect_reports_only_structural_corruption() {
+        let path = temp_session_path("detect");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 缺失工具结果 → 结构性损坏
+        let corrupt = [header(), user("u1", "s0", "hi"), assistant("a1", "u1", &[("c0", "grep")])].join("\n");
+        std::fs::write(&path, format!("{corrupt}\n")).unwrap();
+        let report = detect_session_corruption(&path).unwrap().expect("应检测到缺失工具结果");
+        assert_eq!(report.filled_missing_tool_results, 1);
+        assert!(!has_structural_issues(&AiRepairReport::default()));
+
+        // 配对完整 → 干净
+        let healthy = [
+            header(),
+            user("u1", "s0", "hi"),
+            assistant("a1", "u1", &[("c0", "grep")]),
+            result("r1", "a1", "c0", "grep"),
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{healthy}\n")).unwrap();
+        assert!(detect_session_corruption(&path).unwrap().is_none());
+
+        // 仅半截/损坏行（可能是生成中读到的未写完行）→ 不算结构性损坏
+        std::fs::write(&path, format!("{}\n{{broken", header())).unwrap();
+        assert!(detect_session_corruption(&path).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn persist_repair_backs_up_original_and_replaces_atomically() {
+        let path = temp_session_path("persist");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = [header(), user("u1", "s0", "hi")].join("\n") + "\n";
+        let fixed = [header(), user("u2", "s0", "hi")].join("\n") + "\n";
+        std::fs::write(&path, &raw).unwrap();
+        persist_repair(&path, &raw, &fixed).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), fixed);
+        let bak = std::path::PathBuf::from(format!("{}.bak", path.display()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), raw);
+        assert!(!std::path::PathBuf::from(format!("{}.tmp", path.display())).exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 }

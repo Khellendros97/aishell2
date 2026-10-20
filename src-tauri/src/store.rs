@@ -445,6 +445,15 @@ pub enum ServerSaveResult {
     },
 }
 
+/// 「删除服务器配置和凭据」的报告：deleted = 已随服务器一并删除的凭据名；
+/// kept = 删除服务器后仍被其他服务器引用而保留的凭据名（只删服务器引用，不动凭据本体）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerCredentialDeleteReport {
+    pub deleted_credentials: Vec<String>,
+    pub kept_credentials: Vec<String>,
+}
+
 /// 服务器连接配置。认证镜像字段保留在服务器上以兼容现有前端；实际 SSH 凭据由 credential_id 指向。
 /// 服务器永不携带密码，密码只存 keyring（account `credential:<id>`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2553,6 +2562,102 @@ impl Store {
         Ok(())
     }
 
+    /// 删除服务器配置并尽量清理其关联凭据：凭据在服务器移除后已无其他服务器引用时
+    /// 一并删除（keyring 密钥 + 元数据），仍被引用时保留并计入 kept。
+    /// 级联语义与 delete_server 相同（解绑所有项目 + 附属配置 + 堡垒机目标守卫）。
+    pub fn delete_server_with_credentials(
+        &self,
+        id: &str,
+    ) -> Result<ServerCredentialDeleteReport, String> {
+        let has_targets = self
+            .state
+            .lock()
+            .map_err(|_| "store 状态锁损坏".to_string())?
+            .servers
+            .iter()
+            .any(|server| server.bastion_id.as_deref() == Some(id));
+        if has_targets {
+            let name = self
+                .server(id)
+                .map(|server| server.name)
+                .unwrap_or_else(|| id.to_string());
+            return Err(format!(
+                "堡垒机「{name}」仍有目标主机绑定，请先在「SSH跳转设置」中解除目标主机绑定后再删除"
+            ));
+        }
+        let ids = HashSet::from([id.to_string()]);
+        // 待删服务器引用的凭据：除该服务器外仍被引用的保留，否则一并删除（按 id 判定，凭据名可重复）
+        let (cred_deletable, kept_credentials) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "store 状态锁损坏".to_string())?;
+            let cred_ids: HashSet<String> = guard
+                .servers
+                .iter()
+                .filter(|server| ids.contains(&server.id))
+                .filter_map(|server| server.credential_id.clone())
+                .collect();
+            let mut deletable: Vec<(String, String)> = Vec::new();
+            let mut kept: Vec<String> = Vec::new();
+            for credential in &guard.credentials {
+                if !cred_ids.contains(&credential.id) {
+                    continue;
+                }
+                let still = guard.servers.iter().any(|server| {
+                    !ids.contains(&server.id)
+                        && server.credential_id.as_deref() == Some(credential.id.as_str())
+                });
+                if still {
+                    kept.push(credential.name.clone());
+                } else {
+                    deletable.push((credential.id.clone(), credential.name.clone()));
+                }
+            }
+            (deletable, kept)
+        };
+        // 先删 keyring 密钥再落盘（照 clear_unreferenced_credentials 先例：落盘失败回滚密钥）
+        let mut accounts: Vec<(String, Option<String>)> = Vec::new();
+        for (cred_id, _) in &cred_deletable {
+            let account = keyring_account_credential(cred_id);
+            let old_secret = self.secrets.get(&account).ok();
+            accounts.push((account, old_secret));
+        }
+        for (index, (account, _)) in accounts.iter().enumerate() {
+            if let Err(error) = self.secrets.delete(account) {
+                for (deleted_account, secret) in accounts.iter().take(index) {
+                    if let Some(secret) = secret {
+                        let _ = self.secrets.set(deleted_account, secret);
+                    }
+                }
+                return Err(error);
+            }
+        }
+
+        let removed_ids: HashSet<String> =
+            cred_deletable.iter().map(|(cred_id, _)| cred_id.clone()).collect();
+        let db_accounts = self.with_candidate_state(|state| {
+            let db = Self::remove_servers_from_state(state, &ids, true);
+            state
+                .credentials
+                .retain(|credential| !removed_ids.contains(&credential.id));
+            Ok(db)
+        });
+        if let Err(error) = db_accounts {
+            for (account, secret) in &accounts {
+                if let Some(secret) = secret {
+                    let _ = self.secrets.set(account, secret);
+                }
+            }
+            return Err(error);
+        }
+        self.delete_db_accounts(db_accounts?);
+        Ok(ServerCredentialDeleteReport {
+            deleted_credentials: cred_deletable.into_iter().map(|(_, name)| name).collect(),
+            kept_credentials,
+        })
+    }
+
     /// 清除未被项目直接引用、也不是其依赖堡垒机的服务器及附属配置，返回清除数量。
     pub fn clear_unreferenced_servers(&self) -> Result<usize, String> {
         let (removed, db_accounts) = self.with_candidate_state(|state| {
@@ -3865,6 +3970,20 @@ pub async fn delete_server(
 }
 
 #[tauri::command]
+pub async fn delete_server_with_credentials(
+    store: State<'_, Arc<Store>>,
+    mcp: State<'_, Arc<crate::mcp::McpService>>,
+    ssh: State<'_, Arc<crate::ssh::SshManager>>,
+    id: String,
+) -> Result<ServerCredentialDeleteReport, String> {
+    let report = store.delete_server_with_credentials(&id)?;
+    // 与 delete_server 同级联：MCP 监听同步 + 连接池残留连接断开
+    mcp.sync().await;
+    ssh.disconnect(&id).await;
+    Ok(report)
+}
+
+#[tauri::command]
 pub async fn upsert_project(store: State<'_, Arc<Store>>, project: Project) -> Result<(), String> {
     store.upsert_project(project)
 }
@@ -4789,6 +4908,91 @@ mod tests {
             .iter()
             .all(|item| item.id != credential_id));
         assert!(store.read_server_secret(&server).is_err());
+    }
+
+    #[test]
+    fn delete_server_with_credentials_deletes_unused_and_keeps_shared() {
+        let dir = temp_config_dir("server-cred-delete");
+        let store = test_store(dir);
+        // srv-shared 建凭据 C1；srv-other 共享 C1；srv-solo 建独立凭据 C2
+        store
+            .upsert_server(
+                credential_test_server("srv-shared", "10.0.0.1"),
+                Some("pw-shared"),
+            )
+            .unwrap();
+        let shared_server = store.server("srv-shared").unwrap();
+        let shared_cred = shared_server.credential_id.clone().unwrap();
+        let shared_cred_name = store
+            .credentials_all()
+            .iter()
+            .find(|c| c.id == shared_cred)
+            .unwrap()
+            .name
+            .clone();
+        let mut other = credential_test_server("srv-other", "10.0.0.2");
+        other.credential_id = Some(shared_cred.clone());
+        store.upsert_server(other, None).unwrap();
+        store
+            .upsert_server(
+                credential_test_server("srv-solo", "10.0.0.3"),
+                Some("pw-solo"),
+            )
+            .unwrap();
+        let solo_server = store.server("srv-solo").unwrap();
+        let solo_cred = solo_server.credential_id.clone().unwrap();
+        let solo_cred_name = store
+            .credentials_all()
+            .iter()
+            .find(|c| c.id == solo_cred)
+            .unwrap()
+            .name
+            .clone();
+        store
+            .upsert_project(Project {
+                id: "proj-x".to_string(),
+                name: "P".to_string(),
+                path: None,
+                server_ids: vec![
+                    "srv-shared".to_string(),
+                    "srv-other".to_string(),
+                    "srv-solo".to_string(),
+                ],
+                quick_commands: vec![],
+                folder: String::new(),
+                ai_mode: AiMode::Suggest,
+            })
+            .unwrap();
+
+        // 删除独占凭据服务器：凭据（密钥+元数据）一并删除，项目级联解绑
+        let report = store.delete_server_with_credentials("srv-solo").unwrap();
+        assert_eq!(report.deleted_credentials, vec![solo_cred_name]);
+        assert!(report.kept_credentials.is_empty());
+        assert!(store.server("srv-solo").is_none());
+        assert!(store
+            .credentials_all()
+            .iter()
+            .all(|item| item.id != solo_cred));
+        assert!(store.read_server_secret(&solo_server).is_err());
+
+        // 删除共享凭据服务器：凭据及其密钥保留，另一台服务器仍可解密
+        let report = store.delete_server_with_credentials("srv-shared").unwrap();
+        assert!(report.deleted_credentials.is_empty());
+        assert_eq!(report.kept_credentials, vec![shared_cred_name]);
+        assert!(store.server("srv-shared").is_none());
+        assert!(store
+            .credentials_all()
+            .iter()
+            .any(|item| item.id == shared_cred));
+        assert_eq!(
+            store
+                .read_server_secret(&store.server("srv-other").unwrap())
+                .unwrap(),
+            "pw-shared"
+        );
+        let guard = store.state.lock().unwrap();
+        assert_eq!(guard.projects[0].server_ids, vec!["srv-other".to_string()]);
+        drop(guard);
     }
 
     #[test]

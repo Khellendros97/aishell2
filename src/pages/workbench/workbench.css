@@ -29,8 +29,11 @@
 #sidebar { width: var(--sidebar-w); flex: none; background: var(--bg-1); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
 #sidebar-head {
   height: 34px; flex: none; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 10px 0 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-1); text-transform: uppercase;
+  gap: 8px; padding: 0 10px 0 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-1); text-transform: uppercase;
 }
+/* 标题可被压缩省略、操作区不换行：侧栏拖窄时（如 explorer 排序下拉框 + 三个按钮）不撑破头部 */
+#sidebar-head #sidebar-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#sidebar-actions { flex: none; display: inline-flex; align-items: center; gap: 2px; }
 /* flex column 布局：让面板内容（如 explorer 树）能用 flex:1 撑满可视高度，
    百分比 min-height 在此处无效（本元素无显式 height） */
 #sidebar-content { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
@@ -98,6 +101,23 @@
 .term-main { flex: 1; min-height: 0; display: flex; }
 .term-xterm { flex: 1; min-width: 0; background: var(--term-bg); padding: 6px 0 6px 8px; position: relative; z-index: 0; }
 .term-xterm .xterm { height: 100%; }
+
+/* 终端搜索浮层（Ctrl+F / 右键「查找…」）：绝对定位覆盖在终端右上角，不参与 fit 布局 */
+.term-search {
+  position: absolute; top: 8px; right: 14px; z-index: 5;
+  display: none; align-items: center; gap: 4px;
+  padding: 5px 6px; background: var(--bg-1);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-m);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+}
+.term-search.open { display: flex; }
+.term-search .term-search-input { width: 180px; height: 24px; padding: 0 8px; font-size: 12px; }
+.term-search-count { min-width: 46px; text-align: center; font-size: 11px; color: var(--text-2);
+  font-variant-numeric: tabular-nums; white-space: nowrap; }
+.term-search-count.empty { color: var(--red); }
+.term-search .icon-btn { width: 24px; height: 24px; font-size: 13px; }
+.term-search .term-search-case { font-size: 11px; font-weight: 600; letter-spacing: -0.5px; }
+.term-search .icon-btn.active { color: var(--accent); background: var(--accent-dim); }
 
 /* 历史命令抽屉（右侧 280px，可开合） */
 .term-drawer { width: 280px; flex: none; display: flex; flex-direction: column; background: var(--bg-1);

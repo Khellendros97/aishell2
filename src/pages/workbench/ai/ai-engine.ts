@@ -1981,6 +1981,10 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* 回合以 error 收尾（不发 done）：把已流出的正文定稿落盘，否则只活在内存流式
        气泡里，下一条消息的 emptyPending / 切会话 / 退出进程都会把它丢掉 */
     finalizeInterrupted(sid);
+  } else if (ev.type === 'notice') {
+    /* 后端会话自愈提示（发送前自动修复 / 终态错误后检测到损坏）：纯信息提示，
+       不进对话历史，也不依赖 pending（修复可能发生在回合开始前或结束后） */
+    toast(ev.message, 'info', 6000);
   } else {
     console.error('[AI] 事件错误:', ev.message);
     /* 保留本回合已积累的文本/工具行/动作卡：瞬时错误后 pi 自动重试成功时，后续 delta

@@ -1,19 +1,18 @@
 /**
  * 应用底栏 —— 工作台 / 欢迎页 / 设置页共用（无 .proto 对照，样式自 workbench.css 迁入 statusbar.css）。
- * 结构：左侧信息区（调用方传入）+ 中部进度区 + 右侧（运行中隧道角标 + MCP 角标 + 可选 AI 助手开关）。
+ * 结构：左侧信息区（调用方传入）+ 中部进度区 + 右侧（SSH 隧道角标 + MCP 角标 + 可选 AI 助手开关）。
  * - 进度区容器统一用 .statusbar-progress 类：工作台保活隐藏期间容器仍在 DOM，
  *   与当前页面的容器并存，statusbar-progress.ts 会向所有连接的容器同步渲染；
- * - 隧道角标为全局数据（不区分页面），拉取与 tunnels:changed 订阅由本组件自持；
- * - MCP 角标（已启用服务器数 + 管理弹层）自持数据与刷新，见 components/StatusbarMcp.tsx；
+ * - SSH 隧道角标（数据自持 + 点击控制面板）见 components/StatusbarTunnels.tsx，
+ *   MCP 角标（同形态）见 components/StatusbarMcp.tsx——两者均为全局数据，不区分页面；
  * - AI 开关仅当 onToggleAi 提供时渲染（工作台/欢迎页有 AI 面板；设置页没有则不传）。
- * 与后端接口点：tunnel_list / tunnels:changed（角标，见 src/api.ts）；
- * 进度区数据由 statusbar-progress.ts 订阅 sftp:progress / staging:progress，本组件只提供容器。
+ * 与后端接口点：进度区数据由 statusbar-progress.ts 订阅 sftp:progress / staging:progress，
+ * 本组件只提供容器；角标数据拉取与订阅由各自组件自持（见各文件头）。
  */
-import { useEffect, useState, type ReactNode } from 'react';
-import { onTunnelsChanged, tunnelList } from '../api';
-import type { TunnelState } from '../types';
+import { useEffect, type ReactNode } from 'react';
 import { Icon } from '../shared/Icon';
 import { StatusbarMcp } from './StatusbarMcp';
+import { StatusbarTunnels } from './StatusbarTunnels';
 import { refreshProgress } from '../pages/workbench/statusbar-progress';
 import './statusbar.css';
 
@@ -33,21 +32,6 @@ export interface StatusbarProps {
 }
 
 export function Statusbar({ left, aiVisible, onToggleAi, aiControls, aiDisabled, aiDisabledHint }: StatusbarProps): JSX.Element {
-  /* 运行中隧道角标：挂载拉一次 + tunnels:changed 驱动刷新（全服务器，不过滤） */
-  const [runningTunnels, setRunningTunnels] = useState<TunnelState[]>([]);
-  useEffect(() => {
-    let alive = true;
-    const refresh = (): void => {
-      void tunnelList()
-        .then((list) => { if (alive) setRunningTunnels(list.filter((t) => t.running)); })
-        .catch(() => { /* 后端未就绪静默，下次 tunnels:changed 再刷 */ });
-    };
-    refresh();
-    let unlisten: (() => void) | null = null;
-    void onTunnelsChanged(refresh).then((u) => { unlisten = u; });
-    return () => { alive = false; unlisten?.(); };
-  }, []);
-
   /* 进度区：挂载即建立事件订阅并补渲染（传输/暂存事件先于容器出现时任务已入队，需刷新展示） */
   useEffect(() => { refreshProgress(); }, []);
 
@@ -56,14 +40,7 @@ export function Statusbar({ left, aiVisible, onToggleAi, aiControls, aiDisabled,
       <div className="statusbar-left">{left ?? null}</div>
       <div className="statusbar-progress" aria-live="polite"></div>
       <div className="statusbar-right">
-        {runningTunnels.length > 0 && (
-          <span
-            className="statusbar-item statusbar-tunnels"
-            title={`运行中的 SSH 隧道（${runningTunnels.length}）：${runningTunnels.map((t) => `${t.name}（${t.bindAddr}:${t.localPort}）`).join('、')}`}
-          >
-            <Icon name="tunnel" />{runningTunnels.length}
-          </span>
-        )}
+        <StatusbarTunnels />
         <StatusbarMcp />
         {onToggleAi && (
           <button

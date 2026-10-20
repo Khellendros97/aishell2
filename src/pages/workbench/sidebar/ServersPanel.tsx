@@ -11,11 +11,14 @@
  * Workbench.ai.addServerRef → wbHandles.ai?.addServerRef;旧版 DOM 重建/节点复用改 React key。
  * 2026-08 新增:设置-外观「服务器紧凑布局」开启时卡片默认折叠(仅图标/名称/IP),点击展开操作按钮,
  * 开关存 settings.compactServerList(无 proto/legacy 对照)。
+ * 2026-10 新增:卡片「更多 → 删除…」三模式删除对话框——从项目解绑(配置凭据保留)/删除服务器配置/
+ * 删除服务器配置和凭据(独占凭据一并删、共享凭据保留,后端 delete_server_with_credentials 事务)。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Credential, DbConnection, DbKind, McpDeviceConfig, Server } from '../../../types';
 import {
-  deleteDbConnection, deleteServer, getState, saveDbConnection, setServerLocked, upsertProject,
+  deleteDbConnection, deleteServer, deleteServerWithCredentials, getState, saveDbConnection,
+  setServerLocked, upsertProject,
 } from '../../../api';
 import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, showContextMenu, toast, uid } from '../../../ui';
@@ -54,6 +57,9 @@ interface JumpTargetDraft { server: Server; password: string | null; }
 
 /** SSH跳转草稿:mode create = 新建堡垒机(含堡垒机表单);edit = 编辑既有服务器 */
 interface JumpDraft { mode: 'create' | 'edit'; toggle: boolean; targets: JumpTargetDraft[]; }
+
+/** 删除服务器三模式:unbind = 仅解绑当前项目;server = 删配置;server+credential = 删配置+关联凭据 */
+type DelMode = 'unbind' | 'server' | 'server+credential';
 
 /* ---------- 数据库连接配置弹窗(AI 受管查询通道) ----------
    列表视图 ↔ 表单视图(新增/编辑),密码永不回显;类型/端口/命令清单等共享常量见 ../db。 */
@@ -347,8 +353,8 @@ function DbConnectionsModal({ server, onClose }: { server: Server; onClose: () =
 /* ---------- 面板主体 ---------- */
 
 function ServersPanelBody(): JSX.Element {
-  /* 后端状态快照(服务器 + MCP 设备配置 + 紧凑布局设置);挂载 / project-changed / aishell:data-changed 触发重拉 */
-  const [data, setData] = useState<{ servers: Server[]; credentials: Credential[]; mcpDevices: Record<string, McpDeviceConfig>; compact: boolean }>({ servers: [], credentials: [], mcpDevices: {}, compact: false });
+  /* 后端状态快照(服务器 + MCP 设备配置 + 紧凑布局设置 + 项目列表);挂载 / project-changed / aishell:data-changed 触发重拉 */
+  const [data, setData] = useState<{ servers: Server[]; credentials: Credential[]; mcpDevices: Record<string, McpDeviceConfig>; compact: boolean; projects: { id: string; name: string; serverIds: string[] }[] }>({ servers: [], credentials: [], mcpDevices: {}, compact: false, projects: [] });
   const [reloadKey, setReloadKey] = useState(0);
   const [searchText, setSearchText] = useState('');
   /* 紧凑布局下已展开的服务器 id(默认全部折叠,点击卡片展开/收起) */
@@ -375,13 +381,25 @@ function ServersPanelBody(): JSX.Element {
   /* 数据库连接配置弹窗(条件挂载,淡出后卸载) */
   const [dbServer, setDbServer] = useState<Server | null>(null);
 
+  /* 删除服务器对话框:三模式选择 + 执行中禁按钮 */
+  const [delState, openDel, closeDel] = useFadeModal();
+  const [delServer, setDelServer] = useState<Server | null>(null);
+  const [delMode, setDelMode] = useState<DelMode>('unbind');
+  const [delBusy, setDelBusy] = useState(false);
+
   /* ---------- 数据装载与联动刷新 ---------- */
   useEffect(() => {
     let alive = true;
     void getState()
       .then((state) => {
         if (!alive) return;
-        setData({ servers: state.servers, credentials: state.credentials ?? [], mcpDevices: state.mcpDevices ?? {}, compact: state.settings.compactServerList ?? false });
+        setData({
+          servers: state.servers,
+          credentials: state.credentials ?? [],
+          mcpDevices: state.mcpDevices ?? {},
+          compact: state.settings.compactServerList ?? false,
+          projects: state.projects.map((p) => ({ id: p.id, name: p.name, serverIds: p.serverIds })),
+        });
         // 同步 store 项目快照:欢迎页等外部页面可能改过绑定,而 store 里的 project 是保活内存单例
         // (bound 列表按 project.serverIds 过滤,不刷新则返回后仍按旧绑定渲染)
         const s = useWorkbench.getState();
@@ -685,9 +703,10 @@ function ServersPanelBody(): JSX.Element {
     });
   };
 
+  /** SFTP:每次点击都新开独立标签(唯一 id),支持同一服务器多开(标题由 store 自动编号 #N) */
   const openSftp = (s: Server): void => {
     useWorkbench.getState().openTab({
-      id: 'sftp:' + s.id,
+      id: `sftp:${s.id}:${uid('tab')}`,
       type: 'sftp',
       title: 'SFTP ' + s.name,
       data: { serverId: s.id },
@@ -710,6 +729,64 @@ function ServersPanelBody(): JSX.Element {
       .catch((err) => toast(`切换 AI 锁失败: ${String(err)}`, 'error'));
   };
 
+  /* ---------- 删除服务器(三模式) ---------- */
+
+  const openDeleteModal = (s: Server): void => {
+    setDelServer(s);
+    setDelMode('unbind'); // 每次打开重置为最轻的模式
+    openDel();
+  };
+
+  /** 删除/解绑成功后的统一收尾:关弹窗 + 工作台刷新 + 全局数据广播(欢迎页/设置页保活即时生效) */
+  const finishDelete = (): void => {
+    closeDel();
+    wbEvents.emit('project-changed');
+    window.dispatchEvent(new CustomEvent('aishell:data-changed'));
+  };
+
+  const runDelete = async (): Promise<void> => {
+    const s = delServer;
+    if (!s || delBusy) return;
+    setDelBusy(true);
+    try {
+      if (delMode === 'unbind') {
+        // 先拉后端最新 project 合并:store 的 project 是保活内存快照,直接改会把其他页面已删的绑定写回(照 bindToProject 先例)
+        const st = useWorkbench.getState();
+        const project = st.project;
+        if (!project) throw new Error('当前项目未加载');
+        let latest = project;
+        try {
+          const state = await getState();
+          latest = state.projects.find((p) => p.id === project.id) ?? project;
+        } catch { /* 后端未就绪时用内存快照 */ }
+        if (!latest.serverIds.includes(s.id)) throw new Error('该服务器未绑定当前项目');
+        latest.serverIds = latest.serverIds.filter((id) => id !== s.id);
+        await upsertProject(latest);
+        st.setProject({ ...project, serverIds: latest.serverIds }); // 同步内存单例,避免下次绑定覆盖
+        finishDelete();
+        toast(`已从项目解绑「${s.name}」，服务器配置与凭据已保留`, 'success');
+      } else if (delMode === 'server') {
+        await deleteServer(s.id);
+        finishDelete();
+        toast(`已删除服务器「${s.name}」`, 'success');
+      } else {
+        const report = await deleteServerWithCredentials(s.id);
+        finishDelete();
+        if (report.keptCredentials.length) {
+          toast(`已删除服务器「${s.name}」；凭据「${report.keptCredentials.join('」「')}」仍被其他服务器引用，已保留`, 'info');
+        } else if (report.deletedCredentials.length) {
+          toast(`已删除服务器「${s.name}」及其凭据`, 'success');
+        } else {
+          toast(`已删除服务器「${s.name}」`, 'success');
+        }
+      }
+    } catch (err) {
+      toast(`${delMode === 'unbind' ? '解绑' : '删除'}失败: ${String(err)}`, 'error');
+    } finally {
+      setDelBusy(false);
+    }
+  };
+
   /** 紧凑布局:点击卡片切换展开/收起(展开后才显示编辑/锁定/标签与操作按钮) */
   const toggleExpand = (id: string): void => {
     setExpandedIds((prev) => {
@@ -722,7 +799,7 @@ function ServersPanelBody(): JSX.Element {
 
   /* ---------- 渲染 ---------- */
   const project = useWorkbench((s) => s.project);
-    const { servers, credentials, mcpDevices, compact } = data;
+  const { servers, credentials, mcpDevices, compact, projects } = data;
 
   const ids = project?.serverIds ?? [];
   const bound = servers.filter((s) => ids.includes(s.id));
@@ -737,6 +814,17 @@ function ServersPanelBody(): JSX.Element {
   // 现有全部标签（服务器表单 tag 输入的自动补全候选）
   const allTagOptions = [...new Set(servers.flatMap((s) => s.tags))].sort((a, b) =>
     a.localeCompare(b, 'zh'));
+
+  /* 删除对话框派生值:关联凭据名 / 该凭据还被几台其他服务器引用 / 当前项目之外还绑定的项目名 */
+  const delCred = delServer && delServer.credentialId
+    ? credentials.find((c) => c.id === delServer.credentialId) ?? null
+    : null;
+  const delCredSharedCount = delServer && delServer.credentialId
+    ? servers.filter((x) => x.id !== delServer.id && x.credentialId === delServer.credentialId).length
+    : 0;
+  const delOtherProjects = delServer
+    ? projects.filter((p) => p.id !== project?.id && p.serverIds.includes(delServer.id)).map((p) => p.name)
+    : [];
 
   return (
     <>
@@ -903,6 +991,8 @@ function ServersPanelBody(): JSX.Element {
                               { label: '数据库连接', iconName: 'database', action: () => setDbServer(s) },
                               { label: 'SSH跳转设置', iconName: 'link', action: () => void openJumpEdit(s) },
                               { label: 'SSH 隧道', iconName: 'tunnel', action: () => openTunnel(s) },
+                              'sep',
+                              { label: '删除…', iconName: 'trash', danger: true, action: () => openDeleteModal(s) },
                             ]);
                           }}>
                           <Icon name="more" />
@@ -1034,6 +1124,72 @@ function ServersPanelBody(): JSX.Element {
           <div className="modal-foot">
             <button className="btn" onClick={closeTarget}>取消</button>
             <button className="btn primary" onClick={saveJumpTarget}>保存</button>
+          </div>
+        </div>
+      </div>
+
+      {/* 删除服务器对话框:三模式(从项目解绑/删配置/删配置+凭据),选中项高亮,危险模式红按钮 */}
+      <div
+        className={`modal-mask${delState === 'closed' ? ' hidden' : ''}${delState === 'open' ? ' open' : ''}`}
+        id="server-del-modal"
+        onMouseDown={(e) => { if (e.target === e.currentTarget) closeDel(); }}
+      >
+        <div className="modal" style={{ width: 460 }}>
+          <div className="modal-head">
+            <h3>删除服务器 · {delServer?.name ?? ''}</h3>
+            <button className="icon-btn" title="关闭" onClick={closeDel}><Icon name="x" /></button>
+          </div>
+          <div className="modal-body">
+            <div className="wbs-del-options">
+              <label className={`wbs-del-option${delMode === 'unbind' ? ' active' : ''}`}>
+                <input type="radio" name="server-del-mode" checked={delMode === 'unbind'}
+                  onChange={() => setDelMode('unbind')} />
+                <span className="wbs-del-option-main">
+                  <span className="wbs-del-option-title">从项目中解绑</span>
+                  <span className="wbs-del-option-desc">
+                    仅把服务器从当前项目{project ? `「${project.name}」` : ''}的绑定中移除，服务器配置与凭据保留，可随时重新绑定
+                  </span>
+                </span>
+              </label>
+              <label className={`wbs-del-option${delMode === 'server' ? ' active' : ''}`}>
+                <input type="radio" name="server-del-mode" checked={delMode === 'server'}
+                  onChange={() => setDelMode('server')} />
+                <span className="wbs-del-option-main">
+                  <span className="wbs-del-option-title">删除服务器配置</span>
+                  <span className="wbs-del-option-desc">
+                    从所有项目解绑并删除配置（MCP、SFTP 历史/收藏、数据库连接一并清理），凭据保留
+                    {delOtherProjects.length ? `；其他绑定项目：${delOtherProjects.join('、')}` : ''}
+                  </span>
+                </span>
+              </label>
+              <label className={`wbs-del-option${delMode === 'server+credential' ? ' active' : ''}${delCred ? '' : ' disabled'}`}>
+                <input type="radio" name="server-del-mode" checked={delMode === 'server+credential'}
+                  disabled={!delCred}
+                  onChange={() => setDelMode('server+credential')} />
+                <span className="wbs-del-option-main">
+                  <span className="wbs-del-option-title">删除服务器配置和凭据</span>
+                  <span className="wbs-del-option-desc">
+                    {delCred
+                      ? `在删除配置的基础上同时删除凭据「${delCred.name}」的系统凭据库密钥`
+                        + (delCredSharedCount > 0 ? `；该凭据仍被其他 ${delCredSharedCount} 台服务器引用，将保留` : '')
+                      : '该服务器未关联凭据（SSH 公钥等），没有可删除的凭据'}
+                  </span>
+                </span>
+              </label>
+            </div>
+            {delMode !== 'unbind' ? (
+              <div className="hint" style={{ color: 'var(--red)' }}>删除服务器配置不可恢复，确认请点击「删除」。</div>
+            ) : null}
+          </div>
+          <div className="modal-foot">
+            <button className="btn" onClick={closeDel}>取消</button>
+            <button
+              className={`btn ${delMode === 'unbind' ? 'primary' : 'danger-solid'}`}
+              disabled={delBusy}
+              onClick={() => void runDelete()}
+            >
+              {delMode === 'unbind' ? '解绑' : '删除'}
+            </button>
           </div>
         </div>
       </div>

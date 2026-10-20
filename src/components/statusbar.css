@@ -15,12 +15,19 @@
 .statusbar-item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .statusbar-item .ic, .statusbar-ai-toggle .ic { flex: none; }
 .statusbar-active-tab { max-width: 260px; color: var(--text-2); }
-/* 运行中隧道角标：数量醒目，title 列明细 */
-.statusbar-tunnels { color: var(--green); flex: none; }
-.statusbar-tunnels .ic { color: inherit; }
+/* 运行中隧道角标（components/StatusbarTunnels.tsx）：数量醒目，点击展开控制面板 */
+.statusbar-tunnels { position: relative; flex: none; }
+.statusbar-tunnels-badge {
+  height: 22px; padding: 0 6px; border: none; border-radius: var(--radius-s);
+  background: transparent; color: var(--green); font: inherit; cursor: pointer;
+}
+.statusbar-tunnels-badge:hover { background: var(--bg-hover); color: var(--text-0); }
+.statusbar-tunnels-badge .ic { color: inherit; }
+/* 隧道行状态点（同 tunnel.css .tunnel-status .dot 配色） */
+.sb-tun-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-2); flex: none; }
+.sb-tun-dot.running { background: #2e9e5b; }
 
-/* MCP 角标 + 管理弹层（components/StatusbarMcp.tsx）：三页共用，开关滑块自带
-   （照 servers.css .db-switch 抄制——底栏不依赖 ServersPanel 才加载的样式） */
+/* MCP 角标（components/StatusbarMcp.tsx） */
 .statusbar-mcp { position: relative; flex: none; }
 .statusbar-mcp-badge {
   height: 22px; padding: 0 6px; border: none; border-radius: var(--radius-s);
@@ -28,54 +35,60 @@
 }
 .statusbar-mcp-badge:hover { background: var(--bg-hover); color: var(--text-0); }
 .statusbar-mcp-badge .ic { color: inherit; }
-.statusbar-mcp-panel {
-  position: fixed; z-index: 1250; /* 高于 debug 面板(1100，底栏区域重叠)、低于命令面板(1400)；齿轮入口先收起弹层再开模态，不与模态(1000)叠 */
+
+/* 底栏弹层面板共享骨架（StatusbarMcp / StatusbarTunnels 共用）：fixed 定位坐标由组件
+   按角标矩形现算（right/bottom 内联传入），规避状态栏祖先 overflow 裁剪 */
+.sb-pop-panel {
+  position: fixed; z-index: 1250; /* 高于 debug 面板(1100，底栏区域重叠)、低于命令面板(1400)；齿轮/重操作先收弹层再开模态，不与模态(1000)叠 */
   width: 340px; max-height: min(380px, calc(100vh - 60px));
   display: flex; flex-direction: column;
   background: var(--bg-1); border: 1px solid var(--border-strong); border-radius: var(--radius-m);
   box-shadow: var(--shadow-m); font-size: 12px; overflow: hidden;
 }
-.sb-mcp-head {
+.sb-pop-head {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 9px 12px; border-bottom: 1px solid var(--border); flex: none; min-width: 0;
 }
-.sb-mcp-title { color: var(--text-0); font-weight: 600; flex: none; }
-.sb-mcp-status {
+.sb-pop-title { color: var(--text-0); font-weight: 600; flex: none; }
+.sb-pop-status {
   display: inline-flex; align-items: center; gap: 4px; min-width: 0;
   color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.sb-mcp-status .ic { flex: none; }
-.sb-mcp-status.ok { color: var(--green); }
-.sb-mcp-status.err { color: var(--red); }
-.sb-mcp-list { overflow-y: auto; padding: 4px; }
-.sb-mcp-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-s); }
-.sb-mcp-row:hover { background: var(--bg-hover); }
-.sb-mcp-info { flex: 1; min-width: 0; }
-.sb-mcp-name {
+.sb-pop-status .ic { flex: none; }
+.sb-pop-status.ok { color: var(--green); }
+.sb-pop-status.err { color: var(--red); }
+.sb-pop-list { overflow-y: auto; padding: 4px; }
+.sb-pop-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-s); }
+.sb-pop-row:hover { background: var(--bg-hover); }
+.sb-pop-info { flex: 1; min-width: 0; }
+.sb-pop-name {
   display: flex; align-items: center; gap: 5px; color: var(--text-0); font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.sb-mcp-name .ic { flex: none; color: var(--text-3); }
-.sb-mcp-meta { color: var(--text-2); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sb-mcp-gear { flex: none; width: 24px; height: 24px; }
-.sb-mcp-switch { position: relative; width: 30px; height: 17px; flex: none; cursor: pointer; }
-.sb-mcp-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-.sb-mcp-switch-track {
-  position: absolute; inset: 0; background: var(--bg-3, #3a3d46); border: 1px solid var(--border, #333);
-  border-radius: 9px; transition: background .12s, border-color .12s;
-}
-.sb-mcp-switch-track::after {
-  content: ''; position: absolute; left: 1px; top: 1px; width: 13px; height: 13px; border-radius: 50%;
-  background: var(--text-3, #888); transition: transform .12s, background .12s;
-}
-.sb-mcp-switch input:checked + .sb-mcp-switch-track { background: var(--accent-dim, rgba(74,158,255,.25)); border-color: var(--accent, #4a9eff); }
-.sb-mcp-switch input:checked + .sb-mcp-switch-track::after { transform: translateX(13px); background: var(--accent, #4a9eff); }
-.sb-mcp-switch input:disabled { cursor: not-allowed; }
-.sb-mcp-switch input:disabled + .sb-mcp-switch-track { opacity: 0.45; }
-.sb-mcp-foot {
+.sb-pop-name .ic { flex: none; color: var(--text-3); }
+.sb-pop-meta { color: var(--text-2); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sb-pop-meta.err { color: var(--red); }
+.sb-pop-gear { flex: none; width: 24px; height: 24px; }
+.sb-pop-foot {
   padding: 8px 12px; border-top: 1px solid var(--border); flex: none;
   color: var(--text-3); font-size: 11px; line-height: 1.5;
 }
+/* 弹层行内启停滑块（照 servers.css .db-switch 抄制——底栏三页共用，
+   不依赖 ServersPanel 才加载的样式） */
+.sb-switch { position: relative; width: 30px; height: 17px; flex: none; cursor: pointer; }
+.sb-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.sb-switch-track {
+  position: absolute; inset: 0; background: var(--bg-3, #3a3d46); border: 1px solid var(--border, #333);
+  border-radius: 9px; transition: background .12s, border-color .12s;
+}
+.sb-switch-track::after {
+  content: ''; position: absolute; left: 1px; top: 1px; width: 13px; height: 13px; border-radius: 50%;
+  background: var(--text-3, #888); transition: transform .12s, background .12s;
+}
+.sb-switch input:checked + .sb-switch-track { background: var(--accent-dim, rgba(74,158,255,.25)); border-color: var(--accent, #4a9eff); }
+.sb-switch input:checked + .sb-switch-track::after { transform: translateX(13px); background: var(--accent, #4a9eff); }
+.sb-switch input:disabled { cursor: not-allowed; }
+.sb-switch input:disabled + .sb-switch-track { opacity: 0.45; }
 .statusbar-ai-toggle {
   height: 22px; padding: 0 8px; border: 1px solid transparent; border-radius: var(--radius-s);
   background: transparent; color: var(--text-1); cursor: pointer; font: inherit;

@@ -1,4 +1,16 @@
 /* 资源管理器面板样式 —— 移植自 .proto/workbench-sidebar.js 内联样式（wbs- 前缀改 wbs-explorer-） */
+
+/* 标题栏操作区：下拉框 + 新建/刷新按钮；
+   头部宽度有限（默认侧栏 260px），按钮用 24px、下拉框 62px 以保持标题完整 */
+.wbs-explorer-head-actions { display: inline-flex; align-items: center; gap: 2px; }
+.wbs-explorer-head-actions .icon-btn { width: 24px; height: 24px; font-size: 14px; }
+.wbs-explorer-sort {
+  width: 62px; height: 22px; font-size: 11px; font-weight: 400; letter-spacing: 0;
+  text-transform: none; padding: 0 16px 0 5px;
+  background-position: right 5px center; background-size: 8px 5px; color: var(--text-1);
+}
+.wbs-explorer-sort:hover { border-color: var(--border-strong); }
+
 /* flex:1 0 auto 让树至少撑满可视区（#sidebar-content 为 flex column）：
    末行下方的空白区也在 tree 内，空白区右键菜单 / OS 拖入落点才能覆盖整个面板 */
 .wbs-explorer-tree { padding: 4px 0 8px; flex: 1 0 auto; }

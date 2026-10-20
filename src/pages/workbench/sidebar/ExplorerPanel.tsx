@@ -10,12 +10,17 @@
  * 对外导出契约(不得变更):explorerPanel: SidebarPanelDef(panels.ts 接线);
  * revealLocalPath(path) 在资源管理器中定位文件(SftpTab 下载完成后 import 调用,
  * 实现 = setPanel('explorer') + 面板内展开定位,详见 explorer/explorer.ts)。
+ * 2026-10 新增:标题栏排序方式下拉框(名称/修改时间 × 正倒序),事实源在 explorer/tree.ts,
+ * 目录始终排在文件之前,默认名称正序 = fs_list 后端顺序(无 proto/legacy 对照)。
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Icon } from '../../../shared/Icon';
 import type { SidebarPanelDef } from './panel-types';
 import { useWorkbench } from '../../../stores/workbench';
-import { mountExplorer, revealLocalPath, startInlineInput, refreshAll } from './explorer/explorer';
+import {
+  getSortMode, mountExplorer, revealLocalPath, setSortMode, startInlineInput, refreshAll,
+  type SortMode,
+} from './explorer/explorer';
 import './explorer.css';
 
 export { revealLocalPath };
@@ -43,10 +48,28 @@ function ExplorerPanelBody(): JSX.Element {
   );
 }
 
-/** 侧栏头操作区(legacy explorerHead.renderActions:新建文件 / 新建目录 / 刷新) */
+/** 侧栏头操作区(legacy explorerHead.renderActions:新建文件 / 新建目录 / 刷新 + 排序方式下拉框) */
 function ExplorerHeadActions(): JSX.Element {
+  // 排序方式事实源在 explorer/tree.ts(模块级,跨面板切换保留);此处只做受控镜像
+  const [sort, setSort] = useState<SortMode>(getSortMode);
+  const onSortChange = (mode: SortMode): void => {
+    setSort(mode);
+    setSortMode(mode); // 触发树重绘(不重载目录)
+  };
   return (
-    <>
+    <span className="wbs-explorer-head-actions">
+      <select
+        className="select wbs-explorer-sort"
+        title="排序方式：名称 / 修改时间，↑ 正序 ↓ 倒序（目录始终排在文件之前）"
+        aria-label="排序方式"
+        value={sort}
+        onChange={(e) => onSortChange(e.currentTarget.value as SortMode)}
+      >
+        <option value="name">名称 ↑</option>
+        <option value="name-desc">名称 ↓</option>
+        <option value="mtime">时间 ↑</option>
+        <option value="mtime-desc">时间 ↓</option>
+      </select>
       <button className="icon-btn" title="新建文件" onClick={() => startInlineInput(false, null, null)}>
         <Icon name="filePlus" />
       </button>
@@ -56,7 +79,7 @@ function ExplorerHeadActions(): JSX.Element {
       <button className="icon-btn" title="刷新" onClick={() => void refreshAll()}>
         <Icon name="refresh" />
       </button>
-    </>
+    </span>
   );
 }
 

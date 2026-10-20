@@ -9,7 +9,8 @@
  * 本面板保存成功后同样 emit 'project-changed' 让 ServersPanel 卡片标签同步。
  * 接口点：src/api.ts 的 getState / getMcpStatus / setMcpDevice；
  * 数据模型 src/types.ts（Server / McpDeviceConfig / McpStatus）。
- * 样式：statusbar.css 的 .statusbar-mcp* / .sb-mcp-*（开关滑块自带，不依赖 ServersPanel 的 servers.css）。
+ * 样式：statusbar.css 的 .statusbar-mcp*（角标）+ .sb-pop-* / .sb-switch（与 StatusbarTunnels
+ * 共用的弹层骨架，开关滑块自带，不依赖 ServersPanel 的 servers.css）。
  */
 import { useEffect, useRef, useState } from 'react';
 import { getMcpStatus, getState, setMcpDevice } from '../api';
@@ -132,43 +133,43 @@ export function StatusbarMcp(): JSX.Element | null {
       </button>
       {open && pos && (
         <div
-          className="statusbar-mcp-panel"
+          className="sb-pop-panel"
           style={{ right: pos.right, bottom: pos.bottom }}
           role="dialog"
           aria-label="MCP 服务管理"
         >
-          <div className="sb-mcp-head">
-            <span className="sb-mcp-title">MCP 服务 · 已启用 {rows.length} 台</span>
-            <span className={`sb-mcp-status${statusCls}`} title={statusText}>
+          <div className="sb-pop-head">
+            <span className="sb-pop-title">MCP 服务 · 已启用 {rows.length} 台</span>
+            <span className={`sb-pop-status${statusCls}`} title={statusText}>
               <Icon name={svc?.error ? 'alert' : 'circle'} />
               {statusText}
             </span>
           </div>
-          <div className="sb-mcp-list">
+          <div className="sb-pop-list">
             {rows.map((row) => {
               const locked = row.server.locked;
               const busy = busyId === row.server.id;
               return (
-                <div className="sb-mcp-row" key={row.server.id}>
-                  <div className="sb-mcp-info">
-                    <div className="sb-mcp-name" title={locked ? '服务器已锁定（不允许 AI 访问），MCP 工具调用会被拒绝' : row.server.name}>
+                <div className="sb-pop-row" key={row.server.id}>
+                  <div className="sb-pop-info">
+                    <div className="sb-pop-name" title={locked ? '服务器已锁定（不允许 AI 访问），MCP 工具调用会被拒绝' : row.server.name}>
                       {locked ? <Icon name="lock" /> : null}
                       {row.server.name}
                     </div>
-                    <div className="sb-mcp-meta">
+                    <div className="sb-pop-meta">
                       {row.server.username}@{row.server.host}:{row.server.port}
                     </div>
                   </div>
                   <button
                     type="button"
-                    className="icon-btn sb-mcp-gear"
+                    className="icon-btn sb-pop-gear"
                     title="MCP 功能开关与接入信息"
                     onClick={() => { setOpen(false); openMcpModal(row.server); }}
                   >
                     <Icon name="gear" />
                   </button>
                   <label
-                    className="sb-mcp-switch"
+                    className="sb-switch"
                     title={locked
                       ? '服务器已锁定（不允许 AI 访问），请先在服务器设置中解锁'
                       : '点击停用：从 MCP 可发现设备列表移除（功能开关配置保留）'}
@@ -179,13 +180,13 @@ export function StatusbarMcp(): JSX.Element | null {
                       disabled={locked || busy}
                       onChange={() => { if (!locked) void disableServer(row); }}
                     />
-                    <span className="sb-mcp-switch-track"></span>
+                    <span className="sb-switch-track"></span>
                   </label>
                 </div>
               );
             })}
           </div>
-          <div className="sb-mcp-foot">
+          <div className="sb-pop-foot">
             关闭开关即从 MCP 可发现列表移除（配置保留）；重新启用或配置功能开关，请到服务器卡片「更多 → MCP」。
           </div>
         </div>

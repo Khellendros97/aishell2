@@ -16,6 +16,10 @@
  * 会话建立/重连成功后 maybeAutoRecord 自动启动录制(静默,失败只留日志);设置页保存广播
  * `aishell:data-changed` 失效缓存,只影响此后新建的会话。
  *
+ * 终端搜索(2026-10):Ctrl+F 或右键「查找…」打开右上角浮层(@xterm/addon-search);
+ * 输入即增量查找、Enter/Shift+Enter 上下条、Esc 关闭并交还终端焦点;匹配全高亮 + 结果计数,
+ * 「Aa」切换区分大小写。搜索条绝对定位于 .term-xterm 内,不参与 FitAddon 布局。
+ *
  * React 差异(语义对齐 legacy):
  * - 无 tab.el / tab.pane 命令式 DOM:标签栏「已退出」置灰经 setTabBarExited 按
  *   #tab-bar / #tab-content 子节点顺序定位(两容器同序渲染同一 tabs 数组);
@@ -32,6 +36,7 @@ import { Terminal } from '@xterm/xterm';
 import type { IBuffer, ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import { SearchAddon, type ISearchOptions } from '@xterm/addon-search';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
 
@@ -45,7 +50,7 @@ import type { TermKind } from '../../../api';
 import type { QuickCommand, Server, ServerRef, TermSnapshot } from '../../../types';
 import { saveServerWithCredentialChoice } from '../../settings/server-save';
 import { icon, type IconName } from '../../../icons';
-import { attachCombo, copyText, showContextMenu, toast, uid } from '../../../ui';
+import { attachCombo, copyText, showContextMenu, toast, uid, type CtxMenuItems } from '../../../ui';
 import { dbg } from '../../../debug';
 import { currentTheme, onThemeChange } from '../../../theme';
 import {
@@ -242,6 +247,7 @@ class TermSession {
   /** 主题切换时模块级 liveTerms 需要重写 options.theme,不封装 */
   readonly term: Terminal;
   private readonly fit: FitAddon;
+  private readonly search: SearchAddon;
   private readonly tab: Tab;
   private readonly host: HTMLElement;
   private readonly infoCmd: HTMLElement;
@@ -286,6 +292,14 @@ class TermSession {
   private exitBar: HTMLElement | null = null;
   private exitBarTitle: HTMLElement | null = null;
   private exitBarDesc: HTMLElement | null = null;
+  /** 搜索浮层（懒创建，Ctrl+F / 右键「查找…」；打开期间覆盖在终端右上角） */
+  private searchBar: HTMLElement | null = null;
+  private searchInput: HTMLInputElement | null = null;
+  private searchCountEl: HTMLElement | null = null;
+  /** 区分大小写开关（按钮 active 态） */
+  private searchCaseSensitive = false;
+  /** addon-search 结果计数（仅在带 decorations 搜索时回调） */
+  private searchSub: { dispose(): void } | null = null;
 
   /** 日志用短 id（term:srv-xxx:t-yyyy → t-yyyy） */
   private get sid(): string {
@@ -329,11 +343,20 @@ class TermSession {
       fontSize: 13,
       cursorBlink: true,
       scrollback: 5000,
+      /* addon-search 的「全部匹配高亮」用 registerDecoration（xterm proposed API）：
+         未开启时 findNext 会在高亮阶段抛错，表现为搜索不跳转也不高亮 */
+      allowProposedApi: true,
       theme: TERM_THEMES[currentTheme()],
     });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     this.term.loadAddon(new WebLinksAddon());
+    this.search = new SearchAddon();
+    this.term.loadAddon(this.search);
+    /* 结果计数：只有带 decorations 的搜索才会回调；浮层未创建时也安全（渲染时判空） */
+    this.searchSub = this.search.onDidChangeResults(({ resultIndex, resultCount }) => {
+      this.renderSearchCount(resultIndex, resultCount);
+    });
     /* xterm 6.0.0 内建 DECRQM 处理器(requestMode 内 const enum 经 Vite 转译引用未声明变量)
        被调用必抛 ReferenceError,同步打断写队列排空链 → 终端渲染永久停摆
        (vim/less 等全屏程序启动必发 CSI ? Ps $ p 查询,触发即「卡死」)。
@@ -343,8 +366,9 @@ class TermSession {
     this.term.open(this.host);
     this.term.onData((data) => this.onUserInput(data));
 
-    /* 自定义右键菜单（原生菜单已全局禁用）：添加到对话 / 复制 / 粘贴 / 重连。
-       添加到对话 = 把该终端对应引用加入 AI 输入框（SSH → @remote:服务器名称，本地 → @local） */
+    /* 自定义右键菜单（原生菜单已全局禁用）：添加到对话 / 打开文件管理器 / 复制 / 粘贴 / 重连。
+       添加到对话 = 把该终端对应引用加入 AI 输入框（SSH → @remote:服务器名称，本地 → @local）；
+       「打开文件管理器」仅 SSH 终端显示 = 新开该服务器的 SFTP 标签。 */
     this.host.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -352,16 +376,27 @@ class TermSession {
       const ref: ServerRef = data.kind === 'ssh' && data.serverId
         ? { serverId: data.serverId, name: this.tabTitle }
         : { serverId: null, name: '本地终端' };
-      showContextMenu(e.clientX, e.clientY, [
+      const items: CtxMenuItems = [
         { label: '添加到对话', iconName: 'chatPlus', action: () => wbHandles.ai?.addServerRef?.(ref) },
+      ];
+      if (data.kind === 'ssh' && data.serverId) {
+        const serverId = data.serverId;
+        items.push(
+          { label: '打开文件管理器', iconName: 'folder', action: () => this.openSftpForServer(serverId) },
+          'sep',
+        );
+      }
+      items.push(
         { label: '复制', iconName: 'copy', disabled: !this.term.hasSelection(), action: () => this.copySelection() },
         { label: '粘贴', iconName: 'clipboard', action: () => void this.pasteClipboard() },
+        { label: '查找…', iconName: 'search', action: () => this.openSearch() },
         this.recording
           ? { label: '停止录制', iconName: 'circle', action: () => { void this.stopRecording(false); this.term.focus(); } }
           : { label: '开始录制', iconName: 'circle', action: () => { void this.startRecording(); this.term.focus(); } },
         { label: '导出终端输出…', iconName: 'download', action: () => void this.exportOutput() },
         { label: '重连终端(当前会话将中断)', iconName: 'refresh', action: () => void this.reconnect() },
-      ]);
+      );
+      showContextMenu(e.clientX, e.clientY, items);
     });
     /* 中键快捷复制/粘贴；终端应用启用鼠标追踪时交还给应用（vim/tmux 等）。 */
     this.host.addEventListener('mousedown', (e) => {
@@ -374,6 +409,19 @@ class TermSession {
        preventDefault 必须调：否则浏览器默认行为（Chromium 的粘贴为纯文本）会再粘贴一遍 */
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
+      /* Ctrl+F 打开终端搜索（会话结束后也可查 scrollback）；先于 exit bar 的按键处理，
+         只拦截 Ctrl+F，其余按键在已结束态仍交给 handleExitBarKey */
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === 'KeyF') {
+        e.preventDefault();
+        this.openSearch();
+        return false;
+      }
+      /* 搜索浮层打开时 Esc 关闭（焦点已从输入框回到终端的情形）；仅在浮层打开时拦截 */
+      if (e.key === 'Escape' && this.searchBar?.classList.contains('open')) {
+        e.preventDefault();
+        this.closeSearch();
+        return false;
+      }
       /* 会话已结束:Enter/R/S 三个快捷键交本模块处理(不落终端) */
       if (this.exited || this.failed) return !this.handleExitBarKey(e);
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
@@ -494,6 +542,150 @@ class TermSession {
       const text = await navigator.clipboard.readText();
       if (text) this.term.paste(text);
     } catch { /* 剪贴板读取失败（权限等）静默 */ }
+    this.term.focus();
+  }
+
+  /** 打开该服务器的 SFTP 文件管理器（每次新开标签，与服务器卡片的多开语义一致；
+      标题优先取最新服务器名，后端状态不可用时回退终端标题） */
+  private openSftpForServer(serverId: string): void {
+    void (async () => {
+      const name = (await getState().catch(() => null))
+        ?.servers.find((s) => s.id === serverId)?.name ?? this.tabTitle;
+      useWorkbench.getState().openTab({
+        id: `sftp:${serverId}:${uid('tab')}`,
+        type: 'sftp',
+        title: `SFTP ${name}`,
+        data: { serverId },
+      });
+    })();
+  }
+
+  /* ---------- 终端搜索（xterm addon-search；Ctrl+F / 右键「查找…」） ----------
+     浮层覆盖在终端右上角（绝对定位，不参与 fit 布局）。匹配高亮用 decorations 绘制，
+     结果计数由 onDidChangeResults 回填；Esc 关闭并清高亮、焦点交还终端。 */
+
+  /** 主题相关的匹配高亮配色（xterm decoration 要求 #RRGGBB） */
+  private searchDecorations(): NonNullable<ISearchOptions['decorations']> {
+    const dark = currentTheme() === 'dark';
+    return {
+      matchBackground: dark ? '#2f4f75' : '#b9d7fb',
+      matchOverviewRuler: '#4f8ef7',
+      activeMatchBackground: dark ? '#8a6d1f' : '#ffd33d',
+      activeMatchColorOverviewRuler: '#f2cc60',
+    };
+  }
+
+  /** 懒创建搜索浮层并绑定交互（只建一次；openSearch 负责显隐与聚焦） */
+  private ensureSearchBar(): HTMLElement {
+    if (this.searchBar) return this.searchBar;
+    const bar = document.createElement('div');
+    bar.className = 'term-search';
+    bar.innerHTML = `
+      <input class="input term-search-input" type="text" placeholder="查找终端输出…" spellcheck="false" aria-label="查找终端输出">
+      <span class="term-search-count" aria-live="polite"></span>
+      <button class="icon-btn term-search-case" title="区分大小写" aria-label="区分大小写" aria-pressed="false">Aa</button>
+      <button class="icon-btn term-search-prev" title="上一个匹配（Shift+Enter）" aria-label="上一个匹配">${icon('arrowUp')}</button>
+      <button class="icon-btn term-search-next" title="下一个匹配（Enter）" aria-label="下一个匹配">${icon('arrowDown')}</button>
+      <button class="icon-btn term-search-close" title="关闭（Esc）" aria-label="关闭搜索">${icon('x')}</button>`;
+    this.host.appendChild(bar);
+
+    const input = bar.querySelector('.term-search-input') as HTMLInputElement;
+    const count = bar.querySelector('.term-search-count') as HTMLElement;
+    const caseBtn = bar.querySelector('.term-search-case') as HTMLButtonElement;
+    const prevBtn = bar.querySelector('.term-search-prev') as HTMLButtonElement;
+    const nextBtn = bar.querySelector('.term-search-next') as HTMLButtonElement;
+    const closeBtn = bar.querySelector('.term-search-close') as HTMLButtonElement;
+    this.searchBar = bar;
+    this.searchInput = input;
+    this.searchCountEl = count;
+
+    /* 输入即增量查找（输入框获得焦点时按键不会进终端）；空串清高亮与计数 */
+    input.addEventListener('input', () => {
+      if (!input.value) {
+        this.search.clearDecorations();
+        this.renderSearchCount(-1, 0);
+        return;
+      }
+      this.runSearch('next', true);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeSearch();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        this.runSearch(e.shiftKey ? 'prev' : 'next');
+      } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.code === 'KeyF') {
+        e.preventDefault();
+        input.select();
+      }
+    });
+    caseBtn.onclick = () => {
+      this.searchCaseSensitive = !this.searchCaseSensitive;
+      caseBtn.classList.toggle('active', this.searchCaseSensitive);
+      caseBtn.setAttribute('aria-pressed', String(this.searchCaseSensitive));
+      if (input.value) this.runSearch('next');
+      input.focus();
+    };
+    prevBtn.onclick = () => { this.runSearch('prev'); input.focus(); };
+    nextBtn.onclick = () => { this.runSearch('next'); input.focus(); };
+    closeBtn.onclick = () => this.closeSearch();
+    return bar;
+  }
+
+  /** 结果计数渲染（无输入清空；0 条标红「无结果」；越过高亮上限时只显示总数） */
+  private renderSearchCount(resultIndex: number, resultCount: number): void {
+    const el = this.searchCountEl;
+    if (!el) return;
+    if (!this.searchInput?.value) {
+      el.textContent = '';
+      el.classList.remove('empty');
+      return;
+    }
+    if (resultCount === 0) {
+      el.textContent = '无结果';
+      el.classList.add('empty');
+      return;
+    }
+    el.classList.remove('empty');
+    el.textContent = resultIndex < 0 ? `${resultCount}` : `${resultIndex + 1}/${resultCount}`;
+  }
+
+  private runSearch(direction: 'next' | 'prev', incremental = false): void {
+    const input = this.searchInput;
+    if (!input || !input.value) {
+      this.search.clearDecorations();
+      this.renderSearchCount(-1, 0);
+      return;
+    }
+    const options: ISearchOptions = {
+      caseSensitive: this.searchCaseSensitive,
+      incremental,
+      decorations: this.searchDecorations(),
+    };
+    if (direction === 'next') this.search.findNext(input.value, options);
+    else this.search.findPrevious(input.value, { ...options, incremental: false });
+  }
+
+  /** 打开搜索浮层（Ctrl+F / 右键「查找…」）：已有内容时立即重新定位 */
+  private openSearch(): void {
+    const bar = this.ensureSearchBar();
+    bar.classList.add('open');
+    const input = this.searchInput;
+    if (!input) return;
+    input.focus();
+    input.select();
+    if (input.value) this.runSearch('next', true);
+  }
+
+  private closeSearch(): void {
+    this.searchBar?.classList.remove('open');
+    this.search.clearDecorations();
+    if (this.searchCountEl) {
+      this.searchCountEl.textContent = '';
+      this.searchCountEl.classList.remove('empty');
+    }
     this.term.focus();
   }
 
@@ -1227,6 +1419,13 @@ class TermSession {
     this.exitBarDesc = null;
     this.unlisteners.forEach((u) => { try { u(); } catch { /* 忽略退订异常 */ } });
     this.unlisteners = [];
+    // 搜索浮层与结果订阅随会话销毁（xterm.dispose 会连带释放 addon 本身）
+    this.searchSub?.dispose();
+    this.searchSub = null;
+    this.searchBar?.remove();
+    this.searchBar = null;
+    this.searchInput = null;
+    this.searchCountEl = null;
     if (!this.exited) void termClose(this.tab.id).catch(() => {});
     try { this.term.dispose(); } catch { /* 忽略 dispose 异常 */ }
   }
