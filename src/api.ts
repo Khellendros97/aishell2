@@ -269,6 +269,10 @@ export type AiEvent =
   | { type: 'segment' }
   | { type: 'done' }
   | { type: 'settled' }
+  /** 后端会话自愈等纯信息提示（不进对话历史，前端只弹 toast）：
+   *  - 发送前自动修复：会话历史损坏已修复、AI 进程已重启
+   *  - 终态错误后检测：发现损坏，下一条消息发送前会自动修复 */
+  | { type: 'notice'; message: string }
   | { type: 'error'; message: string }
   | { type: 'approval'; requestId: string; toolCallId: string; action: string; intent: string; summary: string;
       /** 智能审批自动放行：true 时卡片直接展示「已智能放行」（后端已回 confirmed，无需再回复） */
