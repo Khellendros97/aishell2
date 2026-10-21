@@ -13,7 +13,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
 import type { AppState, CloudMode, CloudStatus, LlmConfig, Settings as AppSettings, Theme, TimelineCloudInfo, UpdateStatus } from '../../types';
-import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, saveSettings, setMcpPort, setTheme, timelineCloudInfo, timelineCloudPurge, updateCheck, updateDownload, updateInstall } from '../../api';
+import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, piVersion, saveSettings, setMcpPort, setTheme, timelineCloudInfo, timelineCloudPurge, updateCheck, updateDownload, updateInstall } from '../../api';
 import { navigate } from '../../router';
 import { toast, confirmDialog } from '../../ui';
 import { CredentialsPanel } from './CredentialsPanel';
@@ -193,6 +193,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const hosted = cloudMode === 'hosted';
   /* 关于与更新：状态来自全局更新总线（Topbar 徽标同源，不重复检查） */
   const [upd, setUpd] = useState<UpdateStatus | null>(null);
+  /* 关于与更新：内嵌 pi 运行时版本（挂载时检测一次；error 为中文原因） */
+  const [piVer, setPiVer] = useState<{ version?: string; error?: string } | null>(null);
   /* 时间线云同步：三层开关满足情况 + 容量超限标记（后端 timeline_upload.rs 状态） */
   const [tlCloud, setTlCloud] = useState<TimelineCloudInfo | null>(null);
 
@@ -287,6 +289,15 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
 
   /* 更新状态总线订阅（已有快照立即回调；卸载退订） */
   useEffect(() => onUpdateStatus(setUpd), []);
+
+  /* 内嵌 pi 运行时版本：挂载检测一次（「关于与更新」展示；失败展示原因不阻塞其他内容） */
+  useEffect(() => {
+    let cancelled = false;
+    void piVersion()
+      .then((version) => { if (!cancelled) setPiVer({ version }); })
+      .catch((err) => { if (!cancelled) setPiVer({ error: String(err) }); });
+    return () => { cancelled = true; };
+  }, []);
 
   /* 时间线云同步状态：装载拉一次，开关保存/删除云端数据后由调用处刷新 */
   useEffect(() => {
@@ -955,6 +966,19 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
               <label>当前版本</label>
               <div className="mcp-status-line" id="upd-current">
                 AIShell v{upd?.currentVersion ?? '…'}（stable 频道）
+              </div>
+            </div>
+            <div className="field">
+              <label>内嵌 AI 运行时</label>
+              <div
+                className={`mcp-status-line${piVer?.error ? ' err' : ''}`}
+                id="upd-pi-version"
+              >
+                {!piVer
+                  ? '正在检测 pi 版本…'
+                  : piVer.error
+                    ? `检测失败：${piVer.error}`
+                    : `pi v${piVer.version}`}
               </div>
             </div>
             {!upd ? (

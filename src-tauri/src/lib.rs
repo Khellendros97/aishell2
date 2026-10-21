@@ -404,6 +404,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             ai::ai_chat,
             ai::ai_abort,
             ai::ai_debug_info,
+            ai::pi_version,
             ai::ai_kill_project,
             ai::ai_set_thinking,
             ai_images::ai_attach_images,

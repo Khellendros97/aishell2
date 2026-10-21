@@ -2,7 +2,7 @@
 //! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)` /
 //! `ai_set_thinking(project_id, level)` / `set_ai_mode(project_id, mode)` /
 //! `ai_respond_approval(key, request_id, confirmed)` /
-//! `ai_respond_db_request(key, request_id, response)`；
+//! `ai_respond_db_request(key, request_id, response)` / `pi_version()`；
 //! 事件 `ai:event:<key>` payload：
 //!   - `{type:"delta",text}` / `{type:"tool",tool,label}` / `{type:"segment"}`
 //!   - `{type:"done"}` / `{type:"error",message}`
@@ -3032,6 +3032,54 @@ pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(),
     Ok(())
 }
 
+/// 内嵌 pi 运行时版本（设置-关于与更新展示）。
+/// 优先读 `resources/pi/VERSION`（scripts/fetch-pi.mjs 写入，内容沿用上游 release tag，
+/// 形如 `v1.3.0`）；侧车文件缺失时回退执行 `pi --version`（手工替换二进制等场景）。
+/// 返回不带 `v` 前缀的版本号，与 AIShell 版本展示风格一致。
+#[tauri::command]
+pub fn pi_version(mgr: State<'_, Arc<AiManager>>) -> Result<String, String> {
+    read_pi_version(&mgr.pi_dir)
+}
+
+fn read_pi_version(pi_dir: &std::path::Path) -> Result<String, String> {
+    let bin = pi_dir.join(PI_BIN_NAME);
+    if !bin.is_file() {
+        return Err("未找到内嵌 pi 运行时（安装可能不完整，请重新安装）".to_string());
+    }
+    if let Ok(raw) = std::fs::read_to_string(pi_dir.join("VERSION")) {
+        let version = normalize_pi_version(&raw);
+        if !version.is_empty() {
+            return Ok(version);
+        }
+    }
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().map_err(|e| format!("读取 pi 版本失败：{e}"))?;
+    if !out.status.success() {
+        return Err("读取 pi 版本失败（pi --version 退出异常）".to_string());
+    }
+    let version = normalize_pi_version(&String::from_utf8_lossy(&out.stdout));
+    if version.is_empty() {
+        return Err("读取 pi 版本失败（pi --version 未输出内容）".to_string());
+    }
+    Ok(version)
+}
+
+/// `v1.3.0` / `V1.3.0` / `1.3.0` → `1.3.0`；空内容返回空串由调用方判定失败。
+fn normalize_pi_version(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .trim_start_matches(['v', 'V'])
+        .to_string()
+}
+
 /// pi 运行时诊断信息：前端控制台输出，用于排查安装版资源布局问题。
 /// 附带最近一次技能装载中被项目同名技能覆盖的全局技能（避免 pi「同名保留第一个」依赖未声明顺序）。
 #[tauri::command]
@@ -3997,5 +4045,26 @@ mod tests {
         // 只剩注入行/空白 → 回退占位
         assert_eq!(timeline_user_summary("[当前工作区域: 本地]\n  \n"), "（空输入）");
         assert_eq!(timeline_user_summary(""), "（空输入）");
+    }
+
+    #[test]
+    fn pi_version_reads_version_file_and_strips_prefix() {
+        let dir = temp_dir("pi-version");
+        std::fs::write(dir.join(PI_BIN_NAME), b"fake").unwrap();
+        std::fs::write(dir.join("VERSION"), "v1.3.0\n").unwrap();
+        assert_eq!(read_pi_version(&dir).unwrap(), "1.3.0");
+        // 无前缀/大写 V 同样归一（手工写入的版本文件）
+        std::fs::write(dir.join("VERSION"), "V1.3.1").unwrap();
+        assert_eq!(read_pi_version(&dir).unwrap(), "1.3.1");
+        // 空白版本文件 → 不把空串当版本（回退路径失败时返回中文错误，不会展示空版本）
+        std::fs::write(dir.join("VERSION"), "  \n").unwrap();
+        assert_eq!(normalize_pi_version("  \n"), "");
+    }
+
+    #[test]
+    fn pi_version_missing_runtime_reports_chinese_error() {
+        let dir = temp_dir("pi-version-missing");
+        let err = read_pi_version(&dir).unwrap_err();
+        assert!(err.contains("未找到内嵌 pi 运行时"), "实际错误：{err}");
     }
 }

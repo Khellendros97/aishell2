@@ -312,6 +312,8 @@ export const onAiSessionTitle = (cb: (ev: AiSessionTitleEvent) => void): Promise
 export const aiAbort = (key: string) => call<void>('ai_abort', { key });
 /** pi 运行时诊断（候选路径命中情况 + 安装目录实际内容），供控制台输出排查安装版问题 */
 export const aiDebugInfo = () => call<string>('ai_debug_info');
+/** 内嵌 pi 运行时版本（设置-关于与更新展示；后端优先读 resources/pi/VERSION，缺失回退 pi --version） */
+export const piVersion = () => call<string>('pi_version');
 /** 工作台卸载/切项目时调用：kill 该项目全部 pi 进程 */
 export const aiKillProject = (projectId: string) => call<void>('ai_kill_project', { projectId });
 /** 修复会话历史（右键菜单「修复会话」）：杀会话 pi 进程后校验修复 sessions jsonl
