@@ -10,7 +10,7 @@
 import './styles/design.css';
 import { createRoot } from 'react-dom/client';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { aiAnyBusy, aiWindowClose, getState, isConfigComplete, openDevtools } from './api';
+import { aiAnyBusy, aiWindowClose, getState, isConfigComplete, onTrayExitRequest, openDevtools, trayAvailable } from './api';
 import { initCommandPanel } from './command-panel';
 import { initDebug } from './debug';
 import { initUpdates } from './updates';
@@ -59,33 +59,84 @@ document.addEventListener('keydown', (e) => {
 /* 按窗口分两种角色：
    - 分离窗口(label = ai-detach):关闭即聚合——onCloseRequested 先 flush 正式消息，
      再由 ai_window_close 记录当前会话并 destroy；宿主 ctx 全程在线收流，AI 忙也不弹确认。
-   - 主窗口:有任务(anyAiBusy 本窗口常驻上下文——分离后 ctx 仍在收流,天然覆盖分离窗口的
-     忙态;外加 aiAnyBusy 后端进程表兜底)一律 preventDefault 拦下,弹确认框;确认后先带走
-     分离窗口再 destroy() 强制关闭——destroy 不再触发 closeRequested(不会递归回本守卫),
-     后端退出收尾(exit_cleanup_if_last_window)照常执行。无任务放行前也要调 ai_window_close
-     兜底带走分离窗口,否则主窗口销毁后的退出收尾会 kill_all pi,分离窗口沦为僵尸。
-     确认框打开期间的再次关闭请求也拦下(不重复弹框,也不放行——否则第二击会绕过未确认的
-     对话框直接关窗)。无 Tauri 环境(纯浏览器)静默跳过。 */
+   - 主窗口:
+     · closeToTray 开启且托盘可用:关闭 = 隐藏到托盘(Rust 侧 prevent_close + hide,窗口
+       不销毁,会话继续在后台运行),这里 preventDefault 拦下 JS 默认 destroy、不弹 AI 忙
+       确认;托盘创建失败(查询 tray_available 为 false)时照常走下面的关窗流程。
+       托盘菜单「退出 AIShell」经 tray:exit-request 事件回到确认 + 落盘 + destroy 流程。
+     · closeToTray 关闭:有任务(anyAiBusy 本窗口常驻上下文——分离后 ctx 仍在收流,天然覆盖
+       分离窗口的忙态;外加 aiAnyBusy 后端进程表兜底)一律 preventDefault 拦下,弹确认框;确认后
+       先带走分离窗口再 destroy() 强制关闭——destroy 不再触发 closeRequested(不会递归回本守卫),
+       后端退出收尾(exit_cleanup_if_last_window)照常执行。无任务放行前也要调 ai_window_close
+       兜底带走分离窗口,否则主窗口销毁后的退出收尾会 kill_all pi,分离窗口沦为僵尸。
+       确认框打开期间的再次关闭请求也拦下(不重复弹框,也不放行——否则第二击会绕过未确认的
+       对话框直接关窗)。无 Tauri 环境(纯浏览器)静默跳过。 */
 let closeGuardDialogOpen = false;
 void (async () => {
   let win: ReturnType<typeof getCurrentWindow>;
   try {
     win = getCurrentWindow();
-    const isDetachWindow = win.label === 'ai-detach';
-    let detachCloseStarted = false;
+  } catch { return; } // 无 Tauri 注入(vite dev 纯浏览器调试):无窗口概念,跳过
+  if (win.label === 'ai-detach') {
+    /* X 关闭与面板「聚合」都必须先落盘正式消息。后端 ai_window_close 使用 destroy，
+       不会再次进入本守卫；正在生成的 pending 不定稿，交给宿主上下文继续续流。 */
+    let closeStarted = false;
     await win.onCloseRequested(async (event) => {
-      if (isDetachWindow) {
-        /* X 关闭先落盘正式消息；后端 destroy 不会递归进入本守卫。 */
+      event.preventDefault();
+      if (closeStarted) return;
+      closeStarted = true;
+      try {
+        await flushAiSessionSnapshots();
+        await aiWindowClose(currentDetachedAiSessionId());
+      } catch (err) {
+        closeStarted = false;
+        console.error('[AI] 聚合窗口关闭失败:', err);
+      }
+    });
+    return;
+  }
+
+  /* 强制退出:带走分离窗口 → 落盘未定稿正文 → destroy(触发 Destroyed 收尾) */
+  const forceQuit = async (): Promise<void> => {
+    await aiWindowClose().catch(() => { /* 分离窗口可能已自行关闭 */ });
+    /* 关闭前把已流出但未定稿的助手正文落盘（await 到写入完成再销毁窗口，
+       否则进程退出后该段正文永久丢失）。分离是双端订阅，本窗口 ctx 已含分离窗口
+       的 pending，无需单独处理对方。 */
+    await flushAiPendingOutput().catch(() => { /* 落盘失败不阻塞关闭 */ });
+    await win.destroy();
+  };
+
+  /* 托盘「退出」与 AI 忙时的关闭确认共用：有任务先二次确认，无任务直接退出 */
+  const confirmAndQuit = async (): Promise<void> => {
+    const backendBusy = await aiAnyBusy().catch(() => false);
+    if (!anyAiBusy() && !backendBusy) {
+      await forceQuit();
+      return;
+    }
+    if (closeGuardDialogOpen) return;
+    closeGuardDialogOpen = true;
+    let confirmed = false;
+    try {
+      confirmed = await confirmDialog({
+        title: 'AI 任务尚未结束',
+        message: 'AI 助手仍在生成回复或等待你的确认，关闭将中断进行中的任务。确定要关闭 AIShell 吗？',
+        danger: true,
+        okText: '仍然关闭',
+      });
+    } finally {
+      closeGuardDialogOpen = false;
+    }
+    if (confirmed) await forceQuit();
+  };
+
+  try {
+    await win.onCloseRequested(async (event) => {
+      /* 关闭即隐藏到托盘:Rust 侧已 prevent_close + hide,窗口与全部会话继续存活。
+         必须 preventDefault——Tauri 的 JS onCloseRequested 在未拦截时会主动 destroy()
+         窗口(绕过 Rust 的 hide);同时先查托盘是否真的可用,创建失败时放行关窗。 */
+      const closeToTray = await getState().then((s) => s.settings.closeToTray).catch(() => false);
+      if (closeToTray && (await trayAvailable().catch(() => false))) {
         event.preventDefault();
-        if (detachCloseStarted) return;
-        detachCloseStarted = true;
-        try {
-          await flushAiSessionSnapshots();
-          await aiWindowClose(currentDetachedAiSessionId());
-        } catch (err) {
-          detachCloseStarted = false;
-          console.error('[AI] 聚合窗口关闭失败:', err);
-        }
         return;
       }
       const backendBusy = await aiAnyBusy().catch(() => false);
@@ -94,28 +145,10 @@ void (async () => {
         return; // 无 AI 任务:放行,不弹框
       }
       event.preventDefault();
-      if (closeGuardDialogOpen) return;
-      closeGuardDialogOpen = true;
-      let confirmed = false;
-      try {
-        confirmed = await confirmDialog({
-          title: 'AI 任务尚未结束',
-          message: 'AI 助手仍在生成回复或等待你的确认，关闭将中断进行中的任务。确定要关闭 AIShell 吗？',
-          danger: true,
-          okText: '仍然关闭',
-        });
-      } finally {
-        closeGuardDialogOpen = false;
-      }
-      if (confirmed) {
-        await aiWindowClose().catch(() => { /* 分离窗口可能已自行关闭 */ });
-        /* 关闭前把已流出但未定稿的助手正文落盘（await 到写入完成再销毁窗口，
-           否则进程退出后该段正文永久丢失）。分离是双端订阅，本窗口 ctx 已含分离窗口
-           的 pending，无需单独处理对方。 */
-        await flushAiPendingOutput().catch(() => { /* 落盘失败不阻塞关闭 */ });
-        await win.destroy();
-      }
+      await confirmAndQuit(); // 忙态可能在等待期间变化,复用内部的最新判定
     });
+    /* 托盘右键「退出 AIShell」:后端已先显示主窗口,这里复用忙态确认流程 */
+    await onTrayExitRequest(() => { void confirmAndQuit(); });
   } catch { /* 无 Tauri 注入(vite dev 纯浏览器调试):无窗口概念,跳过 */ }
 })();
 

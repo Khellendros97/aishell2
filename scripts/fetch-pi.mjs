@@ -123,7 +123,7 @@ try {
     fail(`解压后未找到 ${target.bin}，请检查包内部结构`);
   }
 
-  // 整体替换 DEST：先清旧目录再搬入，保证旁车资源（theme/assets/node_modules）与二进制同级且无残留
+  // 整体替换 DEST：先清旧目录再搬入，保证旁车资源（theme/assets/native 等）与二进制同级且无残留
   rmSync(DEST, { recursive: true, force: true });
   mkdirSync(DEST, { recursive: true });
   for (const f of readdirSync(tmpDir)) {

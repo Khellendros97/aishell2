@@ -85,6 +85,8 @@ export interface Settings {
   autoRecordTerminal: boolean;
   /** 文件打开方式（双击 explorer/SFTP 文件时生效）；旧配置无此字段按内置编辑器优先 */
   fileOpenMode: 'editor-first' | 'system-first' | 'explorer' | 'ask';
+  /** 关闭窗口时最小化到托盘：开启后点关闭按钮隐藏到系统托盘（终端/AI 会话继续运行）；旧配置无此字段按关闭 */
+  closeToTray: boolean;
 }
 
 /** 云服务接入模式（与 store.rs CloudMode serde lowercase 对齐） */
