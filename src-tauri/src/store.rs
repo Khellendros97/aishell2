@@ -198,6 +198,10 @@ pub struct Settings {
     /// 旧配置无此字段时按内置编辑器优先处理（保持原行为）。
     #[serde(default)]
     pub file_open_mode: FileOpenMode,
+    /// 关闭窗口时最小化到托盘：开启后主窗口 CloseRequested 被拦截并 hide，托盘图标可恢复；
+    /// 终端/AI 会话在后台继续运行。旧配置无此字段时按关闭处理（保持原行为）。
+    #[serde(default)]
+    pub close_to_tray: bool,
 }
 
 /// 全新安装（无 aishell.json）默认值：自动备份远程文件与自动切换工作区域按开启。
@@ -219,6 +223,7 @@ impl Default for Settings {
             auto_record_terminal: false,
             sidebar_default: SidebarDefault::default(),
             file_open_mode: FileOpenMode::default(),
+            close_to_tray: false,
         }
     }
 }
@@ -3507,12 +3512,20 @@ pub async fn get_task_project(store: State<'_, Arc<Store>>) -> Result<Project, S
 
 #[tauri::command]
 pub async fn save_settings(
+    app: tauri::AppHandle,
     store: State<'_, Arc<Store>>,
     settings: Settings,
     api_key: Option<String>,
     brave_key: Option<String>,
 ) -> Result<(), String> {
-    store.save_settings(settings, api_key.as_deref(), brave_key.as_deref())
+    // 托盘开关随保存即时生效（创建/移除图标），无需重启应用
+    let close_to_tray = settings.close_to_tray;
+    store.save_settings(settings, api_key.as_deref(), brave_key.as_deref())?;
+    if let Err(e) = crate::tray::sync(&app, close_to_tray) {
+        // 系统托盘创建失败不应让设置保存失败（例如无桌面托盘的环境）
+        eprintln!("同步系统托盘状态失败: {e}");
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3828,6 +3841,7 @@ mod tests {
                 auto_record_terminal: false,
                 sidebar_default: crate::store::SidebarDefault::default(),
                 file_open_mode: crate::store::FileOpenMode::default(),
+                close_to_tray: false,
             },
             credentials: vec![
                 Credential {
@@ -6953,6 +6967,7 @@ mod tests {
                     auto_record_terminal: false,
                     sidebar_default: crate::store::SidebarDefault::default(),
                     file_open_mode: crate::store::FileOpenMode::default(),
+                    close_to_tray: false,
                 },
                 Some("sk-test-key"),
                 None,
@@ -7152,6 +7167,7 @@ mod tests {
                     auto_record_terminal: false,
                     sidebar_default: crate::store::SidebarDefault::default(),
                     file_open_mode: crate::store::FileOpenMode::default(),
+                    close_to_tray: false,
                 },
                 None,
                 Some("bsk-1"),
@@ -8239,6 +8255,37 @@ mod tests {
         assert!(
             !reloaded.settings().auto_record_terminal,
             "旧配置无 autoRecordTerminal 字段默认关闭"
+        );
+    }
+
+    /// 关闭窗口最小化到托盘：全新默认关闭；旧配置无 closeToTray 字段同样按关闭
+    /// （保持既有用户「点关闭即退出」的行为）。
+    #[test]
+    fn close_to_tray_defaults_off_and_round_trips() {
+        let config = temp_config_dir("close-to-tray");
+        let store = test_store(config.clone());
+        assert!(!store.settings().close_to_tray, "全新默认应为关闭");
+        let mut settings = store.settings().clone();
+        settings.close_to_tray = true;
+        store.save_settings(settings, None, None).unwrap();
+        assert!(store.settings().close_to_tray, "开启后应持久化");
+        // 删掉字段模拟旧配置，重新装载仍应关闭
+        let state_path = config.join(STATE_FILE);
+        let raw = fs::read(&state_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("closeToTray");
+        fs::write(&state_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = test_store(config);
+        assert!(
+            !reloaded.settings().close_to_tray,
+            "旧配置无 closeToTray 字段默认关闭"
         );
     }
 

@@ -1,4 +1,6 @@
-//! pi sidecar 黑盒集成测试（pi v0.83.0 RPC + 本地 mock OpenAI 流式服务，不访问真实 LLM / keyring）。
+//! pi sidecar 黑盒集成测试（内嵌 pi RPC + 本地 mock OpenAI 流式服务，不访问真实 LLM / keyring）。
+//! 升级 pi 侧车（node scripts/fetch-pi.mjs --force）后必须先跑本测试：扩展 API / RPC 事件 /
+//! CLI 参数若在跨版本间变更，会在这里先暴露。
 //!
 //! 验证 aishell-guard.ts 三模式权限边界（计划验证项 3）：
 //! - suggest：越界写（含 `../`）被拒且项目外文件不变，.aishell/ 内放行，全程无审批请求；

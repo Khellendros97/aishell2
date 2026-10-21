@@ -72,6 +72,7 @@ const EMPTY_STATE: AppState = {
     notifyLongTasks: true,
     autoRecordTerminal: false, sidebarDefault: 'explorer',
     fileOpenMode: 'editor-first',
+    closeToTray: false,
   },
   servers: [], credentials: [], projects: [], sessions: {}, projectFolders: [], commandFolders: [], uiExpanded: {},
   sftpHistory: {}, sftpFavorites: {}, dbConnections: {}, mcp: { port: 8945 }, mcpDevices: {},
