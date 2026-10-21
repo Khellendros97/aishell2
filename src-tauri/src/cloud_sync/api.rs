@@ -82,12 +82,16 @@ impl fmt::Display for TransportFailure {
 impl std::error::Error for TransportFailure {}
 
 /// 网络边界。fake 只需要实现该 trait，不会触及真实网络或 keyring。
+// allow(unknown_lints)：double_must_use 是 Rust 1.99 新增 lint（本地旧工具链不认识）；
+// 该 lint 报的是 #[async_trait] 宏生成的 `#[must_use]` 与 Box<dyn Future> 返回类型叠加，属宏产物误报。
+#[allow(unknown_lints, clippy::double_must_use)]
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn send(&self, request: TransportRequest) -> Result<TransportResponse, TransportFailure>;
 }
 
 /// 获取 access token 的接口。它刻意独立于 cloud.rs 私有的 credentials/token 请求细节。
+#[allow(unknown_lints, clippy::double_must_use)]
 #[async_trait]
 pub trait TokenSource: Send + Sync {
     async fn access_token(&self) -> Result<String, String>;

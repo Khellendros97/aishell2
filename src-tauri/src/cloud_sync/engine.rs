@@ -8,6 +8,9 @@ use super::protocol::{AckRequest, ChangesResponse, SnapshotResponse, SyncItem};
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_SNAPSHOT_RESTARTS: usize = 3;
 
+// allow(unknown_lints)：double_must_use 是 Rust 1.99 新增 lint（本地旧工具链不认识）；
+// 该 lint 报的是 #[async_trait] 宏生成的 `#[must_use]` 与 Box<dyn Future> 返回类型叠加，属宏产物误报。
+#[allow(unknown_lints, clippy::double_must_use)]
 #[async_trait]
 pub trait SyncRemote: Send + Sync {
     async fn changes(&self, after: i64, limit: usize) -> ApiResult<ChangesResponse>;
@@ -34,6 +37,7 @@ impl<T: Transport> SyncRemote for SyncApi<T> {
     }
 }
 
+#[allow(unknown_lints, clippy::double_must_use)]
 #[async_trait]
 pub trait ChangeApplier: Send + Sync {
     /// 一页必须整体完成后才能返回；失败时调用方不会 ACK 本页游标。
