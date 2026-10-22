@@ -17,8 +17,13 @@ export interface LlmConfig {
   inputModes: Array<'text' | 'image'>;
 }
 
+/** 联网搜索提供商；deepseek 复用模型 API Key，brave 需单独配置 Key。 */
+export type SearchProvider = 'deepseek' | 'brave';
+
 export interface SearchConfig {
   enabled: boolean;
+  /** 搜索提供商；旧配置无此字段时后端按 deepseek 处理 */
+  provider: SearchProvider;
 }
 
 /** 知识库配置（云端只读中转，开放 API 文档 §4）：autoInject 只控制「发消息前自动把分数最高的前 N 条命中注入用户输入」；

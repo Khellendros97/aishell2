@@ -12,7 +12,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
-import type { AppState, CloudMode, CloudStatus, LlmConfig, Settings as AppSettings, Theme, TimelineCloudInfo, UpdateStatus } from '../../types';
+import type { AppState, CloudMode, CloudStatus, LlmConfig, SearchProvider, Settings as AppSettings, Theme, TimelineCloudInfo, UpdateStatus } from '../../types';
 import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, piVersion, saveSettings, setMcpPort, setTheme, timelineCloudInfo, timelineCloudPurge, updateCheck, updateDownload, updateInstall } from '../../api';
 import { navigate } from '../../router';
 import { toast, confirmDialog } from '../../ui';
@@ -45,6 +45,7 @@ interface SysFields {
   effort: LlmConfig['effort'];
   inputModes: LlmConfig['inputModes'];
   searchEnabled: boolean;
+  searchProvider: SearchProvider;
   braveKey: string;
   aiWorkdir: boolean;
   approvalMode: AppSettings['approvalMode'];
@@ -65,7 +66,7 @@ interface SysFields {
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
 const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
-  effort: 'low', inputModes: ['text'], searchEnabled: false, braveKey: '', aiWorkdir: false,
+  effort: 'low', inputModes: ['text'], searchEnabled: false, searchProvider: 'deepseek', braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '',
   kbAutoInject: false, kbInjectCount: '5', compactServerList: false,
   sidebarDefault: 'explorer',
@@ -241,6 +242,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       effort: s.settings.llm.effort || 'low',
       inputModes: s.settings.llm.inputModes?.length ? s.settings.llm.inputModes : ['text'],
       searchEnabled: s.settings.search?.enabled ?? false,
+      searchProvider: s.settings.search?.provider ?? 'deepseek',
       braveKey: '', // 同上：Brave key 永不回传
       aiWorkdir: s.settings.autoSwitchAiWorkdir ?? true,
       approvalMode: s.settings.approvalMode ?? 'smart',
@@ -398,7 +400,10 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
        cloud 段原样带回（账号页/云状态管理，本表单不覆盖） */
     const settings: AppSettings = {
       workspaceDir, llm,
-      search: { enabled: hosted ? (dbRef.current?.settings.search?.enabled ?? false) : fields.searchEnabled },
+      search: {
+        enabled: hosted ? (dbRef.current?.settings.search?.enabled ?? false) : fields.searchEnabled,
+        provider: hosted ? (dbRef.current?.settings.search?.provider ?? 'deepseek') : fields.searchProvider,
+      },
       theme: currentTheme(),
       autoSwitchAiWorkdir: fields.aiWorkdir, projectView: dbRef.current?.settings.projectView ?? 'card',
       approvalMode: fields.approvalMode,
@@ -892,12 +897,30 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   disabled={hosted}
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, searchEnabled: checked })); }}
                 />
-                <div className="hint">启用后 AI 助手可通过 Brave Search 获取最新信息（问时效性问题时自动使用）</div>
+                <div className="hint">启用后 AI 助手可联网搜索并抓取网页正文（问时效性问题时自动使用）</div>
               </div>
               {hosted ? (
-                <div className="hint" id="cloud-hosted-search-note">搜索由公司服务器代理，本地无需配置 Brave Key</div>
+                <div className="hint" id="cloud-hosted-search-note">搜索由公司服务器代理，本地无需配置搜索 Key</div>
               ) : (
-                <div className="field" id="search-key-field">
+                <>
+                <div className="field">
+                  <label>搜索提供商</label>
+                  <select
+                    className="select"
+                    id="f-search-provider"
+                    value={fields.searchProvider}
+                    onChange={(e) => { const v = e.currentTarget.value as SearchProvider; setFields((f) => ({ ...f, searchProvider: v })); }}
+                  >
+                    <option value="deepseek">DeepSeek 搜索（推荐，复用模型 API Key）</option>
+                    <option value="brave">Brave Search（需单独配置 Key）</option>
+                  </select>
+                  <div className="hint">
+                    {fields.searchProvider === 'deepseek'
+                      ? '直接复用上方模型 API Key，无需单独配置；模型需使用 DeepSeek。DeepSeek 搜索/抓取按每千次成功请求 5 元计费'
+                      : 'Brave 搜索需要单独申请 API Key；网页抓取仍走 DeepSeek（模型为 DeepSeek 时可用）'}
+                  </div>
+                </div>
+                {fields.searchProvider === 'brave' && <div className="field" id="search-key-field">
                   <label>Brave Search API Key</label>
                   <div className="input-row">
                     <input
@@ -920,7 +943,8 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   <div className="hint">
                     免费额度 2000 次/月，<a href="https://api-dashboard.search.brave.com/app/keys" data-open-url="https://api-dashboard.search.brave.com/app/keys" onClick={onOpenUrl}>获取 Brave Search API Key</a>
                   </div>
-                </div>
+                </div>}
+                </>
               )}
             </fieldset>
             <fieldset className="llm-group">
