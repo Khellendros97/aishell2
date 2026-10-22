@@ -60,7 +60,7 @@ const EMPTY_STATE: AppState = {
   settings: {
     workspaceDir: null,
     llm: { modelId: '', baseUrl: '', effort: 'low', inputModes: ['text'] },
-    search: { enabled: false },
+    search: { enabled: false, provider: 'deepseek' },
     theme: 'dark',
     autoSwitchAiWorkdir: true,
     projectView: 'card',

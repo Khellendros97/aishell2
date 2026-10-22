@@ -29,7 +29,7 @@
 //! 三档模式（按项目持久化，见 store.rs AiMode）：suggest / agent / yolo。权限事实源在
 //! pi_ext/aishell-guard.ts（每次 spawn 重写进 agent_dir 并显式 --extension 加载）：
 //!
-//! - suggest：read/grep/find/ls/write/edit(+web_search)+request_agent_mode（申请切换工作模式），写仅限 .aishell/；
+//! - suggest：read/grep/find/ls/write/edit(+web_search/web_fetch)+request_agent_mode（申请切换工作模式），写仅限 .aishell/；
 //! - agent/yolo：读写限项目根 + delete_path/run_command/sftp_upload/sftp_download；
 //! - agent 对受控工具逐调用 `AISHELL_APPROVAL:` confirm 审批；suggest 直接阻止；
 //! - yolo 简化审批：默认全自动执行（影响范围不明不拦截），仅 guard 识别的极高风险操作
@@ -76,7 +76,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::ai_actions::{AiActions, SftpDownloadItem, SftpUploadItem, MAX_SFTP_BATCH_ITEMS};
 use crate::ai_impact::{analyze_remote_command, merge_plans, validate_impact_plan, Effect, ImpactPlan};
 use crate::skills::{SkillOrigin, SkillSummary};
-use crate::store::{AiMode, ApprovalMode, Store};
+use crate::store::{AiMode, ApprovalMode, SearchProvider, Store};
 
 /// 空闲回收阈值：pi 进程空闲（非生成中、无待审批）超过该时长后由空闲回收线程回收。
 /// 会话历史在 session 文件落盘，下次 ai_chat 走 need_spawn 自动按同一 session 重生，
@@ -92,7 +92,8 @@ const SYSTEM_PROMPT_SUGGEST: &str = "你是 AIShell 的内置终端助手。用�
 - write/edit：只能写项目下 .aishell/ 目录内的文件（可用于保存笔记、记忆、计划；父目录不存在会自动创建）。
 - 没有 bash 工具，不能执行任何命令。
 - request_agent_mode：当你需要执行命令或修改项目源码等 .aishell/ 之外的文件时，调用该工具向用户申请切换到工作(Agent)模式；需用户同意，不同意则继续给出建议。
-- web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
+- web_search：联网搜索（默认 DeepSeek 搜索，可在设置切换 Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
+- web_fetch：抓取网页正文（DeepSeek 网页抓取）。需要阅读某条搜索结果的完整内容或用户给出链接时使用，参数 url 必须是 http/https 地址；抓取结果已转为 Markdown，引用时注明来源。
 - ask/confirm：需要用户决策或补充信息时，用 ask 一次性提出一个或多个问题（每问可附 2–4 个候选选项；界面已为每个问题自动附带自由输入框，不要生成「其他/由你来指定」这类占位选项）；单一的是/否确认（如执行前的最终确认）用 confirm。用户提交后回答会作为工具结果返回；不要只在回复正文里罗列问题等用户打字回复。
 - 用户要求修改项目源码等 .aishell/ 之外的文件时：不要调用 write/edit（会被拒），改为给出命令或补丁文本让用户自行处理。
 输出协议（必须严格遵守）：
@@ -113,7 +114,8 @@ const SYSTEM_PROMPT_AGENT: &str = "你是 AIShell 的内置终端助手。用户
 - py：在本机执行 Python 脚本（code 内联脚本 / path 项目内 .py 文件，二选一；args 传命令行参数；默认 60 秒超时，可用 timeoutSeconds 覆盖）。脚本内可 `import aishell` 使用内置 SDK 调用服务器能力——servers.list() 服务器清单、ssh.exec() 远程命令、sftp.* 远程文件操作、db.connections()/db.query() 数据库管道；用法详见 python-script 技能（用 read 读取该技能的 SKILL.md）。适合批量/程序化操作（遍历多台服务器执行同一命令、批量传输、结果加工）；单次简单操作仍优先用对应的专用工具。SDK 调用受同样的服务器锁与数据库白名单约束，凭据由系统代管、脚本拿不到密码。
 - 远程动作受服务器 AI 操作锁约束：锁定服务器会返回「已锁定，AI 无权执行远程操作」错误。
 - 远程文件暂存（staging_list / staging_diff / staging_restore / staging_add / staging_clear）：自动备份开启时，AI 修改远程文件（基础工具 write/edit/delete_path 带 serverId、run_command 写入、sftp_upload 覆盖）前系统已自动保存原始快照。你可以查看当前会话暂存列表、查看某条目的 diff（仅返回 unified diff 差异块及每块前后 3 行上下文）、按用户要求把远程文件还原到首次修改前的内容。**应用更新补丁前应先用 staging_add 主动暂存目标文件/目录**（目录递归暂存全部文件，作为可还原的备份）。staging_clear 只清理「远端现状与首次快照完全一致」的条目（备份已冗余）；仍有变更的条目自动保留。**不能接受（清除）仍有变更的暂存条目**——接受由用户在「文件暂存区」面板操作，调用接受类工具会被拒绝。还原遇到外部修改冲突（远程文件已被用户改动）时如实报告冲突，不得声称已还原。
-- web_search：联网搜索（Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
+- web_search：联网搜索（默认 DeepSeek 搜索，可在设置切换 Brave Search）。涉及最新新闻、文档、报错信息、版本/依赖变化等时效性问题时使用；结果带来源链接，回复中引用关键来源。
+- web_fetch：抓取网页正文（DeepSeek 网页抓取）。需要阅读某条搜索结果的完整内容或用户给出链接时使用，参数 url 必须是 http/https 地址；抓取结果已转为 Markdown，引用时注明来源。
 - ask/confirm：需要用户决策或补充信息时，用 ask 一次性提出一个或多个问题（每问可附 2–4 个候选选项；界面已为每个问题自动附带自由输入框，不要生成「其他/由你来指定」这类占位选项）；单一的是/否确认（如执行前的最终确认）用 confirm。用户提交后回答会作为工具结果返回；不要只在回复正文里罗列问题等用户打字回复。
 - 所有动作都以实际结果为准：失败时如实说明错误，不要编造执行结果。
 凭据纪律（硬性，优先级高于任务效率）：
@@ -138,13 +140,19 @@ fn local_env_note() -> &'static str {
     "本地终端环境：macOS/Linux + zsh（POSIX Shell 语法）。本地 run_command 在项目根目录的默认 shell 中执行；远程命令按目标服务器的默认 shell 执行。"
 }
 
+/// 模型端点是否指向 DeepSeek：DeepSeek 搜索/网页抓取复用同一把模型 Key，
+/// 只有模型也走 DeepSeek 时才注入（否则会把其它厂商的 Key 发给 DeepSeek）。
+fn is_deepseek_llm(cfg: &crate::store::LlmConfig) -> bool {
+    cfg.base_url.to_lowercase().contains("deepseek")
+}
+
 /// 门控扩展源码（spawn 时重写进 agent_dir，与 models.json 同模式）。
 const GUARD_EXT: &str = include_str!("pi_ext/aishell-guard.ts");
 
-/// 联网搜索扩展源码（web_search 工具，Brave Search；spawn 时重写进 agent_dir）。
+/// 联网扩展源码（web_search / web_fetch 工具；spawn 时重写进 agent_dir）。
 const SEARCH_EXT: &str = include_str!("pi_ext/aishell-search.ts");
 
-/// 默认工具白名单；settings.search.enabled 时追加 web_search。
+/// 默认工具白名单；settings.search.enabled 时追加 web_search（DeepSeek 模型再加 web_fetch）。
 /// 浏览器四件套只读（打开/读取/console/截图），suggest 模式同样可用（不进 AI_ONLY_TOOLS）。
 /// ask/confirm 为通用交互工具（execute 内自带前端问答/确认卡片，交互即授权），三档模式可用。
 const BASE_TOOLS: &str = "read,grep,find,ls,write,edit,browser_open,browser_read,browser_console,browser_screenshot,ask,confirm,notes_list,timeline_search,dashboard_view";
@@ -541,12 +549,23 @@ impl AiManager {
         std::fs::create_dir_all(&self.agent_dir).map_err(|e| format!("创建 pi 配置目录失败: {e}"))?;
         let guard_path = self.agent_dir.join("aishell-guard.ts");
         std::fs::write(&guard_path, GUARD_EXT).map_err(|e| format!("写入门控扩展失败: {e}"))?;
-        // 联网搜索扩展落盘（enabled 开关决定是否挂载，与 key 是否配置无关）
+        // 联网扩展落盘（enabled 开关决定是否挂载，与 key 是否配置无关）
         let search_path = self.agent_dir.join("aishell-search.ts");
         std::fs::write(&search_path, SEARCH_EXT).map_err(|e| format!("写入搜索扩展失败: {e}"))?;
-        let search_enabled = self.store.settings().search.enabled;
+        let search_cfg = self.store.settings().search;
+        let search_enabled = search_cfg.enabled;
+        // DeepSeek 搜索/抓取复用模型 Key：仅当模型端点也是 DeepSeek 时才注入，
+        // 避免把其它厂商的 Key 发给 DeepSeek（此时 web_search 返回中文配置引导）。
+        let deepseek_llm = is_deepseek_llm(&cfg);
         // 搜索 key 未配置时不注入 env：工具仍挂载，调用时由扩展返回中文引导错误
         let brave_key = self.store.read_secret("brave:apikey").ok();
+        let brave_ready = brave_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false);
+        // 「没配置搜索引擎但模型是 DeepSeek」兜底：选了 Brave 却没有 Key 时自动走 DeepSeek
+        let search_provider = if search_cfg.provider == SearchProvider::Brave && !brave_ready && deepseek_llm {
+            SearchProvider::Deepseek
+        } else {
+            search_cfg.provider
+        };
 
         // 初始工具集按模式下发（agent/yolo 直接启用变更工具，避免依赖扩展加载期 setActiveTools）；
         // 热切换仍由 /aishell-mode 命令 + 扩展 applyToolset 增量同步。
@@ -559,6 +578,10 @@ impl AiManager {
         };
         if search_enabled {
             tools.push_str(",web_search");
+            // 网页抓取固定走 DeepSeek；模型不是 DeepSeek 时不挂载，避免模型看到不可用的工具
+            if deepseek_llm {
+                tools.push_str(",web_fetch");
+            }
         }
 
         // 会话持久化（每 key 固定路径）：pi 自动把对话条目落盘到此 jsonl；
@@ -641,6 +664,17 @@ impl AiManager {
             .env("AISHELL_GLOBAL_SKILLS_DIR", enc(&global_skills))
             .env("AISHELL_NOTES_DIR", enc(&notes_dirs))
             .env("AISHELL_DASHBOARD_DIR", enc(&dashboard_dirs));
+        cmd.env(
+            "AISHELL_SEARCH_PROVIDER",
+            match search_provider {
+                SearchProvider::Brave => "brave",
+                SearchProvider::Deepseek => "deepseek",
+            },
+        );
+        if deepseek_llm {
+            cmd.env("AISHELL_DEEPSEEK_KEY", &api_key)
+                .env("AISHELL_DEEPSEEK_BASE", &cfg.base_url);
+        }
         if let Some(key) = brave_key {
             cmd.env("BRAVE_API_KEY", key);
         }

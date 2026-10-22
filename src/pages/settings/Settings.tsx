@@ -12,7 +12,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
-import type { AppState, LlmConfig, Settings as AppSettings, Theme } from '../../types';
+import type { AppState, LlmConfig, SearchProvider, Settings as AppSettings, Theme } from '../../types';
 import { CredentialsPanel } from './CredentialsPanel';
 import { BrowserPanel } from './BrowserPanel';
 import { getMcpStatus, getState, openDialog, saveSettings, setMcpPort, setTheme } from '../../api';
@@ -42,6 +42,7 @@ interface SysFields {
   effort: LlmConfig['effort'];
   inputModes: LlmConfig['inputModes'];
   searchEnabled: boolean;
+  searchProvider: SearchProvider;
   braveKey: string;
   aiWorkdir: boolean;
   approvalMode: AppSettings['approvalMode'];
@@ -60,7 +61,7 @@ interface SysFields {
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
 const EMPTY_FIELDS: SysFields = {
   theme: 'dark', workspace: '', modelId: '', baseUrl: '', apiKey: '',
-  effort: 'low', inputModes: ['text'], searchEnabled: false, braveKey: '', aiWorkdir: false,
+  effort: 'low', inputModes: ['text'], searchEnabled: false, searchProvider: 'deepseek', braveKey: '', aiWorkdir: false,
   approvalMode: 'smart', autoBackup: false, mcpPort: '', compactServerList: false,
   sidebarDefault: 'explorer',
   tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true, autoRecordTerminal: false,
@@ -206,6 +207,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       effort: s.settings.llm.effort || 'low',
       inputModes: s.settings.llm.inputModes?.length ? s.settings.llm.inputModes : ['text'],
       searchEnabled: s.settings.search?.enabled ?? false,
+      searchProvider: s.settings.search?.provider ?? 'deepseek',
       braveKey: '', // 同上：Brave key 永不回传
       aiWorkdir: s.settings.autoSwitchAiWorkdir ?? true,
       approvalMode: s.settings.approvalMode ?? 'smart',
@@ -315,7 +317,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     /* theme 带内存当前值:避免本页打开期间顶栏切换的主题被表单旧值覆盖;
        projectView 由欢迎页视图切换维护,本页保存时原样保留 */
     const settings: AppSettings = {
-      workspaceDir, llm, search: { enabled: fields.searchEnabled }, theme: currentTheme(),
+      workspaceDir, llm, search: { enabled: fields.searchEnabled, provider: fields.searchProvider }, theme: currentTheme(),
       autoSwitchAiWorkdir: fields.aiWorkdir, projectView: dbRef.current?.settings.projectView ?? 'card',
       approvalMode: fields.approvalMode,
       autoBackupRemoteFiles: fields.autoBackup,
@@ -694,9 +696,26 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   checked={fields.searchEnabled}
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, searchEnabled: checked })); }}
                 />
-                <div className="hint">启用后 AI 助手可通过 Brave Search 获取最新信息（问时效性问题时自动使用）</div>
+                <div className="hint">启用后 AI 助手可联网搜索并抓取网页正文（问时效性问题时自动使用）</div>
               </div>
               <div className="field">
+                <label>搜索提供商</label>
+                <select
+                  className="select"
+                  id="f-search-provider"
+                  value={fields.searchProvider}
+                  onChange={(e) => { const v = e.currentTarget.value as SearchProvider; setFields((f) => ({ ...f, searchProvider: v })); }}
+                >
+                  <option value="deepseek">DeepSeek 搜索（推荐，复用模型 API Key）</option>
+                  <option value="brave">Brave Search（需单独配置 Key）</option>
+                </select>
+                <div className="hint">
+                  {fields.searchProvider === 'deepseek'
+                    ? '直接复用上方模型 API Key，无需单独配置；模型需使用 DeepSeek（当前模型不是 DeepSeek 时搜索不可用）。DeepSeek 搜索/抓取按每千次成功请求 5 元计费'
+                    : 'Brave 搜索需要单独申请 API Key；网页抓取仍走 DeepSeek（模型为 DeepSeek 时可用）'}
+                </div>
+              </div>
+              {fields.searchProvider === 'brave' && <div className="field">
                 <label>Brave Search API Key</label>
                 <div className="input-row">
                   <input
@@ -719,7 +738,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                 <div className="hint">
                   免费额度 2000 次/月，<a href="https://api-dashboard.search.brave.com/app/keys" data-open-url="https://api-dashboard.search.brave.com/app/keys" onClick={onOpenUrl}>获取 Brave Search API Key</a>
                 </div>
-              </div>
+              </div>}
             </fieldset>
             <div className="form-actions">
               <button className="btn primary" onClick={() => void save()}>保存</button>

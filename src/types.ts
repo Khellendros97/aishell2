@@ -17,8 +17,13 @@ export interface LlmConfig {
   inputModes: Array<'text' | 'image'>;
 }
 
+/** 联网搜索提供商；deepseek 复用模型 API Key，brave 需单独配置 Key。 */
+export type SearchProvider = 'deepseek' | 'brave';
+
 export interface SearchConfig {
   enabled: boolean;
+  /** 搜索提供商；旧配置无此字段时后端按 deepseek 处理 */
+  provider: SearchProvider;
 }
 
 export interface Settings {

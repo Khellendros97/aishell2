@@ -135,11 +135,23 @@ pub enum SidebarDefault {
     Servers,
 }
 
+/// 联网搜索提供商；默认 DeepSeek（复用模型 API Key，无需单独配置搜索密钥）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchProvider {
+    #[default]
+    Deepseek,
+    Brave,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchConfig {
-    /// 是否向 AI 助手挂载 web_search 工具；key 未配置时仍挂载，调用时返回中文引导错误。
+    /// 是否向 AI 助手挂载 web_search / web_fetch 工具；key 未配置时仍挂载，调用时返回中文引导错误。
     pub enabled: bool,
+    /// 搜索提供商；旧配置无此字段时按 DeepSeek 处理（模型也是 DeepSeek 时直接复用模型 Key）。
+    #[serde(default)]
+    pub provider: SearchProvider,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6954,7 +6966,7 @@ mod tests {
                         effort: Effort::High,
                         input_modes: vec![InputMode::Text],
                     },
-                    search: SearchConfig { enabled: false },
+                    search: SearchConfig { enabled: false, ..Default::default() },
                     theme: Theme::Dark,
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::Card,
@@ -7154,7 +7166,7 @@ mod tests {
                 Settings {
                     workspace_dir: None,
                     llm: LlmConfig::default(),
-                    search: SearchConfig { enabled: true },
+                    search: SearchConfig { enabled: true, ..Default::default() },
                     theme: Theme::Dark,
                     auto_switch_ai_workdir: false,
                     project_view: ProjectView::List,
@@ -7179,7 +7191,7 @@ mod tests {
         store
             .save_settings(
                 Settings {
-                    search: SearchConfig { enabled: false },
+                    search: SearchConfig { enabled: false, ..Default::default() },
                     ..store.settings()
                 },
                 None,
@@ -7205,6 +7217,8 @@ mod tests {
         let old = r#"{"workspaceDir":"C:\\ws","llm":{"modelId":"deepseek-chat","baseUrl":"https://api.deepseek.com/v1","effort":"medium"},"theme":"dark"}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
         assert!(!s.search.enabled);
+        // 旧配置无 search.provider 字段 → 默认 DeepSeek（模型也是 DeepSeek 时复用同一把 Key）
+        assert_eq!(s.search.provider, SearchProvider::Deepseek);
         // 旧配置无 inputModes 字段 → 反序列化为空，启动时由 normalize_input_modes 按模型 id 推导补齐
         assert!(s.llm.input_modes.is_empty());
         // 旧配置无 autoSwitchAiWorkdir 字段 → 默认开启（无感升级）
