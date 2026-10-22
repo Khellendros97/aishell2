@@ -10,8 +10,14 @@
 //! 修复策略（保守：只动会进入模型上下文的「有效区域」）：
 //! - 从最后一行沿 parentId 回溯确定叶子链，取链上最后一个 compaction 为切割点；切割点
 //!   之前的条目已被摘要覆盖、不参与上下文构建，一律原样保留。
-//! - 有效区域内：孤儿 toolResult（所属 assistant toolCall 不在有效区域内）→ 删除；
-//!   assistant 的 toolCall 缺结果 → 合成 isError 结果补齐（缺失同样会被端点拒绝）。
+//! - 有效区域内先按 pi `buildSessionProjection` 语义叠加 context_edit：同一 target 以链上
+//!   最后一条编辑为准，`replacement: null` 表示把该条从模型上下文剔除。**剔除必须参与配对
+//!   判定**——pi 的 length/overflow 恢复会省略「被放弃的 assistant 尝试」，但其
+//!   `_prepareRun` / `_prepareRetry` 路径只省略 assistant、把工具结果留在上下文里；只按原始
+//!   条目做配对检查会误判为健康（「修复会话」修不好的正是这一类），端点则持续 400。
+//! - 可见消息按模型上下文顺序校验「assistant(toolCalls) → 紧邻 toolResult」：无主的、
+//!   顺序错位的、重复应答的 toolResult → 删除；assistant 的 toolCall 缺结果 → 合成
+//!   isError 结果补齐（缺失同样会被端点拒绝）。
 //! - compaction 自带 firstKeptEntryId / retainedTail 时按文档语义纳入保留范围一并校验。
 //!
 //! 修复必须先 `AiManager::kill_session` 等待 pi 进程退出（内存态独占写文件）；下次 ai_chat
@@ -69,27 +75,6 @@ impl Entry {
     fn kind(&self) -> &str {
         self.v["type"].as_str().unwrap_or("")
     }
-    fn role(&self) -> Option<&str> {
-        self.v["message"]["role"].as_str()
-    }
-    fn tool_call_id(&self) -> Option<&str> {
-        self.v["message"]["toolCallId"].as_str()
-    }
-    /// assistant 消息 content 块里的 toolCall（id, name）对；非数组 content 返回空。
-    fn tool_calls(&self) -> Vec<(String, String)> {
-        let Some(blocks) = self.v["message"]["content"].as_array() else {
-            return Vec::new();
-        };
-        blocks
-            .iter()
-            .filter(|b| b["type"].as_str() == Some("toolCall"))
-            .filter_map(|b| {
-                let id = b["id"].as_str()?.to_string();
-                let name = b["name"].as_str().unwrap_or("").to_string();
-                Some((id, name))
-            })
-            .collect()
-    }
 }
 
 fn parse_entry(line: &str) -> Option<Entry> {
@@ -98,6 +83,201 @@ fn parse_entry(line: &str) -> Option<Entry> {
         return None;
     }
     Some(Entry { raw: line.to_string(), v, modified: false })
+}
+
+/// 上下文可见位置：retainedTail 内的消息下标 / 链上条目下标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisLoc {
+    Tail(usize),
+    Entry(usize),
+}
+
+/// 可见消息的配对语义（pi 把条目转成消息后的角色形状）。
+enum VisKind {
+    /// assistant + 它携带的 (toolCallId, toolName)
+    Assistant(Vec<(String, String)>),
+    /// toolResult + 应答的 toolCallId
+    ToolResult(String),
+    /// 其它消息（user/system/custom_message/branch_summary）：结束当前工具块
+    Barrier,
+}
+
+struct VisMsg {
+    loc: VisLoc,
+    kind: VisKind,
+}
+
+/// 从 content 块数组提取 toolCall（原始条目与 context_edit replacement 共用）。
+fn calls_from_content(content: &Value) -> Vec<(String, String)> {
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b["type"].as_str() == Some("toolCall"))
+        .filter_map(|b| {
+            let id = b["id"].as_str()?;
+            if id.is_empty() {
+                return None;
+            }
+            Some((id.to_string(), b["name"].as_str().unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
+fn classify_message(message: &Value) -> VisKind {
+    match message["role"].as_str() {
+        Some("assistant") => VisKind::Assistant(calls_from_content(&message["content"])),
+        Some("toolResult") => VisKind::ToolResult(
+            message["toolCallId"].as_str().unwrap_or("").to_string(),
+        ),
+        _ => VisKind::Barrier,
+    }
+}
+
+/// 上下文编辑的生效结果（同一 target 取链上最后一条）。
+enum ContextEdit {
+    Omit,
+    Replace(Value),
+}
+
+/// 收集有效区域内全部 context_edit：targetId → 最新编辑（链上顺序覆盖）。
+fn latest_context_edits(
+    slots: &[Option<Entry>],
+    effective: &[usize],
+) -> HashMap<String, ContextEdit> {
+    let mut edits: HashMap<String, ContextEdit> = HashMap::new();
+    for &i in effective {
+        let Some(entry) = slots[i].as_ref() else { continue };
+        if entry.kind() != "context_edit" {
+            continue;
+        }
+        let Some(target) = entry.v["targetId"].as_str() else { continue };
+        let edit = match entry.v.get("replacement") {
+            None | Some(Value::Null) => ContextEdit::Omit,
+            Some(replacement) => ContextEdit::Replace(replacement.clone()),
+        };
+        edits.insert(target.to_string(), edit);
+    }
+    edits
+}
+
+/// replacement 的正文形状：字符串按 pi 规则归一为单个 text 块。
+fn replacement_content(replacement: &Value) -> Value {
+    match replacement {
+        Value::Array(_) => replacement.clone(),
+        Value::String(text) => json!([{ "type": "text", "text": text }]),
+        _ => json!([]),
+    }
+}
+
+/// 有效区域（切割点之后 + firstKept 保留段）的可见消息，已叠加 context_edit。
+/// 非上下文条目（model_change / thinking_level_change / context_edit 等）不产生消息。
+fn effective_visible_messages(
+    slots: &[Option<Entry>],
+    effective: &[usize],
+    edits: &HashMap<String, ContextEdit>,
+) -> Vec<VisMsg> {
+    let mut visible = Vec::new();
+    for &i in effective {
+        let Some(entry) = slots[i].as_ref() else { continue };
+        let kind = entry.kind();
+        if kind != "message" && kind != "custom_message" && kind != "branch_summary" {
+            continue;
+        }
+        match edits.get(entry.id()) {
+            Some(ContextEdit::Omit) => continue,
+            Some(ContextEdit::Replace(replacement)) if kind == "message" => {
+                let message = &entry.v["message"];
+                let kind = match message["role"].as_str() {
+                    Some("assistant") => {
+                        VisKind::Assistant(calls_from_content(&replacement_content(replacement)))
+                    }
+                    Some("toolResult") => VisKind::ToolResult(
+                        message["toolCallId"].as_str().unwrap_or("").to_string(),
+                    ),
+                    _ => VisKind::Barrier,
+                };
+                visible.push(VisMsg { loc: VisLoc::Entry(i), kind });
+            }
+            _ => {
+                let kind = if kind == "message" {
+                    classify_message(&entry.v["message"])
+                } else {
+                    VisKind::Barrier
+                };
+                visible.push(VisMsg { loc: VisLoc::Entry(i), kind });
+            }
+        }
+    }
+    visible
+}
+
+/// retainedTail 是一段自包含的消息检查点（没有条目 id，也不会被 context_edit 指向）。
+fn tail_visible_messages(tail: &[Value]) -> Vec<VisMsg> {
+    tail.iter()
+        .enumerate()
+        .map(|(i, message)| VisMsg {
+            loc: VisLoc::Tail(i),
+            kind: classify_message(message),
+        })
+        .collect()
+}
+
+struct PendingBlock {
+    /// 工具块中最后一个可见结果（尚无结果时是 assistant 本身）：补齐结果的插入锚点。
+    last: VisLoc,
+    /// 尚未应答的 (toolCallId, toolName)，保持 assistant 声明顺序。
+    missing: Vec<(String, String)>,
+}
+
+/// 缺失结果补齐计划：插入锚点 + 该块缺失的 (toolCallId, toolName)。
+type FillPlan = (VisLoc, Vec<(String, String)>);
+
+fn close_block(pending: &mut Option<PendingBlock>, fills: &mut Vec<FillPlan>) {
+    let Some(block) = pending.take() else { return };
+    if !block.missing.is_empty() {
+        fills.push((block.last, block.missing));
+    }
+}
+
+/// 按模型上下文顺序校验工具块：删除无主/错位/重复的 toolResult，记录缺失结果的补齐锚点。
+/// 端点要求 assistant(tool_calls) 后紧跟每个调用的 tool 消息；只检查「调用 id 在整个有效
+/// 区域出现过」会把 context_edit 剔除 assistant 后遗留的结果误判为配对。
+fn plan_tool_repairs(visible: &[VisMsg]) -> (Vec<VisLoc>, Vec<FillPlan>) {
+    let mut removed: Vec<VisLoc> = Vec::new();
+    let mut fills: Vec<FillPlan> = Vec::new();
+    let mut pending: Option<PendingBlock> = None;
+    for msg in visible {
+        match &msg.kind {
+            VisKind::Barrier => close_block(&mut pending, &mut fills),
+            VisKind::Assistant(calls) => {
+                close_block(&mut pending, &mut fills);
+                if !calls.is_empty() {
+                    pending = Some(PendingBlock { last: msg.loc, missing: calls.clone() });
+                }
+            }
+            VisKind::ToolResult(call_id) => {
+                let matched = pending.as_mut().is_some_and(|block| {
+                    let Some(pos) = block.missing.iter().position(|(id, _)| id == call_id) else {
+                        return false;
+                    };
+                    block.missing.remove(pos);
+                    block.last = msg.loc;
+                    true
+                });
+                if matched {
+                    if pending.as_ref().is_some_and(|block| block.missing.is_empty()) {
+                        pending = None;
+                    }
+                } else {
+                    removed.push(msg.loc);
+                }
+            }
+        }
+    }
+    close_block(&mut pending, &mut fills);
+    (removed, fills)
 }
 
 /// unix 天数 → 件历日期（Howard Hinnant 的 civil_from_days 算法）。
@@ -225,27 +405,12 @@ pub(crate) fn repair_session_lines(raw: &str) -> (String, AiRepairReport) {
         (chain.clone(), None)
     };
 
-    // 配对集合：有效区域 assistant 的 toolCall id / toolResult id。retainedTail 与切割后
-    // 条目共同构成模型上下文，配对判定必须跨容器合并。
-    let mut call_names: HashMap<String, String> = HashMap::new(); // callId -> toolName
-    let mut result_ids: HashSet<String> = HashSet::new();
-    for &i in &effective {
-        let Some(e) = slots[i].as_ref() else { continue };
-        match e.role() {
-            Some("assistant") => {
-                for (id, name) in e.tool_calls() {
-                    call_names.entry(id).or_insert(name);
-                }
-            }
-            Some("toolResult") => {
-                if let Some(id) = e.tool_call_id() {
-                    result_ids.insert(id.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
+    // 可见消息 = 模型真正会收到的消息序列：retainedTail（压缩检查点内嵌消息）在前，
+    // 切割点之后的有效条目在后。context_edit 的剔除/替换必须先叠加，配对判定只看可见
+    // 消息——pi 恢复流程省略 assistant 但留下其结果时，原始条目看起来是完整配对。
+    let edits = latest_context_edits(&slots, &effective);
     let mut tail_vec: Vec<Value> = Vec::new();
+    let mut visible: Vec<VisMsg> = Vec::new();
     if let Some(ti) = tail_slot {
         tail_vec = slots[ti]
             .as_ref()
@@ -254,23 +419,32 @@ pub(crate) fn repair_session_lines(raw: &str) -> (String, AiRepairReport) {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        collect_tail_pairing(&tail_vec, &mut call_names, &mut result_ids);
+        visible.extend(tail_visible_messages(&tail_vec));
     }
+    visible.extend(effective_visible_messages(&slots, &effective, &edits));
+    let (removed, fills) = plan_tool_repairs(&visible);
+    let removed_entries: Vec<usize> = removed
+        .iter()
+        .filter_map(|loc| match loc {
+            VisLoc::Entry(i) => Some(*i),
+            VisLoc::Tail(_) => None,
+        })
+        .collect();
+    let mut removed_tail: Vec<usize> = removed
+        .iter()
+        .filter_map(|loc| match loc {
+            VisLoc::Tail(i) => Some(*i),
+            VisLoc::Entry(_) => None,
+        })
+        .collect();
 
-    // 1) 删除有效区域内的孤儿 toolResult（所属 assistant 不在有效区域内）。连片删除时
-    //    子条目沿删除表重接到首个幸存祖先。
+    // 1) 删除无主/错位/重复的 toolResult。连片删除时子条目沿删除表重接到首个幸存祖先。
     let mut removed_parents: HashMap<String, Option<String>> = HashMap::new();
-    for &i in &effective {
+    for &i in &removed_entries {
         let Some(e) = slots[i].as_ref() else { continue };
-        if e.role() != Some("toolResult") {
-            continue;
-        }
-        if e.tool_call_id().is_none_or(|id| !call_names.contains_key(id)) {
-            let parent = e.parent_id().map(str::to_string);
-            removed_parents.insert(e.id().to_string(), parent);
-            slots[i] = None;
-            report.removed_orphan_tool_results += 1;
-        }
+        let parent = e.parent_id().map(str::to_string);
+        removed_parents.insert(e.id().to_string(), parent);
+        slots[i] = None;
     }
     if !removed_parents.is_empty() {
         for slot in slots.iter_mut().flatten() {
@@ -291,108 +465,93 @@ pub(crate) fn repair_session_lines(raw: &str) -> (String, AiRepairReport) {
             slot.modified = true;
         }
     }
+    report.removed_orphan_tool_results += removed_entries.len() as u32;
 
-    // 2) retainedTail 内的孤儿 toolResult 同样删除（消息级，改数组后写回）。
-    if !tail_vec.is_empty() {
-        let before = tail_vec.len();
-        tail_vec.retain(|m| {
-            !(m["role"].as_str() == Some("toolResult")
-                && m["toolCallId"].as_str().is_none_or(|id| !call_names.contains_key(id)))
-        });
-        report.removed_orphan_tool_results += (before - tail_vec.len()) as u32;
+    // 2) retainedTail 内的同类删除（消息级，改数组后写回）。
+    removed_tail.sort_unstable();
+    for &i in removed_tail.iter().rev() {
+        if i < tail_vec.len() {
+            tail_vec.remove(i);
+        }
     }
+    report.removed_orphan_tool_results += removed_tail.len() as u32;
 
-    // 3) 补齐缺失结果：有效区域 assistant 的 toolCall 没有对应 toolResult → 合成
-    //    isError 条目，插在该 assistant 工具块末尾（其后属于该块的连续 toolResult 之后）。
+    // 3) 补齐缺失结果：锚点可能是链上条目或 tail 消息，分别插入对应容器。
     let mut used_ids: HashSet<String> = index.keys().cloned().collect();
-    let mut missing: Vec<(usize, String, String)> = Vec::new();
-    for &i in &effective {
-        let Some(e) = slots[i].as_ref() else { continue };
-        if e.role() != Some("assistant") {
-            continue;
-        }
-        for (id, name) in e.tool_calls() {
-            if !result_ids.contains(&id) {
-                missing.push((i, id, name));
-            }
+    let mut entry_fills: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    let mut tail_fills: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    for (anchor, calls) in fills {
+        match anchor {
+            VisLoc::Entry(i) => entry_fills.push((i, calls)),
+            VisLoc::Tail(i) => tail_fills.push((i, calls)),
         }
     }
-    // 按文件顺序从后往前插，前面的插入不会使后面已记录的下标失效。
-    missing.sort_by_key(|(i, _, _)| *i);
-    for (i, call_id, tool_name) in missing.into_iter().rev() {
-        let block_call_ids: HashSet<String> = slots[i]
-            .as_ref()
-            .map(|e| e.tool_calls().into_iter().map(|(id, _)| id).collect())
-            .unwrap_or_default();
-        let mut insert_at = i + 1;
-        while let Some(e) = slots.get(insert_at).and_then(|s| s.as_ref()) {
-            let in_block = e.role() == Some("toolResult")
-                && e.tool_call_id().is_some_and(|id| block_call_ids.contains(id));
-            if !in_block {
-                break;
-            }
-            insert_at += 1;
-        }
-        let parent_of_synth = slots
-            .get(insert_at - 1)
+    // tail 锚点按已删除消息数量回移（锚点本身是可见消息，不会被删）。
+    for (anchor, _) in tail_fills.iter_mut() {
+        let shift = removed_tail
+            .iter()
+            .filter(|&&removed_idx| removed_idx < *anchor)
+            .count();
+        *anchor -= shift;
+    }
+    // 链上从后往前插，前面的插入不会使后面已记录的锚点失效。
+    entry_fills.sort_by_key(|(anchor, _)| *anchor);
+    for (anchor, calls) in entry_fills.into_iter().rev() {
+        let mut parent_id = slots
+            .get(anchor)
             .and_then(|s| s.as_ref())
             .map(|e| e.id().to_string());
-        let ts = now_iso_millis();
-        let synth_id = fresh_id(&mut used_ids);
-        let synth = json!({
-            "type": "message",
-            "id": synth_id,
-            "parentId": parent_of_synth.map(Value::String).unwrap_or(Value::Null),
-            "timestamp": ts,
-            "message": {
-                "role": "toolResult",
-                "toolCallId": call_id,
-                "toolName": tool_name,
-                "content": [{ "type": "text", "text": MISSING_RESULT_TEXT }],
-                "isError": true,
+        let mut group: Vec<Option<Entry>> = Vec::with_capacity(calls.len());
+        let mut last_synth_id = String::new();
+        for (call_id, tool_name) in calls {
+            let ts = now_iso_millis();
+            let synth_id = fresh_id(&mut used_ids);
+            let synth = json!({
+                "type": "message",
+                "id": synth_id,
+                "parentId": parent_id.map(Value::String).unwrap_or(Value::Null),
                 "timestamp": ts,
-            },
-        });
-        // 重接链：插入点原有的下一条目 parentId 指向新条目。
-        if let Some(next) = slots.get_mut(insert_at).and_then(|s| s.as_mut()) {
-            next.v["parentId"] = Value::String(synth_id);
-            next.modified = true;
-        }
-        slots.insert(insert_at, Some(Entry { raw: String::new(), v: synth, modified: true }));
-        report.filled_missing_tool_results += 1;
-    }
-
-    // 4) retainedTail 内缺失结果的补齐（消息级，追加到数组末尾）。
-    if !tail_vec.is_empty() {
-        let mut tail_missing: Vec<(String, String)> = Vec::new();
-        for m in &tail_vec {
-            if m["role"].as_str() != Some("assistant") {
-                continue;
-            }
-            if let Some(blocks) = m["content"].as_array() {
-                for b in blocks {
-                    if b["type"].as_str() == Some("toolCall") {
-                        if let Some(id) = b["id"].as_str() {
-                            if !result_ids.contains(id) {
-                                tail_missing
-                                    .push((id.to_string(), b["name"].as_str().unwrap_or("").to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (id, name) in tail_missing {
-            tail_vec.push(json!({
-                "role": "toolResult",
-                "toolCallId": id,
-                "toolName": name,
-                "content": [{ "type": "text", "text": MISSING_RESULT_TEXT }],
-                "isError": true,
-                "timestamp": now_iso_millis(),
-            }));
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": call_id,
+                    "toolName": tool_name,
+                    "content": [{ "type": "text", "text": MISSING_RESULT_TEXT }],
+                    "isError": true,
+                    "timestamp": ts,
+                },
+            });
+            parent_id = Some(synth_id.clone());
+            last_synth_id = synth_id;
+            group.push(Some(Entry { raw: String::new(), v: synth, modified: true }));
             report.filled_missing_tool_results += 1;
         }
+        // 重接链：插入点之后的首个存活条目 parentId 指向新条目。插入点可能是刚删除的
+        // None 槽位，必须往后找首个存活条目，否则合成结果不在叶链上、根本不进上下文。
+        if let Some(next) = slots.iter_mut().skip(anchor + 1).flatten().next() {
+            next.v["parentId"] = Value::String(last_synth_id);
+            next.modified = true;
+        }
+        slots.splice(anchor + 1..anchor + 1, group);
+    }
+    // tail 从后往前插（消息级）。
+    tail_fills.sort_by_key(|(anchor, _)| *anchor);
+    for (anchor, calls) in tail_fills.into_iter().rev() {
+        let group: Vec<Value> = calls
+            .iter()
+            .map(|(call_id, tool_name)| {
+                json!({
+                    "role": "toolResult",
+                    "toolCallId": call_id,
+                    "toolName": tool_name,
+                    "content": [{ "type": "text", "text": MISSING_RESULT_TEXT }],
+                    "isError": true,
+                    "timestamp": now_iso_millis(),
+                })
+            })
+            .collect();
+        report.filled_missing_tool_results += group.len() as u32;
+        let insert_at = (anchor + 1).min(tail_vec.len());
+        tail_vec.splice(insert_at..insert_at, group);
     }
     if let Some(ti) = tail_slot {
         let unchanged = {
@@ -423,33 +582,6 @@ pub(crate) fn repair_session_lines(raw: &str) -> (String, AiRepairReport) {
         .collect();
     let body = if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) };
     (body, report)
-}
-
-/// 汇总 retainedTail 消息数组里的配对信息（assistant toolCall / toolResult）。
-fn collect_tail_pairing(tail: &[Value], call_names: &mut HashMap<String, String>, result_ids: &mut HashSet<String>) {
-    for m in tail {
-        match m["role"].as_str() {
-            Some("assistant") => {
-                if let Some(blocks) = m["content"].as_array() {
-                    for b in blocks {
-                        if b["type"].as_str() == Some("toolCall") {
-                            if let Some(id) = b["id"].as_str() {
-                                call_names
-                                    .entry(id.to_string())
-                                    .or_insert_with(|| b["name"].as_str().unwrap_or("").to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            Some("toolResult") => {
-                if let Some(id) = m["toolCallId"].as_str() {
-                    result_ids.insert(id.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 /// 会话历史文件路径（ai_chat 的 spawn、手动修复、发送前自动修复共用同一规则）。
@@ -815,6 +947,106 @@ mod tests {
         let (body, report) = repair_session_lines(&raw);
         assert!(!report.changed);
         assert_eq!(body, format!("{raw}\n"));
+    }
+
+    #[test]
+    fn context_edit_omitted_assistant_removes_orphan_result() {
+        // pi length/overflow 恢复：context_edit 只剔除 assistant（toolCall 参数被截断的尝试），
+        // 其 toolResult 仍留在上下文 → 端点 400；修复必须把该结果一并删除。
+        let raw = [
+            header(),
+            user("u1", "s0", "hi"),
+            assistant("a1", "u1", &[("c0", "grep")]),
+            result("r1", "a1", "c0", "grep"),
+            assistant("a2", "r1", &[("c1", "edit")]),
+            result("r2", "a2", "c1", "edit"),
+            line(json!({"type":"context_edit","id":"e1","parentId":"r2","timestamp":"2026-10-13T00:00:04.000Z","targetId":"a2","replacement":null})),
+            user("u2", "e1", "next"),
+        ]
+        .join("\n");
+        let (body, report) = repair_session_lines(&raw);
+        assert_eq!(report.removed_orphan_tool_results, 1);
+        assert_eq!(report.filled_missing_tool_results, 0);
+        assert!(report.changed);
+        let entries = reparse(&body);
+        assert!(entries.iter().all(|e| e["id"].as_str() != Some("r2")));
+        // u2 沿删除表重接到 context_edit 条目
+        assert_eq!(entries.last().unwrap()["parentId"].as_str(), Some("e1"));
+    }
+
+    #[test]
+    fn context_edit_omitted_tool_result_fills_visible_call() {
+        // 反向：toolResult 被剔除但 assistant 仍可见 → 必须补齐，否则端点报工具调用无应答。
+        let raw = [
+            header(),
+            user("u1", "s0", "hi"),
+            assistant("a1", "u1", &[("c0", "grep")]),
+            result("r1", "a1", "c0", "grep"),
+            line(json!({"type":"context_edit","id":"e1","parentId":"r1","timestamp":"2026-10-13T00:00:04.000Z","targetId":"r1","replacement":null})),
+            user("u2", "e1", "next"),
+        ]
+        .join("\n");
+        let (body, report) = repair_session_lines(&raw);
+        assert_eq!(report.filled_missing_tool_results, 1);
+        assert_eq!(report.removed_orphan_tool_results, 0);
+        let entries = reparse(&body);
+        let synth = entries
+            .iter()
+            .find(|e| {
+                e["message"]["toolCallId"].as_str() == Some("c0")
+                    && e["message"]["isError"].as_bool() == Some(true)
+            })
+            .expect("应补齐可见调用的结果");
+        // 合成结果插在 a1 之后、被剔除的 r1 之前：可见上下文为 a1 → synth → u2。
+        assert_eq!(synth["parentId"].as_str(), Some("a1"));
+        let synth_pos = entries.iter().position(|e| e["id"] == synth["id"]).unwrap();
+        assert_eq!(entries[synth_pos + 1]["id"].as_str(), Some("r1"));
+        assert_eq!(entries[synth_pos + 1]["parentId"].as_str(), synth["id"].as_str());
+    }
+
+    #[test]
+    fn context_edit_replacement_dropping_tool_call_removes_result() {
+        // replacement 只剩文本块（pi 把字符串归一为 text block）→ assistant 不再带 ToolCall，
+        // 原结果变成无主结果，必须删除。
+        let raw = [
+            header(),
+            user("u1", "s0", "hi"),
+            assistant("a1", "u1", &[("c0", "grep")]),
+            result("r1", "a1", "c0", "grep"),
+            line(json!({"type":"context_edit","id":"e1","parentId":"r1","timestamp":"2026-10-13T00:00:04.000Z","targetId":"a1","replacement":"（已省略）"})),
+            user("u2", "e1", "next"),
+        ]
+        .join("\n");
+        let (body, report) = repair_session_lines(&raw);
+        assert_eq!(report.removed_orphan_tool_results, 1);
+        assert_eq!(report.filled_missing_tool_results, 0);
+        let entries = reparse(&body);
+        assert!(entries.iter().all(|e| e["id"].as_str() != Some("r1")));
+    }
+
+    #[test]
+    fn out_of_order_tool_results_are_removed_and_filled() {
+        // assistant 工具块后先出现另一条 assistant：前一调用补结果，错位结果删除。
+        let raw = [
+            header(),
+            user("u1", "s0", "hi"),
+            assistant("a1", "u1", &[("c0", "grep")]),
+            assistant("a2", "a1", &[("c1", "read")]),
+            result("r1", "a2", "c0", "grep"),
+            result("r2", "r1", "c1", "read"),
+            user("u2", "r2", "next"),
+        ]
+        .join("\n");
+        let (body, report) = repair_session_lines(&raw);
+        assert_eq!(report.filled_missing_tool_results, 1);
+        assert_eq!(report.removed_orphan_tool_results, 1);
+        let entries = reparse(&body);
+        // 修复后链路：a1 → synth(c0) → a2 → r2(c1) → u2
+        assert_eq!(entries.len(), 7);
+        assert_eq!(entries[3]["message"]["toolCallId"].as_str(), Some("c0"));
+        assert_eq!(entries[3]["message"]["isError"].as_bool(), Some(true));
+        assert_eq!(entries[4]["id"].as_str(), Some("a2"));
+        assert_eq!(entries[5]["message"]["toolCallId"].as_str(), Some("c1"));
     }
 
     fn temp_session_path(tag: &str) -> std::path::PathBuf {

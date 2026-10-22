@@ -400,6 +400,19 @@ struct LoadedSkills {
     global_root: PathBuf,
 }
 
+/// 模型上下文窗口：pi 内置目录里 DeepSeek V4 系列（deepseek-flash / v4-flash / v4-pro
+/// 及 vision 变体）均为 1M 窗口、384k 最大输出；旧 chat/reasoner 与未知自定义模型按
+/// 128k 保守声明——声明过大会让 pi 的自动压缩几乎不触发、超限请求直接被上游拒绝
+/// （托管模式的上游模型由云平台配置，客户端只能按配置的模型 id 推断）。
+fn context_window_for(model_id: &str) -> u64 {
+    let id = model_id.to_lowercase();
+    if id.contains("deepseek") && (id.contains("flash") || id.contains("v4")) {
+        1_000_000
+    } else {
+        128_000
+    }
+}
+
 /// 构造 pi 的 models.json 内容（providers.deepseek + 单模型）。
 /// reasoning：v4 系列、reasoner 与 deepseek-flash（v4 视觉模型的后继）支持思考档位，
 /// deepseek-chat 等旧模型不支持（pi 会强制 thinking off）。
@@ -415,7 +428,11 @@ fn models_json_for(cfg: &crate::store::LlmConfig) -> serde_json::Value {
         "id": model_id,
         "name": model_id,
         "reasoning": reasoning,
-        "contextWindow": 64000,
+        // 窗口必须覆盖「压缩摘要 + keepRecent 保留段 + 系统提示」之外再留足输出预算：
+        // 声明过小（曾为 64k）时 pi 的 clampMaxTokensToContext = 窗口 - 上下文 - 4096，
+        // 接近上限会算出 max_tokens=1，模型 length 截断；截断恢复省略 assistant 而留下
+        // 孤儿 toolResult，会话持续 400。V4 系按真实 1M 声明（见 context_window_for）。
+        "contextWindow": context_window_for(model_id),
     });
     if cfg.supports_image_input() {
         model["input"] = json!(["text", "image"]);
@@ -3328,6 +3345,7 @@ mod tests {
         assert_eq!(model["input"], json!(["text", "image"]), "勾选图片应声明图片输入");
         assert_eq!(model["id"], "deepseek-flash");
         assert_eq!(model["reasoning"], true, "deepseek-flash 支持思考档位");
+        assert_eq!(model["contextWindow"], 1_000_000, "V4 Flash 真实窗口 1M");
         assert_eq!(with_image["providers"]["deepseek"]["baseUrl"], "https://api.deepseek.com/v1", "尾部斜杠应去除");
         assert_eq!(with_image["providers"]["deepseek"]["apiKey"], "$DEEPSEEK_API_KEY");
 
@@ -3335,6 +3353,18 @@ mod tests {
         let model = &text_only["providers"]["deepseek"]["models"][0];
         assert!(model.get("input").is_none(), "未勾选图片不应带 input 字段");
         assert_eq!(model["reasoning"], false, "deepseek-chat 不支持思考档位");
+        assert_eq!(model["contextWindow"], 128_000, "旧模型按 128k 保守声明");
+    }
+
+    #[test]
+    fn context_window_tracks_model_family() {
+        assert_eq!(context_window_for("deepseek-flash"), 1_000_000);
+        assert_eq!(context_window_for("DeepSeek-V4-Flash"), 1_000_000);
+        assert_eq!(context_window_for("deepseek-v4-flash-vision-exp"), 1_000_000);
+        assert_eq!(context_window_for("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(context_window_for("deepseek-chat"), 128_000);
+        assert_eq!(context_window_for("deepseek-reasoner"), 128_000);
+        assert_eq!(context_window_for("qwen3-coder"), 128_000);
     }
 
     #[test]
