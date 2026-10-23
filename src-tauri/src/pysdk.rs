@@ -235,7 +235,7 @@ impl SdkCtx {
                 .to_string()
         };
         let result: Result<Value, String> = match method {
-            "list_servers" => self.actions.sdk_list_servers(&self.project_id),
+            "list_servers" => self.actions.sdk_list_servers(&self.project_id).await,
             "ssh_exec" => {
                 let timeout = params.get("timeoutSeconds").and_then(Value::as_u64);
                 self.actions

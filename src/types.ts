@@ -826,6 +826,47 @@ export interface AiWindowChangedEvent {
   detached: boolean;
 }
 
+/** 堡垒机 SSO 一次性会话（Rust sso.rs SsoOpen）：密码永不下发前端 */
+export interface SsoOpen {
+  serverId: string;
+  host: string;
+  port: number;
+  username: string;
+  /** ssh 开终端；sftp 开文件管理器（齐治 xftp 载荷） */
+  protocol: 'ssh' | 'sftp';
+  title: string;
+}
+
+/** 首启挂起的 SSO 结果（Rust sso.rs SsoPending）：open 与 error 至多一个非空 */
+export interface SsoPending {
+  open: SsoOpen | null;
+  error: string | null;
+}
+
+/** 堡垒机临时会话与通道状态（Rust ssh.rs SsoSessionInfo）：密码永不下发前端 */
+export interface SsoSessionInfo {
+  serverId: string;
+  host: string;
+  port: number;
+  username: string;
+  title: string;
+  kind: 'ssh' | 'sftp';
+  projectId: string | null;
+  /** TCP 连接还在（不代表有可用 channel） */
+  connected: boolean;
+  /** 有打开的终端 shell（AI 命令可用） */
+  hasTerminal: boolean;
+  /** 有活着的 SFTP channel（AI 文件操作/自动备份可用） */
+  hasSftp: boolean;
+  seq: number;
+}
+
+/** 终端 AI 执行状态（Rust ssh.rs 事件 term:ai-busy:<tabId>） */
+export interface TermAiBusyEvent {
+  running: boolean;
+  command?: string;
+}
+
 /** sessions: projectId -> ChatSession[] */
 export interface AppState {
   settings: Settings;

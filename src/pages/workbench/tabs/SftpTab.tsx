@@ -41,7 +41,7 @@ import '../sftp.css';
 import type { FsEntry, FsStat, SftpFavorite, SshExecResult } from '../../../types';
 import {
   fsDelete, fsEnsureDir, getState, setSftpFavorites, setSftpHistory, sftpCopy, sftpCreate, sftpDelete, sftpDownload,
-  sftpHome, sftpList, sftpOpen, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec, stagingAdd,
+  sftpHome, sftpList, sftpOpen, sftpRelease, sftpRename, sftpStat, sftpUniqueName, sftpUpload, sshExec, stagingAdd,
   timelineBindServer,
 } from '../../../api';
 import { confirmCheckDialog, confirmDialog, promptDialog, showContextMenu, toast, uid, type CtxItem } from '../../../ui';
@@ -1949,6 +1949,10 @@ export function SftpTab({ tab, active: _active }: TabProps): JSX.Element {
       closeHistory(st);
       sftpTabs.delete(tab.id);
       tabApis.delete(tab.id);
+      // 堡垒机临时会话：关闭标签即释放 SFTP channel，服务器卡片指示灯随之变灰
+      if (st.serverId.startsWith('sso-')) {
+        void sftpRelease(st.serverId).catch(() => { /* 后端未就绪/会话已失效忽略 */ });
+      }
     };
     // tab.id 与 tab.data 在标签存活期内稳定,仅挂载一次
     // eslint-disable-next-line react-hooks/exhaustive-deps

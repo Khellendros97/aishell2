@@ -41,13 +41,13 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
 
 import {
-  SSH_AUTH_FAILED_PREFIX, SSH_NEED_DEPLOY_KEY_PREFIX, getState, onTermData, onTermExit, openDialog,
-  saveDialog, sshDeployPublicKey, termClose, termCreate, termExport, termInput, termRecordStart,
-  termRecordStop, termResize, timelineBindServer, timelineReport,
+  SSH_AUTH_FAILED_PREFIX, SSH_NEED_DEPLOY_KEY_PREFIX, getState, onTermAiBusy, onTermData, onTermExit,
+  openDialog, saveDialog, sshDeployPublicKey, termAiCancel, termClose, termCreate, termExport,
+  termInput, termRecordStart, termRecordStop, termResize, timelineBindServer, timelineReport,
   upsertProject,
 } from '../../../api';
 import type { TermKind } from '../../../api';
-import type { QuickCommand, Server, ServerRef, TermSnapshot } from '../../../types';
+import type { QuickCommand, Server, ServerRef, TermAiBusyEvent, TermSnapshot } from '../../../types';
 import { saveServerWithCredentialChoice } from '../../settings/server-save';
 import { icon, type IconName } from '../../../icons';
 import { attachCombo, copyText, showContextMenu, toast, uid, type CtxMenuItems } from '../../../ui';
@@ -279,6 +279,9 @@ class TermSession {
   private failed = false;
   private exited = false;
   private resizer: ResizeObserver | null = null;
+  /** AI 正在本终端注入命令：锁键盘 + 顶部执行条（后端 term:ai-busy:<tabId> 驱动） */
+  private aiBusy = false;
+  private aiBar: HTMLElement | null = null;
   /** 后端会话建立前到达的输入（含 xterm 对查询序列的自动应答）缓存,就绪后按序补发。 */
   private pendingInput: string[] = [];
   private pendingInputLen = 0;
@@ -422,6 +425,11 @@ class TermSession {
         this.closeSearch();
         return false;
       }
+      /* AI 正在本终端执行命令：键盘全部交给执行条（停止按钮为 DOM，不依赖键盘） */
+      if (this.aiBusy) {
+        e.preventDefault();
+        return false;
+      }
       /* 会话已结束:Enter/R/S 三个快捷键交本模块处理(不落终端) */
       if (this.exited || this.failed) return !this.handleExitBarKey(e);
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
@@ -448,6 +456,7 @@ class TermSession {
     try {
       this.unlisteners.push(await onTermData(this.tab.id, (d) => this.onBackendData(d)));
       this.unlisteners.push(await onTermExit(this.tab.id, (code) => this.onExit(code)));
+      this.unlisteners.push(await onTermAiBusy(this.tab.id, (e) => this.onAiBusy(e)));
       // SSH 终端：登记 serverId 的项目归属（后端连接池 connect/disconnect/exec 事件
       // 据此计入本项目时间线；fire-and-forget，登记失败不影响终端建立）
       if (kind === 'ssh' && data.serverId) {
@@ -691,6 +700,8 @@ class TermSession {
 
   private onUserInput(data: string): void {
     if (this.failed || this.exited) return;
+    // AI 注入执行期间丢弃用户输入（后端 TermManager::input 同样丢弃，双保险）
+    if (this.aiBusy) return;
     if (!this.ready) {
       // 通道尚未就绪(SSH 建连需 1-2s):缓存而非丢弃,上限 8KB 防无界增长
       if (this.pendingInputLen + data.length <= 8192) {
@@ -890,6 +901,8 @@ class TermSession {
     }
     if (this.exited) return;
     this.exited = true;
+    this.aiBusy = false;
+    this.hideAiBar();
     dbg(`${this.sid} fe-exit code=${code}`);
     // 进程退出 = 会话终结：末块定稿上报时间线
     const last = this.blocks[this.blocks.length - 1];
@@ -967,6 +980,42 @@ class TermSession {
     this.exitBar?.classList.remove('open');
   }
 
+  /* ---------- AI 执行提示条（顶部；不切标签，仅锁输入） ---------- */
+
+  private onAiBusy(e: TermAiBusyEvent): void {
+    this.aiBusy = !!e.running;
+    if (this.aiBusy) this.showAiBar(e.command);
+    else this.hideAiBar();
+  }
+
+  private showAiBar(command?: string): void {
+    if (!this.aiBar) {
+      const bar = document.createElement('div');
+      bar.className = 'term-aibar';
+      const text = document.createElement('div');
+      text.className = 'term-aibar-text';
+      const stop = document.createElement('button');
+      stop.className = 'btn small term-aibar-stop';
+      stop.textContent = '停止';
+      stop.onclick = () => { void termAiCancel(this.tab.id).catch(() => { /* 会话已关闭 */ }); };
+      bar.append(text, stop);
+      this.host.appendChild(bar);
+      this.aiBar = bar;
+    }
+    const text = this.aiBar.querySelector('.term-aibar-text');
+    if (text) {
+      const cmd = (command ?? '').trim();
+      text.textContent = cmd
+        ? `AI 正在执行：${cmd.length > 120 ? `${cmd.slice(0, 120)}…` : cmd}`
+        : 'AI 正在执行命令…';
+    }
+    this.aiBar.classList.add('open');
+  }
+
+  private hideAiBar(): void {
+    this.aiBar?.classList.remove('open');
+  }
+
   /**
    * 会话结束态下的快捷键:Enter 关标签 / R 重连 / S 导出。
    * 返回 true = 已消费（xterm 不再处理该按键）。Escape 交给上层（不消费）。
@@ -995,7 +1044,7 @@ class TermSession {
   private closeTabAction(): void {
     dbg(`${this.sid} fe-exitbar-close-tab`);
     this.hideExitBar();
-    useWorkbench.getState().closeTab(this.tab.id);
+    void useWorkbench.getState().requestCloseTab(this.tab.id);
   }
 
   /** 提示条「重新连接」：收起提示条后走既有 reconnect 流程（失败会再次浮出）。 */
@@ -1415,6 +1464,8 @@ class TermSession {
     if (this.recording) void this.stopRecording(true);
     this.exitBar?.remove();
     this.exitBar = null;
+    this.aiBar?.remove();
+    this.aiBar = null;
     this.exitBarTitle = null;
     this.exitBarDesc = null;
     this.unlisteners.forEach((u) => { try { u(); } catch { /* 忽略退订异常 */ } });

@@ -16,11 +16,14 @@ pub mod notify;
 pub mod pcap;
 pub mod redact;
 pub mod session_title;
+/// 前台终端命令通道（AI 复用用户已打开的 SSH shell；含哨兵捕获与 ANSI 清洗）
+pub mod shell_exec;
 pub mod pythoninstall;
 pub mod pysdk;
 pub mod sftp;
 pub mod skills;
 pub mod smart_approval;
+pub mod sso;
 pub mod ssh;
 pub mod staging;
 pub mod ssh_keys;
@@ -108,7 +111,26 @@ pub(crate) fn exit_cleanup_if_last_window(app: &tauri::AppHandle, dying_label: &
 }
 
 pub fn run() {
+    // 堡垒机 SSO 客户端（如 C:\sso_client\xshell_agent.exe）以
+    // `AIShell.exe -url ssh://user:一次性密码@host:port` 拉起：先记下 URL，
+    // setup 里登记内存临时服务器，前端挂载后经 sso_take_pending 取走。
+    // 注意：绝不要把 argv 原文写日志（含一次性密码）。
+    sso::remember_launch_url(sso::url_from_args(
+        std::env::args_os().map(|a| a.to_string_lossy().into_owned()),
+    ));
+
     tauri::Builder::default()
+        // 单实例必须最先注册：SSO 客户端每次登录都会启动一个 AIShell 进程，
+        // 已有实例时把 `-url` 转发过去，避免开第二个窗口/丢会话。
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(url) = sso::url_from_args(argv) {
+                sso::handle_incoming(app, &url);
+            } else if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         // 内置浏览器自行接管 target=_blank / window.open；全局注入会让远程子 webview
         // 误调 opener IPC 并被 ACL 拒绝。显式 openUrl 命令仍由插件提供。
         .plugin(
@@ -236,6 +258,15 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             trace::init(config_dir.join("ai-trace"), store.trace_enabled());
             app.manage(store.clone());
             app.manage(ssh.clone());
+            // 临时会话/通道状态变化推给前端（卡片指示灯、AI 执行横幅）
+            {
+                let app2 = app.handle().clone();
+                ssh.set_event_sink(move |event, payload| {
+                    let _ = app2.emit(event, payload);
+                });
+            }
+            // 首启带 -url：解析并登记一次性 SSO 服务器；前端 sso_take_pending 取走。
+            sso::init_launch(&ssh);
             app.manage(terms);
             app.manage(ai.clone());
             app.manage(staging);
@@ -308,6 +339,11 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
         })
         .invoke_handler(tauri::generate_handler![
             open_devtools,
+            sso::sso_take_pending,
+            sso::sso_access_client_takeover,
+            sso::sso_set_access_client_takeover,
+            ssh::sso_sessions,
+            ssh::sftp_release,
             store::is_config_complete,
             store::get_state,
             store::get_task_project,
@@ -349,6 +385,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             term::term_input,
             term::term_resize,
             term::term_close,
+            term::term_ai_cancel,
             term::term_record_start,
             term::term_record_stop,
             term::term_export,

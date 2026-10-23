@@ -15,10 +15,10 @@
  * 删除服务器配置和凭据(独占凭据一并删、共享凭据保留,后端 delete_server_with_credentials 事务)。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Credential, DbConnection, DbKind, McpDeviceConfig, Server } from '../../../types';
+import type { Credential, DbConnection, DbKind, McpDeviceConfig, Server, SsoSessionInfo } from '../../../types';
 import {
-  deleteDbConnection, deleteServer, deleteServerWithCredentials, getState, saveDbConnection,
-  setServerLocked, upsertProject,
+  deleteDbConnection, deleteServer, deleteServerWithCredentials, getState, onSsoSessionsChanged,
+  saveDbConnection, setServerLocked, ssoSessions, upsertProject,
 } from '../../../api';
 import { useWorkbench, wbEvents, wbHandles } from '../../../stores/workbench';
 import { confirmDialog, showContextMenu, toast, uid } from '../../../ui';
@@ -357,6 +357,8 @@ function ServersPanelBody(): JSX.Element {
   const [data, setData] = useState<{ servers: Server[]; credentials: Credential[]; mcpDevices: Record<string, McpDeviceConfig>; compact: boolean; projects: { id: string; name: string; serverIds: string[] }[] }>({ servers: [], credentials: [], mcpDevices: {}, compact: false, projects: [] });
   const [reloadKey, setReloadKey] = useState(0);
   const [searchText, setSearchText] = useState('');
+  /* 堡垒机临时会话（Rust 内存，按资源合并展示；连接状态由 sso:sessions-changed 刷新） */
+  const [ssoList, setSsoList] = useState<SsoSessionInfo[]>([]);
   /* 紧凑布局下已展开的服务器 id(默认全部折叠,点击卡片展开/收起) */
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
@@ -413,6 +415,26 @@ function ServersPanelBody(): JSX.Element {
       })
       .catch(() => { /* 后端未就绪时按空列表渲染 */ });
     return () => { alive = false; };
+  }, [reloadKey]);
+
+  /* 临时会话：挂载 + 数据广播 + 后端通道状态事件时重拉（面板按需挂载，不能只靠事件） */
+  useEffect(() => {
+    let alive = true;
+    let unlisten: (() => void) | null = null;
+    const load = (): void => {
+      void ssoSessions()
+        .then((list) => { if (alive) setSsoList(list); })
+        .catch(() => { /* 后端未就绪时按空列表渲染 */ });
+    };
+    load();
+    void onSsoSessionsChanged(load).then((fn) => {
+      if (alive) unlisten = fn;
+      else fn();
+    });
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
   }, [reloadKey]);
 
   /* 面板联动刷新:项目数据变更(其他模块改绑定/命令收藏等) */
@@ -815,6 +837,40 @@ function ServersPanelBody(): JSX.Element {
   const allTagOptions = [...new Set(servers.flatMap((s) => s.tags))].sort((a, b) =>
     a.localeCompare(b, 'zh'));
 
+  /* 临时会话按资源（用户@host:port）合并：终端/SFTP 各自独立连接，灯取组内 OR */
+  const ssoGroups = (() => {
+    if (!project) return [];
+    const map = new Map<string, {
+      key: string; title: string; host: string; port: number; username: string;
+      hasTerminal: boolean; hasSftp: boolean; seq: number;
+    }>();
+    for (const s of ssoList) {
+      if (s.projectId !== project.id) continue;
+      const key = `${s.username}@${s.host}:${s.port}`;
+      const prev = map.get(key);
+      if (!prev) {
+        map.set(key, {
+          key, title: s.title, host: s.host, port: s.port, username: s.username,
+          hasTerminal: s.hasTerminal, hasSftp: s.hasSftp, seq: s.seq,
+        });
+      } else {
+        prev.hasTerminal = prev.hasTerminal || s.hasTerminal;
+        prev.hasSftp = prev.hasSftp || s.hasSftp;
+        if (s.seq >= prev.seq) {
+          prev.seq = s.seq;
+          prev.title = s.title;
+        }
+      }
+    }
+    return [...map.values()].sort((a, b) => b.seq - a.seq);
+  })();
+  const ssoFiltered = q
+    ? ssoGroups.filter((g) =>
+        g.title.toLowerCase().includes(q)
+        || g.host.toLowerCase().includes(q)
+        || g.username.toLowerCase().includes(q))
+    : ssoGroups;
+
   /* 删除对话框派生值:关联凭据名 / 该凭据还被几台其他服务器引用 / 当前项目之外还绑定的项目名 */
   const delCred = delServer && delServer.credentialId
     ? credentials.find((c) => c.id === delServer.credentialId) ?? null
@@ -850,6 +906,48 @@ function ServersPanelBody(): JSX.Element {
             <span className="tag blue">本地</span>
           </div>
         </div>
+
+        {/* 堡垒机临时会话：按资源合并；SSH/SFTP 不提供按钮，只显示通道指示灯 */}
+        {ssoFiltered.length > 0 && (
+          <>
+            <div className="wbs-server-head">
+              <span>临时会话</span>
+              <span className="wbs-sso-hint">堡垒机登录拉起 · 仅本次运行有效</span>
+            </div>
+            <div className="wbs-server-list wbs-sso-list">
+              {ssoFiltered.map((g) => (
+                <div key={g.key} className="card wbs-server-card wbs-sso-card">
+                  <div className="wbs-server-top">
+                    <span className="wbs-server-icon"><Icon name="terminal" /></span>
+                    <span className="wbs-server-main">
+                      <span className="wbs-server-name">{g.title}</span>
+                      <span className="wbs-server-addr mono">{g.username}@{g.host}:{g.port}</span>
+                    </span>
+                    <span className="tag purple">临时会话</span>
+                  </div>
+                  <div className="wbs-sso-status" aria-label="临时会话通道状态">
+                    <span
+                      className={`wbs-sso-led${g.hasTerminal ? ' running' : ''}`}
+                      title={g.hasTerminal
+                        ? 'SSH 终端已连接：AI 可在此执行命令'
+                        : 'SSH 终端未连接：AI 执行命令前请先在堡垒机页面打开 SSH'}
+                    >
+                      <i className="dot" /> SSH
+                    </span>
+                    <span
+                      className={`wbs-sso-led${g.hasSftp ? ' running' : ''}`}
+                      title={g.hasSftp
+                        ? 'SFTP 已连接：AI 可读写文件并自动备份'
+                        : 'SFTP 未连接：AI 文件操作/自动备份需先打开 SFTP'}
+                    >
+                      <i className="dot" /> SFTP
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
 
         {/* 「远程服务器」标题行 + 新建/SSH跳转入口(空列表也可新建) */}
         <div className="wbs-server-head">

@@ -17,7 +17,8 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use russh::client;
@@ -25,7 +26,9 @@ use russh::ChannelMsg;
 use serde::Serialize;
 use tauri::State;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
+use crate::shell_exec::{build_envelope, wait_capture, AiCapture, AltScreenTracker};
 use crate::store;
 
 const NSSSH_PRIVATE_KEY_HEADER: &[u8] = b"---- BEGIN NSSSH PRIVATE KEY ----";
@@ -40,6 +43,14 @@ pub const NEED_DEPLOY_PREFIX: &str = "[SSH需部署公钥]";
 
 /// 认证失败的中文错误（带原始错误摘要）：用户名、密码或密钥不正确，或认证方法不被服务器支持。
 fn auth_failed_msg(server: &store::Server, detail: &str) -> String {
+    // 一次性 SSO 会话：凭据是堡垒机页面刚下发的一次性密码，没有「重设凭据」入口，
+    // 明确引导回堡垒机重新登录（前端也找不到该服务器，不会弹重设对话框）。
+    if server.id.starts_with("sso-") {
+        return format!(
+            "{AUTH_FAILED_PREFIX}堡垒机一次性登录凭据已失效或不被接受，\
+             请回到堡垒机管理页面重新点击登录（原始错误：{detail}）"
+        );
+    }
     format!(
         "{AUTH_FAILED_PREFIX}服务器「{}」（{}:{}）认证失败：用户名、密码或密钥不正确，\
          请重新设置后重试（原始错误：{detail}）",
@@ -111,6 +122,64 @@ impl client::Handler for CliHandler {
     }
 }
 
+/// 一次性 SSO 会话的协议类型（界面上区分 SSH/SFTP 指示灯与 AI 路由）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SsoKind {
+    Ssh,
+    Sftp,
+}
+
+impl SsoKind {
+    pub fn parse(raw: &str) -> SsoKind {
+        if raw.eq_ignore_ascii_case("sftp") {
+            SsoKind::Sftp
+        } else {
+            SsoKind::Ssh
+        }
+    }
+}
+
+/// 一次性 SSO 会话（堡垒机 Web 单点登录拉起）：服务器元数据 + 一次性密码只在本进程内存，
+/// 不写 aishell.json / keyring / 时间线；App 退出即消失。
+struct EphemeralServer {
+    server: store::Server,
+    password: Zeroizing<String>,
+    kind: SsoKind,
+    seq: u64,
+}
+
+/// 终端已打开的 shell 通道（AI 注入的命令通道；SSO 网关一条连接只允许一个 channel）。
+pub struct ShellSession {
+    tab_id: String,
+    write_half: Arc<russh::ChannelWriteHalf<russh::client::Msg>>,
+    capture: Arc<AiCapture>,
+    alt_screen: Arc<AltScreenTracker>,
+    seq: u64,
+}
+
+/// 临时会话的前端展示/状态（密码绝不下发）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SsoSessionInfo {
+    pub server_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub title: String,
+    pub kind: SsoKind,
+    pub project_id: Option<String>,
+    /// TCP 连接是否还在（不代表有可用 channel）
+    pub connected: bool,
+    /// 该会话上有打开的终端 shell（AI 命令可用）
+    pub has_terminal: bool,
+    /// 该会话有活着的 SFTP channel（AI 文件操作/自动备份可用）
+    pub has_sftp: bool,
+    pub seq: u64,
+}
+
+type EventSink = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
 /// 连接门面：线程安全（内部 Mutex<HashMap>），同一 server 所有会话共享一条 TCP 连接。
 pub struct SshManager {
     store: Arc<store::Store>,
@@ -118,6 +187,21 @@ pub struct SshManager {
     /// serverId → 项目归属（时间线埋点用）：连接池按 serverId 复用、跨项目共享，
     /// 归属取「最近触发方」（终端/SFTP 打开或 AI 动作发起时 bind_project 登记）。
     projects: Mutex<HashMap<String, String>>,
+    /// 堡垒机 SSO 拉起的一次性服务器（sso.rs 登记）：不在 Store 中，密码只在内存。
+    /// 用 std Mutex 而非 tokio：server_label 等同步路径要查，锁内无 await。
+    ephemeral: StdMutex<HashMap<String, EphemeralServer>>,
+    /// SSO 一次性会话的 serverId → 已建立的 SFTP 会话：所有 SFTP 操作复用同一个 channel。
+    /// 部分堡垒机网关（如齐治 TERM-SSHD）一条 TCP 连接只允许一个会话通道，
+    /// 每次操作新开 channel 会在第二次起被拒（ConnectFailed）；普通服务器保持原行为。
+    sftp: Mutex<HashMap<String, Arc<russh_sftp::client::SftpSession>>>,
+    /// serverId → 已打开的终端 shell（AI 命令注入通道；TermManager 创建/关闭时登记）。
+    /// std Mutex：server_label/列表等同步路径要查，锁内无 await。
+    shells: StdMutex<HashMap<String, Arc<ShellSession>>>,
+    /// 会话/通道状态变化通知前端（`sso:sessions-changed`、`term:ai-busy:<tab>`）。
+    /// setup 里注入 app.emit；测试环境保持 None。
+    event_sink: StdMutex<Option<EventSink>>,
+    ephemeral_seq: AtomicU64,
+    shell_seq: AtomicU64,
 }
 
 /// 转发通道失败的可能原因提示（错误信息追加用；纯函数便于单测）。
@@ -131,13 +215,328 @@ fn tcp_forward_hint(err: &str) -> &'static str {
     }
 }
 
+/// 建连/认证超时：普通服务器 10s（无响应时快速失败）；
+/// 堡垒机 SSO 一次性会话（`sso-` 前缀）放宽到 60s——网关要等到目标侧会话建好才完成
+/// SSH 握手，实测本机到网关约 14s，10s 会稳定误判超时（终端与 SFTP 同一路径）。
+fn link_timeout(server: &store::Server) -> Duration {
+    if server.id.starts_with("sso-") {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
 impl SshManager {
     pub fn new(store: Arc<store::Store>) -> Self {
         SshManager {
             store,
             sessions: Mutex::new(HashMap::new()),
             projects: Mutex::new(HashMap::new()),
+            ephemeral: StdMutex::new(HashMap::new()),
+            sftp: Mutex::new(HashMap::new()),
+            shells: StdMutex::new(HashMap::new()),
+            event_sink: StdMutex::new(None),
+            ephemeral_seq: AtomicU64::new(1),
+            shell_seq: AtomicU64::new(1),
         }
+    }
+
+    /// 注入前端事件出口（setup 中绑定 app.emit；测试不调用）。
+    pub fn set_event_sink(
+        &self,
+        sink: impl Fn(&str, serde_json::Value) + Send + Sync + 'static,
+    ) {
+        if let Ok(mut slot) = self.event_sink.lock() {
+            *slot = Some(Arc::new(sink));
+        }
+    }
+
+    fn emit_ui(&self, event: &str, payload: serde_json::Value) {
+        let sink = self.event_sink.lock().ok().and_then(|s| s.clone());
+        if let Some(sink) = sink {
+            sink(event, payload);
+        }
+    }
+
+    fn notify_sessions_changed(&self) {
+        self.emit_ui("sso:sessions-changed", serde_json::Value::Null);
+    }
+
+    /// 登记一次性 SSO 服务器（sso.rs 调用）。密码只保存在内存，连接建立后随 Zeroizing 释放。
+    pub(crate) fn add_ephemeral(
+        &self,
+        server: store::Server,
+        password: Zeroizing<String>,
+        kind: SsoKind,
+    ) -> Result<(), String> {
+        let seq = self.ephemeral_seq.fetch_add(1, Ordering::Relaxed);
+        let mut map = self.ephemeral.lock().map_err(|e| e.to_string())?;
+        map.insert(
+            server.id.clone(),
+            EphemeralServer {
+                server,
+                password,
+                kind,
+                seq,
+            },
+        );
+        drop(map);
+        self.notify_sessions_changed();
+        Ok(())
+    }
+
+    pub(crate) fn is_ephemeral(&self, server_id: &str) -> bool {
+        self.ephemeral
+            .lock()
+            .map(|m| m.contains_key(server_id))
+            .unwrap_or(false)
+    }
+
+    /// 会话所属资源身份（网关按 host:port+登录用户区分资源）。
+    fn ephemeral_identity(&self, server_id: &str) -> Option<(String, u16, String)> {
+        let map = self.ephemeral.lock().ok()?;
+        let e = map.get(server_id)?;
+        Some((e.server.host.clone(), e.server.port, e.server.username.clone()))
+    }
+
+    /// 列出全部临时会话及通道状态（前端卡片与 AI list_servers 共用）。
+    pub async fn ephemeral_infos(&self) -> Vec<SsoSessionInfo> {
+        let entries: Vec<(String, store::Server, SsoKind, u64)> = {
+            let Ok(map) = self.ephemeral.lock() else {
+                return Vec::new();
+            };
+            map.iter()
+                .map(|(id, e)| (id.clone(), e.server.clone(), e.kind, e.seq))
+                .collect()
+        };
+        let shells: Vec<String> = {
+            self.shells
+                .lock()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let sftp_ids: Vec<String> = {
+            let map = self.sftp.lock().await;
+            map.keys().cloned().collect()
+        };
+        let projects: HashMap<String, String> = {
+            let map = self.projects.lock().await;
+            map.clone()
+        };
+        let mut out = Vec::with_capacity(entries.len());
+        for (id, server, kind, seq) in entries {
+            let connected = self.live_handle(&id).await.is_some();
+            out.push(SsoSessionInfo {
+                server_id: id.clone(),
+                host: server.host,
+                port: server.port,
+                username: server.username,
+                title: server.name,
+                kind,
+                project_id: projects.get(&id).cloned(),
+                connected,
+                has_terminal: shells.iter().any(|s| s == &id),
+                has_sftp: connected && sftp_ids.iter().any(|s| s == &id),
+                seq,
+            });
+        }
+        out.sort_by_key(|s| s.seq);
+        out
+    }
+
+    /// 同一资源的其他临时会话 id（SFTP 会话与终端会话是两条独立连接）。
+    fn sibling_ids(&self, server_id: &str) -> Vec<String> {
+        let Some((host, port, user)) = self.ephemeral_identity(server_id) else {
+            return Vec::new();
+        };
+        let Ok(map) = self.ephemeral.lock() else {
+            return Vec::new();
+        };
+        map.iter()
+            .filter(|(id, e)| {
+                id.as_str() != server_id
+                    && e.server.host == host
+                    && e.server.port == port
+                    && e.server.username == user
+            })
+            .map(|(id, e)| (id.clone(), e.seq))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// 解析可用于 AI 命令注入的 shell：优先本 id，其次同资源的终端会话。
+    pub(crate) fn resolve_shell(&self, server_id: &str) -> Option<(String, Arc<ShellSession>)> {
+        let Ok(map) = self.shells.lock() else {
+            return None;
+        };
+        if let Some(shell) = map.get(server_id) {
+            return Some((server_id.to_string(), Arc::clone(shell)));
+        }
+        let mut best: Option<(String, Arc<ShellSession>)> = None;
+        for id in self.sibling_ids(server_id) {
+            if let Some(shell) = map.get(&id) {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, b)| shell.seq > b.seq)
+                {
+                    best = Some((id.clone(), Arc::clone(shell)));
+                }
+            }
+        }
+        best
+    }
+
+    /// 该资源是否有活着的 SFTP channel（自动备份/AI 文件操作的前提）。
+    pub(crate) async fn has_sftp_for(&self, server_id: &str) -> bool {
+        let own = { self.sftp.lock().await.contains_key(server_id) };
+        if own {
+            return true;
+        }
+        let sibs = self.sibling_ids(server_id);
+        let map = self.sftp.lock().await;
+        sibs.iter().any(|id| map.contains_key(id))
+    }
+
+    /// 注册终端 shell（TermManager::create_ssh 调用）。
+    pub(crate) fn register_shell(
+        &self,
+        server_id: &str,
+        tab_id: &str,
+        write_half: Arc<russh::ChannelWriteHalf<russh::client::Msg>>,
+        capture: Arc<AiCapture>,
+        alt_screen: Arc<AltScreenTracker>,
+    ) -> Arc<ShellSession> {
+        let shell = Arc::new(ShellSession {
+            tab_id: tab_id.to_string(),
+            write_half,
+            capture,
+            alt_screen,
+            seq: self.shell_seq.fetch_add(1, Ordering::Relaxed),
+        });
+        if let Ok(mut map) = self.shells.lock() {
+            map.insert(server_id.to_string(), Arc::clone(&shell));
+        }
+        if self.is_ephemeral(server_id) {
+            self.notify_sessions_changed();
+        }
+        shell
+    }
+
+    /// 注销终端 shell（关闭/读循环结束调用；tab_id 不匹配说明已被重连替换，忽略）。
+    pub(crate) fn unregister_shell(&self, server_id: &str, tab_id: &str) {
+        let removed = if let Ok(mut map) = self.shells.lock() {
+            if map.get(server_id).is_some_and(|s| s.tab_id == tab_id) {
+                map.remove(server_id).is_some()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if removed && self.is_ephemeral(server_id) {
+            self.notify_sessions_changed();
+        }
+    }
+
+    /// AI 正在该终端注入命令（TermManager::input 据此丢弃用户按键）。
+    pub(crate) fn shell_busy_by_tab(&self, tab_id: &str) -> bool {
+        self.shells
+            .lock()
+            .map(|m| m.values().any(|s| s.tab_id == tab_id && s.capture.is_busy()))
+            .unwrap_or(false)
+    }
+
+    /// 停止某个终端上的 AI 命令：让等待方立即返回，并向 shell 发 Ctrl-C。
+    pub(crate) fn cancel_shell_by_tab(&self, tab_id: &str) -> Result<(), String> {
+        let shell = self
+            .shells
+            .lock()
+            .ok()
+            .and_then(|m| m.values().find(|s| s.tab_id == tab_id).cloned());
+        let Some(shell) = shell else {
+            return Err("该终端没有正在执行的 AI 命令".to_string());
+        };
+        shell.capture.abort("AI 命令已取消");
+        let wh = Arc::clone(&shell.write_half);
+        tauri::async_runtime::spawn(async move {
+            let _ = wh.data_bytes("\u{3}".to_string()).await;
+        });
+        self.emit_ui(
+            &format!("term:ai-busy:{tab_id}"),
+            serde_json::json!({ "running": false }),
+        );
+        Ok(())
+    }
+
+    fn emit_ai_busy(&self, tab_id: &str, running: bool, command: Option<String>) {
+        let mut payload = serde_json::json!({ "running": running });
+        if let Some(cmd) = command {
+            payload["command"] = serde_json::Value::String(cmd);
+        }
+        self.emit_ui(&format!("term:ai-busy:{tab_id}"), payload);
+    }
+
+    /// 在用户已打开的终端 shell 里执行命令（哨兵协议，见 shell_exec.rs）。
+    /// 找不到终端、终端处于全屏程序、或注入串过长时直接报错，不新开 channel。
+    pub async fn exec_in_shell(
+        self: &Arc<Self>,
+        server_id: &str,
+        command: &str,
+        cwd: Option<&str>,
+        timeout: Duration,
+    ) -> Result<crate::ai_actions::CommandResult, String> {
+        let (_, shell) = self.resolve_shell(server_id).ok_or_else(|| {
+            format!(
+                "临时会话「{}」没有可用的终端通道：请先在服务器列表打开该资源的终端，再让 AI 执行命令",
+                self.server_label(server_id).unwrap_or_else(|| server_id.to_string())
+            )
+        })?;
+        if shell.alt_screen.is_active() {
+            return Err("终端正在运行全屏程序（如 vim/top），请退出后重试".to_string());
+        }
+        let _guard = shell.capture.lock().await;
+        // 等锁期间可能进入了全屏程序
+        if shell.alt_screen.is_active() {
+            return Err("终端正在运行全屏程序（如 vim/top），请退出后重试".to_string());
+        }
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let envelope = build_envelope(&nonce, cwd, command)?;
+        let rx = shell.capture.begin(&nonce);
+        self.emit_ai_busy(&shell.tab_id, true, Some(command.to_string()));
+        if let Err(e) = shell.write_half.data_bytes(format!("{envelope}\r")).await {
+            shell.capture.abort("写入终端失败");
+            self.emit_ai_busy(&shell.tab_id, false, None);
+            return Err(format!("写入终端通道失败：{e}"));
+        }
+        let result = wait_capture(rx, timeout).await;
+        self.emit_ai_busy(&shell.tab_id, false, None);
+        match result {
+            Ok(captured) => Ok(crate::ai_actions::CommandResult {
+                stdout: captured.text,
+                stderr: String::new(),
+                exit_code: captured.exit_code,
+                timed_out: false,
+                note: None,
+            }),
+            Err(e) => {
+                // 超时/输出超限：清槽并发 Ctrl-C，避免 shell 残留在半条命令上
+                shell.capture.abort(e.clone());
+                let _ = shell.write_half.data_bytes("\u{3}".to_string()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// 测试用：确认一次性密码已登记（不导出给前端）。
+    #[cfg(test)]
+    pub(crate) fn ephemeral_password(&self, server_id: &str) -> Option<String> {
+        self.ephemeral
+            .lock()
+            .ok()?
+            .get(server_id)
+            .map(|e| e.password.as_str().to_string())
     }
 
     /// 登记 serverId 的项目归属（时间线 connect/disconnect/exec 事件按项目落盘）。
@@ -147,11 +546,20 @@ impl SshManager {
             .lock()
             .await
             .insert(server_id.to_string(), project_id.to_string());
+        if self.is_ephemeral(server_id) {
+            self.notify_sessions_changed();
+        }
     }
 
-    /// 服务器显示名（时间线/日志标签用）：未找到返回 None。
+    /// 服务器显示名（时间线/日志标签用）：Store 查不到时回落到一次性 SSO 会话。
     pub(crate) fn server_label(&self, server_id: &str) -> Option<String> {
-        self.store.server(server_id).map(|s| s.name)
+        self.store.server(server_id).map(|s| s.name).or_else(|| {
+            self.ephemeral
+                .lock()
+                .ok()?
+                .get(server_id)
+                .map(|e| e.server.name.clone())
+        })
     }
 
     /// 时间线事件写入：仅当该 server 已登记项目归属时记录（未登记说明与工作台项目无关，
@@ -210,13 +618,27 @@ impl SshManager {
         if let Some(handle) = self.live_handle(server_id).await {
             return Ok(handle);
         }
-        let server = self
-            .store
-            .server(server_id)
-            .ok_or_else(|| format!("服务器不存在：{server_id}"))?;
+        // 一次性 SSO 服务器不在 Store 中：从内存表取服务器与密码。
+        // 密码覆盖只在本函数内使用，连接建立后随 Zeroizing 释放。
+        let mut password_override: Option<Zeroizing<String>> =
+            password_override.map(|p| Zeroizing::new(p.to_string()));
+        let server = match self.store.server(server_id) {
+            Some(server) => server,
+            None => {
+                let map = self.ephemeral.lock().map_err(|e| e.to_string())?;
+                let ephemeral = map
+                    .get(server_id)
+                    .ok_or_else(|| format!("服务器不存在：{server_id}"))?;
+                if password_override.is_none() {
+                    password_override = Some(ephemeral.password.clone());
+                }
+                ephemeral.server.clone()
+            }
+        };
+        let password = password_override.as_ref().map(|p| p.as_str());
         let handle = match &server.bastion_id {
             // 普通服务器 / 堡垒机：直连
-            None => self.connect_handle(&server, password_override).await?,
+            None => self.connect_handle(&server, password).await?,
             // 目标主机：先连堡垒机，再经其转发（堡垒机本身不允许再挂堡垒机，杜绝链式跳板）
             Some(bastion_id) => {
                 let bastion = self.store.server(bastion_id).ok_or_else(|| {
@@ -235,8 +657,8 @@ impl SshManager {
                     ));
                 }
                 let bastion_handle =
-                    Box::pin(self.get_or_connect_inner(bastion_id, password_override)).await?;
-                self.connect_via_jump(&server, &bastion, bastion_handle, password_override)
+                    Box::pin(self.get_or_connect_inner(bastion_id, password)).await?;
+                self.connect_via_jump(&server, &bastion, bastion_handle, password)
                     .await?
             }
         };
@@ -282,7 +704,44 @@ impl SshManager {
     pub async fn open_sftp(
         self: &Arc<Self>,
         server_id: &str,
-    ) -> Result<russh_sftp::client::SftpSession, String> {
+    ) -> Result<Arc<russh_sftp::client::SftpSession>, String> {
+        // SSO 一次性会话复用已建立的 SFTP channel：部分堡垒机网关（齐治 TERM-SSHD）
+        // 一条连接只允许一个会话通道，每次操作新开 channel 会在第二次起被拒（ConnectFailed）。
+        let sso = server_id.starts_with("sso-");
+        if sso {
+            let cached = self.sftp.lock().await.get(server_id).cloned();
+            if let Some(session) = cached {
+                if self.live_handle(server_id).await.is_some() {
+                    return Ok(session);
+                }
+                // 底层连接已断开：丢弃缓存，按新连接重建
+                self.sftp.lock().await.remove(server_id);
+                self.notify_sessions_changed();
+            }
+            // 同资源的 SFTP 标签是另一条连接：终端会话的文件操作/AI 备份复用它
+            for sibling in self.sibling_ids(server_id) {
+                let cached = self.sftp.lock().await.get(&sibling).cloned();
+                if let Some(session) = cached {
+                    if self.live_handle(&sibling).await.is_some() {
+                        return Ok(session);
+                    }
+                    self.sftp.lock().await.remove(&sibling);
+                    self.notify_sessions_changed();
+                }
+            }
+            // 本会话已有终端 shell：网关一条连接只允许一个 channel，不能再开 SFTP
+            let has_shell = self
+                .shells
+                .lock()
+                .map(|m| m.contains_key(server_id))
+                .unwrap_or(false);
+            if has_shell {
+                return Err(
+                    "该临时会话只有终端通道：请先在服务器列表打开该资源的 SFTP，再让 AI 读写文件"
+                        .to_string(),
+                );
+            }
+        }
         let handle = self.get_or_connect(server_id).await?;
         let channel = handle
             .channel_open_session()
@@ -292,9 +751,31 @@ impl SshManager {
             .request_subsystem(true, "sftp")
             .await
             .map_err(|e| format!("申请 SFTP 子系统失败：{e}"))?;
-        russh_sftp::client::SftpSession::new(channel.into_stream())
-            .await
-            .map_err(|e| format!("初始化 SFTP 会话失败：{e}"))
+        let session = Arc::new(
+            russh_sftp::client::SftpSession::new(channel.into_stream())
+                .await
+                .map_err(|e| format!("初始化 SFTP 会话失败：{e}"))?,
+        );
+        if !sso {
+            return Ok(session);
+        }
+        // 并发首开时保留先到的那条，后到的 channel 随 Arc 释放
+        let mut map = self.sftp.lock().await;
+        let session = map
+            .entry(server_id.to_string())
+            .or_insert(session)
+            .clone();
+        drop(map);
+        self.notify_sessions_changed();
+        Ok(session)
+    }
+
+    /// 释放临时会话的 SFTP channel（SFTP 标签关闭时前端调用），让卡片灯及时变灰。
+    pub async fn release_sftp(&self, server_id: &str) {
+        let existed = self.sftp.lock().await.remove(server_id).is_some();
+        if existed {
+            self.notify_sessions_changed();
+        }
     }
 
     /// 执行单条远程命令并收集 stdout/stderr/退出码（复用底层连接；channel 用完即弃）。
@@ -380,12 +861,17 @@ impl SshManager {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             exit_code,
             timed_out,
+            note: None,
         })
     }
 
     /// 断开并清理该 server 的连接（下次操作自动重连）。
     pub async fn disconnect(&self, server_id: &str) {
+        let sftp_removed = self.sftp.lock().await.remove(server_id).is_some();
         let handle = self.sessions.lock().await.remove(server_id);
+        if sftp_removed || self.is_ephemeral(server_id) {
+            self.notify_sessions_changed();
+        }
         if let Some(handle) = handle {
             if let Some(s) = self.store.server(server_id) {
                 self.timeline_event(
@@ -475,7 +961,8 @@ impl SshManager {
         map.get(server_id).filter(|h| !h.is_closed()).cloned()
     }
 
-    /// 直连建连 + 认证（各 10s 超时）。password_override 仅供测试注入，None 时走 Store/keyring。
+    /// 直连建连 + 认证（普通服务器各 10s；SSO 临时会话见 `link_timeout`）。
+    /// password_override 仅供测试注入，None 时走 Store/keyring。
     async fn connect_handle(
         &self,
         server: &store::Server,
@@ -492,17 +979,18 @@ impl SshManager {
         }
         let config = Arc::new(client::Config::default());
         let addr = (server.host.as_str(), server.port);
-        let handle = tokio::time::timeout(
-            Duration::from_secs(10),
-            client::connect(config, addr, CliHandler),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "连接服务器「{}」超时（10s）：{}:{}",
-                server.name, server.host, server.port
-            )
-        })?
+        let timeout = link_timeout(server);
+        let handle = tokio::time::timeout(timeout, client::connect(config, addr, CliHandler))
+            .await
+            .map_err(|_| {
+                format!(
+                    "连接服务器「{}」超时（{}s）：{}:{}",
+                    server.name,
+                    timeout.as_secs(),
+                    server.host,
+                    server.port
+                )
+            })?
         .map_err(|e| {
             format!(
                 "连接服务器「{}」失败（{}:{}）：{e}",
@@ -584,15 +1072,22 @@ impl SshManager {
         password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
         let mut handle = handle;
+        let timeout = link_timeout(server);
         let accepted = match (server.auth_type, password_override) {
             // 显式密码：无论服务器认证类型一律密码认证
             (_, Some(password)) => {
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_password(&server.username, password.to_string()),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
@@ -608,11 +1103,17 @@ impl SshManager {
                     .read_server_secret(server)
                     .map_err(|e| format!("读取服务器「{}」的密码失败：{e}", server.name))?;
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_password(&server.username, password),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
@@ -644,11 +1145,17 @@ impl SshManager {
                         .flatten(),
                 );
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_publickey(&server.username, key),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
@@ -680,11 +1187,17 @@ impl SshManager {
                         .flatten(),
                 );
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_publickey(&server.username, key),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
@@ -755,6 +1268,10 @@ impl SshManager {
                     if matches!(map.get(&server_id), Some(h) if Arc::ptr_eq(h, &handle)) {
                         map.remove(&server_id);
                         drop(map);
+                        manager.sftp.lock().await.remove(&server_id);
+                        if manager.is_ephemeral(&server_id) {
+                            manager.notify_sessions_changed();
+                        }
                         if let Some(s) = manager.store.server(&server_id) {
                             manager
                                 .timeline_event(
@@ -805,6 +1322,24 @@ pub struct SshExecResult {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// 临时会话卡片数据（前端服务器列表「临时会话」分组；密码绝不下发）。
+#[tauri::command]
+pub async fn sso_sessions(
+    ssh: State<'_, Arc<SshManager>>,
+) -> Result<Vec<SsoSessionInfo>, String> {
+    Ok(ssh.ephemeral_infos().await)
+}
+
+/// 关闭临时会话的 SFTP channel（SFTP 标签卸载时调用；普通服务器忽略）。
+#[tauri::command]
+pub async fn sftp_release(
+    ssh: State<'_, Arc<SshManager>>,
+    server_id: String,
+) -> Result<(), String> {
+    ssh.release_sftp(&server_id).await;
+    Ok(())
 }
 
 /// SFTP 直执命令（待优化 5）：复用 SshManager 既有连接（每 serverId 一条），
@@ -903,6 +1438,95 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_servers_are_labeled_and_keep_password_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-ephemeral-store-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = SshManager::new(Arc::new(store::test_store(dir.clone())));
+        let server = store::Server {
+            id: "sso-test".to_string(),
+            name: "user@bastion".to_string(),
+            host: "iam.example.edu".to_string(),
+            port: 2022,
+            auth_type: store::AuthType::Password,
+            username: "user".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        };
+        manager
+            .add_ephemeral(
+                server,
+                Zeroizing::new("one-time".to_string()),
+                SsoKind::Ssh,
+            )
+            .unwrap();
+        assert_eq!(manager.server_label("sso-test").as_deref(), Some("user@bastion"));
+        assert_eq!(
+            manager.ephemeral_password("sso-test").as_deref(),
+            Some("one-time")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_infos_reports_project_kind_and_channels() {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-ephemeral-infos-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = Arc::new(SshManager::new(Arc::new(store::test_store(dir.clone()))));
+        let mk = |id: &str, title: &str| store::Server {
+            id: id.to_string(),
+            name: title.to_string(),
+            host: "10.0.0.9".to_string(),
+            port: 22,
+            auth_type: store::AuthType::Password,
+            username: "demo".to_string(),
+            key_path: String::new(),
+            credential_id: None,
+            locked: false,
+            is_bastion: false,
+            bastion_id: None,
+            tags: Vec::new(),
+        };
+        manager
+            .add_ephemeral(
+                mk("sso-a", "root@demo"),
+                Zeroizing::new("p".to_string()),
+                SsoKind::Ssh,
+            )
+            .unwrap();
+        manager
+            .add_ephemeral(
+                mk("sso-b", "root@demo"),
+                Zeroizing::new("p".to_string()),
+                SsoKind::Sftp,
+            )
+            .unwrap();
+        manager.bind_project("sso-a", "proj-1").await;
+
+        let infos = manager.ephemeral_infos().await;
+        assert_eq!(infos.len(), 2);
+        let a = infos.iter().find(|i| i.server_id == "sso-a").unwrap();
+        assert_eq!(a.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(a.kind, SsoKind::Ssh);
+        assert!(!a.connected && !a.has_terminal && !a.has_sftp);
+        let b = infos.iter().find(|i| i.server_id == "sso-b").unwrap();
+        assert_eq!(b.kind, SsoKind::Sftp);
+        assert!(manager.is_ephemeral("sso-a"));
+        assert!(!manager.is_ephemeral("srv-x"));
+        assert!(!manager.has_sftp_for("sso-a").await);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn detects_only_complete_nsssh_header() {
         assert!(has_nsssh_header(
             b"---- BEGIN NSSSH PRIVATE KEY ----\r\npayload"
@@ -941,6 +1565,17 @@ mod tests {
         assert!(deploy_command("key' evil").is_err());
         assert!(deploy_command("key\nmulti").is_err());
         assert!(deploy_command("   ").is_err());
+    }
+
+    #[test]
+    fn auth_failed_msg_for_sso_points_back_to_bastion() {
+        let mut server = key_server("/tmp/home/.ssh");
+        server.id = "sso-test".to_string();
+        let msg = auth_failed_msg(&server, "Disconnected");
+        assert!(msg.starts_with(AUTH_FAILED_PREFIX));
+        assert!(msg.contains("一次性登录凭据"));
+        assert!(msg.contains("重新点击登录"));
+        assert!(msg.contains("原始错误：Disconnected"));
     }
 
     #[test]

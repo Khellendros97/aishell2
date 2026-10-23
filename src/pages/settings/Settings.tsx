@@ -4,7 +4,8 @@
  * 密码与 apiKey 表单留空提交 null（后端保持原值），显示位不打回明文；
  * 浏览按钮走 @tauri-apps/plugin-dialog（openDialog）；hint 外链经 @tauri-apps/plugin-opener 外部浏览器打开。
  * DOM id/class 与旧版一致，settings.css 直接复用；顶栏由 App.tsx 提供，本组件不渲染 Topbar。
- * 2026-08 起按用户要求新增左侧分类导航（功能特性/外观/快捷键/API 接口，SETTINGS_NAV 四页），
+ * 2026-08 起按用户要求新增左侧分类导航（功能特性/外观/快捷键/API 接口等，SETTINGS_NAV），
+ * 2026-10 新增「堡垒机客户端接管」页：厂商列表 + logo + 接管开关（齐治 accessclient:// 等），
  * 字段状态共享一份 SysFields，三个可编辑页的保存按钮等价（整表单提交）；快捷键页只读，此布局无 proto 对照。
  * 页面底部接入三页共用的 components/Statusbar 底栏（进度区/隧道角标；本页无 AI 面板，不传 AI 开关）。
  * 历史说明：原「服务器配置」面板（服务器卡片/搜索/分组/拖拽/模态/从 Xshell 导入）已随
@@ -13,7 +14,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, MouseEvent } from 'react';
 import type { AppState, CloudMode, CloudStatus, LlmConfig, SearchProvider, Settings as AppSettings, Theme, TimelineCloudInfo, UpdateStatus } from '../../types';
-import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, piVersion, saveSettings, setMcpPort, setTheme, timelineCloudInfo, timelineCloudPurge, updateCheck, updateDownload, updateInstall } from '../../api';
+import { cloudStatus, getMcpStatus, getState, onCloudChanged, openDialog, piVersion, saveSettings, setMcpPort, setTheme, ssoAccessClientTakeover, ssoSetAccessClientTakeover, timelineCloudInfo, timelineCloudPurge, updateCheck, updateDownload, updateInstall } from '../../api';
 import { navigate } from '../../router';
 import { toast, confirmDialog } from '../../ui';
 import { CredentialsPanel } from './CredentialsPanel';
@@ -34,6 +35,9 @@ const INPUT_MODE_OPTIONS: Array<{ value: LlmInputMode; label: string }> = [
   { value: 'text', label: '文本' },
   { value: 'image', label: '图片' },
 ];
+
+/** 厂商 logo（白色文字部分需要深色底板才可见，见 settings.css .vendor-logo） */
+const qizhiLogoUrl = new URL('../../assets/vendor-qizhi.png', import.meta.url).href;
 
 /** 表单字段（与旧版 f-* 元素一一对应；apiKey / braveKey 只存本次输入，加载时恒为空串） */
 interface SysFields {
@@ -82,10 +86,11 @@ interface McpStatusLine {
 }
 
 /** 左侧导航分类：MCP 归功能特性；快捷键页只读。 */
-type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api' | 'credentials' | 'about' | 'browser';
+type SettingsPage = 'features' | 'appearance' | 'shortcuts' | 'api' | 'credentials' | 'about' | 'browser' | 'bastion';
 
 const SETTINGS_NAV: { id: SettingsPage; label: string; icon: IconName }[] = [
   { id: 'features', label: '功能特性', icon: 'zap' },
+  { id: 'bastion', label: '堡垒机客户端接管', icon: 'server' },
   { id: 'credentials', label: '凭据库', icon: 'key' },
   { id: 'appearance', label: '外观', icon: 'monitor' },
   { id: 'shortcuts', label: '快捷键', icon: 'key' },
@@ -198,6 +203,9 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
   const [piVer, setPiVer] = useState<{ version?: string; error?: string } | null>(null);
   /* 时间线云同步：三层开关满足情况 + 容量超限标记（后端 timeline_upload.rs 状态） */
   const [tlCloud, setTlCloud] = useState<TimelineCloudInfo | null>(null);
+  /* 齐治 AccessClient 协议接管：状态在注册表（HKCU），不属 Settings 表单；切换即生效 */
+  const [accTakeover, setAccTakeover] = useState<boolean | null>(null);
+  const [accTakeoverErr, setAccTakeoverErr] = useState('');
 
   /* reason=missing-config：顶部黄色提示条（同 .proto/settings.js） */
   const warnShown = params.get('reason') === 'missing-config';
@@ -310,6 +318,15 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     return () => { cancelled = true; };
   }, []);
 
+  /* 齐治 AccessClient 协议接管状态：挂载读一次（注册表状态，非 Settings 字段） */
+  useEffect(() => {
+    let cancelled = false;
+    void ssoAccessClientTakeover()
+      .then((v) => { if (!cancelled) setAccTakeover(v); })
+      .catch(() => { if (!cancelled) setAccTakeover(false); });
+    return () => { cancelled = true; };
+  }, []);
+
   /* 托管/个人模式（CR-2.2）：账号页切换后本页表单形态即时刷新；
      同时刷新 dbRef（保存时 settings.cloud 原样带回，需最新值） */
   useEffect(() => {
@@ -323,6 +340,17 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
     void onCloudChanged(applyCloudStatus).then((u) => { un = u; }).catch(() => {});
     return () => { un?.(); };
   }, []);
+
+  /* 协议接管开关：立即写/删注册表项，不随「保存」提交；失败时回读真实状态 */
+  const toggleAccessClientTakeover = async (next: boolean): Promise<void> => {
+    setAccTakeoverErr('');
+    try {
+      setAccTakeover(await ssoSetAccessClientTakeover(next));
+    } catch (err) {
+      setAccTakeoverErr(String(err));
+      void ssoAccessClientTakeover().then(setAccTakeover).catch(() => {});
+    }
+  };
 
   /* Workspace 浏览…：真实目录选择 */
   const browseWorkspace = async (): Promise<void> => {
@@ -784,6 +812,70 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
             <div className="form-actions">
               <button className="btn primary" onClick={() => void save()}>保存</button>
             </div>
+          </section>
+          )}
+          {page === 'bastion' && (
+          <section id="panel-bastion" className="settings-panel">
+            <div className="panel-head"><div className="panel-title">堡垒机客户端接管</div></div>
+            <div className="hint bastion-intro">
+              部分堡垒机只在 Web 页面提供入口，靠厂商客户端拉起本地 SSH/SFTP 工具。开启对应厂商的接管后，
+              在堡垒机页面点击连接会直接由 AIShell 打开终端或文件管理器；临时会话只在本次运行有效，
+              AI 助手可通过它执行命令与传输文件。关闭接管会回落到厂商客户端。
+            </div>
+            <div className="vendor-list">
+              <div className="vendor-card">
+                <div className="vendor-logo">
+                  <img src={qizhiLogoUrl} alt="齐治科技" />
+                </div>
+                <div className="vendor-main">
+                  <div className="vendor-title">
+                    齐治科技 AccessClient
+                    <span className="vendor-badge">accessclient://</span>
+                  </div>
+                  <div className="vendor-desc">
+                    接管 Web 堡垒机的 accessclient:// 协议（用户级 HKCU 覆盖，无需管理员）。
+                    支持 SSH 与 SFTP 载荷；仅 Windows 生效，关闭后回落到已安装的 AccessClient。
+                  </div>
+                  <div className={`mcp-status-line${accTakeover ? ' ok' : ''}`}>
+                    {accTakeover === null
+                      ? '正在读取接管状态…'
+                      : accTakeover
+                        ? '已接管：堡垒机页面的连接将直接打开 AIShell'
+                        : '未接管：打开右侧开关启用'}
+                  </div>
+                  {accTakeoverErr && <div className="mcp-status-line err">{accTakeoverErr}</div>}
+                </div>
+                <div className="vendor-actions">
+                  <label className="vendor-toggle" title="写入/删除当前用户的 accessclient:// 协议覆盖">
+                    <input
+                      id="f-access-client-takeover"
+                      type="checkbox"
+                      checked={accTakeover ?? false}
+                      disabled={accTakeover === null}
+                      onChange={(e) => { const checked = e.currentTarget.checked; void toggleAccessClientTakeover(checked); }}
+                    />
+                    <span>{accTakeover ? '已接管' : '接管'}</span>
+                  </label>
+                </div>
+              </div>
+
+              <div className="vendor-card">
+                <div className="vendor-logo generic"><Icon name="link" /></div>
+                <div className="vendor-main">
+                  <div className="vendor-title">
+                    xshell_agent 类客户端
+                    <span className="vendor-badge muted">手工配置</span>
+                  </div>
+                  <div className="vendor-desc">
+                    厂商 SSO 客户端读取 db_path.ini 的客户端路径，并以
+                    <code> -url ssh://… </code>
+                    拉起本地工具。目前需手工把 db_path.ini 的 xshell= 指向 AIShell 可执行文件，
+                    配置后由 AIShell 直接接管该 URL。
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="vendor-footnote">后续对接的堡垒机厂商会陆续出现在这里。</div>
           </section>
           )}
           {page === 'api' && (

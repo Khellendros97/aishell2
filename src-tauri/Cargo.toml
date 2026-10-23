@@ -21,6 +21,8 @@ tauri-build = { version = "2", features = [] }
 # 内置浏览器 localhtml 自定义协议（本地 HTML 文件加载）：协议响应类型 + 路径百分号解码
 http = "1"
 percent-encoding = "2"
+# 堡垒机 SSO 客户端以 `-url ssh://user:一次性密码@host:port` 拉起 AIShell：严格解析 URL
+url = "2"
 # devtools: release 安装版也保留 F12 开发者工具，便于现场排查（如 pi 资源布局问题）
 # unstable: 主窗口内嵌子 webview（内置浏览器面板）所需 —— tauri 2.11 的
 #   WebviewBuilder / Window::add_child 均受该 feature 门控
@@ -38,6 +40,9 @@ tauri = { version = "2", default-features = false, features = [
   "dbus",
 ] }
 tauri-plugin-opener = "2"
+# 单实例：堡垒机 SSO 客户端每次登录都会启动一个 AIShell 进程，已有实例时把
+# `-url` 参数转发给运行中的实例，避免开第二个窗口/丢会话
+tauri-plugin-single-instance = "2"
 # 客户端自动更新（update.rs）：下载/验签/安装走 updater plugin；端点与 target 运行期注入，
 # 公钥固化在 tauri.conf.json plugins.updater.pubkey（CLI 要求 createUpdaterArtifacts 时必须存在）
 tauri-plugin-updater = "2"
@@ -56,6 +61,8 @@ tauri-plugin-dialog = "2.7.2"
 # 直接用 WinRT toast——不用 tauri-plugin-notification：其 JS 发送走 WebView2 Web Notification
 # 重复通知被吞，Rust 命令又接不到 on_activated（无法点击聚焦），未注册 AUMID 还回退 PowerShell 图标）
 base64 = "0.22"
+# 齐治 AccessClient 的 accessclient:// 载荷 = base64(zlib(JSON))，需自行解压
+flate2 = "1"
 # 智能审批：直连 LLM API 判定操作是否危险（不走 pi）；
 # multipart：用户反馈附件上传（POST /api/feedback，multipart/form-data）
 reqwest = { version = "0.12", features = ["json", "multipart"] }
@@ -95,6 +102,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows = { version = "0.61", features = ["Win32_Foundation"] }
+# 堡垒机协议接管：HKCU\Software\Classes\accessclient 用户级覆盖（无需管理员）
+winreg = "0.55"
 tauri-winrt-notification = "0.7"
 
 # 离线 vendor：hyper 的 server feature 依赖 crates.io 的 httpdate，构建环境无外网时

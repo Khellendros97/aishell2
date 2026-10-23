@@ -1,7 +1,8 @@
 //! SFTP 文件管理 —— sftp_home / sftp_list / sftp_stat / sftp_read / sftp_write / sftp_upload /
 //! sftp_download / sftp_rename / sftp_copy / sftp_delete。
-//! 连接一律经 ssh::SshManager::open_sftp 获取（连接复用由 SshManager 负责）；
-//! SftpSession 每次命令新建、用完即弃。目录递归在后端完成，重名自动 `name (1).ext`。
+//! 连接与 SFTP channel 一律经 ssh::SshManager::open_sftp 获取：按 serverId 复用同一个
+//! SftpSession（堡垒机网关常限制一条连接只允许一个会话通道，不能每命令新开 channel）。
+//! 目录递归在后端完成，重名自动 `name (1).ext`。
 //! FsEntry / FsStat 复用 fsops 同名结构（serde camelCase，与 src/types.ts 对齐）；
 //! 权限修改（chmod）不提供后端命令，由前端经迷你终端 autoRun 执行（见 mini-term.ts 契约）。
 

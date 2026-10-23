@@ -23,6 +23,8 @@ export interface Tab {
   icon: IconName;
   data: TabData;
   onClose: ((tab: Tab) => void) | null;
+  /** 用户主动关闭前的确认（返回 false 取消关闭）；工作台销毁/换项目的批量 close 不触发 */
+  confirmClose: (() => boolean | Promise<boolean>) | null;
 }
 
 export interface OpenTabOptions {
@@ -31,6 +33,7 @@ export interface OpenTabOptions {
   title: string;
   data?: TabData;
   onClose?: ((tab: Tab) => void) | null;
+  confirmClose?: (() => boolean | Promise<boolean>) | null;
   activate?: boolean;
 }
 
@@ -104,7 +107,10 @@ interface WorkbenchState {
   /** 左侧功能面板(sidebar)是否折叠隐藏(折叠时仅保留 activity-bar 图标栏) */
   sidebarCollapsed: boolean;
   openTab(options: OpenTabOptions): Tab | null;
+  /** 直接关闭（跳确认）：仅用于工作台销毁/换项目等非用户主动路径 */
   closeTab(id: string): void;
+  /** 用户主动关闭入口：先走 tab.confirmClose（如有），确认后才真正关闭 */
+  requestCloseTab(id: string): Promise<void>;
   activateTab(id: string): void;
   setTabTitle(id: string, title: string): void;
   /** 拖拽排序:把 id 标签移到 toIndex(最终数组下标,自动钳制);仅调整顺序,
@@ -170,7 +176,7 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
   aiVisible: true,
   sidebarCollapsed: false,
 
-  openTab({ id, type, title, data = {}, onClose = null, activate = true }) {
+  openTab({ id, type, title, data = {}, onClose = null, confirmClose = null, activate = true }) {
     const s = get();
     const existing = s.tabs.find((t) => t.id === id);
     if (existing) {
@@ -183,7 +189,7 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
     const finalTitle = type === 'terminal' || type === 'sftp'
       ? uniqueTabTitle(title, s.tabs, type)
       : title;
-    const tab: Tab = { id, type, title: finalTitle, icon: TYPE_ICONS[type] ?? 'file', data, onClose };
+    const tab: Tab = { id, type, title: finalTitle, icon: TYPE_ICONS[type] ?? 'file', data, onClose, confirmClose };
     set({
       tabs: [...s.tabs, tab],
       activeId: activate || s.tabs.length === 0 ? id : s.activeId,
@@ -205,6 +211,21 @@ export const useWorkbench = create<WorkbenchState>((set, get) => ({
       nextActive = next ? next.id : null;
     }
     set({ tabs: rest, activeId: nextActive });
+  },
+
+  async requestCloseTab(id) {
+    const tab = get().tabs.find((t) => t.id === id);
+    if (!tab) return;
+    if (tab.confirmClose) {
+      let ok = false;
+      try {
+        ok = await tab.confirmClose();
+      } catch {
+        ok = false;
+      }
+      if (!ok) return;
+    }
+    get().closeTab(id);
   },
 
   activateTab(id) {

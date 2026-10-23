@@ -2084,6 +2084,13 @@ fn compute_approval_impact(
         "run_command" => {
             let command = strf("command");
             let server_id = strf("serverId");
+            // 临时会话：cwd 无法远程解析（终端 shell 当前目录），审批按 "/" 估算影响，
+            // 指纹里固定用空串，执行阶段也传空串（沿用 shell cwd），两边必须一致。
+            if actions.is_ephemeral_server(&server_id) {
+                let cwd = entry.cwd.clone().unwrap_or_default();
+                let base = if cwd.is_empty() { "/" } else { cwd.as_str() };
+                return (Some(analyze_remote_command(&command, base)), Some(cwd));
+            }
             let cwd = match &entry.cwd {
                 Some(c) => Some(c.clone()),
                 None => runtime
@@ -2226,6 +2233,7 @@ async fn run_internal_action(
     let result = match action {
         "list_servers" => actions
             .list_servers(project_id)
+            .await
             .map(|text| json!({"ok": true, "text": text})),
         "notes_list" => Ok(match (store.notes_root(), crate::notes::notes_listing(store)) {
             (Ok(root), Ok(l)) => json!({"ok": true, "text": format_notes_listing(&root, &l)}),
@@ -2649,6 +2657,22 @@ async fn resolve_exec_plan(
             )
         }
     };
+    // 临时会话：不解析远程 home（没有 SFTP channel 会失败），与审批阶段保持 cwd 空串
+    if actions.is_ephemeral_server(&sid) {
+        let (cwd, plan) = match entry {
+            Some(e) if e.tool == "run_command" => {
+                let cwd = e.cwd.clone().unwrap_or_default();
+                let base = if cwd.is_empty() { "/" } else { cwd.as_str() };
+                let plan = e
+                    .plan
+                    .clone()
+                    .unwrap_or_else(|| analyze_remote_command(command, base));
+                (cwd, plan)
+            }
+            _ => (String::new(), analyze_remote_command(command, "/")),
+        };
+        return (Ok(cwd), Ok(plan));
+    }
     match entry {
         Some(e) if e.tool == "run_command" => {
             let cwd = match &e.cwd {
@@ -2701,6 +2725,9 @@ fn assemble_command_text(store: &Arc<Store>, r: crate::ai_actions::CommandResult
         text.push_str(&format!(
             "\n[AIShell：输出含 {redacted} 处凭据，已脱敏；如需凭据请用户手动操作]"
         ));
+    }
+    if let Some(note) = &r.note {
+        text.push_str(&format!("\n[AIShell：{note}]"));
     }
     if text.len() > MAX_RESULT_CHARS {
         text.truncate(MAX_RESULT_CHARS);

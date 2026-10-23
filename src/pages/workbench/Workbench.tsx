@@ -306,7 +306,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
         'sep',
       );
     }
-    items.push({ label: '关闭标签', iconName: 'x', action: () => useWorkbench.getState().closeTab(tab.id) });
+    items.push({ label: '关闭标签', iconName: 'x', action: () => void useWorkbench.getState().requestCloseTab(tab.id) });
     showContextMenu(e.clientX, e.clientY, items);
   };
 
@@ -408,7 +408,7 @@ export default function Workbench({ active, targetParam, onReady, onFail }: Work
               >
                 <span className="tab-icon"><Icon name={t.icon} /></span>
                 <span className="tab-title">{t.title}</span>
-                <button className="tab-close" title="关闭" onClick={() => useWorkbench.getState().closeTab(t.id)}><Icon name="x" /></button>
+                <button className="tab-close" title="关闭" onClick={() => void useWorkbench.getState().requestCloseTab(t.id)}><Icon name="x" /></button>
               </div>
             ))}
           </div>

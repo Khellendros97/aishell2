@@ -95,6 +95,31 @@ pub struct CommandResult {
     pub exit_code: Option<i32>,
     /// 整体执行是否触发调用方设置的超时。
     pub timed_out: bool,
+    /// 执行路径附带的提示（如临时会话跳过自动备份）；无则不下发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// 按资源合并后的临时会话（AI 列表条目）。
+struct EphemeralGroup {
+    server_id: String,
+    title: String,
+    host: String,
+    port: u16,
+    username: String,
+    has_terminal: bool,
+    has_sftp: bool,
+}
+
+impl EphemeralGroup {
+    fn channels(&self) -> &'static str {
+        match (self.has_terminal, self.has_sftp) {
+            (true, true) => "终端可用、文件可用",
+            (true, false) => "终端可用（文件操作需先打开 SFTP）",
+            (false, true) => "文件可用（执行命令需先打开终端）",
+            (false, false) => "无活跃通道（请先打开终端或 SFTP）",
+        }
+    }
 }
 
 /// AI 动作执行器（由 AiManager 持有并复用 Store + SshManager + RemoteStaging + BrowserManager）。
@@ -210,19 +235,46 @@ impl AiActions {
                 let sid = server_id.ok_or_else(|| "远程目标必须提供 serverId".to_string())?;
                 self.ensure_ai_allowed(&sid)?;
                 self.ssh.bind_project(&sid, project_id).await;
-                // 有效工作目录：调用方解析结果优先（与审批分析同源），否则现取
-                let effective_cwd = match &working_directory {
-                    Some(c) if c.starts_with('/') => c.clone(),
+                // 临时会话（堡垒机 SSO）：命令只能注入用户已打开的终端 shell，不新开 channel
+                let ephemeral = self.ssh.is_ephemeral(&sid);
+                // 有效工作目录：显式值优先；普通服务器取 home；临时会话退回 shell 当前目录
+                let effective_cwd: Option<String> = match &working_directory {
+                    // 审批阶段临时会话无法解析 cwd，传空串表示「沿用 shell 当前目录」
+                    Some(c) if c.trim().is_empty() => {
+                        if ephemeral {
+                            None
+                        } else {
+                            return Err("工作目录必须是绝对路径".to_string());
+                        }
+                    }
+                    Some(c) if c.starts_with('/') => Some(c.clone()),
                     Some(_) => return Err("工作目录必须是绝对路径".to_string()),
-                    None => self.remote_home(&sid).await?,
+                    None if ephemeral => None,
+                    None => Some(self.remote_home(&sid).await?),
                 };
+                let plan_cwd = effective_cwd.clone().unwrap_or_else(|| "/".to_string());
                 let auto_backup = self.staging.auto_backup_enabled();
                 let plan = match impact {
                     Some(p) => p,
-                    None => analyze_remote_command(&command, &effective_cwd),
+                    None => analyze_remote_command(&command, &plan_cwd),
                 };
-                // 自动备份：bounded → 执行前逐文件快照（任一失败即阻止执行）
-                if auto_backup && plan.effect == Effect::Bounded {
+                let mut note: Option<String> = None;
+                let want_backup = auto_backup && plan.effect == Effect::Bounded;
+                // 临时会话的备份必须复用同资源的 SFTP channel；没有就跳过并提示
+                let do_backup = if want_backup {
+                    if ephemeral && !self.ssh.has_sftp_for(&sid).await {
+                        note = Some(
+                            "临时会话未打开 SFTP，已跳过自动备份（如需备份，请先打开该资源的 SFTP 标签）"
+                                .to_string(),
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
+                if do_backup {
                     let mut paths: Vec<&str> = Vec::new();
                     for c in &plan.changes {
                         if !paths.contains(&c.path.as_str()) {
@@ -240,19 +292,34 @@ impl AiActions {
                             .await?;
                     }
                 }
-                // 用同一绝对 cwd 包装命令（保证分析路径与实际执行环境一致）
-                let wrapped = format!("cd {} && {}", shell_quote(&effective_cwd), command);
                 // 超时转 Err（与本地执行一致以错误返回；自动备份刷新据此跳过）
-                let result = match self.ssh.exec_with_timeout(&sid, &wrapped, timeout).await {
-                    Ok(r) if r.timed_out => Err(format!(
-                        "命令执行超时（{} 秒），已尝试终止远端命令",
-                        timeout.as_secs()
-                    )),
-                    other => other,
+                let result = if ephemeral {
+                    match self
+                        .ssh
+                        .exec_in_shell(&sid, &command, effective_cwd.as_deref(), timeout)
+                        .await
+                    {
+                        Ok(r) if r.timed_out => Err(format!(
+                            "命令执行超时（{} 秒），已尝试终止远端命令",
+                            timeout.as_secs()
+                        )),
+                        other => other,
+                    }
+                } else {
+                    // 用同一绝对 cwd 包装命令（保证分析路径与实际执行环境一致）
+                    let cwd = effective_cwd.as_deref().unwrap_or("/");
+                    let wrapped = format!("cd {} && {}", shell_quote(cwd), command);
+                    match self.ssh.exec_with_timeout(&sid, &wrapped, timeout).await {
+                        Ok(r) if r.timed_out => Err(format!(
+                            "命令执行超时（{} 秒），已尝试终止远端命令",
+                            timeout.as_secs()
+                        )),
+                        other => other,
+                    }
                 };
                 // 执行后刷新 current 状态（best-effort：刷新失败不掩盖命令结果）
                 if let Ok(_result) = &result {
-                    if auto_backup && plan.effect == Effect::Bounded {
+                    if do_backup {
                         for c in &plan.changes {
                             let _ = self
                                 .staging
@@ -267,10 +334,19 @@ impl AiActions {
                         }
                     }
                 }
+                let mut result = result;
+                if let (Ok(r), Some(note)) = (&mut result, note) {
+                    r.note = Some(note);
+                }
                 result
             }
             other => Err(format!("未知命令目标：{other}")),
         }
+    }
+
+    /// 是否为堡垒机一次性临时会话（命令需走前台终端、cwd 不能远程解析）。
+    pub(crate) fn is_ephemeral_server(&self, server_id: &str) -> bool {
+        self.ssh.is_ephemeral(server_id)
     }
 
     /// 服务器显示名（时间线 run_command 目标标记等只读用途，同步查询不涉网络）。
@@ -1066,14 +1142,15 @@ impl AiActions {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             exit_code: out.status.code(),
             timed_out: false,
+            note: None,
         })
     }
 
     // ---------------------------------------------------------------- py SDK 桥方法（pysdk.rs 一次性通道的 dispatcher 调用）
 
-    /// SDK 通道的服务器清单（结构化 JSON）：项目绑定的服务器 + 锁定状态。
+    /// SDK 通道的服务器清单（结构化 JSON）：项目绑定的服务器 + 锁定状态 + 临时会话。
     /// 与 list_servers 文本版同事实源；凭据永不出 keyring，这里只暴露连接元数据。
-    pub fn sdk_list_servers(&self, project_id: &str) -> Result<serde_json::Value, String> {
+    pub async fn sdk_list_servers(&self, project_id: &str) -> Result<serde_json::Value, String> {
         let project = self
             .store
             .project(project_id)
@@ -1091,7 +1168,64 @@ impl AiActions {
                 }));
             }
         }
+        for g in self.ephemeral_groups(project_id).await {
+            out.push(json!({
+                "id": g.server_id,
+                "name": g.title,
+                "host": g.host,
+                "port": g.port,
+                "username": g.username,
+                "locked": false,
+                "ephemeral": true,
+                "hasTerminal": g.has_terminal,
+                "hasSftp": g.has_sftp,
+            }));
+        }
         Ok(serde_json::Value::Array(out))
+    }
+
+    /// 临时会话按资源（host:port+用户）合并：AI 列表与卡片共用同一分组规则。
+    /// 返回的 server_id 是「命令优先终端、文件优先 SFTP」的规范 id。
+    async fn ephemeral_groups(&self, project_id: &str) -> Vec<EphemeralGroup> {
+        let infos = self.ssh.ephemeral_infos().await;
+        let mut groups: std::collections::HashMap<(String, u16, String), Vec<&crate::ssh::SsoSessionInfo>> =
+            std::collections::HashMap::new();
+        for info in infos
+            .iter()
+            .filter(|s| s.project_id.as_deref() == Some(project_id))
+        {
+            groups
+                .entry((info.host.clone(), info.port, info.username.clone()))
+                .or_default()
+                .push(info);
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for (_, mut sessions) in groups {
+            sessions.sort_by_key(|s| s.seq);
+            let latest = *sessions.last().expect("group non-empty");
+            let terminal = sessions
+                .iter()
+                .filter(|s| s.has_terminal)
+                .max_by_key(|s| s.seq)
+                .copied();
+            let sftp = sessions
+                .iter()
+                .filter(|s| s.has_sftp)
+                .max_by_key(|s| s.seq)
+                .copied();
+            let canonical = terminal.or(sftp).unwrap_or(latest);
+            out.push(EphemeralGroup {
+                server_id: canonical.server_id.clone(),
+                title: latest.title.clone(),
+                host: canonical.host.clone(),
+                port: canonical.port,
+                username: canonical.username.clone(),
+                has_terminal: terminal.is_some(),
+                has_sftp: sftp.is_some(),
+            });
+        }
+        out.sort_by(|a, b| b.server_id.cmp(&a.server_id));
+        out
     }
 
     /// SDK 通道的数据库连接清单（仅启用中；凭据不返回）。
@@ -1131,7 +1265,11 @@ impl AiActions {
             return Err("命令不能为空".to_string());
         }
         let timeout = command_timeout(timeout_seconds)?;
-        let r = self.ssh.exec_with_timeout(server_id, command, timeout).await?;
+        let r = if self.ssh.is_ephemeral(server_id) {
+            self.ssh.exec_in_shell(server_id, command, None, timeout).await?
+        } else {
+            self.ssh.exec_with_timeout(server_id, command, timeout).await?
+        };
         Ok(self.redact_result(r))
     }
 
@@ -1820,8 +1958,8 @@ impl AiActions {
     }
 
     /// 查询项目绑定的可操作服务器列表（只读；供 LLM 在远程动作前确认 serverId）。
-    /// 输出含锁定状态标注；不返回密钥/密钥路径等敏感字段。
-    pub fn list_servers(&self, project_id: &str) -> Result<String, String> {
+    /// 输出含锁定状态标注与按资源合并的临时会话；不返回密钥/密钥路径等敏感字段。
+    pub async fn list_servers(&self, project_id: &str) -> Result<String, String> {
         let project = self
             .store
             .project(project_id)
@@ -1875,14 +2013,37 @@ impl AiActions {
                 }
             }
         }
-        if lines.is_empty() {
+        let persisted = lines.len();
+        let groups = self.ephemeral_groups(project_id).await;
+        let mut text = String::new();
+        if persisted > 0 {
+            text.push_str(&format!(
+                "项目绑定服务器（{} 台）：\n{}\n",
+                persisted,
+                lines.join("\n")
+            ));
+        }
+        if !groups.is_empty() {
+            text.push_str(&format!(
+                "临时会话（堡垒机 SSO，仅本进程有效，{} 台）：\n",
+                groups.len()
+            ));
+            for g in &groups {
+                text.push_str(&format!(
+                    "- serverId={}，名称={}，地址={}:{}，用户={}，认证=一次性 SSO，通道={}\n",
+                    g.server_id,
+                    g.title,
+                    g.host,
+                    g.port,
+                    g.username,
+                    g.channels()
+                ));
+            }
+            text.push_str("  - 说明：命令经 AIShell 当前已打开的终端执行（run_command 没有终端会失败）；文件操作与自动备份需要已打开 SFTP；同一资源只需使用上面这个 serverId。\n");
+        }
+        if text.is_empty() {
             return Ok("项目未绑定任何远程服务器".to_string());
         }
-        let mut text = format!(
-            "项目绑定服务器（{} 台）：\n{}",
-            lines.len(),
-            lines.join("\n")
-        );
         text.push_str("\n提示：远程 run_command / sftp_upload / sftp_download 请使用上述 serverId；锁定服务器会返回「已锁定」错误。数据库查询用 db_query，connectionId 取上述「数据库连接」条目中的 connectionId。");
         Ok(text)
     }
@@ -1968,7 +2129,14 @@ impl AiActions {
                 &[],
             ),
         };
-        self.ssh.exec(&server_id, &command).await
+        if self.ssh.is_ephemeral(&server_id) {
+            // 临时会话没有额外 channel：DB 客户端命令同样注入前台终端执行
+            self.ssh
+                .exec_in_shell(&server_id, &command, None, std::time::Duration::from_secs(60))
+                .await
+        } else {
+            self.ssh.exec(&server_id, &command).await
+        }
     }
 
     /* ---------- 内部 ---------- */
@@ -2038,16 +2206,21 @@ impl AiActions {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             exit_code: out.status.code(),
             timed_out: false,
+            note: None,
         })
     }
 
     /// 远程动作前的锁检查（只放本模块入口）。
     /// pub(crate)：pysdk.rs 的 SDK 桥 dispatcher 复用同一锁语义。
     pub(crate) fn ensure_ai_allowed(&self, server_id: &str) -> Result<(), String> {
+        // 堡垒机一次性临时会话不在 Store：存在即放行（临时会话没有锁定配置）。
+        if self.ssh.is_ephemeral(server_id) {
+            return Ok(());
+        }
         let server = self
             .store
             .server(server_id)
-            .ok_or_else(|| format!("服务器不存在：{server_id}"))?;
+            .ok_or_else(|| format!("服务器不存在或临时会话已失效：{server_id}"))?;
         if server.locked {
             return Err(format!(
                 "服务器「{}」已锁定，AI 无权执行远程操作",
@@ -2856,8 +3029,8 @@ mod tests {
         assert!(err4.unwrap_err().contains("已禁用"));
     }
 
-    #[test]
-    fn list_servers_reports_binding_and_lock_status() {
+    #[tokio::test]
+    async fn list_servers_reports_binding_and_lock_status() {
         let dir = std::env::temp_dir().join(format!(
             "aishell-ai-actions-list-servers-{}",
             std::process::id()
@@ -2936,7 +3109,7 @@ mod tests {
 
         let store = Arc::new(store);
         let actions = test_actions(Arc::clone(&store));
-        let text = actions.list_servers("proj-x").unwrap();
+        let text = actions.list_servers("proj-x").await.unwrap();
         assert!(text.contains("serverId=srv-a"), "应列出绑定服务器: {text}");
         assert!(text.contains("生产机"));
         assert!(text.contains("10.0.0.1:22"));
@@ -2952,7 +3125,7 @@ mod tests {
         );
         assert!(!text.contains("C:\\key"), "不得泄露密钥路径: {text}");
         // 项目不存在 → 中文错误
-        let err = actions.list_servers("proj-missing").unwrap_err();
+        let err = actions.list_servers("proj-missing").await.unwrap_err();
         assert!(
             err.contains("项目不存在：proj-missing"),
             "错误串不符: {err}"
@@ -2969,8 +3142,62 @@ mod tests {
                 ai_mode: crate::store::AiMode::Suggest,
             })
             .unwrap();
-        let text = actions.list_servers("proj-empty").unwrap();
+        let text = actions.list_servers("proj-empty").await.unwrap();
         assert!(text.contains("项目未绑定任何远程服务器"), "实际: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_servers_includes_ephemeral_sessions_and_allows_ai() {
+        let dir = std::env::temp_dir().join(format!(
+            "aishell-ai-actions-ephemeral-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::store::test_store(dir.clone());
+        store
+            .upsert_project(crate::store::Project {
+                id: "proj-e".to_string(),
+                name: "E".to_string(),
+                path: None,
+                server_ids: vec![],
+                quick_commands: vec![],
+                folder: String::new(),
+                ai_mode: crate::store::AiMode::Agent,
+            })
+            .unwrap();
+        let store = Arc::new(store);
+        let actions = test_actions(Arc::clone(&store));
+        actions
+            .ssh
+            .add_ephemeral(
+                crate::store::Server {
+                    id: "sso-abc".to_string(),
+                    name: "root@demo".to_string(),
+                    host: "10.0.0.9".to_string(),
+                    port: 22,
+                    auth_type: crate::store::AuthType::Password,
+                    username: "demo".to_string(),
+                    key_path: String::new(),
+                    credential_id: None,
+                    locked: false,
+                    is_bastion: false,
+                    bastion_id: None,
+                    tags: Vec::new(),
+                },
+                zeroize::Zeroizing::new("otp".to_string()),
+                crate::ssh::SsoKind::Ssh,
+            )
+            .unwrap();
+        actions.ssh.bind_project("sso-abc", "proj-e").await;
+
+        let text = actions.list_servers("proj-e").await.unwrap();
+        assert!(text.contains("临时会话"), "应有临时会话段: {text}");
+        assert!(text.contains("serverId=sso-abc"), "{text}");
+        assert!(text.contains("无活跃通道"), "未开终端应标无通道: {text}");
+        // 临时会话存在即允许 AI 操作（无锁定配置）；失效 id 仍拒绝
+        assert!(actions.ensure_ai_allowed("sso-abc").is_ok());
+        assert!(actions.ensure_ai_allowed("sso-missing").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

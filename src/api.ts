@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, DashboardSpec, DashboardRender, AiWindowChangedEvent, AiRepairReport, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, PcapReadOut, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerCredentialDeleteResult, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, DashboardSpec, DashboardRender, AiWindowChangedEvent, AiRepairReport, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, PcapReadOut, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerCredentialDeleteResult, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SsoOpen, SsoPending, SsoSessionInfo, TermAiBusyEvent, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -25,6 +25,37 @@ export const getTaskProject = () => call<Project>('get_task_project');
 /** Python SDK 成功导入配置后的全局通知。 */
 export const onConfigChanged = (cb: (event: ConfigChanged) => void): Promise<UnlistenFn> =>
   listen<ConfigChanged>('config:changed', (e) => cb(e.payload));
+
+/* ---------------- 堡垒机 Web SSO（sso.rs） ----------------
+   两种厂商客户端：xshell_agent.exe 读取 db_path.ini 的 xshell= 路径并以
+   `AIShell.exe -url ssh://user:一次性密码@host:port` 拉起 AIShell；齐治 AccessClient 用
+   `accessclient://<base64(zlib(JSON))>`，接管后同样由 AIShell 解码。
+   已有实例经 single-instance 转发并 emit sso:open；首启会话由 sso_take_pending 取走。
+   密码只在 Rust 内存，事件/pending payload 不含密码。 */
+export const onSsoOpen = (cb: (p: SsoOpen) => void): Promise<UnlistenFn> =>
+  listen<SsoOpen>('sso:open', (e) => cb(e.payload));
+export const onSsoError = (cb: (message: string) => void): Promise<UnlistenFn> =>
+  listen<string>('sso:error', (e) => cb(e.payload));
+export const ssoTakePending = () => call<SsoPending>('sso_take_pending');
+/** 当前进程内的堡垒机临时会话（服务器列表「临时会话」分组 + 通道状态） */
+export const ssoSessions = () => call<SsoSessionInfo[]>('sso_sessions');
+/** 临时会话的会话/通道状态变化（新增、bind 项目、终端/SFTP 开关、断线） */
+export const onSsoSessionsChanged = (cb: () => void): Promise<UnlistenFn> =>
+  listen<null>('sso:sessions-changed', () => cb());
+/** SFTP 标签关闭时释放临时会话的 SFTP channel（普通服务器忽略） */
+export const sftpRelease = (serverId: string) => call<void>('sftp_release', { serverId });
+/** 停止 AI 注入到某终端 tab 的命令（Ctrl-C） */
+export const termAiCancel = (id: string) => call<void>('term_ai_cancel', { id });
+/** 终端 AI 执行状态（顶部执行条 + 输入锁） */
+export const onTermAiBusy = (
+  id: string,
+  cb: (e: TermAiBusyEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<TermAiBusyEvent>(`term:ai-busy:${id}`, (e) => cb(e.payload));
+/** 齐治 AccessClient 接管：HKCU 用户级覆盖 accessclient:// 协议，无需管理员 */
+export const ssoAccessClientTakeover = () => call<boolean>('sso_access_client_takeover');
+export const ssoSetAccessClientTakeover = (enabled: boolean) =>
+  call<boolean>('sso_set_access_client_takeover', { enabled });
 export const saveSettings = (settings: Settings, apiKey: string | null, braveKey: string | null) =>
   call<void>('save_settings', { settings, apiKey, braveKey });
 /** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */

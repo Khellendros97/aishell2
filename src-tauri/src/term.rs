@@ -22,6 +22,7 @@ use russh::{ChannelMsg, ChannelWriteHalf};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::shell_exec::{AiCapture, AltScreenTracker};
 use crate::ssh::SshManager;
 
 /* ---------------- 事件 payload（字段名与 src/api.ts 一一对应） ---------------- */
@@ -175,6 +176,10 @@ pub fn debug_export(path: String, content: String) -> Result<(), String> {
 pub struct TermHandle {
     backend: TermBackend,
     closed: AtomicBool,
+    /// SSH 终端对应的 serverId（本地终端为 None）：AI 注入/输入锁/注销 shell 注册表用
+    server_id: Option<String>,
+    /// SSH 终端上 AI 命令的捕获槽（与 SshManager.shells 里的同一份）
+    capture: Option<Arc<AiCapture>>,
 }
 
 impl TermHandle {
@@ -476,6 +481,8 @@ impl TermManager {
                 killer,
             },
             closed: AtomicBool::new(false),
+            server_id: None,
+            capture: None,
         });
         self.map
             .lock()
@@ -564,11 +571,25 @@ impl TermManager {
             let _ = write_half.data_bytes(format!("cd {quoted}\r")).await;
         }
 
+        // AI 命令通道：捕获槽与全屏状态由本终端读循环喂数据，SshManager 持有同一份
+        // 引用供 run_command 注入；非 SSO 服务器同样注册，但 AI 只在临时会话走注入。
+        let capture = AiCapture::new();
+        let alt_screen = AltScreenTracker::new();
+        self.ssh.register_shell(
+            server_id,
+            &id,
+            Arc::clone(&write_half),
+            Arc::clone(&capture),
+            Arc::clone(&alt_screen),
+        );
+
         let handle = Arc::new(TermHandle {
             backend: TermBackend::Ssh {
                 write_half: Arc::clone(&write_half),
             },
             closed: AtomicBool::new(false),
+            server_id: Some(server_id.to_string()),
+            capture: Some(Arc::clone(&capture)),
         });
         self.map
             .lock()
@@ -578,6 +599,7 @@ impl TermManager {
         let mgr = Arc::clone(self);
         let app = app.clone();
         let id2 = id.clone();
+        let server_id2 = server_id.to_string();
         tauri::async_runtime::spawn(async move {
             let mut read_half = read_half;
             let mut code: Option<i32> = None;
@@ -601,6 +623,8 @@ impl TermManager {
                         let pkts = std::mem::take(&mut batch_pkts);
                         let bytes = std::mem::take(&mut batch_bytes);
                         diag(&format!("recv id={id2} batch pkts={pkts} len={bytes}"));
+                        capture.feed(&batch);
+                        alt_screen.feed(&batch);
                         mgr.tee_record(&id2, &batch);
                         let r = app.emit(
                             &format!("term:data:{id2}"),
@@ -658,9 +682,14 @@ impl TermManager {
             flush_batch!();
             if !carry.is_empty() {
                 let data = String::from_utf8_lossy(&carry).into_owned();
+                capture.feed(&data);
+                alt_screen.feed(&data);
                 mgr.tee_record(&id2, &data);
                 let _ = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
             }
+            // 通道结束：AI 等待中的命令必须以错误返回，否则 run_command 会挂到超时
+            capture.abort("终端连接已关闭");
+            mgr.ssh.unregister_shell(&server_id2, &id2);
             // 仅当 map 里仍是本句柄才移除：同 id 重连后旧读任务的迟到清理不得误删新句柄
             mgr.map.lock().ok().and_then(|mut m| {
                 if m.get(&id2).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
@@ -684,7 +713,16 @@ impl TermManager {
     }
 
     pub async fn input(&self, id: &str, data: &str) -> Result<(), String> {
+        // AI 正在该终端执行命令时丢弃用户输入（前端同时锁键盘，这里防 paste/竞态）
+        if self.ssh.shell_busy_by_tab(id) {
+            return Ok(());
+        }
         self.handle(id)?.write(data).await
+    }
+
+    /// 停止 AI 在当前终端注入的命令（Ctrl-C + 让等待方立即返回）。
+    pub async fn cancel_ai(&self, id: &str) -> Result<(), String> {
+        self.ssh.cancel_shell_by_tab(id)
     }
 
     pub async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
@@ -698,6 +736,12 @@ impl TermManager {
             map.remove(id)
         };
         if let Some(h) = handle {
+            if let Some(sid) = &h.server_id {
+                if let Some(cap) = &h.capture {
+                    cap.abort("终端已关闭");
+                }
+                self.ssh.unregister_shell(sid, id);
+            }
             h.close().await;
         }
         // 前端 stopRecording 与本命令并发竞态兜底：close 先到时补写异常结束行再落盘
@@ -910,6 +954,14 @@ pub async fn term_input(
     data: String,
 ) -> Result<(), String> {
     manager.input(&id, &data).await
+}
+
+#[tauri::command]
+pub async fn term_ai_cancel(
+    manager: State<'_, Arc<TermManager>>,
+    id: String,
+) -> Result<(), String> {
+    manager.cancel_ai(&id).await
 }
 
 #[tauri::command]

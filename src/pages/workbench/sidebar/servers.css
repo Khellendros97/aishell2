@@ -118,3 +118,19 @@
 .wbs-del-option-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .wbs-del-option-title { font-size: 12.5px; font-weight: 600; color: var(--text-0); }
 .wbs-del-option-desc { font-size: 11px; color: var(--text-2); line-height: 1.55; }
+
+/* ---------- 堡垒机临时会话卡片（按资源合并；SSH/SFTP 只显示通道指示灯） ---------- */
+.wbs-sso-hint { font-size: 10.5px; color: var(--text-3); font-weight: 400; }
+.wbs-sso-list { gap: 8px; }
+.wbs-sso-card { cursor: default; }
+.wbs-sso-status { display: flex; align-items: center; gap: 16px; padding: 2px 2px 0; }
+.wbs-sso-led {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--text-3); user-select: none;
+}
+.wbs-sso-led .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-3); display: inline-block; flex: none;
+}
+.wbs-sso-led.running { color: var(--green, #4bc17c); }
+.wbs-sso-led.running .dot { background: var(--green, #4bc17c); }
