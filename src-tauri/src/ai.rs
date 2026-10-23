@@ -938,7 +938,7 @@ impl AiManager {
                     continue;
                 };
                 // trace：pi 事件流记录（增量类 text_delta/thinking_delta/toolcall_delta 高频刷屏，
-                // 过滤不记——文本由 assistant_output 聚合落盘覆盖，思维链本就只留长度无独立价值）
+                // 过滤不记——文本由 assistant_output 聚合落盘覆盖，思维链仅用于前端临时预览）
                 if !is_trace_flood_event(&ev) {
                     crate::trace::log(&key2, "pi_event", json!({"raw": line.as_str()}));
                 }
@@ -966,6 +966,19 @@ impl AiManager {
                                     let _ = app2.emit(&event, json!({"type": "delta", "text": delta}));
                                 }
                             }
+                            // 思维链增量：仅用于前端「深度思考 n 秒」临时预览（第二行横向滚动），
+                            // 不记 trace、不进 output_buf；正文/工具/回合结束到达后前端即移除。
+                            Some("thinking_delta") => {
+                                if let Some(delta) = ae.get("delta").and_then(serde_json::Value::as_str) {
+                                    if !delta.is_empty() {
+                                        let _ = app2.emit(&event, json!({"type": "thinking", "text": delta}));
+                                    }
+                                }
+                            }
+                            // 思维链结束：通知前端立即移除预览组件（正文开始前的空档显示「正在输入」）
+                            Some("thinking_end") => {
+                                let _ = app2.emit(&event, json!({"type": "thinkingEnd"}));
+                            }
                             // 生成出错（type=error 也在 message_update 信封里）
                             Some("error") => {
                                 if terminal_emitted {
@@ -983,7 +996,7 @@ impl AiManager {
                                 let _ = app2.emit(&event, json!({"type": "error", "message": msg}));
                                 notify_corruption();
                             }
-                            // thinking_delta / toolcall_* 等丢弃
+                            // toolcall_* 等丢弃
                             _ => {}
                         }
                     }
