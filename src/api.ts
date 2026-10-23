@@ -270,6 +270,11 @@ export const onTunnelsChanged = (cb: () => void): Promise<UnlistenFn> =>
  *  - settled：回合以 error 收尾（pi 不补发 done）时的收尾信号，前端据此把已流出的正文定稿落盘。 */
 export type AiEvent =
   | { type: 'delta'; text: string }
+  /** 思维链增量：生成中临时预览（「深度思考 n 秒」+ 横向滚动正文），不进历史；
+   *  正文/工具/回合结束事件到达后前端丢弃该组件 */
+  | { type: 'thinking'; text: string }
+  /** 思维链结束：立即移除预览组件（正文尚未开始的空档回到「正在输入」） */
+  | { type: 'thinkingEnd' }
   | { type: 'tool'; tool: string; label: string }
   | { type: 'segment' }
   | { type: 'done' }
