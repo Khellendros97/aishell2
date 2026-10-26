@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use russh::client;
 use russh::ChannelMsg;
@@ -202,6 +202,8 @@ pub struct SshManager {
     event_sink: StdMutex<Option<EventSink>>,
     ephemeral_seq: AtomicU64,
     shell_seq: AtomicU64,
+    /// 建连诊断序号：同一份日志里区分并发/重试的各次 TCP+KEX+认证。
+    connect_seq: AtomicU64,
 }
 
 /// 转发通道失败的可能原因提示（错误信息追加用；纯函数便于单测）。
@@ -216,14 +218,52 @@ fn tcp_forward_hint(err: &str) -> &'static str {
 }
 
 /// 建连/认证超时：普通服务器 10s（无响应时快速失败）；
-/// 堡垒机 SSO 一次性会话（`sso-` 前缀）放宽到 60s——网关要等到目标侧会话建好才完成
-/// SSH 握手，实测本机到网关约 14s，10s 会稳定误判超时（终端与 SFTP 同一路径）。
+/// 堡垒机 SSO 临时会话（`sso-` 前缀）放宽到 60s，兼容仅支持慢速 DH 的旧网关；
+/// 这是错误兜底而非性能手段，快速路径由 `client_config` 的 ECDH 优先顺序提供。
 fn link_timeout(server: &store::Server) -> Duration {
     if server.id.starts_with("sso-") {
         Duration::from_secs(60)
     } else {
         Duration::from_secs(10)
     }
+}
+
+/// russh 默认候选不含 ECDH，部分堡垒机因此退到慢速 DH-GEX（实测单次超过 20s）。
+/// 保留默认顺序，仅在首个 DH-GEX 前插入 NIST ECDH：Curve25519 仍优先，DH 回退不变。
+fn client_config() -> client::Config {
+    let mut config = client::Config::default();
+    let mut kex = config.preferred.kex.to_vec();
+    let insert_at = kex
+        .iter()
+        .position(|name| {
+            *name == russh::kex::DH_GEX_SHA256 || *name == russh::kex::DH_GEX_SHA1
+        })
+        .unwrap_or(kex.len());
+    kex.splice(
+        insert_at..insert_at,
+        [
+            russh::kex::ECDH_SHA2_NISTP256,
+            russh::kex::ECDH_SHA2_NISTP384,
+            russh::kex::ECDH_SHA2_NISTP521,
+        ],
+    );
+    config.preferred.kex = kex.into();
+    config
+}
+
+/// SSH 建连/通道诊断：记录 serverId、阶段、耗时与错误；不写 URL、密码或会话内容。
+fn ssh_diag(server_id: &str, stage: &str, detail: impl std::fmt::Display) {
+    crate::term::diag(&format!("[ssh] server={server_id} stage={stage} {detail}"));
+}
+
+fn connect_diag(server_id: &str, attempt: u64, stage: &str, detail: impl std::fmt::Display) {
+    crate::term::diag(&format!(
+        "[ssh] conn={attempt} server={server_id} stage={stage} {detail}"
+    ));
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
 }
 
 impl SshManager {
@@ -238,6 +278,7 @@ impl SshManager {
             event_sink: StdMutex::new(None),
             ephemeral_seq: AtomicU64::new(1),
             shell_seq: AtomicU64::new(1),
+            connect_seq: AtomicU64::new(1),
         }
     }
 
@@ -616,8 +657,10 @@ impl SshManager {
         password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
         if let Some(handle) = self.live_handle(server_id).await {
+            ssh_diag(server_id, "pool", "hit");
             return Ok(handle);
         }
+        ssh_diag(server_id, "pool", "miss");
         // 一次性 SSO 服务器不在 Store 中：从内存表取服务器与密码。
         // 密码覆盖只在本函数内使用，连接建立后随 Zeroizing 释放。
         let mut password_override: Option<Zeroizing<String>> =
@@ -684,24 +727,91 @@ impl SshManager {
         cols: u16,
         rows: u16,
     ) -> Result<russh::Channel<russh::client::Msg>, String> {
+        let started = Instant::now();
+        ssh_diag(server_id, "shell", "start");
+        let result = self.open_shell_inner(server_id, cols, rows).await;
+        match &result {
+            Ok(_) => ssh_diag(
+                server_id,
+                "shell",
+                format!("ok total_ms={}", elapsed_ms(started)),
+            ),
+            Err(e) => ssh_diag(
+                server_id,
+                "shell",
+                format!("error total_ms={} error={e}", elapsed_ms(started)),
+            ),
+        }
+        result
+    }
+
+    async fn open_shell_inner(
+        self: &Arc<Self>,
+        server_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<russh::Channel<russh::client::Msg>, String> {
         let handle = self.get_or_connect(server_id).await?;
+        let stage = Instant::now();
+        ssh_diag(server_id, "channel_open", "start");
         let channel = handle
             .channel_open_session()
             .await
             .map_err(|e| format!("打开服务器会话通道失败：{e}"))?;
+        ssh_diag(
+            server_id,
+            "channel_open",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
+        );
+        let stage = Instant::now();
+        ssh_diag(server_id, "pty", "start");
         channel
             .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
             .await
             .map_err(|e| format!("申请远程 PTY 失败：{e}"))?;
+        ssh_diag(
+            server_id,
+            "pty",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
+        );
+        let stage = Instant::now();
+        ssh_diag(server_id, "shell_start", "start");
         channel
             .request_shell(true)
             .await
             .map_err(|e| format!("启动远程 shell 失败：{e}"))?;
+        ssh_diag(
+            server_id,
+            "shell_start",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
+        );
         Ok(channel)
     }
 
     /// 打开（或复用）连接并在其上建立 SFTP 会话。
     pub async fn open_sftp(
+        self: &Arc<Self>,
+        server_id: &str,
+    ) -> Result<Arc<russh_sftp::client::SftpSession>, String> {
+        let started = Instant::now();
+        ssh_diag(server_id, "sftp", "start");
+        let result = self.open_sftp_inner(server_id).await;
+        match &result {
+            Ok(_) => ssh_diag(
+                server_id,
+                "sftp",
+                format!("ok total_ms={}", elapsed_ms(started)),
+            ),
+            Err(e) => ssh_diag(
+                server_id,
+                "sftp",
+                format!("error total_ms={} error={e}", elapsed_ms(started)),
+            ),
+        }
+        result
+    }
+
+    async fn open_sftp_inner(
         self: &Arc<Self>,
         server_id: &str,
     ) -> Result<Arc<russh_sftp::client::SftpSession>, String> {
@@ -712,6 +822,7 @@ impl SshManager {
             let cached = self.sftp.lock().await.get(server_id).cloned();
             if let Some(session) = cached {
                 if self.live_handle(server_id).await.is_some() {
+                    ssh_diag(server_id, "sftp_cache", "hit=own");
                     return Ok(session);
                 }
                 // 底层连接已断开：丢弃缓存，按新连接重建
@@ -723,6 +834,7 @@ impl SshManager {
                 let cached = self.sftp.lock().await.get(&sibling).cloned();
                 if let Some(session) = cached {
                     if self.live_handle(&sibling).await.is_some() {
+                        ssh_diag(server_id, "sftp_cache", format!("hit=sibling:{sibling}"));
                         return Ok(session);
                     }
                     self.sftp.lock().await.remove(&sibling);
@@ -743,18 +855,39 @@ impl SshManager {
             }
         }
         let handle = self.get_or_connect(server_id).await?;
+        let stage = Instant::now();
+        ssh_diag(server_id, "sftp_channel_open", "start");
         let channel = handle
             .channel_open_session()
             .await
             .map_err(|e| format!("打开服务器会话通道失败：{e}"))?;
+        ssh_diag(
+            server_id,
+            "sftp_channel_open",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
+        );
+        let stage = Instant::now();
+        ssh_diag(server_id, "sftp_subsystem", "start");
         channel
             .request_subsystem(true, "sftp")
             .await
             .map_err(|e| format!("申请 SFTP 子系统失败：{e}"))?;
+        ssh_diag(
+            server_id,
+            "sftp_subsystem",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
+        );
+        let stage = Instant::now();
+        ssh_diag(server_id, "sftp_init", "start");
         let session = Arc::new(
             russh_sftp::client::SftpSession::new(channel.into_stream())
                 .await
                 .map_err(|e| format!("初始化 SFTP 会话失败：{e}"))?,
+        );
+        ssh_diag(
+            server_id,
+            "sftp_init",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
         );
         if !sso {
             return Ok(session);
@@ -867,6 +1000,7 @@ impl SshManager {
 
     /// 断开并清理该 server 的连接（下次操作自动重连）。
     pub async fn disconnect(&self, server_id: &str) {
+        ssh_diag(server_id, "disconnect", "manual");
         let sftp_removed = self.sftp.lock().await.remove(server_id).is_some();
         let handle = self.sessions.lock().await.remove(server_id);
         if sftp_removed || self.is_ephemeral(server_id) {
@@ -968,6 +1102,35 @@ impl SshManager {
         server: &store::Server,
         password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        let attempt = self.connect_seq.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        connect_diag(&server.id, attempt, "connect", "start");
+        let result = self
+            .connect_handle_inner(server, password_override, attempt)
+            .await;
+        match &result {
+            Ok(_) => connect_diag(
+                &server.id,
+                attempt,
+                "connect",
+                format!("ok total_ms={}", elapsed_ms(started)),
+            ),
+            Err(e) => connect_diag(
+                &server.id,
+                attempt,
+                "connect",
+                format!("error total_ms={} error={e}", elapsed_ms(started)),
+            ),
+        }
+        result
+    }
+
+    async fn connect_handle_inner(
+        &self,
+        server: &store::Server,
+        password_override: Option<&str>,
+        attempt: u64,
+    ) -> Result<Arc<client::Handle<CliHandler>>, String> {
         if server.username.trim().is_empty() {
             return Err(format!(
                 "服务器「{}」未配置登录用户名，请在设置中补充",
@@ -977,27 +1140,105 @@ impl SshManager {
         if server.auth_type == store::AuthType::Key {
             reject_unsupported_key_format(server)?;
         }
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(client_config());
         let addr = (server.host.as_str(), server.port);
         let timeout = link_timeout(server);
-        let handle = tokio::time::timeout(timeout, client::connect(config, addr, CliHandler))
-            .await
-            .map_err(|_| {
-                format!(
+        let link_started = Instant::now();
+        let stage = Instant::now();
+        connect_diag(&server.id, attempt, "tcp", "start");
+        let socket = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await
+        {
+            Ok(Ok(socket)) => {
+                connect_diag(
+                    &server.id,
+                    attempt,
+                    "tcp",
+                    format!("ok elapsed_ms={}", elapsed_ms(stage)),
+                );
+                socket
+            }
+            Ok(Err(e)) => {
+                connect_diag(
+                    &server.id,
+                    attempt,
+                    "tcp",
+                    format!("error elapsed_ms={} error={e}", elapsed_ms(stage)),
+                );
+                return Err(format!(
+                    "连接服务器「{}」失败（{}:{}）：{e}",
+                    server.name, server.host, server.port
+                ));
+            }
+            Err(_) => {
+                connect_diag(
+                    &server.id,
+                    attempt,
+                    "tcp",
+                    format!("timeout elapsed_ms={}", elapsed_ms(stage)),
+                );
+                return Err(format!(
                     "连接服务器「{}」超时（{}s）：{}:{}",
                     server.name,
                     timeout.as_secs(),
                     server.host,
                     server.port
-                )
-            })?
-        .map_err(|e| {
-            format!(
-                "连接服务器「{}」失败（{}:{}）：{e}",
-                server.name, server.host, server.port
-            )
-        })?;
-        self.authenticate_handle(handle, server, password_override)
+                ));
+            }
+        };
+        // 与 russh client::connect 等价：配置要求时设置 TCP_NODELAY，失败只告警。
+        if config.nodelay {
+            if let Err(e) = socket.set_nodelay(true) {
+                connect_diag(&server.id, attempt, "tcp", format!("nodelay_warn={e}"));
+            }
+        }
+        // TCP 与 KEX 共用一个总预算，不能因拆分日志埋点把最长等待放大成两倍。
+        let remaining = timeout.saturating_sub(link_started.elapsed());
+        let stage = Instant::now();
+        connect_diag(&server.id, attempt, "kex", "start");
+        let handle = match tokio::time::timeout(
+            remaining,
+            client::connect_stream(config, socket, CliHandler),
+        )
+        .await
+        {
+            Ok(Ok(handle)) => {
+                connect_diag(
+                    &server.id,
+                    attempt,
+                    "kex",
+                    format!("ok elapsed_ms={}", elapsed_ms(stage)),
+                );
+                handle
+            }
+            Ok(Err(e)) => {
+                connect_diag(
+                    &server.id,
+                    attempt,
+                    "kex",
+                    format!("error elapsed_ms={} error={e}", elapsed_ms(stage)),
+                );
+                return Err(format!(
+                    "连接服务器「{}」失败（{}:{}）：{e}",
+                    server.name, server.host, server.port
+                ));
+            }
+            Err(_) => {
+                connect_diag(
+                    &server.id,
+                    attempt,
+                    "kex",
+                    format!("timeout elapsed_ms={}", elapsed_ms(stage)),
+                );
+                return Err(format!(
+                    "连接服务器「{}」超时（{}s）：{}:{}",
+                    server.name,
+                    timeout.as_secs(),
+                    server.host,
+                    server.port
+                ));
+            }
+        };
+        self.authenticate_handle(handle, server, password_override, attempt)
             .await
     }
 
@@ -1012,6 +1253,37 @@ impl SshManager {
         bastion_handle: Arc<client::Handle<CliHandler>>,
         password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        let attempt = self.connect_seq.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        connect_diag(&server.id, attempt, "jump", "start");
+        let result = self
+            .connect_via_jump_inner(server, bastion, bastion_handle, password_override, attempt)
+            .await;
+        match &result {
+            Ok(_) => connect_diag(
+                &server.id,
+                attempt,
+                "jump",
+                format!("ok total_ms={}", elapsed_ms(started)),
+            ),
+            Err(e) => connect_diag(
+                &server.id,
+                attempt,
+                "jump",
+                format!("error total_ms={} error={e}", elapsed_ms(started)),
+            ),
+        }
+        result
+    }
+
+    async fn connect_via_jump_inner(
+        self: &Arc<Self>,
+        server: &store::Server,
+        bastion: &store::Server,
+        bastion_handle: Arc<client::Handle<CliHandler>>,
+        password_override: Option<&str>,
+        attempt: u64,
+    ) -> Result<Arc<client::Handle<CliHandler>>, String> {
         if server.username.trim().is_empty() {
             return Err(format!(
                 "目标主机「{}」未配置登录用户名，请在设置中补充",
@@ -1022,6 +1294,8 @@ impl SshManager {
             reject_unsupported_key_format(server)?;
         }
         let via = format!("经堡垒机「{}」", bastion.name);
+        let stage = Instant::now();
+        connect_diag(&server.id, attempt, "jump_channel", "start");
         let channel = tokio::time::timeout(
             Duration::from_secs(10),
             bastion_handle.channel_open_direct_tcpip(
@@ -1048,7 +1322,15 @@ impl SshManager {
                 tcp_forward_hint(&e_str)
             )
         })?;
-        let config = Arc::new(client::Config::default());
+        connect_diag(
+            &server.id,
+            attempt,
+            "jump_channel",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
+        );
+        let config = Arc::new(client_config());
+        let stage = Instant::now();
+        connect_diag(&server.id, attempt, "kex", "start");
         let handle = tokio::time::timeout(
             Duration::from_secs(10),
             client::connect_stream(config, channel.into_stream(), CliHandler),
@@ -1056,7 +1338,13 @@ impl SshManager {
         .await
         .map_err(|_| format!("{via}连接目标主机「{}」超时（10s）", server.name))?
         .map_err(|e| format!("{via}连接目标主机「{}」失败：{e}", server.name))?;
-        self.authenticate_handle(handle, server, password_override)
+        connect_diag(
+            &server.id,
+            attempt,
+            "kex",
+            format!("ok elapsed_ms={}", elapsed_ms(stage)),
+        );
+        self.authenticate_handle(handle, server, password_override, attempt)
             .await
     }
 
@@ -1066,6 +1354,35 @@ impl SshManager {
     /// 测试注入与「公钥部署」都靠它——部署的目标服务器本身是 PublicKey，
     /// 但需要的是用用户本次输入的密码登录一次（见 deploy_public_key）。
     async fn authenticate_handle(
+        &self,
+        handle: client::Handle<CliHandler>,
+        server: &store::Server,
+        password_override: Option<&str>,
+        attempt: u64,
+    ) -> Result<Arc<client::Handle<CliHandler>>, String> {
+        let started = Instant::now();
+        connect_diag(&server.id, attempt, "auth", "start");
+        let result = self
+            .authenticate_handle_inner(handle, server, password_override)
+            .await;
+        match &result {
+            Ok(_) => connect_diag(
+                &server.id,
+                attempt,
+                "auth",
+                format!("ok elapsed_ms={}", elapsed_ms(started)),
+            ),
+            Err(e) => connect_diag(
+                &server.id,
+                attempt,
+                "auth",
+                format!("error elapsed_ms={} error={e}", elapsed_ms(started)),
+            ),
+        }
+        result
+    }
+
+    async fn authenticate_handle_inner(
         &self,
         handle: client::Handle<CliHandler>,
         server: &store::Server,
@@ -1237,6 +1554,7 @@ impl SshManager {
             }
             map.insert(server_id.to_string(), Arc::clone(&handle));
         }
+        ssh_diag(server_id, "pool", "inserted");
         if let Some(s) = self.store.server(server_id) {
             let via = if s.bastion_id.is_some() {
                 "（经堡垒机）"
@@ -1262,6 +1580,7 @@ impl SshManager {
             loop {
                 interval.tick().await;
                 if handle.is_closed() {
+                    ssh_diag(&server_id, "connection", "closed");
                     let mut map = manager.sessions.lock().await;
                     // 仅摘除仍指向同一连接的表项（避免误删并发重建的新连接）；
                     // 断开时间线事件也只在真正摘除时记录（与 disconnect() 的手动事件不重复）
@@ -1435,6 +1754,34 @@ mod tests {
             bastion_id: None,
             tags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn client_config_prefers_ecdh_before_dh_gex() {
+        let config = client_config();
+        let kex = config.preferred.kex.as_ref();
+        let position = |target| {
+            kex.iter()
+                .position(|name| *name == target)
+                .expect("默认 KEX 候选应保留")
+        };
+        let curve = position(russh::kex::CURVE25519);
+        let p256 = position(russh::kex::ECDH_SHA2_NISTP256);
+        let p384 = position(russh::kex::ECDH_SHA2_NISTP384);
+        let p521 = position(russh::kex::ECDH_SHA2_NISTP521);
+        let gex = position(russh::kex::DH_GEX_SHA256);
+
+        assert!(curve < p256, "Curve25519 仍应优先于 ECDH");
+        assert_eq!(p256 + 1, p384);
+        assert_eq!(p384 + 1, p521);
+        assert!(p521 < gex, "全部 ECDH 都应排在 DH-GEX 前");
+        assert_eq!(
+            kex.iter()
+                .filter(|name| **name == russh::kex::ECDH_SHA2_NISTP256)
+                .count(),
+            1,
+            "ECDH 不得重复插入"
+        );
     }
 
     #[test]

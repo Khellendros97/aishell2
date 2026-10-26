@@ -103,11 +103,23 @@ fn diag_tx() -> Option<&'static std::sync::mpsc::Sender<String>> {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             use std::io::BufWriter;
+            use std::sync::mpsc::RecvTimeoutError;
             let mut w = BufWriter::new(f);
-            // 不逐行 flush：BufWriter 满 8KB 自动落盘即可。逐行 flush 在满速输出
-            // （tar -v 等每秒数千行）时每行一次 syscall，还会被杀毒 minifilter 放大。
-            for line in rx {
-                let _ = writeln!(w, "{line}");
+            // 高频输出仍靠 BufWriter 攒批，避免逐行 syscall；空闲 200ms 必须 flush，
+            // 否则一次建连只有几 KB 日志时，最后的关键阶段会长期滞留缓冲区。
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(line) => {
+                        let _ = writeln!(w, "{line}");
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        let _ = w.flush();
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = w.flush();
+                        break;
+                    }
+                }
             }
         });
         Some(tx)
@@ -120,6 +132,36 @@ static DEBUG_APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
 pub fn set_debug_app(app: AppHandle) {
     let _ = DEBUG_APP.set(app);
+}
+
+/// 只转发 russh 的实际协商算法，不接管/输出其他依赖日志。
+/// 算法事件不含凭据；DH 参数、报文与会话内容仍保持不记录。
+struct RusshDiagLogger;
+
+static RUSSH_DIAG_LOGGER: RusshDiagLogger = RusshDiagLogger;
+
+impl log::Log for RusshDiagLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() == log::Level::Debug && metadata.target() == "russh::client::kex"
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let msg = record.args().to_string();
+        if msg.starts_with("negotiated algorithms:") {
+            diag(&format!("[ssh] stage=kex_negotiated {msg}"));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+pub fn init_diag_logger() {
+    if log::set_logger(&RUSSH_DIAG_LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
 }
 
 /// 追加一行带毫秒时间戳的诊断日志；失败静默（绝不影响终端主路径）。
@@ -184,7 +226,7 @@ pub struct TermHandle {
 
 impl TermHandle {
     /// 向终端写入数据（本地 PTY / SSH channel 统一入口）。
-    async fn write(&self, data: &str) -> Result<(), String> {
+    async fn write(&self, id: &str, data: &str) -> Result<(), String> {
         if self.closed.load(Ordering::SeqCst) {
             return Err("终端已关闭".to_string());
         }
@@ -196,10 +238,20 @@ impl TermHandle {
                 w.flush().map_err(|e| format!("PTY 写入失败: {e}"))
             }
             TermBackend::Ssh { write_half } => {
+                let started = std::time::Instant::now();
+                diag(&format!("send start id={id} len={}", data.len()));
                 let r = write_half.data_bytes(data.to_string()).await;
                 match &r {
-                    Ok(()) => diag(&format!("send ok len={}", data.len())),
-                    Err(e) => diag(&format!("send err len={} err={e}", data.len())),
+                    Ok(()) => diag(&format!(
+                        "send ok id={id} len={} elapsed_ms={}",
+                        data.len(),
+                        started.elapsed().as_millis()
+                    )),
+                    Err(e) => diag(&format!(
+                        "send err id={id} len={} elapsed_ms={} err={e}",
+                        data.len(),
+                        started.elapsed().as_millis()
+                    )),
                 }
                 r.map_err(|e| format!("SSH 通道写入失败: {e}"))
             }
@@ -717,7 +769,7 @@ impl TermManager {
         if self.ssh.shell_busy_by_tab(id) {
             return Ok(());
         }
-        self.handle(id)?.write(data).await
+        self.handle(id)?.write(id, data).await
     }
 
     /// 停止 AI 在当前终端注入的命令（Ctrl-C + 让等待方立即返回）。

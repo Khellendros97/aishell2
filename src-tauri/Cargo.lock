@@ -108,6 +108,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "keyring",
+ "log",
  "percent-encoding",
  "portable-pty",
  "rand 0.10.2",

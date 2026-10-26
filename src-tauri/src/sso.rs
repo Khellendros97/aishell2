@@ -393,6 +393,25 @@ pub fn handle_incoming(app: &AppHandle, raw: &str) {
 /// 解析 URL → 创建内存临时服务器 → 返回前端展示信息。
 /// 密码只交给 `SshManager::add_ephemeral`，不进入返回值。
 fn prepare(ssh: &Arc<SshManager>, raw: &str) -> Result<SsoOpen, String> {
+    let started = std::time::Instant::now();
+    crate::term::diag("[sso] stage=prepare start");
+    let result = prepare_inner(ssh, raw);
+    match &result {
+        Ok(open) => crate::term::diag(&format!(
+            "[sso] server={} protocol={} stage=prepare ok total_ms={}",
+            open.server_id,
+            open.protocol,
+            started.elapsed().as_millis()
+        )),
+        Err(e) => crate::term::diag(&format!(
+            "[sso] stage=prepare error total_ms={} error={e}",
+            started.elapsed().as_millis()
+        )),
+    }
+    result
+}
+
+fn prepare_inner(ssh: &Arc<SshManager>, raw: &str) -> Result<SsoOpen, String> {
     let spec = if is_access_client_url(raw) {
         parse_access_client(raw)?
     } else {

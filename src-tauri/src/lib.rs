@@ -111,6 +111,8 @@ pub(crate) fn exit_cleanup_if_last_window(app: &tauri::AppHandle, dying_label: &
 }
 
 pub fn run() {
+    // 在任何 SSH 建连前启用算法协商诊断；只转发 russh 的 negotiated algorithms 事件。
+    term::init_diag_logger();
     // 堡垒机 SSO 客户端（如 C:\sso_client\xshell_agent.exe）以
     // `AIShell.exe -url ssh://user:一次性密码@host:port` 拉起：先记下 URL，
     // setup 里登记内存临时服务器，前端挂载后经 sso_take_pending 取走。
