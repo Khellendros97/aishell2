@@ -1,7 +1,7 @@
 //! SSH 连接管理 —— 连接复用（同一 server 的终端与 SFTP 共享一条 TCP 连接，russh 多路复用）、
 //! 密码认证走 keyring `server:<id>`、密钥走 russh-keys load_secret_key；
 //! Xshell 专用 NSSSH 私钥在加载前给出可执行的 OpenSSH 导出提示，带密码短语密钥亦明确报错；
-//! check_server_key MVP 直接信任（A5 已知限制）、连接与认证各自 10s 超时。
+//! check_server_key MVP 直接信任（A5 已知限制）、连接与认证超时见 `link_timeout`（普通 10s，堡垒机链路 60s）。
 //!
 //! 认证失败识别（待优化 4）：错误密码/密钥的常规表现是 `AuthResult::Failure`，
 //! 认证期间被服务器断开（如 MaxAuthTries 超限）表现为 `Error::Disconnect`；
@@ -118,6 +118,38 @@ pub struct SshManager {
     /// serverId → 项目归属（时间线埋点用）：连接池按 serverId 复用、跨项目共享，
     /// 归属取「最近触发方」（终端/SFTP 打开或 AI 动作发起时 bind_project 登记）。
     projects: Mutex<HashMap<String, String>>,
+}
+
+/// 建连/认证超时：普通服务器 10s（无响应时快速失败）；
+/// 堡垒机本身（is_bastion）与经堡垒机跳转的目标主机（bastion_id 非空）放宽到 60s，
+/// 兼容握手慢的网关（慢速 DH-GEX 单次可超过 20s，见 `client_config`）。
+fn link_timeout(server: &store::Server) -> Duration {
+    if server.is_bastion || server.bastion_id.is_some() {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
+/// russh 默认候选不含 ECDH，部分堡垒机因此退到慢速 DH-GEX（实测单次超过 20s）。
+/// 保留默认顺序，仅在首个 DH-GEX 前插入 NIST ECDH：Curve25519 仍优先，DH 回退不变。
+fn client_config() -> client::Config {
+    let mut config = client::Config::default();
+    let mut kex = config.preferred.kex.to_vec();
+    let insert_at = kex
+        .iter()
+        .position(|name| *name == russh::kex::DH_GEX_SHA256 || *name == russh::kex::DH_GEX_SHA1)
+        .unwrap_or(kex.len());
+    kex.splice(
+        insert_at..insert_at,
+        [
+            russh::kex::ECDH_SHA2_NISTP256,
+            russh::kex::ECDH_SHA2_NISTP384,
+            russh::kex::ECDH_SHA2_NISTP521,
+        ],
+    );
+    config.preferred.kex = kex.into();
+    config
 }
 
 /// 转发通道失败的可能原因提示（错误信息追加用；纯函数便于单测）。
@@ -475,7 +507,7 @@ impl SshManager {
         map.get(server_id).filter(|h| !h.is_closed()).cloned()
     }
 
-    /// 直连建连 + 认证（各 10s 超时）。password_override 仅供测试注入，None 时走 Store/keyring。
+    /// 直连建连 + 认证（超时见 `link_timeout`：堡垒机 60s、普通 10s）。password_override 仅供测试注入，None 时走 Store/keyring。
     async fn connect_handle(
         &self,
         server: &store::Server,
@@ -490,19 +522,20 @@ impl SshManager {
         if server.auth_type == store::AuthType::Key {
             reject_unsupported_key_format(server)?;
         }
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(client_config());
         let addr = (server.host.as_str(), server.port);
-        let handle = tokio::time::timeout(
-            Duration::from_secs(10),
-            client::connect(config, addr, CliHandler),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "连接服务器「{}」超时（10s）：{}:{}",
-                server.name, server.host, server.port
-            )
-        })?
+        let timeout = link_timeout(server);
+        let handle = tokio::time::timeout(timeout, client::connect(config, addr, CliHandler))
+            .await
+            .map_err(|_| {
+                format!(
+                    "连接服务器「{}」超时（{}s）：{}:{}",
+                    server.name,
+                    timeout.as_secs(),
+                    server.host,
+                    server.port
+                )
+            })?
         .map_err(|e| {
             format!(
                 "连接服务器「{}」失败（{}:{}）：{e}",
@@ -515,7 +548,7 @@ impl SshManager {
 
     /// 经堡垒机连接目标主机：堡垒机连接复用连接池，在堡垒机上开 direct-tcpip 通道指向
     /// 目标主机 host:port，再把通道当作传输层跑目标主机的 SSH 握手（russh connect_stream），
-    /// 随后按目标主机自身凭据认证。各步 10s 超时，错误信息带堡垒机名便于排查。
+    /// 随后按目标主机自身凭据认证。超时统一 `link_timeout`（跳转目标 60s），错误信息带堡垒机名便于排查。
     /// password_override 仅供测试注入（透传给认证）。
     async fn connect_via_jump(
         self: &Arc<Self>,
@@ -534,8 +567,9 @@ impl SshManager {
             reject_unsupported_key_format(server)?;
         }
         let via = format!("经堡垒机「{}」", bastion.name);
+        let timeout = link_timeout(server);
         let channel = tokio::time::timeout(
-            Duration::from_secs(10),
+            timeout,
             bastion_handle.channel_open_direct_tcpip(
                 &server.host,
                 server.port as u32,
@@ -546,8 +580,11 @@ impl SshManager {
         .await
         .map_err(|_| {
             format!(
-                "{via}连接目标主机「{}」超时（10s）：{}:{}",
-                server.name, server.host, server.port
+                "{via}连接目标主机「{}」超时（{}s）：{}:{}",
+                server.name,
+                timeout.as_secs(),
+                server.host,
+                server.port
             )
         })?
         .map_err(|e| {
@@ -560,19 +597,25 @@ impl SshManager {
                 tcp_forward_hint(&e_str)
             )
         })?;
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(client_config());
         let handle = tokio::time::timeout(
-            Duration::from_secs(10),
+            timeout,
             client::connect_stream(config, channel.into_stream(), CliHandler),
         )
         .await
-        .map_err(|_| format!("{via}连接目标主机「{}」超时（10s）", server.name))?
+        .map_err(|_| {
+            format!(
+                "{via}连接目标主机「{}」超时（{}s）",
+                server.name,
+                timeout.as_secs()
+            )
+        })?
         .map_err(|e| format!("{via}连接目标主机「{}」失败：{e}", server.name))?;
         self.authenticate_handle(handle, server, password_override)
             .await
     }
 
-    /// 在已建立 SSH 会话的 handle 上完成用户认证（各 10s 超时）。
+    /// 在已建立 SSH 会话的 handle 上完成用户认证（超时见 `link_timeout`）。
     /// 直连（connect_handle）与跳板（connect_via_jump）共用。
     /// password_override 有值时强制走密码认证（与服务器 authType 无关）：
     /// 测试注入与「公钥部署」都靠它——部署的目标服务器本身是 PublicKey，
@@ -584,15 +627,22 @@ impl SshManager {
         password_override: Option<&str>,
     ) -> Result<Arc<client::Handle<CliHandler>>, String> {
         let mut handle = handle;
+        let timeout = link_timeout(server);
         let accepted = match (server.auth_type, password_override) {
             // 显式密码：无论服务器认证类型一律密码认证
             (_, Some(password)) => {
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_password(&server.username, password.to_string()),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
@@ -608,11 +658,17 @@ impl SshManager {
                     .read_server_secret(server)
                     .map_err(|e| format!("读取服务器「{}」的密码失败：{e}", server.name))?;
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_password(&server.username, password),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
@@ -644,11 +700,17 @@ impl SshManager {
                         .flatten(),
                 );
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_publickey(&server.username, key),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
@@ -680,11 +742,17 @@ impl SshManager {
                         .flatten(),
                 );
                 let res = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    timeout,
                     handle.authenticate_publickey(&server.username, key),
                 )
                 .await
-                .map_err(|_| format!("认证服务器「{}」超时（10s）", server.name))?
+                .map_err(|_| {
+                    format!(
+                        "认证服务器「{}」超时（{}s）",
+                        server.name,
+                        timeout.as_secs()
+                    )
+                })?
                 .map_err(|e| {
                     if is_auth_failure(&e) {
                         auth_failed_msg(server, &e.to_string())
