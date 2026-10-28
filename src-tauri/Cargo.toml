@@ -12,7 +12,10 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "aishell_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 只保留 rlib：桌面（Windows/mac）二进制链接 rlib 即可。staticlib/cdylib 是移动端
+# （iOS/Android）才需要的产物，留着会让每次 cargo build 多两次全量链接并各写一份
+# 同样大的调试符号（实测 aishell_lib.pdb 293MB），是增量构建的主要固定开销之一。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -101,4 +104,11 @@ tauri-winrt-notification = "0.7"
 # 无法下载，以 vendor/httpdate（本仓库自写的最小实现，API 兼容）本地替换。
 [patch.crates-io]
 httpdate = { path = "vendor/httpdate" }
+
+# 构建速度：dev/test 只生成行号表（panic 回溯仍有 file:line），不生成完整的类型/变量
+# 调试信息——aishell.pdb 从 342MB 降到 148MB，链接与落盘明显变快。
+# 需要在调试器里看变量时临时改回 `debug = true`（或 `cargo build --config
+# 'profile.dev.debug=true'`）。test profile 默认继承 dev，无需重复声明。
+[profile.dev]
+debug = "line-tables-only"
 
