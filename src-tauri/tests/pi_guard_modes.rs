@@ -83,6 +83,8 @@ struct MockState {
     script: Mutex<VecDeque<String>>,
     /// 收到的 role=tool 消息内容（断言越界拒绝错误用）
     tool_messages: Mutex<Vec<String>>,
+    /// 每次模型请求的完整 messages（steering 顺序与图片保留断言用）
+    request_messages: Mutex<Vec<Vec<Value>>>,
     requests: AtomicUsize,
 }
 
@@ -218,7 +220,10 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
             if let Some(arr) = req["tools"].as_array() {
                 for t in arr {
                     if let Some(params) = t["function"]["parameters"].as_object() {
-                        let typ = params.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let typ = params
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
                         if typ != "object" {
                             let name = t["function"]["name"].as_str().unwrap_or("?");
                             let body = format!(
@@ -246,6 +251,11 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
                 .unwrap_or_default();
             eprintln!("[mock] request tools={tools:?}");
             let messages = req["messages"].as_array().cloned().unwrap_or_default();
+            state
+                .request_messages
+                .lock()
+                .unwrap()
+                .push(messages.clone());
             let last_role = messages
                 .last()
                 .and_then(|m| m["role"].as_str())
@@ -276,6 +286,18 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<MockState>) -> std::io::R
                 // 新一轮：按脚本下发工具调用（脚本耗尽则直接收尾）
                 let spec = state.script.lock().unwrap().pop_front();
                 match spec {
+                    Some(s) if s.starts_with("delay:") => {
+                        let millis = s[6..].parse::<u64>().unwrap_or(300);
+                        tokio::time::sleep(Duration::from_millis(millis)).await;
+                        (
+                            "text/event-stream",
+                            if streaming {
+                                final_payload_streaming()
+                            } else {
+                                final_payload_json()
+                            },
+                        )
+                    }
                     Some(s) if s != "final" => {
                         let p = toolcall_payload_streaming(&s);
                         ("text/event-stream", p)
@@ -356,6 +378,7 @@ impl Pi {
                         "id": "test-model",
                         "name": "test-model",
                         "reasoning": false,
+                        "input": ["text", "image"],
                         "contextWindow": 64000,
                     }],
                 }
@@ -465,6 +488,61 @@ impl Pi {
 
     fn prompt(&mut self, text: &str) {
         self.write(&json!({"type": "prompt", "message": text}));
+    }
+
+    fn steer(&mut self, id: &str, text: &str) {
+        self.write(&json!({"id": id, "type": "steer", "message": text}));
+    }
+
+    fn prompt_steer(&mut self, id: &str, text: &str) {
+        self.write(&json!({
+            "id": id,
+            "type": "prompt",
+            "message": text,
+            "streamingBehavior": "steer",
+        }));
+    }
+
+    fn prompt_follow_up(&mut self, id: &str, text: &str) {
+        self.write(&json!({
+            "id": id,
+            "type": "prompt",
+            "message": text,
+            "streamingBehavior": "followUp",
+        }));
+    }
+
+    fn prompt_steer_with_image(&mut self, id: &str, text: &str) {
+        self.write(&json!({
+            "id": id,
+            "type": "prompt",
+            "message": text,
+            "streamingBehavior": "steer",
+            "images": [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}],
+        }));
+    }
+
+    fn clear_queue(&mut self, id: &str) {
+        self.write(&json!({"id": id, "type": "clear_queue"}));
+    }
+
+    fn wait_response(&self, command: &str) -> Value {
+        self.wait_event(|ev| ev["type"] == "response" && ev["command"] == command)
+    }
+
+    fn wait_user_message(&self, text: &str) -> Value {
+        self.wait_event(|ev| {
+            if ev["type"] != "message_start" || ev["message"]["role"] != "user" {
+                return false;
+            }
+            let content = &ev["message"]["content"];
+            content.as_str() == Some(text)
+                || content.as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block["type"] == "text" && block["text"].as_str() == Some(text)
+                    })
+                })
+        })
     }
 
     fn respond_confirm(&mut self, request_id: &str, confirmed: bool) {
@@ -725,7 +803,11 @@ async fn yolo_mode_auto_executes_without_approval_and_blocks_escape() {
     );
 
     assert_eq!(pi.confirm_count(), 0, "yolo 写/删文件不应产生审批请求");
-    assert_eq!(pi.action_count(), 0, "delete_path 在扩展内执行，不应有动作桥请求");
+    assert_eq!(
+        pi.action_count(),
+        0,
+        "delete_path 在扩展内执行，不应有动作桥请求"
+    );
 }
 
 /// /aishell-mode 热切换：非法值保持原模式；合法值立即生效（suggest→agent 后出现审批）。
@@ -763,6 +845,175 @@ async fn mode_hot_switch_via_command() {
     pi.wait_settled();
     assert!(env.project_dir.join("second.txt").is_file());
     assert_eq!(pi.confirm_count(), 2, "非法模式不应改变当前模式");
+}
+
+// ---------------------------------------------------------------- steering 插话协议
+
+fn request_message_text(message: &Value) -> Option<String> {
+    let content = &message["content"];
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    content.as_array().map(|blocks| {
+        blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+async fn wait_request_count(env: &Env, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = env.mock_state.request_messages.lock().unwrap().len();
+        if count >= expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "等待第 {expected} 次模型请求超时，当前 {count} 次");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// 工具等待审批时排队：工具结果之后、下一次模型请求之前应出现真正的 user steering 消息。
+#[tokio::test(flavor = "multi_thread")]
+async fn steering_is_delivered_after_tool_result_before_next_request() {
+    let (env, pi) = setup("agent", &[WRITE_ALLOWED_TXT, "final"]).await;
+    let Some(mut pi) = pi else { return };
+
+    pi.prompt("写入 allowed.txt");
+    let req = pi.wait_confirm_request();
+    pi.steer("steer-tool", "工具完成后改成检查文件内容");
+    let queued = pi.wait_response("steer");
+    assert_eq!(queued["success"], true);
+    assert_eq!(queued["data"]["disposition"], "queued");
+    pi.respond_confirm(req["id"].as_str().unwrap(), true);
+    pi.wait_user_message("工具完成后改成检查文件内容");
+    pi.wait_settled();
+
+    let requests = env.mock_state.request_messages.lock().unwrap();
+    assert!(requests.len() >= 2, "工具结果后必须发起下一次模型请求");
+    let next = &requests[1];
+    assert_eq!(next[next.len() - 2]["role"], "tool");
+    assert_eq!(next[next.len() - 1]["role"], "user");
+    assert_eq!(
+        request_message_text(&next[next.len() - 1]).as_deref(),
+        Some("工具完成后改成检查文件内容")
+    );
+}
+
+/// 当前回复没有工具调用时，steering 也必须触发下一回合，而不是留在队列里静默结束。
+#[tokio::test(flavor = "multi_thread")]
+async fn steering_without_tool_calls_starts_another_turn() {
+    let (env, pi) = setup("suggest", &["delay:500", "final"]).await;
+    let Some(mut pi) = pi else { return };
+
+    pi.prompt("先回答第一段");
+    let started = pi.wait_response("prompt");
+    assert_eq!(started["data"]["disposition"], "started");
+    pi.prompt_steer("steer-final", "第一段结束后继续补充第二点");
+    let queued = pi.wait_response("prompt");
+    assert_eq!(queued["success"], true);
+    assert_eq!(queued["data"]["disposition"], "queued");
+    pi.wait_user_message("第一段结束后继续补充第二点");
+    wait_request_count(&env, 2).await;
+    pi.wait_settled();
+
+    let requests = env.mock_state.request_messages.lock().unwrap();
+    assert_eq!(requests.len(), 2, "无工具调用时 steering 也应触发第二次请求");
+    let last = requests[1].last().unwrap();
+    assert_eq!(last["role"], "user");
+    assert_eq!(
+        request_message_text(last).as_deref(),
+        Some("第一段结束后继续补充第二点")
+    );
+}
+
+/// prompt + steering 在回合恰好已结束时应直接 started，而不是成功排入无人消费的空闲队列。
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_steering_when_idle_starts_immediately() {
+    let (env, pi) = setup("suggest", &["final"]).await;
+    let Some(mut pi) = pi else { return };
+
+    pi.prompt_steer("steer-idle", "空闲时直接回答插话");
+    let started = pi.wait_response("prompt");
+    assert_eq!(started["success"], true);
+    assert_eq!(started["data"]["disposition"], "started");
+    pi.wait_user_message("空闲时直接回答插话");
+    pi.wait_settled();
+    assert_eq!(env.mock_state.request_messages.lock().unwrap().len(), 1);
+}
+
+/// clear_queue 同时返回 followUp；恢复后它仍应在当前工作结束后进入下一回合。
+#[tokio::test(flavor = "multi_thread")]
+async fn clear_queue_follow_up_can_be_restored() {
+    let (env, pi) = setup("suggest", &["delay:3000", "final"]).await;
+    let Some(mut pi) = pi else { return };
+
+    pi.prompt("保持当前回合运行");
+    assert_eq!(pi.wait_response("prompt")["data"]["disposition"], "started");
+    pi.prompt_follow_up("follow-up-1", "后续正式提问");
+    assert_eq!(pi.wait_response("prompt")["data"]["disposition"], "queued");
+    pi.steer("steer-temp", "可取消的插话");
+    assert_eq!(pi.wait_response("steer")["success"], true);
+    pi.clear_queue("clear-follow-up");
+    let cleared = pi.wait_response("clear_queue");
+    assert_eq!(cleared["data"]["steering"], json!(["可取消的插话"]));
+    assert_eq!(cleared["data"]["followUp"], json!(["后续正式提问"]));
+
+    pi.prompt_follow_up("follow-up-restored", "后续正式提问");
+    assert_eq!(pi.wait_response("prompt")["data"]["disposition"], "queued");
+    pi.wait_user_message("后续正式提问");
+    wait_request_count(&env, 2).await;
+    pi.wait_settled();
+    let requests = env.mock_state.request_messages.lock().unwrap();
+    assert_eq!(requests[1].last().unwrap()["role"], "user");
+    assert_eq!(request_message_text(requests[1].last().unwrap()).as_deref(), Some("后续正式提问"));
+}
+
+/// clear_queue 返回原文并清空；重新排队带图消息时，文本与 ImageContent 均完整保留。
+#[tokio::test(flavor = "multi_thread")]
+async fn steering_clear_queue_and_requeue_preserves_images() {
+    let (env, pi) = setup("suggest", &["delay:3000", "final"]).await;
+    let Some(mut pi) = pi else { return };
+
+    pi.prompt("保持当前回合运行");
+    let started = pi.wait_response("prompt");
+    assert_eq!(started["data"]["disposition"], "started");
+    pi.steer("steer-1", "第一条暂存");
+    assert_eq!(pi.wait_response("steer")["success"], true);
+    pi.steer("steer-2", "第二条暂存");
+    assert_eq!(pi.wait_response("steer")["success"], true);
+    pi.clear_queue("clear-test");
+    let cleared = pi.wait_response("clear_queue");
+    assert_eq!(cleared["success"], true);
+    assert_eq!(
+        cleared["data"]["steering"],
+        json!(["第一条暂存", "第二条暂存"])
+    );
+
+    pi.prompt_steer_with_image("steer-image", "第二条暂存");
+    assert_eq!(pi.wait_response("prompt")["success"], true);
+    pi.wait_user_message("第二条暂存");
+    wait_request_count(&env, 2).await;
+    pi.wait_settled();
+
+    let requests = env.mock_state.request_messages.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let content = requests[1].last().unwrap()["content"].as_array().unwrap();
+    assert!(content.iter().any(|block| {
+        block["type"] == "text" && block["text"].as_str() == Some("第二条暂存")
+    }));
+    assert!(content.iter().any(|block| {
+        (block["type"] == "image"
+            && block["data"].as_str() == Some("aGVsbG8=")
+            && block["mimeType"].as_str() == Some("image/png"))
+            || (block["type"] == "image_url"
+                && block["image_url"]["url"]
+                    .as_str()
+                    .is_some_and(|url| url == "data:image/png;base64,aGVsbG8="))
+    }), "图片块未按预期保留，实际 content: {content:?}");
 }
 
 // ---------------------------------------------------------------- 技能权限探针
@@ -1002,7 +1253,11 @@ async fn yolo_delete_global_skill_allowed_escape_rejected() {
     pi.wait_settled();
     assert!(escape.exists(), "workspace 邻居文件越界必须保留");
     assert_tool_error(&env, "权限边界");
-    assert_eq!(pi.confirm_count(), 1, "yolo 仅删除目录产生一次审批；越界删除在权限边界被拒");
+    assert_eq!(
+        pi.confirm_count(),
+        1,
+        "yolo 仅删除目录产生一次审批；越界删除在权限边界被拒"
+    );
 }
 
 /// 非法环境变量（fail-closed）：技能目录读被拒，只保留项目根权限。

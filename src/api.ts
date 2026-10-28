@@ -6,7 +6,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  AiMode, DashboardSpec, DashboardRender, AiWindowChangedEvent, AiRepairReport, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, PcapReadOut, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerCredentialDeleteResult, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SsoOpen, SsoPending, SsoSessionInfo, TermAiBusyEvent, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
+  AiMode, DashboardSpec, DashboardRender, AiWindowChangedEvent, AiRepairReport, AppState, ArchiveMode, AttachImageItem, AttachedImage, BrowserEvent, BrowserFavorite, BrowserHistoryItem, BrowserProxyConfig, BrowserState, ChatMsg, ChatSession, CloudBackupPage, CloudBackupProgress, CloudMode, CloudStatus, ConfigChanged, Credential, CredentialMode, DbConnection, DbKind, DwsAuthStatus, DwsReportDraft, DwsSubmitResult, DwsTemplate, Feedback, FeedbackCategory, FeedbackPage, FeedbackStatus, FsEntry, FsStat, IncentiveLeaderboard, IncentivePoints, IncentiveRules, IncentiveSkillUpload, IncentiveTicketReport, InterruptedBackup, KbHit, KeyPairInfo, McpDeviceConfig, McpStatus, MemoryCard, MemoryEvent, MemoryHit, MemoryScope, NotesListing, PcapReadOut, Project, PublishPageState, ReadImageOut, RestoreCollisionMode, RestoreOutcome, Server, Settings, ServerCredentialDeleteResult, ServerSaveResult, SftpFavorite, SftpProgress, SftpWriteResult, SsoOpen, SsoPending, SsoSessionInfo, TermAiBusyEvent, SkillDocument, SkillHubDetail, SkillHubList, SkillHubPublishOutcome, SkillHubVersionDetail, SkillOrigin, SkillSummary, StagedFile, StagingClearOutcome, StagingContent, StagingDiff, StagingExportOutcome, StagingProgress, SshExecResult, SyncDevice, SyncStatus, Theme, TimelineCloudInfo, TimelineEntry, TimelineQuery, TimelineTag, TraceEntry, TunnelConfig, TunnelState, UpdateProgress, UpdateReadyInfo, UpdateStatus, UsageReport, XshellImportResult,
 } from './types';
 
 export function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -303,6 +303,8 @@ export type AiEvent =
   | { type: 'thinkingEnd' }
   | { type: 'tool'; tool: string; label: string }
   | { type: 'segment' }
+  /** 任一 user 消息开始执行；新窗口/恢复 followUp 时若尚无 pending，据此建立接收气泡。 */
+  | { type: 'runStarted' }
   | { type: 'done' }
   | { type: 'settled' }
   /** 后端会话自愈等纯信息提示（不进对话历史，前端只弹 toast）：
@@ -323,11 +325,32 @@ export type AiEvent =
   /** confirm 工具（通用是非确认）：单一问题 + 确认/取消，经 aiRespondConfirm 回执布尔 */
   | { type: 'confirm'; requestId: string; toolCallId: string; question: string }
   | { type: 'actionStart'; toolCallId: string; tool: string; args: Record<string, unknown> }
-  | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string };
+  | { type: 'actionEnd'; toolCallId: string; tool: string; isError: boolean; result: string }
+  /** 后端暂存队列完整快照；items 顺序即后续 steering 投递顺序。 */
+  | { type: 'stagedQueue'; items: AiStagedItem[] }
+  /** steering 已作为真正的 user 消息进入 pi；message 为入队时保存的完整富引用消息。 */
+  | { type: 'stagedDelivered'; id: string; message: ChatMsg }
+  /** 取消后的队列重建失败等异步错误；目标卡片应移除并提示用户。 */
+  | { type: 'stagedError'; id: string; message: string };
+export interface AiStagedItem {
+  id: string;
+  message: ChatMsg;
+}
 /** key = `<projectId>:<sessionId>`；同 key 并发生成由后端先 abort 再发。
  *  images：随消息附带的多模态图片（mime + 不带 dataURL 前缀的 base64），经 pi RPC images 字段进入 user 消息。 */
 export const aiChat = (key: string, prompt: string, images?: Array<{ mimeType: string; data: string }>) =>
   call<void>('ai_chat', { key, prompt, images });
+/** 生成中暂存插话；idle 表示回合已结束，调用方应改走 aiChat。 */
+export const aiSteer = (
+  key: string,
+  id: string,
+  prompt: string,
+  images: Array<{ mimeType: string; data: string }> | undefined,
+  message: ChatMsg,
+) => call<'queued' | 'delivered' | 'idle'>('ai_steer', { key, id, prompt, images, message });
+export const aiStagedList = (key: string) => call<AiStagedItem[]>('ai_staged_list', { key });
+/** 返回 false 表示消息已投递或不存在，不能再按待发送项取消。 */
+export const aiCancelSteer = (key: string, id: string) => call<boolean>('ai_cancel_steer', { key, id });
 /** 图片附件物化：按来源（本地/远程/剪贴板 base64）读取、魔数嗅探后落到 <project>/.aishell/ai-images/，
  *  返回落盘副本信息；整批任一失败报错。 */
 export const aiAttachImages = (projectId: string, items: AttachImageItem[]) =>

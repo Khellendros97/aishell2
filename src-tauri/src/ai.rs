@@ -1,5 +1,6 @@
 //! AI 助手（pi 子进程 RPC 嵌入）。
-//! 契约：命令 `ai_chat(key, prompt)` / `ai_abort(key)` / `ai_kill_project(project_id)` /
+//! 契约：命令 `ai_chat(key, prompt)` / `ai_steer(key, id, prompt, images, message)` /
+//! `ai_cancel_steer(key, id)` / `ai_staged_list(key)` / `ai_abort(key)` / `ai_kill_project(project_id)` /
 //! `ai_set_thinking(project_id, level)` / `set_ai_mode(project_id, mode)` /
 //! `ai_respond_approval(key, request_id, confirmed)` /
 //! `ai_respond_db_request(key, request_id, response)` / `pi_version()`；
@@ -10,6 +11,8 @@
 //!     正文定稿落盘（无此信号则只活在内存流式气泡里，下一条消息即被吞）
 //!   - `{type:"approval",requestId,toolCallId,action,intent,summary}`
 //!   - `{type:"actionStart",toolCallId,tool,args}` / `{type:"actionEnd",toolCallId,tool,isError,result}`
+//!   - `{type:"stagedQueue",items}`：后端暂存插话完整快照；`stagedDelivered` 表示插话已作为
+//!     真正的 user 消息进入 pi，前端据此切分当前 AI 片段并写入正式历史；`stagedError` 为异步重建失败
 //!   - `{type:"notice",message}`：后端自愈提示（会话历史损坏已自动修复 / 检测到损坏待修复），
 //!     纯信息，不进对话历史，前端只弹 toast
 //!
@@ -290,6 +293,21 @@ pub(crate) const PI_BIN_NAME: &str = "pi";
 /// 内部动作返回给模型的结果截断上限（pi docs 要求工具必须截断输出，防上下文溢出）。
 const MAX_RESULT_CHARS: usize = 30_000;
 
+/// 一条尚未投递的 steering 消息。message 是前端 ChatMsg 的原始 JSON，投递时原样回传，
+/// 后端无需复制全部引用类型；prompt/images 用于取消后的剩余队列重建。
+#[derive(Clone, Debug)]
+struct StagedMessage {
+    id: String,
+    prompt: String,
+    /// pi 实际排队文本（skill/prompt template 展开后由 queue_update 回同步）。
+    native_prompt: String,
+    images: Vec<serde_json::Value>,
+    message: serde_json::Value,
+}
+
+type StagedQueue = Arc<Mutex<Vec<StagedMessage>>>;
+type RpcWaiters = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>;
+
 /// 单个 key 的 pi 进程。
 pub struct AiProc {
     child: Child,
@@ -297,6 +315,14 @@ pub struct AiProc {
     stdin: Arc<Mutex<ChildStdin>>,
     busy: Arc<AtomicBool>,
     killed: Arc<AtomicBool>,
+    /// 尚未作为 user 消息进入 pi 会话的 steering 队列；事实源在后端，双窗口据此收敛。
+    staged: StagedQueue,
+    /// 已收到 message_start 的插话 id；区分「真实投递」与进程退出导致的队列清空。
+    delivered_staged: Arc<Mutex<HashSet<String>>>,
+    /// steering/clear_queue 的 RPC 响应等待者（request id → oneshot）。
+    rpc_waiters: RpcWaiters,
+    /// 同一 key 的入队/取消串行化，避免 clear_queue 与重建队列交叉。
+    queue_op: Arc<tokio::sync::Mutex<()>>,
     /// 待处理审批：extension_ui_request id -> toolCallId（ai_respond_approval 校验用）。
     approvals: Arc<Mutex<HashMap<String, String>>>,
     /// 启动时技能快照指纹（origin|name|enabled|scope|正文 稳定序列化）；ai_chat 发现
@@ -312,6 +338,61 @@ pub struct AiProc {
     /// 最近一次发起对话（ai_chat 发 prompt）的时刻；空闲回收线程据此判断是否超时回收。
     /// 生成/审批等待期间 busy=true 不参与回收判定，故只需在发送时刷新。
     last_active: Instant,
+}
+
+fn staged_items(queue: &[StagedMessage]) -> Vec<serde_json::Value> {
+    queue
+        .iter()
+        .map(|item| json!({"id": item.id, "message": item.message}))
+        .collect()
+}
+
+fn staged_cancel_requested(
+    queue: &[StagedMessage],
+    id: &str,
+    returned: &[String],
+) -> bool {
+    queue
+        .iter()
+        .find(|item| item.id == id)
+        .is_some_and(|target| returned.iter().any(|text| text == &target.native_prompt))
+}
+
+/// queue_update 只含尚未投递的原生队列。staged 可能多一个「已 drain、message_start 未到」
+/// 的队头，因此从尾部对齐；skill/template 展开后的文本写回对应项，供投递与取消匹配。
+fn sync_native_prompts(queue: &mut [StagedMessage], native: &[String]) {
+    let start = queue.len().saturating_sub(native.len());
+    for (item, text) in queue[start..].iter_mut().zip(native.iter()) {
+        item.native_prompt = text.clone();
+    }
+}
+
+fn emit_staged_queue(app: &AppHandle, event: &str, staged: &StagedQueue) {
+    let items = staged
+        .lock()
+        .map(|queue| staged_items(&queue))
+        .unwrap_or_default();
+    let _ = app.emit(event, json!({"type": "stagedQueue", "items": items}));
+}
+
+/// RPC user 消息的文本形态：纯文本消息 content 是字符串，带图消息是 text/image 块数组。
+/// steering 匹配只比较文本块，图片仍由后端队列中的原始 images 保留。
+fn user_message_text(message: &serde_json::Value) -> Option<String> {
+    let content = message.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let blocks = content.as_array()?;
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
 }
 
 /// AI 进程管理器：每 key 一个长驻 pi 进程，进程生命周随工作台（ai_kill_project / Drop）结束。
@@ -873,12 +954,17 @@ impl AiManager {
                 global_skills.join(", "),
                 system_prompt,
             ),
-        }));
+            }),
+        );
 
         let busy = Arc::new(AtomicBool::new(false));
         let killed = Arc::new(AtomicBool::new(false));
         let approvals: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let last_prompt = Arc::new(Mutex::new(String::new()));
+        let staged: StagedQueue = Arc::new(Mutex::new(Vec::new()));
+        let delivered_staged = Arc::new(Mutex::new(HashSet::new()));
+        let rpc_waiters: RpcWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let queue_op = Arc::new(tokio::sync::Mutex::new(()));
         let app2 = app.clone();
         let key2 = key.to_string();
         let event = format!("ai:event:{key2}");
@@ -894,6 +980,9 @@ impl AiManager {
         let store2 = Arc::clone(&self.store);
         let cloud2 = self.cloud.clone();
         let last_prompt2 = Arc::clone(&last_prompt);
+        let staged2 = Arc::clone(&staged);
+        let delivered_staged2 = Arc::clone(&delivered_staged);
+        let rpc_waiters2 = Arc::clone(&rpc_waiters);
         let mgr2 = Arc::clone(self);
         thread::spawn(move || {
             // 影响计划跟踪：tool_execution_start 登记 → 审批补充 → AISHELL_ACTION 消费
@@ -1176,17 +1265,23 @@ impl AiManager {
                                     .and_then(|arr| arr.first())
                                     .and_then(|b| b.get("text"))
                                     .and_then(serde_json::Value::as_str)
-                                    .or_else(|| ev.get("errorMessage").and_then(serde_json::Value::as_str))
+                                    .or_else(|| {
+                                        ev.get("errorMessage").and_then(serde_json::Value::as_str)
+                                    })
                                     .unwrap_or("")
                                     .to_string();
-                                crate::trace::log(&key2, "tool_call", json!({
+                                crate::trace::log(
+                                    &key2,
+                                    "tool_call",
+                                    json!({
                                     "tool": t,
                                     "toolCallId": trace_id,
                                     "status": if is_err { "error" } else { "success" },
                                     "durationMs": crate::trace::now_ms().saturating_sub(start),
                                     "args": args,
                                     "result": result_text,
-                                }));
+                                    }),
+                                );
                                 // 时间线：AI 工具调用（全量，含只读工具；与 trace 同一配对数据）。
                                 // read 读到 SKILL.md 时改记「技能」事件（替换通用工具事件，避免同类重复）；
                                 // run_command 摘要带目标标记（本地/服务器名）——它不再另写「命令」事件
@@ -1316,6 +1411,68 @@ impl AiManager {
                             .get("message")
                             .and_then(|m| m.get("role"))
                             .and_then(serde_json::Value::as_str);
+                        if role == Some("user") {
+                            let delivered =
+                                ev.get("message")
+                                    .and_then(user_message_text)
+                                    .and_then(|text| {
+                                        let mut queue =
+                                            staged2.lock().unwrap_or_else(|p| p.into_inner());
+                                        let index = queue
+                                            .iter()
+                                            .position(|item| item.native_prompt == text)
+                                            .or_else(|| {
+                                                // prompt 在空闲时直接 started，不会有 queue_update；
+                                                // slash skill/template 展开后只能按队头来源匹配。
+                                                queue.first().and_then(|item| {
+                                                    item.native_prompt
+                                                        .trim_start()
+                                                        .starts_with('/')
+                                                        .then_some(0)
+                                                })
+                                            })?;
+                                        Some(queue.remove(index))
+                                    });
+                            if let Some(item) = delivered {
+                                delivered_staged2
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .insert(item.id.clone());
+                                *last_prompt2.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    item.prompt.clone();
+                                crate::trace::log(
+                                    &key2,
+                                    "user_input",
+                                    json!({
+                                        "prompt": item.prompt,
+                                        "steered": true,
+                                        "images": item.images.iter().map(|img| json!({
+                                            "mimeType": img["mimeType"],
+                                            "bytes": img["data"].as_str().map(|d| d.len() * 3 / 4).unwrap_or(0),
+                                        })).collect::<Vec<_>>(),
+                                    }),
+                                );
+                                crate::timeline::append(
+                                    &store2,
+                                    &project_id2,
+                                    "ai_user",
+                                    timeline_user_summary(&item.prompt),
+                                    Some(item.prompt.clone()),
+                                );
+                                let _ = app2.emit(
+                                    &event,
+                                    json!({
+                                        "type": "stagedDelivered",
+                                        "id": item.id,
+                                        "message": item.message,
+                                    }),
+                                );
+                                emit_staged_queue(&app2, &event, &staged2);
+                            }
+                            // 普通 prompt、恢复的 followUp 与新挂载窗口也需要建立接收气泡；
+                            // 已有 pending 的前端会忽略，本地显式停止的会话不会复活。
+                            let _ = app2.emit(&event, json!({"type": "runStarted"}));
+                        }
                         if role == Some("assistant") && text_started {
                             text_started = false;
                             let _ = app2.emit(&event, json!({"type": "segment"}));
@@ -1363,11 +1520,40 @@ impl AiManager {
                             notify_corruption();
                         }
                     }
+                    "queue_update" => {
+                        let native = ev
+                            .get("steering")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let mut queue = staged2.lock().unwrap_or_else(|p| p.into_inner());
+                        sync_native_prompts(&mut queue, &native);
+                    }
                     // 命令响应失败：只有 prompt 被拒（消息未进模型）才算对话错误；后台命令
                     // （set_thinking_level 等）失败不得冒充对话错误——那会误置 terminal_emitted
                     // 吞掉回合结束的 done，前端卡在生成态
                     "response" => {
-                        let command = ev.get("command").and_then(serde_json::Value::as_str).unwrap_or("prompt");
+                        // steering/clear_queue 命令等待真实 RPC 回执；先唤醒等待者，再沿用
+                        // 普通 prompt 的失败处理。oneshot 只取一次，超时/进程退出由读取末尾兜底。
+                        if let Some(id) = ev.get("id").and_then(serde_json::Value::as_str) {
+                            let waiter = rpc_waiters2
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(id);
+                            if let Some(tx) = waiter {
+                                let _ = tx.send(ev.clone());
+                            }
+                        }
+                        let command = ev
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("prompt");
                         if command == "prompt"
                             && ev.get("success").and_then(serde_json::Value::as_bool) == Some(false)
                             && !terminal_emitted
@@ -1436,6 +1622,19 @@ impl AiManager {
                 // 进程崩溃不会再有 agent_settled：补发收尾信号，让前端把已流出的正文定稿落盘
                 let _ = app2.emit(&event, json!({"type": "settled"}));
             }
+            // stdout 关闭后，所有未完成的 steering/clear_queue 等待者立即失败，
+            // 不让 Tauri 命令永久挂起；未投递卡片随进程生命周期结束清除。
+            staged2.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            emit_staged_queue(&app2, &event, &staged2);
+            let waiters: Vec<_> = rpc_waiters2
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .drain()
+                .map(|(_, tx)| tx)
+                .collect();
+            for tx in waiters {
+                let _ = tx.send(json!({"success": false, "error": "pi 进程已退出"}));
+            }
             procs2
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1450,6 +1649,10 @@ impl AiManager {
                 busy,
                 killed,
                 approvals,
+                staged,
+                delivered_staged,
+                rpc_waiters,
+                queue_op,
                 skill_fingerprint: loaded.fingerprint,
                 last_prompt,
                 cloud_token,
@@ -1720,12 +1923,20 @@ fn handle_extension_ui_request(
             .get("message")
             .and_then(serde_json::Value::as_str)
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-            .and_then(|v| v.get("question").and_then(serde_json::Value::as_str).map(str::to_string))
+            .and_then(|v| {
+                v.get("question")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
-        crate::trace::log(&trace_key, "guard", json!({
+        crate::trace::log(
+            &trace_key,
+            "guard",
+            json!({
             "kind": "confirm_request",
             "detail": format!("AI 请求用户确认: {question}"),
-        }));
+            }),
+        );
         let _ = app2.emit(
             event,
             json!({
@@ -2258,9 +2469,8 @@ async fn run_internal_action(
                     .and_then(serde_json::Value::as_u64)
                     .map(|v| v as usize),
             };
-            crate::timeline::search(store, project_id, &query).map(|entries| {
-                json!({"ok": true, "text": format_timeline_entries(&entries)})
-            })
+            crate::timeline::search(store, project_id, &query)
+                .map(|entries| json!({"ok": true, "text": format_timeline_entries(&entries)}))
         }
         "run_command" => {
             let intent = str_field("intent");
@@ -2614,9 +2824,11 @@ async fn run_internal_action(
             let title = str_field("title");
             let content = str_field("content");
             match cloud {
-                Some(c) => crate::cloud::feedback_submit_for_ai(c, store, &category, &title, &content)
+                Some(c) => {
+                    crate::cloud::feedback_submit_for_ai(c, store, &category, &title, &content)
                     .await
-                    .map(|text| json!({"ok": true, "text": text})),
+                        .map(|text| json!({"ok": true, "text": text}))
+                }
                 None => Err("云服务不可用，无法提交反馈".to_string()),
             }
         }
@@ -2625,7 +2837,9 @@ async fn run_internal_action(
         "dashboard_reload" => crate::dashboard::reload_for_ai(actions, store, project_id)
             .await
             .map(|text| json!({"ok": true, "text": text})),
-        "dashboard_view" => Ok(json!({"ok": true, "text": crate::dashboard::view_summary(project_id)})),
+        "dashboard_view" => {
+            Ok(json!({"ok": true, "text": crate::dashboard::view_summary(project_id)}))
+        }
         other => Err(format!("未知动作：{other}")),
     };
     match result {
@@ -3022,6 +3236,14 @@ pub async fn ai_chat(
         }
         mgr.spawn(&app, &key, &project_id, cloud_token.clone())?;
     }
+    let queue_op = {
+        let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        procs.get(&key).map(|proc| Arc::clone(&proc.queue_op))
+    };
+    let _queue_guard = match &queue_op {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     let Some(proc) = procs.get_mut(&key) else {
         return Err("pi 进程未就绪".to_string());
@@ -3030,8 +3252,12 @@ pub async fn ai_chat(
     proc.last_active = Instant::now();
     let mut aborted_prev = false;
     if proc.busy.swap(true, Ordering::SeqCst) {
+        proc.staged.lock().map_err(|e| e.to_string())?.clear();
+        emit_staged_queue(&app, &format!("ai:event:{key}"), &proc.staged);
         cancel_approvals(proc);
         let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+        w.write_all(b"{\"type\":\"clear_queue\"}\n")
+            .map_err(|e| format!("pi 进程已退出: {e}"))?;
         w.write_all(b"{\"type\":\"abort\"}\n")
             .map_err(|e| format!("pi 进程已退出: {e}"))?;
         aborted_prev = true;
@@ -3090,13 +3316,413 @@ pub async fn ai_chat(
     Ok(())
 }
 
-/// 中止当前生成（进程不存在时静默成功）；顺带取消该 key 待审批项。
+/// 写一条带 id 的 RPC 命令并等待对应 response。进程退出时读取线程会唤醒全部等待者，
+/// 因此这里不使用固定超时，也不会把「stdin 写入成功」误当成 pi 已接受。
+async fn rpc_request(
+    stdin: Arc<Mutex<ChildStdin>>,
+    waiters: RpcWaiters,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let id = payload
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "RPC 请求缺少 id".to_string())?
+        .to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    waiters
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), tx);
+    let mut buf = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    buf.push(b'\n');
+    let write = stdin
+        .lock()
+        .map_err(|e| e.to_string())?
+        .write_all(&buf)
+        .map_err(|e| format!("pi 进程已退出: {e}"));
+    if let Err(error) = write {
+        waiters.lock().map_err(|e| e.to_string())?.remove(&id);
+        return Err(error);
+    }
+    rx.await.map_err(|_| "pi RPC 响应通道已关闭".to_string())
+}
+
+fn prompt_payload(item: &StagedMessage, request_id: &str) -> serde_json::Value {
+    let mut payload = json!({
+        "id": request_id,
+        "type": "prompt",
+        "message": item.prompt,
+        "streamingBehavior": "steer",
+    });
+    if !item.images.is_empty() {
+        payload["images"] = json!(item.images);
+    }
+    payload
+}
+
+fn follow_up_prompt_payload(text: &str, request_id: &str) -> serde_json::Value {
+    json!({
+        "id": request_id,
+        "type": "prompt",
+        "message": text,
+        "streamingBehavior": "followUp",
+    })
+}
+
+/// 取消后的队列重建统一使用 prompt + streamingBehavior=steer：忙时排队，空闲时直接
+/// 启动下一条，消除 pi 已 settled 而 Rust busy 尚未回落时的空闲 steering 滞留。
+async fn send_staged_rpc(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    waiters: &RpcWaiters,
+    busy: &Arc<AtomicBool>,
+    item: &StagedMessage,
+) -> Result<serde_json::Value, String> {
+    busy.store(true, Ordering::SeqCst);
+    let request_id = format!("staged:{}:{}", item.id, uuid::Uuid::new_v4());
+    let response = rpc_request(
+        Arc::clone(stdin),
+        Arc::clone(waiters),
+        prompt_payload(item, &request_id),
+    )
+    .await?;
+    if response.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(response)
+    } else {
+        Err(err_message(&response))
+    }
+}
+
+/// 失败/handled 后按 pi 实际状态校正 busy，不能仅凭本次调用前的本地镜像决定是否复位。
+async fn sync_busy_state(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    waiters: &RpcWaiters,
+    busy: &Arc<AtomicBool>,
+) {
+    let request_id = format!("get-state:{}", uuid::Uuid::new_v4());
+    match rpc_request(
+        Arc::clone(stdin),
+        Arc::clone(waiters),
+        json!({"id": request_id, "type": "get_state"}),
+    )
+    .await
+    {
+        Ok(ev) => {
+            let streaming = ev
+                .get("data")
+                .and_then(|data| data.get("isStreaming"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            busy.store(streaming, Ordering::SeqCst);
+        }
+        Err(_) => busy.store(false, Ordering::SeqCst),
+    }
+}
+
+/// 生成中暂存一条插话。prompt + streamingBehavior=steer 在忙时排队、空闲时直接 started，
+/// 因此 idle 只表示进程不存在，需要前端走 ai_chat 懒启动；delivered 表示 user 消息已投递
+/// （或扩展命令已 handled），不是单纯的队列消失。
 #[tauri::command]
-pub async fn ai_abort(mgr: State<'_, Arc<AiManager>>, key: String) -> Result<(), String> {
+pub async fn ai_steer(
+    mgr: State<'_, Arc<AiManager>>,
+    app: AppHandle,
+    key: String,
+    id: String,
+    prompt: String,
+    images: Option<Vec<PromptImage>>,
+    message: serde_json::Value,
+) -> Result<String, String> {
+    let queue_op = {
+        let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        let Some(proc) = procs.get(&key) else {
+            return Ok("idle".to_string());
+        };
+        Arc::clone(&proc.queue_op)
+    };
+    let _guard = queue_op.lock().await;
+    let (stdin, waiters, staged, delivered_staged, busy) = {
+        let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        let Some(proc) = procs.get(&key) else {
+            return Ok("idle".to_string());
+        };
+        (
+            Arc::clone(&proc.stdin),
+            Arc::clone(&proc.rpc_waiters),
+            Arc::clone(&proc.staged),
+            Arc::clone(&proc.delivered_staged),
+            Arc::clone(&proc.busy),
+        )
+    };
+    let known = mgr.store.known_secrets();
+    let (masked, redacted) = crate::redact::redact_secrets(&prompt, &known);
+    let prompt = if redacted > 0 {
+        format!("{masked}\n\n[AIShell 提示：以上内容有 {redacted} 处凭据已脱敏，属正常安全机制，请勿尝试绕过获取。]")
+    } else {
+        masked
+    };
+    let images_json: Vec<serde_json::Value> = images
+        .unwrap_or_default()
+        .into_iter()
+        .map(|img| json!({"type": "image", "data": img.data, "mimeType": img.mime_type}))
+        .collect();
+    let item = StagedMessage {
+        id: id.clone(),
+        native_prompt: prompt.clone(),
+        prompt,
+        images: images_json,
+        message,
+    };
+    staged.lock().map_err(|e| e.to_string())?.push(item.clone());
+    busy.store(true, Ordering::SeqCst);
+    let response = rpc_request(
+        Arc::clone(&stdin),
+        Arc::clone(&waiters),
+        prompt_payload(&item, &format!("staged:{id}")),
+    )
+    .await;
+    let still_queued = staged
+        .lock()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|queued| queued.id == id);
+    let was_delivered = delivered_staged
+        .lock()
+        .map_err(|e| e.to_string())?
+        .contains(&id);
+    if was_delivered {
+        return Ok("delivered".to_string());
+    }
+    match response {
+        Ok(ev) if ev.get("success").and_then(serde_json::Value::as_bool) == Some(true) => {
+            let disposition = ev
+                .get("data")
+                .and_then(|data| data.get("disposition"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if disposition == "handled" {
+                staged
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .retain(|queued| queued.id != id);
+                sync_busy_state(&stdin, &waiters, &busy).await;
+                emit_staged_queue(&app, &format!("ai:event:{key}"), &staged);
+                Err("扩展命令已被 pi 直接执行，未作为插话排队；普通消息请去掉命令前缀后重试".to_string())
+            } else if still_queued {
+                emit_staged_queue(&app, &format!("ai:event:{key}"), &staged);
+                Ok("queued".to_string())
+            } else {
+                sync_busy_state(&stdin, &waiters, &busy).await;
+                Err("插话尚未投递，pi 队列已清空，请重新发送".to_string())
+            }
+        }
+        Ok(ev) => {
+            staged
+                .lock()
+                .map_err(|e| e.to_string())?
+                .retain(|queued| queued.id != id);
+            sync_busy_state(&stdin, &waiters, &busy).await;
+            emit_staged_queue(&app, &format!("ai:event:{key}"), &staged);
+            Err(err_message(&ev))
+        }
+        Err(error) => {
+            staged
+                .lock()
+                .map_err(|e| e.to_string())?
+                .retain(|queued| queued.id != id);
+            busy.store(false, Ordering::SeqCst);
+            emit_staged_queue(&app, &format!("ai:event:{key}"), &staged);
+            Err(error)
+        }
+    }
+}
+
+/// 当前会话的后端暂存快照（面板重挂、分离窗口聚合时恢复卡片）。
+#[tauri::command]
+pub async fn ai_staged_list(
+    mgr: State<'_, Arc<AiManager>>,
+    key: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let staged = {
+        let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        let Some(proc) = procs.get(&key) else {
+            return Ok(Vec::new());
+        };
+        Arc::clone(&proc.staged)
+    };
+    let queue = staged.lock().map_err(|e| e.to_string())?;
+    Ok(staged_items(&queue))
+}
+
+/// 逐条取消：pi 只提供整队 clear_queue，因此先取回真实队列，再用保存的完整消息重建
+/// 剩余项。queue_op 保证重建期间没有新入队/第二次取消交叉；已投递项由读取线程先移除。
+#[tauri::command]
+pub async fn ai_cancel_steer(
+    mgr: State<'_, Arc<AiManager>>,
+    app: AppHandle,
+    key: String,
+    id: String,
+) -> Result<bool, String> {
+    let queue_op = {
+        let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        let Some(proc) = procs.get(&key) else {
+            return Ok(false);
+        };
+        Arc::clone(&proc.queue_op)
+    };
+    let _guard = queue_op.lock().await;
+    let (stdin, waiters, staged, busy) = {
+        let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        let Some(proc) = procs.get(&key) else {
+            return Ok(false);
+        };
+        if !proc
+            .staged
+            .lock()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|item| item.id == id)
+        {
+            return Ok(false);
+        }
+        (
+            Arc::clone(&proc.stdin),
+            Arc::clone(&proc.rpc_waiters),
+            Arc::clone(&proc.staged),
+            Arc::clone(&proc.busy),
+        )
+    };
+    let request_id = format!("clear-queue:{}", uuid::Uuid::new_v4());
+    let response = rpc_request(
+        Arc::clone(&stdin),
+        Arc::clone(&waiters),
+        json!({"id": request_id, "type": "clear_queue"}),
+    )
+    .await?;
+    if response.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(err_message(&response));
+    }
+    let returned: Vec<String> = response
+        .get("data")
+        .and_then(|data| data.get("steering"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let follow_ups: Vec<String> = response
+        .get("data")
+        .and_then(|data| data.get("followUp"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let cancelled = {
+        let mut queue = staged.lock().map_err(|e| e.to_string())?;
+        // 目标已从 queue 消失表示 clear_queue 前已投递；其余被 clear 的项仍在下方重建。
+        let cancelled = staged_cancel_requested(&queue, &id, &returned);
+        if cancelled {
+            queue.retain(|item| item.id != id);
+        }
+        cancelled
+    };
+    // 只重建 clear 回执中实际存在的项；已被 pi drain、但 message_start 尚未来到的项
+    // 留在 staged 等投递，绝不能再次写入（否则同一条插话会进入模型两次）。
+    let mut returned_remaining = returned.clone();
+    let remaining = staged
+        .lock()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|item| {
+            let Some(index) = returned_remaining
+                .iter()
+                .position(|text| text == &item.native_prompt)
+            else {
+                return false;
+            };
+            returned_remaining.remove(index);
+            true
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for item in remaining {
+        let still_queued = staged
+            .lock()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|queued| queued.id == item.id);
+        if !still_queued {
+            continue;
+        }
+        if let Err(error) = send_staged_rpc(&stdin, &waiters, &busy, &item).await {
+            sync_busy_state(&stdin, &waiters, &busy).await;
+            staged
+                .lock()
+                .map_err(|e| e.to_string())?
+                .retain(|queued| queued.id != item.id);
+            let _ = app.emit(
+                &format!("ai:event:{key}"),
+                json!({
+                    "type": "stagedError",
+                    "id": item.id,
+                    "message": format!("插话重新排队失败: {error}"),
+                }),
+            );
+        }
+    }
+    // clear_queue 同时清 followUp（ai_chat 的 abort→followUp 兜底会使用）。这些消息已进入
+    // 正式历史，不属于 staged 卡片，必须按原顺序恢复，否则取消一条插话会连带吞掉后续提问。
+    for text in follow_ups {
+        busy.store(true, Ordering::SeqCst);
+        let request_id = format!("follow-up:{}", uuid::Uuid::new_v4());
+        let restored = rpc_request(
+            Arc::clone(&stdin),
+            Arc::clone(&waiters),
+            follow_up_prompt_payload(&text, &request_id),
+        )
+        .await?;
+        if restored.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(format!("恢复后续消息失败: {}", err_message(&restored)));
+        }
+    }
+    emit_staged_queue(&app, &format!("ai:event:{key}"), &staged);
+    Ok(cancelled)
+}
+
+/// 中止当前生成（进程不存在时静默成功）；先清 steering 队列，再取消审批并 abort/kill。
+#[tauri::command]
+pub async fn ai_abort(
+    mgr: State<'_, Arc<AiManager>>,
+    app: AppHandle,
+    key: String,
+) -> Result<(), String> {
+    let queue_op = {
+        let procs = mgr.procs.lock().map_err(|e| e.to_string())?;
+        let Some(proc) = procs.get(&key) else {
+            return Ok(());
+        };
+        Arc::clone(&proc.queue_op)
+    };
+    let _guard = queue_op.lock().await;
     let mut procs = mgr.procs.lock().map_err(|e| e.to_string())?;
     let Some(proc) = procs.get_mut(&key) else {
         return Ok(());
     };
+    proc.staged.lock().map_err(|e| e.to_string())?.clear();
+    emit_staged_queue(&app, &format!("ai:event:{key}"), &proc.staged);
+    // pi 文档要求 abort 前先 clear_queue，否则排队消息会在当前 run 停止后继续执行。
+    // 硬杀分支无需等待 response；空闲分支按 stdin 顺序保证 clear 先于 abort。
+    {
+        let mut w = proc.stdin.lock().map_err(|e| e.to_string())?;
+        let _ = w.write_all(b"{\"type\":\"clear_queue\"}\n");
+    }
     if !proc.busy.load(Ordering::SeqCst) {
         // 空闲：轻量 abort——pi 正常收尾，被中断回合的转录（含尾部）仍写入 session 文件
         cancel_approvals(proc);
@@ -4167,5 +4793,76 @@ mod tests {
         let dir = temp_dir("pi-version-missing");
         let err = read_pi_version(&dir).unwrap_err();
         assert!(err.contains("未找到内嵌 pi 运行时"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn staged_rpc_payload_preserves_images_and_request_id() {
+        let item = StagedMessage {
+            id: "queue-1".to_string(),
+            prompt: "继续处理".to_string(),
+            native_prompt: "继续处理".to_string(),
+            images: vec![json!({"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"})],
+            message: json!({"role": "user", "content": "继续处理"}),
+        };
+        let prompt = prompt_payload(&item, "rpc-2");
+        assert_eq!(prompt["id"], "rpc-2");
+        assert_eq!(prompt["type"], "prompt");
+        assert_eq!(prompt["streamingBehavior"], "steer");
+        assert_eq!(prompt["message"], "继续处理");
+        assert_eq!(prompt["images"][0]["data"], "aGVsbG8=");
+
+        let text_only = StagedMessage { images: Vec::new(), ..item };
+        assert!(prompt_payload(&text_only, "rpc-3").get("images").is_none());
+        let follow_up = follow_up_prompt_payload("后续问题", "rpc-4");
+        assert_eq!(follow_up["streamingBehavior"], "followUp");
+        assert_eq!(follow_up["message"], "后续问题");
+    }
+
+    #[test]
+    fn staged_user_text_matching_and_cancel_receipt_cover_races() {
+        assert_eq!(
+            user_message_text(&json!({"role": "user", "content": "纯文本"})).as_deref(),
+            Some("纯文本")
+        );
+        assert_eq!(
+            user_message_text(&json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "带图文本"},
+                    {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}
+                ]
+            }))
+            .as_deref(),
+            Some("带图文本")
+        );
+        assert_eq!(user_message_text(&json!({"role": "user", "content": []})), None);
+
+        let item = |id: &str, prompt: &str| StagedMessage {
+            id: id.to_string(),
+            prompt: prompt.to_string(),
+            native_prompt: prompt.to_string(),
+            images: Vec::new(),
+            message: json!({"role": "user", "content": prompt}),
+        };
+        let queue = vec![item("a", "相同文本"), item("b", "相同文本")];
+        let returned = vec!["相同文本".to_string()];
+        assert!(staged_cancel_requested(&queue, "b", &returned));
+        assert!(!staged_cancel_requested(&queue, "missing", &returned));
+        assert!(!staged_cancel_requested(&queue, "a", &[]));
+
+        let mut expanded = vec![item("skill", "/skill:deploy"), item("tail", "后续")];
+        sync_native_prompts(
+            &mut expanded,
+            &["展开后的技能正文".to_string(), "后续".to_string()],
+        );
+        assert_eq!(expanded[0].native_prompt, "展开后的技能正文");
+        assert!(staged_cancel_requested(
+            &expanded,
+            "skill",
+            &["展开后的技能正文".to_string()]
+        ));
+        // 队头已 drain 时，单元素原生队列与 staged 尾部对齐，不能覆盖队头展开文本。
+        sync_native_prompts(&mut expanded, &["后续".to_string()]);
+        assert_eq!(expanded[0].native_prompt, "展开后的技能正文");
     }
 }
