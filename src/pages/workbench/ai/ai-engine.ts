@@ -24,7 +24,7 @@
  * ai_chat 的 images 参数经 pi RPC images 字段传给多模态模型；单条 ≤9 张、单张 ≤10MB）；
  * Settings.autoSwitchAiWorkdir 开启时输入框上方 chip 行首位固定显示
  * 工作区域标签（不可移除），随激活终端自动切换并作为当前目标上下文带入。
- * 发送无独立按钮：Enter 发送（输入盒右下角小字提示），生成中右下角切换为中断图标按钮（点击/Enter 停止）。
+ * 发送无独立按钮：Enter 发送（输入盒右下角小字提示），生成中 Enter 暂存插话，右下角中断按钮仅用于停止。
  * AI 回复中的链接：普通点击在内置浏览器标签页打开（活跃页面导航 + openTab('browser')），
  * Ctrl/Shift+点击仍走系统浏览器（openUrl）。
  *
@@ -51,7 +51,8 @@
  * 思维链预览：thinking 事件只保留最近 THINK_PREVIEW_MAX 字符（第一行「深度思考 n 秒」、
  *   第二行单行尾部跟随，滚动速度 = 模型输出速度）；任何非 thinking 事件即清除，不进历史。
  *
- * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_abort /
+ * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_steer /
+ *   ai_cancel_steer / ai_staged_list / ai_abort /
  *   ai_kill_project / ai_set_thinking / ai_respond_approval / ai_respond_db_request /
  *   ai_debug_info / set_ai_mode / get_state / save_settings / save_db_connection /
  *   ai_generate_session_title（首条消息异步标题）/ staging_list /
@@ -71,10 +72,11 @@ import MarkdownIt from 'markdown-it';
 import type { AiActionRecord, AiMode, AppState, AttachImageItem, BrowserPageRef, BrowserRef, ChatMsg, ChatSession, FileRef, ImageRef, KbHit, LlmConfig, NoteRef, PathRef, PcapRef, Project, Server, ServerRef, SkillRef, TermSnapshot } from '../../../types';
 import { icon, type IconName } from '../../../icons';
 import {
-  aiAbort, aiAttachImages, aiChat, aiDebugInfo, aiForwardRef, aiGenerateSessionTitle, aiReadImage, aiRepairSession, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, aiWindowClose, aiWindowOpen, getState, kbSearch, onAiEvent, onAiForwardRef, onAiSessionTitle, onAiWindowChanged, saveDbConnection, saveSettings,
+  aiAbort, aiAttachImages, aiCancelSteer, aiChat, aiDebugInfo, aiForwardRef, aiGenerateSessionTitle, aiReadImage, aiRepairSession, aiRespondApproval, aiRespondAsk, aiRespondConfirm, aiRespondDbRequest, aiSetThinking, aiStagedList, aiSteer, aiWindowClose, aiWindowOpen, getState, kbSearch, onAiEvent, onAiForwardRef, onAiSessionTitle, onAiWindowChanged, saveDbConnection, saveSettings,
   sessionArchive, sessionNote, sessionUpsert, sessionsGet, setAiMode, stagingAccept, stagingList, traceStatus,
   type AiEvent,
   type AiSessionTitleEvent,
+  type AiStagedItem,
 } from '../../../api';
 import { DND_MIME, getActiveTab, getActiveTerminalApi, tabApis, useWorkbench, wbEvents, wbHandles, type AiHandle, type Tab, type TerminalApi, type TimelineAnalysisScopeItem } from '../../../stores/workbench';
 import { getBrowserPagesForMention, openInActivePage } from '../tabs/browser-engine';
@@ -308,6 +310,25 @@ const STYLE = `
 /* 工作区域固定 chip 行(输入框上方):引用 tag 已内嵌输入框,图片附件 chip 也在本行;
    无任何 chip 时行高塌为 0(slot 空内容),仅余 #ai-input-area 的 6px gap */
 #ai-chip-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+#ai-staged-row { display: flex; flex-direction: column; gap: 4px; }
+#ai-staged-row:empty { display: none; }
+.ai-staged-message {
+  display: flex; align-items: center; gap: 7px; min-width: 0;
+  padding: 6px 7px; border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--accent-dim); color: var(--text-0); font-size: 11.5px;
+}
+.ai-staged-message.cancelling { opacity: 0.55; pointer-events: none; }
+.ai-staged-label { flex: none; color: var(--accent-hover); user-select: none; }
+.ai-staged-text {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-1);
+}
+.ai-staged-cancel {
+  width: 22px; height: 22px; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 4px; background: transparent; color: var(--text-2); cursor: pointer;
+}
+.ai-staged-cancel:hover { background: var(--bg-3); color: var(--text-0); }
+.ai-staged-cancel svg { width: 13px; height: 13px; }
 #ai-workarea-slot { flex: none; display: inline-flex; }
 #ai-input-row { position: relative; }
 /* 输入盒:外框承担旧 textarea 的边框/背景/滚动,内部是 contenteditable + 右下角状态区 */
@@ -715,6 +736,18 @@ interface ProjectContext {
   project: Project;
   sessions: Map<string, ChatSession>;
   pendingBy: Map<string, Pending | null>;
+  /** 后端已接受、尚未投递的插话；只用于卡片展示，收到 delivered 才进正式历史。 */
+  stagedBy: Map<string, AiStagedItem[]>;
+  /** 已乐观上卡、仍在准备或等待后端接受的 id；后端快照到达时保留这些本地项。 */
+  stagedSubmitting: Map<string, Set<string>>;
+  /** 用户在后端接受前已取消的 id；提交链在写入前/接受后分别兜底取消。 */
+  stagedCancelRequested: Map<string, Set<string>>;
+  /** 每个会话串行准备并提交插话，UI 不等待，顺序不受异步知识库/图片读取影响。 */
+  stagedSubmitQueues: Map<string, Promise<void>>;
+  /** 每次后端队列事件递增；防止较旧的 list 回包覆盖较新的事件快照。 */
+  stagedVersions: Map<string, number>;
+  /** 本窗口显式停止的会话；与新挂载窗口「尚无 pending」区分，后者仍需接收插话后续流。 */
+  stoppedSessions: Set<string>;
   /** 用户手动展开的工具调用组（key = `<sid>:<消息ts>`） */
   expandedGroups: Set<string>;
   activeSessionId: string;
@@ -792,6 +825,7 @@ export function subscribeAiDetach(fn: () => void): () => void {
 /** 以下是当前视图上下文的别名，保留命令式引擎原有函数结构。 */
 let sessions = new Map<string, ChatSession>();
 let pendingBy = new Map<string, Pending | null>();
+let stagedBy = new Map<string, AiStagedItem[]>();
 let expandedGroups = new Set<string>();
 const snapshots = new Map<string, TermSnapshot>(); // 快照 id -> 全文（输入区 chip + 历史消息 chip 共用）
 const fileRefs = new Map<string, FileRef>(); // 文件引用 id -> 全文（编辑器选区，@文件名_起_止 标签）
@@ -906,6 +940,8 @@ let workareaSlot: HTMLElement;
 let sendBtn: HTMLButtonElement;
 /** 图片附件缩略图行（引用 tag 已内嵌输入框，此行只剩图片 chip） */
 let chipRow: HTMLElement;
+/** 当前会话已接受、待投递的插话卡片行。 */
+let stagedRow: HTMLElement;
 let effortSelect: HTMLSelectElement;
 let modeSelect: HTMLSelectElement;
 /** 思考强度切换防抖：快速连续切换只允许一个保存流程 */
@@ -999,6 +1035,12 @@ function getProjectContext(p: Project): ProjectContext {
     project: p,
     sessions: new Map(),
     pendingBy: new Map(),
+    stagedBy: new Map(),
+    stagedSubmitting: new Map(),
+    stagedCancelRequested: new Map(),
+    stagedSubmitQueues: new Map(),
+    stagedVersions: new Map(),
+    stoppedSessions: new Set(),
     expandedGroups: new Set(),
     activeSessionId: '',
     loaded: false,
@@ -1018,6 +1060,7 @@ function bindViewContext(ctx: ProjectContext): void {
   project = ctx.project;
   sessions = ctx.sessions;
   pendingBy = ctx.pendingBy;
+  stagedBy = ctx.stagedBy;
   expandedGroups = ctx.expandedGroups;
   activeSessionId = ctx.activeSessionId;
 }
@@ -1123,13 +1166,14 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
         </select>
       </div>
       <div id="ai-chip-row"><span id="ai-workarea-slot"></span></div>
+      <div id="ai-staged-row" aria-live="polite"></div>
       <div id="ai-input-row">
         <div id="ai-input-box">
           <div id="ai-input" contenteditable="true" role="textbox" aria-multiline="true" aria-label="AI 对话输入框"
             data-placeholder="向 AI 提问，Shift+Enter 换行；输入 @ 引用终端/文件/服务器/浏览器；可粘贴或拖入图片"></div>
           <span class="ai-input-corner">
             <span class="ai-input-hint">Enter 发送</span>
-            <button class="ai-abort-btn" type="button" title="停止生成 (Enter)" hidden>${icon('square')}</button>
+            <button class="ai-abort-btn" type="button" tabindex="-1" title="停止生成" hidden>${icon('square')}</button>
           </span>
         </div>
       </div>
@@ -1145,6 +1189,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   workareaSlot = el('workarea-slot');
   sendBtn = container.querySelector<HTMLButtonElement>('.ai-abort-btn')!;
   chipRow = el('chip-row');
+  stagedRow = el('staged-row');
   effortSelect = el('effort-select') as HTMLSelectElement;
   modeSelect = el('mode-select') as HTMLSelectElement;
   stagingNotice = el('staging-notice') as HTMLButtonElement;
@@ -1182,6 +1227,7 @@ export function mountAiPanel(container: HTMLElement, options: AiPanelOptions = {
   void aiDebugInfo().then((info) => console.log('[AI] pi 运行时诊断:\n' + info));
 
   bindEvents();
+  renderStagedCards();
   /* 分离/聚合按钮（panelOptions.detach 为空 = 不渲染，见会话条模板） */
   container.querySelector<HTMLButtonElement>('#ai-detach')?.addEventListener('click', () => {
     void (panelOptions.detach?.role === 'detached' ? attachAiWindow() : detachAiWindow());
@@ -1761,6 +1807,7 @@ function ensureSessionSubscription(ctx: ProjectContext, sid: string): Promise<vo
     ctx.subscribing.delete(sid);
     if (ctx.subscriptions.has(sid)) off();
     else ctx.subscriptions.set(sid, off);
+    void refreshStagedList(ctx, sid);
   }).catch((err) => {
     ctx.subscribing.delete(sid);
     console.error('AI 事件订阅失败:', err);
@@ -1814,11 +1861,12 @@ async function switchEffort(level: LlmConfig['effort']): Promise<void> {
 function handleEvent(ctx: ProjectContext, sid: string, ev: AiEvent): void {
   /* 事件回调必须使用其订阅所属项目上下文；项目切换后仍可在后台定稿/落盘，
      只有当前可见上下文才触碰 DOM。同步执行期间暂借旧引擎别名，结束后恢复。 */
-  const previous = { project, sessions, pendingBy, expandedGroups, activeSessionId, eventContext };
+  const previous = { project, sessions, pendingBy, stagedBy, expandedGroups, activeSessionId, eventContext };
   eventContext = ctx;
   project = ctx.project;
   sessions = ctx.sessions;
   pendingBy = ctx.pendingBy;
+  stagedBy = ctx.stagedBy;
   expandedGroups = ctx.expandedGroups;
   activeSessionId = viewContext === ctx ? ctx.activeSessionId : '';
   try {
@@ -1827,6 +1875,7 @@ function handleEvent(ctx: ProjectContext, sid: string, ev: AiEvent): void {
     project = previous.project;
     sessions = previous.sessions;
     pendingBy = previous.pendingBy;
+    stagedBy = previous.stagedBy;
     expandedGroups = previous.expandedGroups;
     activeSessionId = previous.activeSessionId;
     eventContext = previous.eventContext;
@@ -1841,7 +1890,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
      合法的「null + 事件」流。done/settled 例外：finalize 自带 null 安全（仅落盘）。 */
   /* 思维链预览只属于「正在思考」阶段：任何非 thinking 事件（正文/工具/审批/结束/
      错误）都表示这段思考已结束，立即清掉，下一次渲染即移除组件。 */
-  if (ev.type !== 'thinking') {
+  if (ev.type !== 'thinking' && ev.type !== 'stagedQueue' && ev.type !== 'stagedError') {
     const cur = pendingBy.get(sid);
     if (cur?.thinking) cur.thinking = undefined;
   }
@@ -1860,6 +1909,10 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     if (sid === activeSessionId) ensureThinkTimer();
   } else if (ev.type === 'thinkingEnd') {
     /* 顶部通用清除已摘掉 thinking；这里什么都不用做，末尾的 refreshActive 会重建气泡 */
+  } else if (ev.type === 'runStarted') {
+    if (!pendingBy.get(sid) && !eventContext?.stoppedSessions.has(sid)) {
+      pendingBy.set(sid, emptyPending());
+    }
   } else if (ev.type === 'delta') {
     /* 瞬时错误（限流/过载）后 pi 自动重试成功、增量恢复：复用当前 pending（可能是
        错误相）转回流式，错误气泡被内容取代；后端 delta 恢复时已重置终态抑制，
@@ -2047,6 +2100,16 @@ function handleEventBody(sid: string, ev: AiEvent): void {
       cur.text += '\n\n';
       pendingBy.set(sid, cur);
     }
+  } else if (ev.type === 'stagedQueue') {
+    eventContext?.stagedVersions.set(sid, (eventContext.stagedVersions.get(sid) ?? 0) + 1);
+    if (eventContext) mergeStagedSnapshot(eventContext, sid, ev.items);
+  } else if (ev.type === 'stagedDelivered') {
+    eventContext?.stagedVersions.set(sid, (eventContext.stagedVersions.get(sid) ?? 0) + 1);
+    deliverStagedMessage(sid, ev.id, ev.message);
+  } else if (ev.type === 'stagedError') {
+    eventContext?.stagedVersions.set(sid, (eventContext.stagedVersions.get(sid) ?? 0) + 1);
+    stagedBy.set(sid, (stagedBy.get(sid) ?? []).filter((item) => item.id !== ev.id));
+    toast(ev.message, 'error');
   } else if (ev.type === 'done') {
     finalize(sid);
   } else if (ev.type === 'settled') {
@@ -2075,6 +2138,10 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     });
   }
   if (eventContext === viewContext && sid === activeSessionId && !unmounted) {
+    if (ev.type === 'stagedQueue' || ev.type === 'stagedError') {
+      renderStagedCards();
+      return;
+    }
     /* delta 高频到达（每秒数十条）：rAF 合帧只增量更新流式气泡，历史节点不动；
        其余事件低频，同步渲染（含 finalize 后追加定稿消息） */
     if (ev.type === 'delta') schedulePendingRender();
@@ -2161,6 +2228,13 @@ function leaveSession(sid: string, ctx: ProjectContext | null = viewContext): vo
   if (!ctx) return;
   const p = ctx.pendingBy.get(sid) ?? null;
   ctx.pendingBy.set(sid, null);
+  ctx.stoppedSessions.add(sid);
+  const cancelled = ctx.stagedCancelRequested.get(sid) ?? new Set<string>();
+  for (const id of ctx.stagedSubmitting.get(sid) ?? []) cancelled.add(id);
+  ctx.stagedCancelRequested.set(sid, cancelled);
+  ctx.stagedBy.set(sid, []);
+  ctx.stagedVersions.set(sid, (ctx.stagedVersions.get(sid) ?? 0) + 1);
+  if (viewContext === ctx && ctx.activeSessionId === sid) renderStagedCards();
   /* 不限定 stream 相：错误相里同样存在已流出的正文（停止键/模式切换打断时），
      丢掉它正是「最后一段输出被吞」的来源 */
   if (p && p.text.trim()) {
@@ -2474,6 +2548,7 @@ function renderHistory(): void {
   if (pend) replacePending(renderPending(pend));
   if (pend?.thinking) ensureThinkTimer();
   pinThinkLine();
+  renderStagedCards();
   scrollBottom();
 }
 
@@ -2603,6 +2678,7 @@ function refreshActive(): void {
   }
   if (pend?.thinking) ensureThinkTimer();
   pinThinkLine();
+  renderStagedCards();
   scrollBottom();
   updateSendBtn();
 }
@@ -3226,11 +3302,12 @@ function renderPart(p: { kind: string; lang: string; body: string }): string {
  *  再走 switchMode 实时切换路径切到工作模式（跨边界会重启进程、定稿当前生成）；
  *  拒绝 → 仅回复 pi，保持仅建议模式。 */
 async function handleModeRequest(ctx: ProjectContext, sid: string, ev: Extract<AiEvent, { type: 'approval' }>): Promise<void> {
-  const previous = { project, sessions, pendingBy, expandedGroups, activeSessionId, eventContext };
+  const previous = { project, sessions, pendingBy, stagedBy, expandedGroups, activeSessionId, eventContext };
   eventContext = ctx;
   project = ctx.project;
   sessions = ctx.sessions;
   pendingBy = ctx.pendingBy;
+  stagedBy = ctx.stagedBy;
   expandedGroups = ctx.expandedGroups;
   activeSessionId = viewContext === ctx ? ctx.activeSessionId : '';
   if (!project) return;
@@ -4494,12 +4571,257 @@ function closeMention(): void {
   }
 }
 
-/** 生成状态切换：右下角「Enter 发送」小字 ↔ 中断图标按钮（点击/Enter 停止生成） */
+/** 生成状态切换：生成中 Enter 暂存插话，右下角停止按钮始终只负责中断。 */
 function updateSendBtn(): void {
   const generating = isGenerating(activeSessionId);
   sendBtn.hidden = !generating;
   const hint = sendBtn.parentElement?.querySelector<HTMLElement>('.ai-input-hint');
-  if (hint) hint.style.display = generating ? 'none' : '';
+  if (hint) hint.textContent = generating ? 'Enter 插话' : 'Enter 发送';
+}
+
+/** 输入框上方的暂存卡片；消息此时尚未进入 ChatSession.messages，取消不会留下历史。 */
+function renderStagedCards(): void {
+  if (!stagedRow) return;
+  const items = stagedBy.get(activeSessionId) ?? [];
+  stagedRow.replaceChildren();
+  for (const item of items) {
+    const card = document.createElement('div');
+    card.className = 'ai-staged-message';
+    card.dataset.stagedId = item.id;
+    card.title = '将在当前工具调用批次结束后发送；没有后续工具调用时，将在本回合结束后发送';
+    const label = document.createElement('span');
+    label.className = 'ai-staged-label';
+    label.textContent = '插话暂存';
+    const text = document.createElement('span');
+    text.className = 'ai-staged-text';
+    const summary = item.message.content.replace(/\s+/g, ' ').trim();
+    text.textContent = summary || (item.message.imageRefs?.length ? '[图片消息]' : '[引用消息]');
+    text.title = item.message.content;
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'ai-staged-cancel';
+    cancel.title = '取消发送';
+    cancel.setAttribute('aria-label', '取消发送插话');
+    cancel.innerHTML = icon('x');
+    cancel.onclick = () => {
+      card.classList.add('cancelling');
+      void cancelStagedMessage(item.id);
+    };
+    card.append(label, text, cancel);
+    stagedRow.appendChild(card);
+  }
+}
+
+/** 合并后端快照与本地乐观卡片：仍在提交链里的项不能被较早的后端快照抹掉。 */
+function mergeStagedSnapshot(ctx: ProjectContext, sid: string, items: AiStagedItem[]): void {
+  const submitting = ctx.stagedSubmitting.get(sid);
+  const cancelled = ctx.stagedCancelRequested.get(sid);
+  const optimistic = (ctx.stagedBy.get(sid) ?? []).filter((item) =>
+    submitting?.has(item.id) && !cancelled?.has(item.id));
+  const merged = [...items];
+  for (const item of optimistic) {
+    if (!merged.some((existing) => existing.id === item.id)) merged.push(item);
+  }
+  ctx.stagedBy.set(sid, merged);
+}
+
+function captureInputDraft() {
+  return {
+    html: input.innerHTML,
+    snapshots: new Map(snapshots),
+    fileRefs: new Map(fileRefs),
+    serverRefs: new Map(serverRefs),
+    pathRefs: new Map(pathRefs),
+    pcapRefs: new Map(pcapRefs),
+    browserRefs: new Map(browserRefs),
+    pageRefs: new Map(pageRefs),
+    skillRefs: new Map(skillRefs),
+    noteRefs: new Map(noteRefs),
+    images: [...inputImageRefs.values()],
+  };
+}
+type InputDraft = ReturnType<typeof captureInputDraft>;
+
+/** 后台提交失败时恢复原草稿；若用户已继续输入，则把原草稿前置，不覆盖新内容。 */
+function restoreInputDraft(draft: InputDraft): void {
+  input.innerHTML = draft.html + input.innerHTML;
+  for (const [id, value] of draft.snapshots) snapshots.set(id, value);
+  for (const [id, value] of draft.fileRefs) fileRefs.set(id, value);
+  for (const [id, value] of draft.serverRefs) serverRefs.set(id, value);
+  for (const [id, value] of draft.pathRefs) pathRefs.set(id, value);
+  for (const [id, value] of draft.pcapRefs) pcapRefs.set(id, value);
+  for (const [id, value] of draft.browserRefs) browserRefs.set(id, value);
+  for (const [id, value] of draft.pageRefs) pageRefs.set(id, value);
+  for (const [id, value] of draft.skillRefs) skillRefs.set(id, value);
+  for (const [id, value] of draft.noteRefs) noteRefs.set(id, value);
+  for (const ref of draft.images) {
+    if (inputImageRefs.has(ref.id)) continue;
+    inputImageRefs.set(ref.id, ref);
+    addImageRefChip(ref);
+  }
+  input.focus();
+}
+
+async function refreshStagedList(ctx: ProjectContext, sid: string): Promise<void> {
+  const version = ctx.stagedVersions.get(sid) ?? 0;
+  try {
+    const items = await aiStagedList(`${ctx.project.id}:${sid}`);
+    // list 往返期间到达的事件一定更新；旧快照不得把已投递/已取消卡片复活。
+    if ((ctx.stagedVersions.get(sid) ?? 0) !== version) return;
+    mergeStagedSnapshot(ctx, sid, items);
+    if (viewContext === ctx && activeSessionId === sid && !unmounted) renderStagedCards();
+  } catch (err) {
+    console.error('[AI] 读取插话队列失败:', err);
+  }
+}
+
+function removeStagedLocal(ctx: ProjectContext, sid: string, id: string): void {
+  ctx.stagedBy.set(sid, (ctx.stagedBy.get(sid) ?? []).filter((item) => item.id !== id));
+  ctx.stagedVersions.set(sid, (ctx.stagedVersions.get(sid) ?? 0) + 1);
+  if (viewContext === ctx && activeSessionId === sid && !unmounted) renderStagedCards();
+}
+
+/** 立即上卡并清空当前草稿；实际准备与 RPC 在后台按会话串行执行。 */
+function queueStagedMessage(
+  ctx: ProjectContext,
+  sid: string,
+  message: ChatMsg,
+  segments: InputSegment[],
+  chipData: Map<string, ChipDatum>,
+): void {
+  const id = uid('steer');
+  const draft = captureInputDraft();
+  const submitting = ctx.stagedSubmitting.get(sid) ?? new Set<string>();
+  submitting.add(id);
+  ctx.stagedSubmitting.set(sid, submitting);
+  ctx.stagedBy.set(sid, [...(ctx.stagedBy.get(sid) ?? []), { id, message }]);
+  ctx.stagedVersions.set(sid, (ctx.stagedVersions.get(sid) ?? 0) + 1);
+  clearChips();
+  renderStagedCards();
+  input.focus();
+  const previous = ctx.stagedSubmitQueues.get(sid) ?? Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(() => submitStagedMessage(ctx, sid, id, message, segments, chipData, draft));
+  ctx.stagedSubmitQueues.set(sid, next);
+  void next.finally(() => {
+    if (ctx.stagedSubmitQueues.get(sid) === next) ctx.stagedSubmitQueues.delete(sid);
+  });
+}
+
+async function submitStagedMessage(
+  ctx: ProjectContext,
+  sid: string,
+  id: string,
+  message: ChatMsg,
+  segments: InputSegment[],
+  chipData: Map<string, ChipDatum>,
+  draft: InputDraft,
+): Promise<void> {
+  const key = `${ctx.project.id}:${sid}`;
+  const cancelled = (): boolean => ctx.stagedCancelRequested.get(sid)?.has(id) ?? false;
+  try {
+    const { prompt, images } = await preparePrompt(segments, message.imageRefs ?? [], chipData);
+    if (cancelled()) return;
+    const disposition = await aiSteer(key, id, prompt, images.length ? images : undefined, message);
+    if (cancelled()) {
+      if (disposition !== 'idle') await aiCancelSteer(key, id).catch(() => false);
+      return;
+    }
+    if (disposition === 'idle') {
+      await startIdleStagedMessage(ctx, sid, id, message, prompt, images);
+    }
+  } catch (err) {
+    if (!cancelled()) {
+      removeStagedLocal(ctx, sid, id);
+      if (viewContext === ctx && activeSessionId === sid && !unmounted) restoreInputDraft(draft);
+      console.error('[AI] ai_steer 失败:', err);
+      toast(`插话暂存失败：${String(err)}`, 'error');
+    }
+  } finally {
+    ctx.stagedSubmitting.get(sid)?.delete(id);
+    ctx.stagedCancelRequested.get(sid)?.delete(id);
+    if (viewContext === ctx && activeSessionId === sid && !unmounted) renderStagedCards();
+  }
+}
+
+/** 进程恰好已退出时的普通发送回退：复用已准备的 prompt，不中断也不重复排队。 */
+async function startIdleStagedMessage(
+  ctx: ProjectContext,
+  sid: string,
+  id: string,
+  message: ChatMsg,
+  prompt: string,
+  images: Array<{ mimeType: string; data: string }>,
+): Promise<void> {
+  const s = ctx.sessions.get(sid);
+  if (!s) throw new Error('会话未加载');
+  removeStagedLocal(ctx, sid, id);
+  const leftover = ctx.pendingBy.get(sid) ?? null;
+  if (leftover?.text.trim()) pushAssistantMessage(s, leftover.text, collectActions(leftover));
+  s.messages.push(message);
+  ctx.pendingBy.set(sid, emptyPending());
+  ctx.stoppedSessions.delete(sid);
+  void persistSession(s, ctx);
+  if (viewContext === ctx && activeSessionId === sid && !unmounted) {
+    renderHistory();
+    updateSendBtn();
+  }
+  await aiChat(`${ctx.project.id}:${sid}`, prompt, images.length ? images : undefined).catch((err: unknown) => {
+    ctx.pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
+    if (viewContext === ctx && activeSessionId === sid && !unmounted) {
+      renderHistory();
+      updateSendBtn();
+    }
+  });
+}
+
+async function cancelStagedMessage(id: string): Promise<void> {
+  const ctx = viewContext;
+  const sid = activeSessionId;
+  if (!ctx || !sid) return;
+  if (ctx.stagedSubmitting.get(sid)?.has(id)) {
+    const cancelled = ctx.stagedCancelRequested.get(sid) ?? new Set<string>();
+    cancelled.add(id);
+    ctx.stagedCancelRequested.set(sid, cancelled);
+    removeStagedLocal(ctx, sid, id);
+    return;
+  }
+  let cancelled = false;
+  let failed = false;
+  try {
+    cancelled = await aiCancelSteer(`${ctx.project.id}:${sid}`, id);
+  } catch (err) {
+    failed = true;
+    toast(`取消插话失败：${String(err)}`, 'error');
+  } finally {
+    await refreshStagedList(ctx, sid);
+  }
+  // 进程已消失时列表会清空，属于失效移除而非「无法取消」；仅目标仍在发送中才提示。
+  if (!failed && !cancelled && (ctx.stagedBy.get(sid) ?? []).some((item) => item.id === id)) {
+    toast('该插话已开始发送，无法取消', 'info');
+  }
+}
+
+/** 插话成为真正 user 消息：先定稿当前 AI 片段，再以新 pending 接收后续回复。 */
+function deliverStagedMessage(sid: string, id: string, message: ChatMsg): void {
+  const s = sessions.get(sid);
+  if (!s) return;
+  const p = pendingBy.get(sid) ?? null;
+  if (p && (p.text.trim() || p.actions.size > 0)) {
+    pushAssistantMessage(s, p.text, collectActions(p));
+  }
+  s.messages.push(message);
+  const stopped = eventContext?.stoppedSessions.has(sid) ?? false;
+  // 新挂载窗口虽然尚无 pending，也必须接收插话后续流；只有本窗口显式停止才不复活。
+  if (p || !stopped) {
+    pendingBy.set(sid, emptyPending());
+    eventContext?.stoppedSessions.delete(sid);
+  }
+  eventContext?.stagedSubmitting.get(sid)?.delete(id);
+  stagedBy.set(sid, (stagedBy.get(sid) ?? []).filter((item) => item.id !== id));
+  persistSession(s);
+  if (sid === activeSessionId) renderSessionBar();
 }
 
 /** 是否正在生成（错误气泡不算生成中，允许继续发新消息） */
@@ -4517,6 +4839,9 @@ function isGenerating(sid: string): boolean {
  */
 export function anyAiBusy(): boolean {
   for (const ctx of projectContexts.values()) {
+    for (const items of ctx.stagedBy.values()) {
+      if (items.length > 0) return true;
+    }
     for (const p of ctx.pendingBy.values()) {
       if (!p) continue;
       if (p.phase !== 'error' || p.text.trim()) return true;
@@ -4640,15 +4965,6 @@ async function send(textOverride?: string): Promise<void> {
   const sid = activeSessionId;
   const s = sessions.get(sid);
   if (!s) return;
-  // 生成中 → 停止：本地立即定稿并中止后端（leaveSession 同语义：已生成文本落历史）。
-  // 不能只调 aiAbort 等后端终止事件：事件被吞（曾因瞬时错误自动重试后 done 受抑制）
-  // 会导致停止键无效、输入区永久卡在生成态
-  if (isGenerating(sid)) {
-    leaveSession(sid);
-    renderHistory();
-    updateSendBtn();
-    return;
-  }
   closeMention(); // 发送按钮路径可能带着打开的 @ 补全弹层
   // 读取输入区：文本段与内嵌 chip 按输入框内顺序；content 落盘保留 token（历史按 token 还原位置）；
   // 程序化首条消息（main 侧引入：textOverride 非空时直接使用纯文本段，不读输入框）
@@ -4730,6 +5046,13 @@ async function send(textOverride?: string): Promise<void> {
   const text = segmentsToText(segments).trim();
   if (!text && snaps.length === 0 && refs.length === 0 && srefs.length === 0 && prefs.length === 0 && pcrefs.length === 0 && brefs.length === 0 && pgrefs.length === 0 && skrefs.length === 0 && nrefs.length === 0 && imgs.length === 0) return;
 
+  const userMessage: ChatMsg = { role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, pcapRefs: pcrefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, noteRefs: nrefs, imageRefs: imgs, actions: [], ts: Date.now() };
+  const key = `${pid}:${sid}`;
+  if (isGenerating(sid)) {
+    queueStagedMessage(ctx, sid, userMessage, segments, chipData);
+    return;
+  }
+
   // 只有新会话的第一条用户消息触发一次标题任务；后续消息永不自动改名。
   const shouldGenerateTitle = s.messages.length === 0 && !s.autoTitleTriggered;
   if (shouldGenerateTitle) {
@@ -4756,9 +5079,10 @@ async function send(textOverride?: string): Promise<void> {
     void persistSession(s, ctx);
   }
 
-  s.messages.push({ role: 'user', content: text, snapshots: snaps, fileRefs: refs, serverRefs: srefs, pathRefs: prefs, pcapRefs: pcrefs, browserRefs: brefs, browserPageRefs: pgrefs, skillRefs: skrefs, noteRefs: nrefs, imageRefs: imgs, actions: [], ts: Date.now() });
+  s.messages.push(userMessage);
   if (shouldGenerateTitle) s.autoTitleTriggered = true;
   clearChips();
+  ctx.stoppedSessions.delete(sid);
   pendingBy.set(sid, emptyPending());
   renderSessionBar();
   renderHistory();
@@ -4784,10 +5108,26 @@ async function send(textOverride?: string): Promise<void> {
     void persistSession(s, ctx);
   }
 
-  // 提交给 ai_chat 的 prompt = 工作区域上下文 + 输入区各段按序展开（文本原样、chip 展开为引用说明）
+  const { prompt, images } = await preparePrompt(segments, imgs, chipData);
+  aiChat(key, prompt, images.length ? images : undefined).catch((err: unknown) => {
+    // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
+    console.error('[AI] ai_chat 失败:', err);
+    ctx.pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
+    if (viewContext === ctx && !unmounted && sid === activeSessionId) {
+      renderHistory();
+      updateSendBtn();
+      renderSessionBar();
+    }
+  });
+}
+
+/** 普通发送与插话共用的 prompt/图片准备；图片本体只走 RPC images，不拼进文本。 */
+async function preparePrompt(
+  segments: InputSegment[],
+  imgs: ImageRef[],
+  chipData: Map<string, ChipDatum>,
+): Promise<{ prompt: string; images: Array<{ mimeType: string; data: string }> }> {
   const prompt = await buildPrompt(segments, imgs, chipData);
-  // 图片本体不进 prompt：经 ai_chat 的 images 参数走 pi RPC images 字段（多模态 user 消息）。
-  // 回读失败的图片跳过并提示（落盘副本被移动/删除的极端场景），不阻塞整条消息。
   const loaded = await Promise.all(
     imgs.map(async (r) => {
       const out = await loadImageData(r.path);
@@ -4798,16 +5138,7 @@ async function send(textOverride?: string): Promise<void> {
   if (images.length < imgs.length) {
     toast(`${imgs.length - images.length} 张图片读取失败，已跳过`, 'error');
   }
-  aiChat(`${pid}:${sid}`, prompt, images.length ? images : undefined).catch((err: unknown) => {
-    // 提交失败（pi 运行时缺失 / 未配置 API Key 等）：错误气泡红边；完整信息打到控制台便于排查
-    console.error('[AI] ai_chat 失败:', err);
-    ctx.pendingBy.set(sid, { phase: 'error', text: '', error: String(err), tools: [], actions: new Map() });
-    if (viewContext === ctx && !unmounted && sid === activeSessionId) {
-      renderHistory();
-      updateSendBtn();
-      renderSessionBar();
-    }
-  });
+  return { prompt, images };
 }
 
 /**
@@ -5171,7 +5502,30 @@ function bindEvents(): void {
   offSelectionChange = (): void => {
     document.removeEventListener('selectionchange', onSelChange);
   };
-  sendBtn.onclick = () => { void send(); };
+  // 中断只响应明确的鼠标点击。原生 button 即使已聚焦，Enter/键盘合成 click 也转回插话发送，
+  // 不能由浏览器的默认按钮激活行为抢先执行 leaveSession。
+  sendBtn.onmousedown = (e) => e.preventDefault();
+  sendBtn.onkeydown = (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    e.stopPropagation();
+    input.focus();
+    if (e.shiftKey) document.execCommand('insertLineBreak');
+    else void send();
+  };
+  sendBtn.onclick = (e) => {
+    if (e.detail === 0) {
+      // 键盘/辅助技术合成的 click：onkeydown 已拦截，这里作为第二道防线。
+      input.focus();
+      void send();
+      return;
+    }
+    const sid = activeSessionId;
+    if (!sid || !isGenerating(sid)) return;
+    leaveSession(sid);
+    renderHistory();
+    updateSendBtn();
+  };
   effortSelect.onchange = () => {
     void switchEffort(effortSelect.value as LlmConfig['effort']);
   };
