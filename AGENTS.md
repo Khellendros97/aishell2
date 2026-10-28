@@ -20,6 +20,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 提交前三道门全绿:tsc、cargo test、clippy -D warnings。
 
+构建耗时参考(本机 i7-9750H/6c12t):改一个 Rust 文件 `cargo build` 约 45~75s,零改动约 10~15s(大头是 cargo 校验 9851 个 `bundle.resources` 文件);全量 `cargo test` / `clippy --all-targets` 各走 test/check profile,首次几分钟,之后增量。日常只跑单测可用 `cargo test --lib` 省掉 3 个集成测试二进制的链接。`npx tsc --noEmit` 已开增量(`tsconfig.json` incremental),首跑 ~26s、之后 ~10s。
+
 ## 硬约束(踩过的坑)
 
 1. **单测绝不碰真实 keyring**:store.rs 密钥走 `SecretStore` trait,生产 `KeyringSecrets` / 测试 `MemorySecrets`。测试一律用 `test_store()` 构造,禁止 `Store::new()`(会写用户真实的 Windows 凭据管理器)。
@@ -36,6 +38,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 12. **直连 LLM 请求的 max_tokens 必须给思维链留预算**:思考型模型(deepseek reasoning 等)的思维链计入 max_tokens 预算,且多数兼容端点忽略 `reasoning_effort`——预算太小会全部耗在思考上、正文为空(finish_reason=length)。标题生成(32→1024)、智能审批(400→4096)先后踩坑;新直连调用点照 `session_title.rs` 模式:输出提取用 `extract_content`(兼容 content parts 数组),解析失败的 Err 带 finish_reason/是否含思维链/正文片段(`body_snippet`)诊断。
 13. **SSH 私钥收编**:私钥统一保管在 `<workspace>/.aishell/ssh-key/<内容sha256前16位>`(见 `ssh_keys.rs`)——保存密钥型凭据/服务器时自动「收编」复制外部私钥并改写 key_path(复制非移动、幂等),启动/切换 workspace 时 `adopt_managed_ssh_keys` 迁移存量外部密钥(凭据优先→镜像引用服务器→孤儿服务器就地收编并回写凭据,仅变更时落盘);单个收编失败静默跳过、不影响保存主流程,不要把它改成移动或让保存报错。
 14. **SSH 公钥(密钥对)凭据**(AuthType::PublicKey,前端 `'publickey'`):key_path 存**密钥对目录**(默认用户主目录 `.ssh`,按 id_ed25519/id_rsa/id_ecdsa 顺序探测「私钥+同名 .pub」对,规则只在后端 ssh_keys.rs)——**不收编**、不进 keyring、部署密码一次性使用;认证被拒时后端返回 `[SSH需部署公钥]` 前缀错误,前端 terminal.ts 弹「输入密码自动部署」框(ssh-copy-id 等价,幂等追加 authorized_keys),**AI 通道不做部署、直接失败提示**;探测/生成密钥对都走后端命令(ed25519 无密码短语、防覆盖),表单「未发现密钥对,点击立即生成」按钮与连接推导共用同一后端探测规则。
+15. **build.rs 的 `rerun-if-changed` 只许指向存在的文件**:cargo 把「指向不存在文件」的 rerun-if-changed 当作**永久脏**,每次 build/test 都重跑 build 脚本 → 整个 crate 重编(云分支曾因缺 dev.env 零改动也要 3 分钟)。也别拿目录当兜底——cargo 对目录递归扫描,仓库根含 target/ 时永远有更新的文件、指纹反而永久脏。新增 build 输入要判存在性;之后**新建**被监视的 env 文件不会自动生效,需 `touch src-tauri/build.rs` 或 `cargo clean -p aishell`。
 
 ## 架构要点
 
