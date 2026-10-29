@@ -1359,6 +1359,7 @@ async function detachAiWindow(): Promise<void> {
   const pid = project.id;
   const ctx = projectContexts.get(pid);
   try {
+    if (ctx) await flushProjectSessions(ctx);
     await aiWindowOpen(pid, activeSessionId || null, detach.host);
   } catch (err) {
     toast(`打开 AI 分离窗口失败: ${String(err)}`, 'error');
@@ -1375,6 +1376,7 @@ async function detachAiWindow(): Promise<void> {
 async function attachAiWindow(): Promise<void> {
   const detach = panelOptions.detach;
   if (!detach || detach.role !== 'detached' || !project) return;
+  const ctx = projectContexts.get(project.id);
   try {
     if (ctx) await flushProjectSessions(ctx);
     await aiWindowClose(activeSessionId || null);
@@ -1400,7 +1402,6 @@ function createForwardingHandle(projectId: string): AiHandle {
     addSkillRef: (ref) => { if (ref) forward('skill', { ref }); },
     addNoteRef: (ref) => { if (ref) forward('note', { ref }); },
     addImageRef: (ref) => { if (ref) forward('image', { ref }); },
-    if (ctx) await flushProjectSessions(ctx);
     convertNoteToSkill: (ref) => { if (ref) forward('convertNote', { ref }); },
     analyzeTimeline: (scope) => forward('analyzeTimeline', { scope: scope ?? null }),
     startConversation: (prompt) => { forward('startConversation', { prompt }); return Promise.resolve(); },
@@ -1417,7 +1418,6 @@ async function ensureForwardRefListener(): Promise<void> {
   } catch { /* 无 Tauri 环境静默 */ }
 }
 
-  const ctx = projectContexts.get(project.id);
 function dispatchForwardRef(payload: Record<string, unknown>): void {
   const h = mountedForwardHandle;
   if (unmounted || !h) return;
@@ -2452,12 +2452,19 @@ function enqueueSessionSnapshot(target: ProjectContext, snapshot: ChatSession): 
       if (target.persistQueues.get(key) === current) target.persistQueues.delete(key);
     });
   target.persistQueues.set(key, current);
+  /* 大量调用点是 fire-and-forget；注册拒绝处理器避免未处理异常，返回值仍可供 flush await。 */
+  void current.catch(() => { /* 终态错误已在 run 中记录 */ });
   return current;
 }
 
 function persistSession(s: ChatSession, ctx: ProjectContext | null = eventContext ?? viewContext, force = false): Promise<void> {
   const target = ctx ?? eventContext ?? viewContext;
   if (!target) return Promise.resolve();
+  /* 分离期间只有独立窗口拥有完整用户消息；宿主后台事件上下文缺少 user 快照，
+     禁止它整份覆盖独立窗口的持久化历史。显式 flush/退出兜底可强制写。 */
+  if (!force && isAiDetached(target.project.id) && panelOptions.detach?.role !== 'detached') {
+    return Promise.resolve();
+  }
   return enqueueSessionSnapshot(target, cloneChatSession(s));
 }
 
@@ -2517,19 +2524,12 @@ function selectSession(sid: string): void {
 /* ---------- 聊天渲染 ---------- */
 function scrollBottom(): void {
   chat.scrollTop = chat.scrollHeight;
-  /* 大量调用点是 fire-and-forget；注册拒绝处理器避免未处理异常，返回值仍可供 flush await。 */
-  void current.catch(() => { /* 终态错误已在 run 中记录 */ });
 }
 
 function renderHistory(): void {
   /* 全量重建（挂载/切会话/发送等低频路径）：重置全部增量缓存，
      msgEls/pendingEl 重新登记（高频流式路径见 schedulePendingRender/refreshActive） */
   cancelPendingRender();
-  /* 分离期间只有独立窗口拥有完整用户消息；宿主后台事件上下文缺少 user 快照，
-     禁止它整份覆盖独立窗口的持久化历史。显式 flush/退出兜底可强制写。 */
-  if (!force && isAiDetached(target.project.id) && panelOptions.detach?.role !== 'detached') {
-    return Promise.resolve();
-  }
   chat.innerHTML = '';
   msgEls = [];
   segCache.clear();
