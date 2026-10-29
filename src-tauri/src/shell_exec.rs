@@ -133,10 +133,13 @@ impl AiCapture {
                 active.started = true;
                 active.scan = 0;
             } else {
-                // 只保留可能跨批的标记前缀，避免 BEGIN 之前的海量输出占内存
-                let keep = active.begin.len().saturating_sub(1);
-                if buf.len() > keep {
-                    buf = buf[buf.len() - keep..].to_string();
+                // 只保留可能跨批的标记前缀，避免 BEGIN 之前的海量输出占内存。
+                // 按字节数截断必须回退到字符边界：中文输出时 buf.len()-keep 常落在
+                // 多字节字符中间，直接切片 panic 会静默打死整个终端读循环（踩过）
+                let keep_len = active.begin.len().saturating_sub(1);
+                if buf.len() > keep_len {
+                    let start = floor_boundary(&buf, buf.len() - keep_len);
+                    buf = buf[start..].to_string();
                 }
                 active.buf = buf;
                 return;
@@ -152,8 +155,9 @@ impl AiCapture {
             return;
         }
 
-        // END 标记后紧跟退出码与换行；数字可能跨批到达，未拿到换行就继续等
-        let from = active.scan.min(buf.len());
+        // END 标记后紧跟退出码与换行；数字可能跨批到达，未拿到换行就继续等。
+        // scan 是纯字节位点，可能落在多字节字符中间：切片前归一到字符边界
+        let from = floor_boundary(&buf, active.scan.min(buf.len()));
         if let Some(idx) = buf[from..].find(&active.end_prefix) {
             let idx = from + idx;
             let after = idx + active.end_prefix.len();
@@ -189,6 +193,21 @@ impl AiCapture {
             let _ = tx.send(Err(reason.into()));
         }
     }
+}
+
+/// 把字节位点回退到最近的 UTF-8 字符边界（`str::floor_char_boundary` 仍是 unstable）。
+/// SSH 输出批次的尾部保留与扫描位点都按字节数算出来，落在多字节字符中间时
+/// `s[i..]` 会 panic；读循环里 panic 会静默打死该终端的输出通路（实测 '康' 被切在
+/// 第 2 字节），所以切片前一律先归一到字符边界。
+fn floor_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn trim_one_leading_newline(mut s: String) -> String {
@@ -234,8 +253,9 @@ impl AltScreenTracker {
                 self.active.store(on, Ordering::Relaxed);
             }
         }
-        // 保留末尾 8 字节，处理跨批转义序列
-        let keep = probe.len().saturating_sub(8);
+        // 保留末尾 8 字节，处理跨批转义序列；截断点必须回退到字符边界——中文输出时
+        // probe.len()-8 常落在多字节字符中间，直接切片 panic 会打死终端读循环
+        let keep = floor_boundary(&probe, probe.len().saturating_sub(8));
         *tail = probe[keep..].to_string();
     }
 }
@@ -371,6 +391,36 @@ mod tests {
         assert!(t.is_active());
         t.feed("\x1b[?1049l");
         assert!(!t.is_active());
+    }
+
+    /// 回归：尾部保留 8 字节曾按字节直接切片，中文批次会 panic 打死读循环
+    /// （线上实测 `start byte index 1038 is not a char boundary; inside '康'`）。
+    #[test]
+    fn alt_screen_tracker_tolerates_multibyte_tail() {
+        let t = AltScreenTracker::new();
+        t.feed("你好世界"); // 12 字节，len-8=4 落在「好」中间
+        t.feed("康康康康康康康"); // 21 字节，len-8=13 落在字符中间
+        assert!(!t.is_active());
+        // 截断点回退到字符边界后，跨批序列仍能识别
+        t.feed("\x1b[?104");
+        t.feed("9h");
+        assert!(t.is_active());
+    }
+
+    /// 回归：捕获区内外的中文片段曾在 BEGIN 前缀裁剪 / scan 位点切片处 panic。
+    #[tokio::test]
+    async fn capture_tolerates_multibyte_chunks() {
+        let cap = capture();
+        let rx = cap.begin("n4");
+        // 22 字节（4 个汉字 + 10 个 ASCII），buf.len()-keep=1 落在「你」中间
+        cap.feed("你好世界0123456789");
+        cap.feed("__AISHELL_AIBEGIN_n4__\n");
+        // 捕获区内的中文：走 scan 位点切片分支
+        cap.feed("你好，世界\r\n");
+        cap.feed("__AISHELL_AIEND_n4__:0\r\n");
+        let got = wait_capture(rx, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(got.exit_code, Some(0));
+        assert!(got.text.contains("你好，世界"), "{:?}", got.text);
     }
 
     #[test]

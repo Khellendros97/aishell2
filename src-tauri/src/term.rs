@@ -675,8 +675,16 @@ impl TermManager {
                         let pkts = std::mem::take(&mut batch_pkts);
                         let bytes = std::mem::take(&mut batch_bytes);
                         diag(&format!("recv id={id2} batch pkts={pkts} len={bytes}"));
-                        capture.feed(&batch);
-                        alt_screen.feed(&batch);
+                        // 捕获槽/全屏跟踪只是辅助状态：万一 panic 不能顺着读任务抛上去，
+                        // 否则该终端会静默失去输出且不发 term:exit（UTF-8 边界切片踩过）
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            capture.feed(&batch);
+                            alt_screen.feed(&batch);
+                        }))
+                        .is_err()
+                        {
+                            diag(&format!("recv id={id2} feed_panicked len={bytes}"));
+                        }
                         mgr.tee_record(&id2, &batch);
                         let r = app.emit(
                             &format!("term:data:{id2}"),
@@ -734,8 +742,10 @@ impl TermManager {
             flush_batch!();
             if !carry.is_empty() {
                 let data = String::from_utf8_lossy(&carry).into_owned();
-                capture.feed(&data);
-                alt_screen.feed(&data);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    capture.feed(&data);
+                    alt_screen.feed(&data);
+                }));
                 mgr.tee_record(&id2, &data);
                 let _ = app.emit(&format!("term:data:{id2}"), TermDataPayload { data });
             }
