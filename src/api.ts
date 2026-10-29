@@ -368,13 +368,14 @@ export const onAiEvent = (key: string, cb: (ev: AiEvent) => void): Promise<Unlis
   listen<AiEvent>(`ai:event:${key}`, (e) => cb(e.payload));
 
 /* ---------------- AI 助手窗口分离/聚合（Rust ai_window.rs） ----------------
-   分离 = 宿主窗口释放该项目引擎上下文（flush 落盘 + 退订），pi 进程与 aishell.json
-   会话快照 app 级共享，独立窗口重新挂载即可无缝续流；聚合 = 反向。 */
+   双窗口各自常驻订阅同一事件流；分离期间独立窗口负责会话落盘，聚合前 flush，
+   Destroyed 广播带回最后活动的 sessionId，宿主按持久化快照重对账后重挂面板。 */
 /** 分离 AI 助手到独立窗口（同项目重复调用 = 聚焦；异项目已有分离窗口时返回中文错误） */
 export const aiWindowOpen = (projectId: string, sessionId: string | null, host: 'workbench' | 'welcome') =>
   call<void>('ai_window_open', { projectId, sessionId, host });
-/** 聚合还原：优雅关闭分离窗口（分离窗口 JS 侧先释放上下文再放行） */
-export const aiWindowClose = () => call<void>('ai_window_close');
+/** 聚合还原：记录独立窗口当前会话并销毁窗口（调用方已完成正式消息 flush） */
+export const aiWindowClose = (sessionId: string | null = null) =>
+  call<void>('ai_window_close', { sessionId });
 /** 后端进程表是否有任一 pi 忙（生成/审批等待）：主窗口关闭守卫的跨窗口查询 */
 export const aiAnyBusy = () => call<boolean>('ai_any_busy');
 /** 「添加到对话」跨窗口转发：wbHandles.ai 转发桩 → 分离窗口插入引用 chip */

@@ -58,10 +58,11 @@
  *  AI 事件订阅按 projectId:sessionId 常驻在模块级项目上下文中：切换会话/项目只切换视图，
  *  不退订、不 abort；卸载仅回收当前面板 DOM 监听，不杀项目 pi 进程。
  *  窗口分离（ai_window.rs）采用双端订阅：分离后宿主与独立窗口的项目上下文都在线接收
- *  同一事件流（各自独立 ctx，无交接空窗，流式中的对话跨窗口无缝），宿主侧仅抑制系统
- *  通知（notifyOwnerOnly）；分离状态按项目 id 记录在模块级 detachedProjects
- *  （ai:window-changed 驱动），isAiDetached/subscribeAiDetach 供宿主 React 外部订阅
- *  显隐 AI 面板；宿主「添加到对话」经转发桩（ai_forward_ref 命令）送达独立窗口。
+ *  同一事件流（各自独立 ctx，无交接空窗，流式中的对话跨窗口无缝），宿主侧抑制系统
+ *  通知与整份快照落盘（独立窗口才持有完整用户消息）；聚合前独立窗口 flush 正式消息，
+ *  聚合事件带回当前会话 id，宿主再以持久化快照重对账并恢复显示。分离状态按项目 id
+ *  记录在模块级 detachedProjects（ai:window-changed 驱动），isAiDetached/subscribeAiDetach
+ *  供宿主 React 外部订阅显隐 AI 面板；宿主「添加到对话」经转发桩送达独立窗口。
  */
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -85,6 +86,7 @@ import { openAiDbApprovalModal, type DbRequestDetail } from './AiDbApproval';
 import { openArchiveModal } from './ArchiveModal';
 import { openNote } from '../tabs/NoteTab';
 import { DB_DEFAULT_PORTS, DB_KIND_LABEL } from '../db';
+import { reconcileSessionSnapshot } from './session-sync';
 
 /* ---------- 面板样式（原型 workbench-ai.js 注入的样式 + 错误气泡红边） ---------- */
 const STYLE = `
@@ -750,23 +752,28 @@ let detachListenerStarted = false;
 function ensureDetachListener(): void {
   if (detachListenerStarted) return;
   detachListenerStarted = true;
-  onAiWindowChanged((ev) => markDetached(ev.projectId, ev.detached)).catch(() => {
+  onAiWindowChanged((ev) => markDetached(ev.projectId, ev.detached, ev.sessionId)).catch(() => {
     detachListenerStarted = false;
   });
 }
 
-function markDetached(projectId: string, detached: boolean): void {
+function markDetached(projectId: string, detached: boolean, sessionId?: string | null): void {
   const changed = detached ? !detachedProjects.has(projectId) : detachedProjects.has(projectId);
   if (detached) detachedProjects.add(projectId);
   else detachedProjects.delete(projectId);
   if (!changed) return;
-  /* 聚合时后台刷新宿主常驻 ctx 的会话列表：分离期间独立窗口可能新建了会话
-     （双端订阅下消息/流式状态本就收敛，只有会话条目需要补拉）。 */
+  /* 聚合时以独立窗口刚落盘的快照重对账：宿主后台上下文只收到流式事件，用户消息
+     不广播，不能继续把宿主的旧 messages 当权威；同时恢复独立窗口最后停留的会话。 */
   if (!detached) {
     const ctx = projectContexts.get(projectId);
-    if (ctx?.loaded) {
-      ctx.loaded = false;
-      void loadSessions(ctx);
+    if (ctx) {
+      if (sessionId) ctx.activeSessionId = sessionId;
+      const reconcile = (): Promise<void> => {
+        ctx.loaded = false;
+        return loadSessions(ctx, true);
+      };
+      if (ctx.loading && ctx.loadPromise) void ctx.loadPromise.then(reconcile);
+      else void reconcile();
     }
   }
   for (const fn of [...detachListeners]) fn();
@@ -1272,9 +1279,8 @@ function cleanup(handle: ReturnType<typeof createAiHandle>): void {
 /* ---------- 窗口分离（后端 ai_window.rs；见文件头「窗口分离」说明） ----------
    分离采用「双端保持订阅」而非交接释放：分离后宿主与独立窗口的项目上下文都在线接收
    同一事件流（各自独立 ctx，事件各自恰好收到一次，互不缺流），独立窗口是用户可见的
-   拥有者；宿主侧照常后台定稿落盘（与切走项目的 keep-alive 语义一致，天然无交接空窗），
-   仅系统通知在宿主侧抑制（notifyOwnerOnly）避免每个事件弹两条。聚合 = 关闭独立窗口，
-   后端广播让宿主面板重挂——宿主 ctx 一直在线，流式中的对话连渲染状态都无缝续上。
+   拥有者并负责整份会话快照落盘；宿主只保留后台流式状态，不用缺 user 的快照覆盖 store。
+   聚合 = 独立窗口 flush 正式消息后关闭，后端广播并带回当前会话 id，宿主重挂时重对账。
    宿主「添加到对话」经转发桩（createForwardingHandle）跨窗口送达独立窗口插 chip。 */
 
 /** 系统通知出口（分离期间宿主侧抑制）：AI 已分离且本窗口不是独立窗口本体时不弹，
@@ -1285,6 +1291,21 @@ function notifyOwnerOnly(title: string, body: string): void {
   notifyAi(title, body);
 }
 
+/** 分离/聚合前只 flush 正式消息，不把仍在生成的 pending 提前定稿，避免主窗口续流后重复历史。 */
+async function flushProjectSessions(ctx: ProjectContext): Promise<void> {
+  await Promise.all([...ctx.sessions.values()].map((s) => persistSession(s, ctx, true)));
+}
+
+/** 独立窗口 X 关闭与「聚合」共用的全量快照出口（main.tsx 关窗守卫 await）。 */
+export function flushAiSessionSnapshots(): Promise<void> {
+  return Promise.all([...projectContexts.values()].map((ctx) => flushProjectSessions(ctx))).then(() => undefined);
+}
+
+/** 独立窗口最后停留的会话，随 ai_window_close 交给后端聚合事件回传宿主。 */
+export function currentDetachedAiSessionId(): string | null {
+  return panelOptions.detach?.role === 'detached' ? activeSessionId || null : null;
+}
+
 /** 宿主「分离」：后端建窗成功 → 置位触发面板卸载 → 句柄换转发桩。
  *  项目上下文保持在线（后台收流落盘），独立窗口自行挂载订阅同一事件流。
  *  失败（如已有其他项目的分离窗口）只 toast，宿主面板保持原状。 */
@@ -1292,7 +1313,9 @@ async function detachAiWindow(): Promise<void> {
   const detach = panelOptions.detach;
   if (!detach || detach.role !== 'host' || !project) return;
   const pid = project.id;
+  const ctx = projectContexts.get(pid);
   try {
+    if (ctx) await flushProjectSessions(ctx);
     await aiWindowOpen(pid, activeSessionId || null, detach.host);
   } catch (err) {
     toast(`打开 AI 分离窗口失败: ${String(err)}`, 'error');
@@ -1304,13 +1327,15 @@ async function detachAiWindow(): Promise<void> {
   if (panelOptions.workbenchIntegration) wbHandles.ai = createForwardingHandle(pid);
 }
 
-/** 独立窗口「聚合」：优雅关窗，后端 Destroyed 广播 ai:window-changed {detached:false}，
- *  宿主据此重挂面板（宿主 ctx 全程在线，正在生成的回复无缝继续显示）。 */
+/** 独立窗口「聚合」：先落盘正式消息，再销毁窗口；Destroyed 事件带回当前会话 id，
+ *  宿主重挂后从 store 重对账，正在生成的 pending 仍由宿主上下文无缝续上。 */
 async function attachAiWindow(): Promise<void> {
   const detach = panelOptions.detach;
   if (!detach || detach.role !== 'detached' || !project) return;
+  const ctx = projectContexts.get(project.id);
   try {
-    await aiWindowClose();
+    if (ctx) await flushProjectSessions(ctx);
+    await aiWindowClose(activeSessionId || null);
   } catch (err) {
     toast(`聚合 AI 助手失败: ${String(err)}`, 'error');
   }
@@ -1646,9 +1671,9 @@ async function refreshStagingNotice(): Promise<void> {
   }
 }
 
-/** 拉取会话列表：缺省刷新当前视图上下文；传 ctx 时刷新指定项目（聚合后补拉新会话用，
- *  非可见上下文只合并不触碰 DOM——见尾部 viewContext 守卫）。 */
-async function loadSessions(target?: ProjectContext): Promise<void> {
+/** 拉取会话列表：缺省刷新当前视图上下文；传 ctx 时刷新指定项目。
+ *  reconcileMessages 仅用于独立窗口聚合：采用已落盘的完整消息，修复宿主缺用户消息的旧快照。 */
+async function loadSessions(target?: ProjectContext, reconcileMessages = false): Promise<void> {
   const ctx = target ?? viewContext;
   if (!ctx) {
     toast('项目未加载', 'error');
@@ -1684,10 +1709,9 @@ async function loadSessions(target?: ProjectContext): Promise<void> {
         ctx.sessions.set(serverSession.id, serverSession);
         continue;
       }
-      /* 合并服务端标题/领取标记，但保留前端正在生成的消息与 pending，避免
-         sessions_get 的旧快照覆盖首条消息或流式回合。 */
-      current.title = serverSession.title;
-      current.autoTitleTriggered = serverSession.autoTitleTriggered === true;
+      /* 普通加载保留内存消息，避免旧快照覆盖首条消息或流式回合；独立窗口聚合时
+         持久化快照已先 flush，采用它补齐宿主收不到的用户消息（pending 独立保留）。 */
+      reconcileSessionSnapshot(current, serverSession, reconcileMessages);
     }
     /* Rust 按插入序返回（旧→新），已有前端新会话不被异步加载覆盖。 */
     if (!ctx.activeSessionId && visible.length > 0) ctx.activeSessionId = visible[visible.length - 1].id;
@@ -2309,27 +2333,63 @@ function generateSessionNote(pid: string, sid: string): void {
   });
 }
 
+/** session_upsert 单次调用给 20s 上限，失败按 2s/4s/6s 退避重试 3 次；
+ *  防止一次 IPC/写盘抖动让整轮对话只活在某个窗口的内存里。 */
+const PERSIST_CALL_TIMEOUT_MS = 20_000;
+const PERSIST_MAX_RETRIES = 3;
+
+function sessionUpsertBounded(projectId: string, snapshot: ChatSession): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`session_upsert 超时（${PERSIST_CALL_TIMEOUT_MS}ms 未返回）`)),
+      PERSIST_CALL_TIMEOUT_MS,
+    );
+    sessionUpsert(projectId, snapshot).then(
+      () => { clearTimeout(timer); resolve(); },
+      (err) => { clearTimeout(timer); reject(err instanceof Error ? err : new Error(String(err))); },
+    );
+  });
+}
+
 function enqueueSessionSnapshot(target: ProjectContext, snapshot: ChatSession): Promise<void> {
   const key = `${target.project.id}:${snapshot.id}`;
   const previous = target.persistQueues.get(key) ?? Promise.resolve();
+  const run = async (): Promise<void> => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await sessionUpsertBounded(target.project.id, snapshot);
+        return;
+      } catch (err) {
+        if (attempt >= PERSIST_MAX_RETRIES) {
+          console.error('[AI] 会话保存失败（含重试）:', key, err);
+          if (!unmounted && viewContext === target) toast(`会话保存失败：${String(err)}`, 'error');
+          throw err;
+        }
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+      }
+    }
+  };
   let current: Promise<void>;
   current = previous
     .catch(() => { /* 上一次失败不阻塞后续快照 */ })
-    .then(() => sessionUpsert(target.project.id, snapshot))
-    .catch((err) => {
-      if (!unmounted && viewContext === target) toast(`会话保存失败：${String(err)}`, 'error');
-      else console.error('[AI] 会话保存失败:', err);
-    })
+    .then(run)
     .finally(() => {
       if (target.persistQueues.get(key) === current) target.persistQueues.delete(key);
     });
   target.persistQueues.set(key, current);
+  /* 大量调用点是 fire-and-forget；注册拒绝处理器避免未处理异常，返回值仍可供 flush await。 */
+  void current.catch(() => { /* 终态错误已在 run 中记录 */ });
   return current;
 }
 
-function persistSession(s: ChatSession, ctx: ProjectContext | null = eventContext ?? viewContext): Promise<void> {
+function persistSession(s: ChatSession, ctx: ProjectContext | null = eventContext ?? viewContext, force = false): Promise<void> {
   const target = ctx ?? eventContext ?? viewContext;
   if (!target) return Promise.resolve();
+  /* 分离期间只有独立窗口拥有完整用户消息；宿主后台事件上下文缺少 user 快照，
+     禁止它整份覆盖独立窗口的持久化历史。显式 flush/退出兜底可强制写。 */
+  if (!force && isAiDetached(target.project.id) && panelOptions.detach?.role !== 'detached') {
+    return Promise.resolve();
+  }
   return enqueueSessionSnapshot(target, cloneChatSession(s));
 }
 
@@ -4631,13 +4691,17 @@ export function anyAiBusy(): boolean {
 export function flushAiPendingOutput(): Promise<void> {
   const jobs: Promise<void>[] = [];
   for (const ctx of projectContexts.values()) {
+    /* 退出时也补写全部正式消息，覆盖此前偶发落盘失败的会话；强制写不受分离属主限制。 */
+    for (const s of ctx.sessions.values()) {
+      if (s.messages.length > 0) jobs.push(persistSession(s, ctx, true));
+    }
     for (const [sid, p] of ctx.pendingBy.entries()) {
       if (!p || !p.text.trim()) continue;
       const s = ctx.sessions.get(sid);
       if (!s) continue;
       pushAssistantMessage(s, p.text, collectActions(p));
       ctx.pendingBy.set(sid, { phase: 'error', text: '', error: p.error, tools: [], actions: new Map() });
-      jobs.push(persistSession(s, ctx));
+      jobs.push(persistSession(s, ctx, true));
     }
   }
   return Promise.allSettled(jobs).then(() => undefined);

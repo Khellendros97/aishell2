@@ -450,6 +450,8 @@ export interface AiWindowChangedEvent {
   projectId: string;
   /** true = 已分离出独立窗口；false = 已聚合回宿主窗口 */
   detached: boolean;
+  /** 聚合时独立窗口最后停留的会话（旧事件/异常路径可为空） */
+  sessionId?: string | null;
 }
 
 /** sessions: projectId -> ChatSession[] */

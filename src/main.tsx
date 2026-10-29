@@ -4,7 +4,7 @@
  * - OS 文件拖入全局兜底(dragDropEnabled:false 后 WebView2 默认行为是导航到拖入文件);
  * - 禁用 WebView2 原生右键菜单(输入框放行);F12 打开 DevTools(应用自控);
  * - AI 任务未结束时拦截窗口关闭,弹确认框二次确认(anyAiBusy + onCloseRequested);
- *   分离窗口(label = ai-detach)关闭即聚合:先释放项目上下文再放行,不弹确认;
+ *   分离窗口(label = ai-detach)关闭即聚合:先 flush 正式会话快照再销毁,不弹确认;
  * - 命令面板 / Debug 日志总线为自包含命令式浮层,保持旧模块不动,继续在此初始化。
  */
 import './styles/design.css';
@@ -16,7 +16,9 @@ import { initDebug } from './debug';
 import { navigate } from './router';
 import { applyTheme } from './theme';
 import { confirmDialog } from './ui';
-import { anyAiBusy, flushAiPendingOutput } from './pages/workbench/ai/ai-engine';
+import {
+  anyAiBusy, currentDetachedAiSessionId, flushAiPendingOutput, flushAiSessionSnapshots,
+} from './pages/workbench/ai/ai-engine';
 import { ErrorBoundary } from './shared/ErrorBoundary';
 import App from './App';
 
@@ -54,9 +56,8 @@ document.addEventListener('keydown', (e) => {
 
 /* ---------- 程序关闭二次确认:AI 助手任务尚未结束时先拦截 ---------- */
 /* 按窗口分两种角色：
-   - 分离窗口(label = ai-detach):关闭即聚合——直接放行(api 层随后 destroy,后端 Destroyed
-     广播 ai:window-changed 让宿主还原面板);分离是双端订阅,宿主 ctx 全程在线收流,
-     关闭不影响任务,故 AI 忙也不弹确认。
+   - 分离窗口(label = ai-detach):关闭即聚合——onCloseRequested 先 flush 正式消息，
+     再由 ai_window_close 记录当前会话并 destroy；宿主 ctx 全程在线收流，AI 忙也不弹确认。
    - 主窗口:
      · closeToTray 开启且托盘可用:关闭 = 隐藏到托盘(Rust 侧 prevent_close + hide,窗口
        不销毁,会话继续在后台运行),这里 preventDefault 拦下 JS 默认 destroy、不弹 AI 忙
@@ -75,7 +76,24 @@ void (async () => {
   try {
     win = getCurrentWindow();
   } catch { return; } // 无 Tauri 注入(vite dev 纯浏览器调试):无窗口概念,跳过
-  if (win.label === 'ai-detach') return; // 关闭即聚合:直接放行,也不注册托盘退出
+  if (win.label === 'ai-detach') {
+    /* X 关闭与面板「聚合」都必须先落盘正式消息。后端 ai_window_close 使用 destroy，
+       不会再次进入本守卫；正在生成的 pending 不定稿，交给宿主上下文继续续流。 */
+    let closeStarted = false;
+    await win.onCloseRequested(async (event) => {
+      event.preventDefault();
+      if (closeStarted) return;
+      closeStarted = true;
+      try {
+        await flushAiSessionSnapshots();
+        await aiWindowClose(currentDetachedAiSessionId());
+      } catch (err) {
+        closeStarted = false;
+        console.error('[AI] 聚合窗口关闭失败:', err);
+      }
+    });
+    return;
+  }
 
   /* 强制退出:带走分离窗口 → 落盘未定稿正文 → destroy(触发 Destroyed 收尾) */
   const forceQuit = async (): Promise<void> => {
