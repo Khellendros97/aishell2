@@ -48,6 +48,8 @@
  *   偏移缓存（segCache，段完成即命中）、段内 ``` 围栏 parts 前缀缓存（fixedParts，
  *   每帧只重渲最后一个 part）、动作卡 DOM 按 toolCallId 复用（cardEls，低频事件重建
  *   气泡时作废）。渲染产出与全量 innerHTML 版逐节点一致（同一 renderAI/renderActionCard）。
+ * 思维链预览：thinking 事件只保留最近 THINK_PREVIEW_MAX 字符（第一行「深度思考 n 秒」、
+ *   第二行单行尾部跟随，滚动速度 = 模型输出速度）；任何非 thinking 事件即清除，不进历史。
  *
  * 与后端的接口点（src/api.ts）：sessions_get / session_upsert / ai_chat / ai_steer /
  *   ai_cancel_steer / ai_staged_list / ai_abort /
@@ -415,6 +417,30 @@ const STYLE = `
 }
 .ai-typing .ai-typing-dot:nth-child(3) { animation-delay: 0.2s; }
 .ai-typing .ai-typing-dot:nth-child(4) { animation-delay: 0.4s; }
+/* 思维链临时预览：第一行秒表，第二行单行尾部跟随（滚动速度 = 模型输出速度）；
+   正文/工具开始后组件整体移除 */
+.ai-think { display: flex; flex-direction: column; gap: 2px; min-width: 0; margin: 2px 0 1px; }
+.ai-think-label {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text-2); white-space: nowrap;
+}
+.ai-think-label::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%; flex: none;
+  background: var(--accent); animation: ai-think-pulse 1.4s ease-in-out infinite;
+}
+.ai-think-line {
+  overflow: hidden; white-space: nowrap; max-width: 100%;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 10%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 10%);
+}
+.ai-think-text {
+  display: inline-block;
+  font-size: 11.5px; color: var(--text-1); line-height: 1.5;
+}
+@keyframes ai-think-pulse {
+  0%, 100% { opacity: .35; transform: scale(.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
 @keyframes ai-blink {
   0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
   30% { opacity: 1; transform: translateY(-2px); }
@@ -549,6 +575,8 @@ interface Pending {
   tools: ToolLine[];
   /** 受控工具动作卡（本轮可观察审计，finalize 时随消息持久化） */
   actions: Map<string, ActionCard>;
+  /** 思维链临时预览（只保留最近一段；正文/工具/回合结束事件到达后清空） */
+  thinking?: { text: string; startedAt: number };
 }
 
 const ACTION_NAMES: Record<string, string> = {
@@ -639,6 +667,10 @@ function argsIntent(tool: string, args: Record<string, unknown>): string {
 }
 
 const emptyPending = (): Pending => ({ phase: 'typing', text: '', tools: [], actions: new Map() });
+
+/** 思维链预览只保留最近 N 个字符：长思考（数万 token）全量塞进单行 DOM/跑马灯没有意义，
+ *  也避免每次 delta 重排超长文本。 */
+const THINK_PREVIEW_MAX = 300;
 
 /** 首条消息的即时临时标题：模型标题回来前也不超过 20 个用户可见字符。 */
 function temporarySessionTitle(text: string, fallback: string): string {
@@ -875,6 +907,9 @@ let msgEls: HTMLElement[] = [];
 let pendingEl: HTMLElement | null = null;
 /** delta 合帧调度句柄（null = 无挂起帧；低频同步渲染前取消，避免旧帧覆盖新状态） */
 let rafId: number | null = null;
+/** 思维链预览的合帧句柄与秒表句柄（结束时立即清空） */
+let thinkRafId: number | null = null;
+let thinkTimerId: number | null = null;
 /** 锚点段渲染缓存：段起始偏移 -> 段原文与顶级节点（段内容不变直接 append 复用，不入 DOM 解析） */
 const segCache = new Map<number, { text: string; nodes: HTMLElement[] }>();
 /** 活跃段内已定型 parts（``` 围栏闭合/新块开启后不再变）的渲染缓存，跨帧复用 */
@@ -1251,6 +1286,8 @@ function cleanup(handle: ReturnType<typeof createAiHandle>): void {
   if (unmounted) return;
   unmounted = true;
   cancelPendingRender();
+  cancelThinkingRender();
+  stopThinkTimer();
   pendingEl = null;
   msgEls = [];
   segCache.clear();
@@ -1840,10 +1877,31 @@ function handleEventBody(sid: string, ev: AiEvent): void {
      发消息发不出去」的来源之一），且复活气泡与本地已定稿的正文重复。正常回合的
      首个事件（actionStart/delta）必然先于 send() 建立的 pending 到达，不存在
      合法的「null + 事件」流。done/settled 例外：finalize 自带 null 安全（仅落盘）。 */
+  /* 思维链预览只属于「正在思考」阶段：任何非 thinking 事件（正文/工具/审批/结束/
+     错误）都表示这段思考已结束，立即清掉，下一次渲染即移除组件。 */
+  if (ev.type !== 'thinking') {
+    const cur = pendingBy.get(sid);
+    if (cur?.thinking) cur.thinking = undefined;
+  }
   if (ev.type === 'runStarted') {
     if (!pendingBy.get(sid) && !eventContext?.stoppedSessions.has(sid)) {
       pendingBy.set(sid, emptyPending());
     }
+  } else if (ev.type === 'thinking') {
+    /* 思维链临时预览：只保留最近 THINK_PREVIEW_MAX 字符（空白压平成单行，避免换行
+       把跑马灯撑成多行）；startedAt 只在首个增量时记录。瞬时错误后 pi 自动重试的
+       思考同样复活气泡（与 delta 分支一致）。 */
+    const p = pendingBy.get(sid) ?? null;
+    if (!p) return;
+    if (!p.thinking) p.thinking = { text: '', startedAt: Date.now() };
+    p.thinking.text = Array.from(`${p.thinking.text}${ev.text}`.replace(/\s+/g, ' '))
+      .slice(-THINK_PREVIEW_MAX)
+      .join('');
+    if (p.phase === 'error') p.phase = 'typing';
+    pendingBy.set(sid, p);
+    if (sid === activeSessionId) ensureThinkTimer();
+  } else if (ev.type === 'thinkingEnd') {
+    /* 顶部通用清除已摘掉 thinking；这里什么都不用做，末尾的 refreshActive 会重建气泡 */
   } else if (ev.type === 'delta') {
     /* 瞬时错误（限流/过载）后 pi 自动重试成功、增量恢复：复用当前 pending（可能是
        错误相）转回流式，错误气泡被内容取代；后端 delta 恢复时已重置终态抑制，
@@ -2076,6 +2134,7 @@ function handleEventBody(sid: string, ev: AiEvent): void {
     /* delta 高频到达（每秒数十条）：rAF 合帧只增量更新流式气泡，历史节点不动；
        其余事件低频，同步渲染（含 finalize 后追加定稿消息） */
     if (ev.type === 'delta') schedulePendingRender();
+    else if (ev.type === 'thinking') scheduleThinkingRender();
     else refreshActive();
     renderSessionBar();
   }
@@ -2472,6 +2531,7 @@ function renderHistory(): void {
   const pend = pendingBy.get(activeSessionId) ?? null;
   if (pend) replacePending(renderPending(pend));
   renderStagedCards();
+  pinThinkLine();
   scrollBottom();
 }
 
@@ -2480,6 +2540,87 @@ function cancelPendingRender(): void {
   if (rafId != null) {
     cancelAnimationFrame(rafId);
     rafId = null;
+  }
+}
+
+/** 取消挂起的思考预览帧（卸载/重建时调用）。 */
+function cancelThinkingRender(): void {
+  if (thinkRafId != null) {
+    cancelAnimationFrame(thinkRafId);
+    thinkRafId = null;
+  }
+}
+
+/** 秒表文案：从首个思维链增量起算，最少显示 1 秒（「深度思考 0 秒」观感不好）。 */
+function thinkLabel(startedAt: number): string {
+  return `深度思考 ${Math.max(1, Math.floor((Date.now() - startedAt) / 1000))} 秒`;
+}
+
+/** 思维链预览组件：第一行计时，第二行单行尾部跟随（文本走转义，不按 markdown 渲染）。 */
+function renderThinkingHtml(t: NonNullable<Pending['thinking']>): string {
+  return `<div class="ai-think"><div class="ai-think-label">${thinkLabel(t.startedAt)}</div>`
+    + `<div class="ai-think-line"><span class="ai-think-text">${escapeHtml(t.text)}</span></div></div>`;
+}
+
+/** 把单行滚到最右端：新内容从右侧进入，滚动速度 = 模型输出速度。
+ *  固定周期的 CSS 跑马灯在 100+ tps 下会严重滞后，这里改为每次增量直接跟到尾部。 */
+function pinThinkLine(): void {
+  const line = pendingEl?.querySelector<HTMLElement>('.ai-think-line');
+  if (line) line.scrollLeft = line.scrollWidth;
+}
+
+/** thinking_delta 高频路径：只更新已有组件的文本/秒数，不重建气泡——重建会让
+ *  第二行跑马灯动画从头开始，视觉上每来一个 delta 就跳一下。首次出现或气泡刚被
+ *  其它事件重建时走一次完整 renderPending。 */
+function scheduleThinkingRender(): void {
+  if (thinkRafId != null) return;
+  thinkRafId = requestAnimationFrame(() => {
+    thinkRafId = null;
+    if (unmounted || !chat.isConnected) return;
+    renderThinkingFrame();
+    scrollBottom();
+  });
+}
+
+function renderThinkingFrame(): void {
+  const p = pendingBy.get(activeSessionId) ?? null;
+  if (!p?.thinking) return;
+  const label = pendingEl?.querySelector<HTMLElement>('.ai-think-label');
+  const text = pendingEl?.querySelector<HTMLElement>('.ai-think-text');
+  if (!label || !text) {
+    replacePending(renderPending(p));
+  } else {
+    text.textContent = p.thinking.text;
+    label.textContent = thinkLabel(p.thinking.startedAt);
+  }
+  pinThinkLine();
+}
+
+/** 思考秒表：thinking_delta 之间可能静默数秒，靠 1s 心跳刷新第一行；
+ *  当前上下文所有会话都不再思考时自动停止。 */
+function ensureThinkTimer(): void {
+  if (thinkTimerId != null) return;
+  thinkTimerId = window.setInterval(() => {
+    if (unmounted) {
+      stopThinkTimer();
+      return;
+    }
+    const anyThinking = [...pendingBy.values()].some((p) => p?.thinking);
+    if (!anyThinking) {
+      stopThinkTimer();
+      return;
+    }
+    const p = pendingBy.get(activeSessionId) ?? null;
+    if (!p?.thinking) return;
+    const label = pendingEl?.querySelector<HTMLElement>('.ai-think-label');
+    if (label) label.textContent = thinkLabel(p.thinking.startedAt);
+  }, 1000);
+}
+
+function stopThinkTimer(): void {
+  if (thinkTimerId != null) {
+    window.clearInterval(thinkTimerId);
+    thinkTimerId = null;
   }
 }
 
@@ -2519,6 +2660,8 @@ function refreshActive(): void {
     pendingEl = null;
   }
   renderStagedCards();
+  if (pend?.thinking) ensureThinkTimer();
+  pinThinkLine();
   scrollBottom();
   updateSendBtn();
 }
@@ -2539,6 +2682,11 @@ function renderPendingBubble(): void {
       pendingEl.remove();
       pendingEl = null;
     }
+    return;
+  }
+  /* 思考预览是高频增量：只原地更新两行内容，不重建气泡（重建会重置跑马灯动画） */
+  if (p.thinking) {
+    renderThinkingFrame();
     return;
   }
   if (p.phase !== 'stream' || !p.text) {
@@ -3011,9 +3159,11 @@ function renderPending(p: Pending): HTMLElement {
   if (p.phase === 'typing' || (p.phase === 'stream' && !p.text)) {
     const headItems = items.slice().sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
       .map((i) => i.html).join('');
-    wrap.innerHTML =
-      `<div class="ai-bubble">${headItems}` +
-      '<span class="ai-typing"><span class="ai-typing-label">正在输入</span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span></span></div>';
+    /* 思考阶段用两行预览替代「正在输入」小点：第一行秒表、第二行横向跑马灯 */
+    const status = p.thinking
+      ? renderThinkingHtml(p.thinking)
+      : '<span class="ai-typing"><span class="ai-typing-label">正在输入</span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span><span class="ai-typing-dot"></span></span>';
+    wrap.innerHTML = `<div class="ai-bubble">${headItems}${status}</div>`;
   } else if (p.phase === 'error') {
     /* 错误只作为补充说明，已流出的正文照常渲染——此前 error 相只渲染报错文本，
        已经显示在屏上的内容会当场被替换掉（用户视角即「输出被吞」） */
@@ -3021,12 +3171,13 @@ function renderPending(p: Pending): HTMLElement {
     wrap.innerHTML = `<div class="ai-bubble error">${partial}<div class="ai-text ai-error-note">${escapeHtml(p.error ?? '')}</div></div>`;
   } else {
     /* 流式:工具行/动作卡按 textLen 锚点穿插进已生成文本(与历史时序排版同规则);
-       全部无锚点时整组前置(尚无文本即发生工具调用的形态) */
+       全部无锚点时整组前置(尚无文本即发生工具调用的形态)。思考预览固定落在气泡末尾。 */
     const anchored = items.some((i) => i.textLen != null);
     const body = anchored
       ? interleaveActions(p.text, items)
       : `${items.map((i) => i.html).join('')}${renderAI(p.text)}`;
-    wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${body}</div></div>`;
+    const think = p.thinking ? renderThinkingHtml(p.thinking) : '';
+    wrap.innerHTML = `<div class="ai-bubble"><div class="ai-text">${body}</div>${think}</div>`;
   }
   return wrap;
 }
