@@ -65,6 +65,7 @@ interface SysFields {
   timelineSync: boolean;
   autoRecordTerminal: boolean;
   fileOpenMode: AppSettings['fileOpenMode'];
+  closeToTray: boolean;
 }
 
 /** 表单初始值 = getState 前的空态（同旧版元素默认值：勾选框未勾、端口空显 placeholder），装载后由后端覆盖 */
@@ -77,6 +78,7 @@ const EMPTY_FIELDS: SysFields = {
   tunnelAutoStart: true, notifyAi: true, notifyLongTasks: true, autoRecordTerminal: false,
   timelineSync: true,
   fileOpenMode: 'editor-first',
+  closeToTray: false,
 };
 
 /** MCP 服务状态行（与旧版 refreshMcpStatus 三种形态对应，见 settings.css .mcp-status-line） */
@@ -266,6 +268,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       timelineSync: s.settings.timelineSyncEnabled ?? true,
       autoRecordTerminal: s.settings.autoRecordTerminal ?? false,
       fileOpenMode: s.settings.fileOpenMode ?? 'editor-first',
+      closeToTray: s.settings.closeToTray ?? false,
     });
     void refreshMcpStatus();
   };
@@ -446,6 +449,7 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
       timelineSyncEnabled: fields.timelineSync,
       autoRecordTerminal: fields.autoRecordTerminal,
       fileOpenMode: fields.fileOpenMode,
+      closeToTray: fields.closeToTray,
     };
     try {
       await saveSettings(settings, apiKey || null, braveKey || null);
@@ -762,6 +766,19 @@ export function Settings({ params }: { params: URLSearchParams }): JSX.Element {
                   onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, autoRecordTerminal: checked })); }}
                 />
                 <div className="hint">开启后，每个终端（SSH/本地）会话建立时自动开始录制输出到项目目录 .aishell/record/&lt;名称&gt;-&lt;时间戳&gt;.log，可在终端顶部「停止录制」按钮手动结束；关闭后终端不再自动录制，已有的录制按钮仍可手动开启</div>
+              </div>
+            </fieldset>
+            <fieldset className="llm-group">
+              <legend>窗口与托盘</legend>
+              <div className="field">
+                <label>关闭窗口时最小化到托盘</label>
+                <input
+                  id="f-close-to-tray"
+                  type="checkbox"
+                  checked={fields.closeToTray}
+                  onChange={(e) => { const checked = e.currentTarget.checked; setFields((f) => ({ ...f, closeToTray: checked })); }}
+                />
+                <div className="hint">开启后，点击窗口关闭按钮会把 AIShell 隐藏到系统托盘（终端、SSH 连接与 AI 任务继续在后台运行），单击托盘图标恢复窗口，右键托盘菜单可退出程序；关闭后点击关闭按钮直接退出（AI 任务进行中仍会二次确认）</div>
               </div>
             </fieldset>
             <fieldset className="llm-group">

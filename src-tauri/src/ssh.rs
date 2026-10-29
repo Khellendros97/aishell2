@@ -1,7 +1,7 @@
 //! SSH 连接管理 —— 连接复用（同一 server 的终端与 SFTP 共享一条 TCP 连接，russh 多路复用）、
 //! 密码认证走 keyring `server:<id>`、密钥走 russh-keys load_secret_key；
 //! Xshell 专用 NSSSH 私钥在加载前给出可执行的 OpenSSH 导出提示，带密码短语密钥亦明确报错；
-//! check_server_key MVP 直接信任（A5 已知限制）、连接与认证各自 10s 超时。
+//! check_server_key MVP 直接信任（A5 已知限制）、连接与认证超时见 `link_timeout`（普通 10s，堡垒机链路 60s）。
 //!
 //! 认证失败识别（待优化 4）：错误密码/密钥的常规表现是 `AuthResult::Failure`，
 //! 认证期间被服务器断开（如 MaxAuthTries 超限）表现为 `Error::Disconnect`；
@@ -206,22 +206,13 @@ pub struct SshManager {
     connect_seq: AtomicU64,
 }
 
-/// 转发通道失败的可能原因提示（错误信息追加用；纯函数便于单测）。
-/// AdministrativelyProhibited = 堡垒机 sshd 拒绝打开转发通道（典型：AllowTcpForwarding no），
-/// 与「在堡垒机上手动 ssh 目标主机」不矛盾——后者是出站客户端连接，不经转发许可。
-fn tcp_forward_hint(err: &str) -> &'static str {
-    if err.to_lowercase().contains("administrativelyprohibited") {
-        "\n可能原因：堡垒机 sshd 禁用了 TCP 转发（AllowTcpForwarding no 或 PermitOpen 限制）。请在堡垒机 /etc/ssh/sshd_config 设置 AllowTcpForwarding yes 并重启 sshd（systemctl restart sshd）后重试。"
-    } else {
-        ""
-    }
-}
-
 /// 建连/认证超时：普通服务器 10s（无响应时快速失败）；
-/// 堡垒机 SSO 临时会话（`sso-` 前缀）放宽到 60s，兼容仅支持慢速 DH 的旧网关；
+/// 堡垒机本身（is_bastion）、经堡垒机跳转的目标主机（bastion_id 非空）以及
+/// 堡垒机 Web SSO 临时会话（`sso-` 前缀）放宽到 60s——网关要等到目标侧会话建好
+/// 才完成 SSH 握手（实测本机到网关约 14s），慢速 DH-GEX 单次也可超过 20s。
 /// 这是错误兜底而非性能手段，快速路径由 `client_config` 的 ECDH 优先顺序提供。
 fn link_timeout(server: &store::Server) -> Duration {
-    if server.id.starts_with("sso-") {
+    if server.id.starts_with("sso-") || server.is_bastion || server.bastion_id.is_some() {
         Duration::from_secs(60)
     } else {
         Duration::from_secs(10)
@@ -235,9 +226,7 @@ fn client_config() -> client::Config {
     let mut kex = config.preferred.kex.to_vec();
     let insert_at = kex
         .iter()
-        .position(|name| {
-            *name == russh::kex::DH_GEX_SHA256 || *name == russh::kex::DH_GEX_SHA1
-        })
+        .position(|name| *name == russh::kex::DH_GEX_SHA256 || *name == russh::kex::DH_GEX_SHA1)
         .unwrap_or(kex.len());
     kex.splice(
         insert_at..insert_at,
@@ -249,6 +238,17 @@ fn client_config() -> client::Config {
     );
     config.preferred.kex = kex.into();
     config
+}
+
+/// 转发通道失败的可能原因提示（错误信息追加用；纯函数便于单测）。
+/// AdministrativelyProhibited = 堡垒机 sshd 拒绝打开转发通道（典型：AllowTcpForwarding no），
+/// 与「在堡垒机上手动 ssh 目标主机」不矛盾——后者是出站客户端连接，不经转发许可。
+fn tcp_forward_hint(err: &str) -> &'static str {
+    if err.to_lowercase().contains("administrativelyprohibited") {
+        "\n可能原因：堡垒机 sshd 禁用了 TCP 转发（AllowTcpForwarding no 或 PermitOpen 限制）。请在堡垒机 /etc/ssh/sshd_config 设置 AllowTcpForwarding yes 并重启 sshd（systemctl restart sshd）后重试。"
+    } else {
+        ""
+    }
 }
 
 /// SSH 建连/通道诊断：记录 serverId、阶段、耗时与错误；不写 URL、密码或会话内容。
@@ -1095,7 +1095,7 @@ impl SshManager {
         map.get(server_id).filter(|h| !h.is_closed()).cloned()
     }
 
-    /// 直连建连 + 认证（普通服务器各 10s；SSO 临时会话见 `link_timeout`）。
+    /// 直连建连 + 认证（超时见 `link_timeout`：堡垒机 / 跳转目标 / SSO 会话 60s，普通 10s）。
     /// password_override 仅供测试注入，None 时走 Store/keyring。
     async fn connect_handle(
         &self,
@@ -1244,7 +1244,7 @@ impl SshManager {
 
     /// 经堡垒机连接目标主机：堡垒机连接复用连接池，在堡垒机上开 direct-tcpip 通道指向
     /// 目标主机 host:port，再把通道当作传输层跑目标主机的 SSH 握手（russh connect_stream），
-    /// 随后按目标主机自身凭据认证。各步 10s 超时，错误信息带堡垒机名便于排查。
+    /// 随后按目标主机自身凭据认证。超时统一 `link_timeout`（跳转目标 60s），错误信息带堡垒机名便于排查。
     /// password_override 仅供测试注入（透传给认证）。
     async fn connect_via_jump(
         self: &Arc<Self>,
@@ -1294,10 +1294,11 @@ impl SshManager {
             reject_unsupported_key_format(server)?;
         }
         let via = format!("经堡垒机「{}」", bastion.name);
+        let timeout = link_timeout(server);
         let stage = Instant::now();
         connect_diag(&server.id, attempt, "jump_channel", "start");
         let channel = tokio::time::timeout(
-            Duration::from_secs(10),
+            timeout,
             bastion_handle.channel_open_direct_tcpip(
                 &server.host,
                 server.port as u32,
@@ -1308,8 +1309,11 @@ impl SshManager {
         .await
         .map_err(|_| {
             format!(
-                "{via}连接目标主机「{}」超时（10s）：{}:{}",
-                server.name, server.host, server.port
+                "{via}连接目标主机「{}」超时（{}s）：{}:{}",
+                server.name,
+                timeout.as_secs(),
+                server.host,
+                server.port
             )
         })?
         .map_err(|e| {
@@ -1332,11 +1336,17 @@ impl SshManager {
         let stage = Instant::now();
         connect_diag(&server.id, attempt, "kex", "start");
         let handle = tokio::time::timeout(
-            Duration::from_secs(10),
+            timeout,
             client::connect_stream(config, channel.into_stream(), CliHandler),
         )
         .await
-        .map_err(|_| format!("{via}连接目标主机「{}」超时（10s）", server.name))?
+        .map_err(|_| {
+            format!(
+                "{via}连接目标主机「{}」超时（{}s）",
+                server.name,
+                timeout.as_secs()
+            )
+        })?
         .map_err(|e| format!("{via}连接目标主机「{}」失败：{e}", server.name))?;
         connect_diag(
             &server.id,
@@ -1348,7 +1358,7 @@ impl SshManager {
             .await
     }
 
-    /// 在已建立 SSH 会话的 handle 上完成用户认证（各 10s 超时）。
+    /// 在已建立 SSH 会话的 handle 上完成用户认证（超时见 `link_timeout`）。
     /// 直连（connect_handle）与跳板（connect_via_jump）共用。
     /// password_override 有值时强制走密码认证（与服务器 authType 无关）：
     /// 测试注入与「公钥部署」都靠它——部署的目标服务器本身是 PublicKey，

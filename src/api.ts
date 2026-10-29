@@ -58,6 +58,11 @@ export const ssoSetAccessClientTakeover = (enabled: boolean) =>
   call<boolean>('sso_set_access_client_takeover', { enabled });
 export const saveSettings = (settings: Settings, apiKey: string | null, braveKey: string | null) =>
   call<void>('save_settings', { settings, apiKey, braveKey });
+/** 托盘右键「退出 AIShell」：后端先显示主窗口再广播，前端复用关闭守卫（AI 忙确认/落盘/destroy）。 */
+export const onTrayExitRequest = (cb: () => void): Promise<UnlistenFn> =>
+  listen('tray:exit-request', () => cb());
+/** 托盘图标当前是否可用（设置开启且创建成功）；关闭守卫据此决定是否拦下 JS 默认 destroy。 */
+export const trayAvailable = () => call<boolean>('tray_available');
 /** 顶栏快捷切换主题专用：只更新 settings.theme,不动其他设置字段 */
 export const setTheme = (theme: Theme) => call<void>('set_theme', { theme });
 export const upsertServer = (server: Server, password: string | null, credentialMode: CredentialMode = 'ask') =>
@@ -534,13 +539,14 @@ export const incentiveSubmitTicketReport = (
 });
 
 /* ---------------- AI 助手窗口分离/聚合（Rust ai_window.rs） ----------------
-   分离 = 宿主窗口释放该项目引擎上下文（flush 落盘 + 退订），pi 进程与 aishell.json
-   会话快照 app 级共享，独立窗口重新挂载即可无缝续流；聚合 = 反向。 */
+   双窗口各自常驻订阅同一事件流；分离期间独立窗口负责会话落盘，聚合前 flush，
+   Destroyed 广播带回最后活动的 sessionId，宿主按持久化快照重对账后重挂面板。 */
 /** 分离 AI 助手到独立窗口（同项目重复调用 = 聚焦；异项目已有分离窗口时返回中文错误） */
 export const aiWindowOpen = (projectId: string, sessionId: string | null, host: 'workbench' | 'welcome') =>
   call<void>('ai_window_open', { projectId, sessionId, host });
-/** 聚合还原：优雅关闭分离窗口（分离窗口 JS 侧先释放上下文再放行） */
-export const aiWindowClose = () => call<void>('ai_window_close');
+/** 聚合还原：记录独立窗口当前会话并销毁窗口（调用方已完成正式消息 flush） */
+export const aiWindowClose = (sessionId: string | null = null) =>
+  call<void>('ai_window_close', { sessionId });
 /** 后端进程表是否有任一 pi 忙（生成/审批等待）：主窗口关闭守卫的跨窗口查询 */
 export const aiAnyBusy = () => call<boolean>('ai_any_busy');
 /** 「添加到对话」跨窗口转发：wbHandles.ai 转发桩 → 分离窗口插入引用 chip */

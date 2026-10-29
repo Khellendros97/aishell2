@@ -34,6 +34,7 @@ pub mod timeline;
 pub mod timeline_upload;
 pub mod update;
 pub mod trace;
+pub mod tray;
 pub mod xshell;
 
 use std::path::PathBuf;
@@ -46,6 +47,14 @@ use tauri::Manager;
 #[tauri::command]
 fn open_devtools(win: tauri::WebviewWindow) {
     win.open_devtools();
+}
+
+/// 托盘图标当前是否可用（设置开启且创建成功）。
+/// 前端关闭守卫据此决定是否 preventDefault：Tauri 的 JS onCloseRequested 在未拦截时
+/// 会主动 destroy() 窗口，托盘模式必须拦下；托盘创建失败时则不能拦（否则窗口关不掉）。
+#[tauri::command]
+fn tray_available(app: tauri::AppHandle) -> bool {
+    tray::is_active(&app)
 }
 
 /// 删除项目前先回收该项目全部 pi，避免项目记录清除后遗留后台进程。
@@ -326,17 +335,35 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
                 // 见 disable_webview2_browser_keys 注释（AI 分离窗口在 ai_window_open 里同样处理）
                 #[cfg(windows)]
                 disable_webview2_browser_keys(&win);
+                // 关窗策略：设置「关闭窗口时最小化到托盘」开启时拦下 CloseRequested 并 hide，
+                // 窗口不销毁（终端/AI 会话全部继续运行），托盘图标负责恢复/退出（见 tray.rs）；
+                // 关闭该开关后按原行为关窗。
                 // 退出收尾：主窗口与 AI 分离窗口都可能最后关闭，收尾统一走
                 // exit_cleanup_if_last_window（杀 AI 会话 / 录制收尾 / 隧道禁用）
                 let app2 = app.handle().clone();
-                win.on_window_event(move |_ev| {
-                    if let tauri::WindowEvent::Destroyed = _ev {
-                        exit_cleanup_if_last_window(&app2, "main");
+                let store2 = store.clone();
+                win.on_window_event(move |ev| match ev {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        // 托盘图标不可用（创建失败）时不隐藏，避免窗口无法再恢复
+                        if store2.settings().close_to_tray && tray::is_active(&app2) {
+                            api.prevent_close();
+                            if let Some(w) = app2.get_webview_window("main") {
+                                let _ = w.hide();
+                            }
+                        }
                     }
+                    tauri::WindowEvent::Destroyed => exit_cleanup_if_last_window(&app2, "main"),
+                    _ => {}
                 });
             }
             // AI 分离窗口运行态（当前分离的项目 id + 窗口几何缓存），见 ai_window.rs
             app.manage(ai_window::AiWindowState::default());
+            // 系统托盘（关闭窗口最小化到托盘）：按持久化设置决定启动时是否创建图标；
+            // 创建失败（无系统托盘环境）只记日志，不影响启动。
+            app.manage(tray::TrayState::default());
+            if let Err(e) = tray::sync(app.handle(), store.settings().close_to_tray) {
+                eprintln!("创建系统托盘失败（关闭窗口最小化到托盘不可用）: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -346,6 +373,7 @@ let cloud_mgr = Arc::new(cloud::CloudManager::default());
             sso::sso_set_access_client_takeover,
             ssh::sso_sessions,
             ssh::sftp_release,
+            tray_available,
             store::is_config_complete,
             store::get_state,
             store::get_task_project,

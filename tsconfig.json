@@ -13,6 +13,10 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    /* 增量类型检查：全量 tsc --noEmit 约 55s，改一个文件也要整图重算；开增量后
+       第二次起只重查受影响文件。.tsbuildinfo 落在 node_modules/.cache，不污染仓库。 */
+    "incremental": true,
+    "tsBuildInfoFile": "node_modules/.cache/tsconfig.tsbuildinfo",
 
     /* Linting */
     "strict": true,

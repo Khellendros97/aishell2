@@ -12,7 +12,10 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "aishell_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 只保留 rlib：桌面（Windows/mac）二进制链接 rlib 即可。staticlib/cdylib 是移动端
+# （iOS/Android）才需要的产物，留着会让每次 cargo build 多两次全量链接并各写一份
+# 同样大的调试符号（实测 aishell_lib.pdb 293MB），是增量构建的主要固定开销之一。
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -26,6 +29,7 @@ url = "2"
 # devtools: release 安装版也保留 F12 开发者工具，便于现场排查（如 pi 资源布局问题）
 # unstable: 主窗口内嵌子 webview（内置浏览器面板）所需 —— tauri 2.11 的
 #   WebviewBuilder / Window::add_child 均受该 feature 门控
+# tray-icon: 系统托盘（设置-功能特性「关闭窗口时最小化到托盘」，见 tray.rs）
 # default-features=false 剔除 common-controls-v6：该 feature 只切换 muda 内部错误弹窗的
 # TaskDialog 实现（v6 独占符号）；应用二进制的 comctl32 v6 清单由 tauri-build 无条件嵌入、
 # 外观不受影响。但启用后 lib 单测二进制（无嵌入清单）会因加载 v5 comctl32 报
@@ -38,6 +42,7 @@ tauri = { version = "2", default-features = false, features = [
   "dynamic-acl",
   "x11",
   "dbus",
+  "tray-icon",
 ] }
 tauri-plugin-opener = "2"
 # 单实例：堡垒机 SSO 客户端每次登录都会启动一个 AIShell 进程，已有实例时把
@@ -112,4 +117,11 @@ tauri-winrt-notification = "0.7"
 # 无法下载，以 vendor/httpdate（本仓库自写的最小实现，API 兼容）本地替换。
 [patch.crates-io]
 httpdate = { path = "vendor/httpdate" }
+
+# 构建速度：dev/test 只生成行号表（panic 回溯仍有 file:line），不生成完整的类型/变量
+# 调试信息——aishell.pdb 从 342MB 降到 148MB，链接与落盘明显变快。
+# 需要在调试器里看变量时临时改回 `debug = true`（或 `cargo build --config
+# 'profile.dev.debug=true'`）。test profile 默认继承 dev，无需重复声明。
+[profile.dev]
+debug = "line-tables-only"
 

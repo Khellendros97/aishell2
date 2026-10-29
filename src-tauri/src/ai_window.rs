@@ -32,12 +32,15 @@ const AI_WINDOW_LABEL: &str = "ai-detach";
 struct AiWindowChanged {
     project_id: String,
     detached: bool,
+    /// 聚合时独立窗口最后停留的会话；建窗/异常路径可为空。
+    session_id: Option<String>,
 }
 
 /// 分离窗口运行态（app.manage，不落盘）：当前分离的项目 id + 最近窗口几何缓存
 /// （Moved/Resized 高频更新，Destroyed 时才落盘，避免拖拽期间频繁写 aishell.json）。
 pub struct AiWindowState {
     project_id: Mutex<Option<String>>,
+    session_id: Arc<Mutex<Option<String>>>,
     geometry: Arc<Mutex<Option<AiWindowGeometry>>>,
 }
 
@@ -45,6 +48,7 @@ impl Default for AiWindowState {
     fn default() -> Self {
         Self {
             project_id: Mutex::new(None),
+            session_id: Arc::new(Mutex::new(None)),
             geometry: Arc::new(Mutex::new(None)),
         }
     }
@@ -72,10 +76,7 @@ fn visible_on_some_monitor(app: &AppHandle, geo: &AiWindowGeometry) -> bool {
         return true;
     }
     let (x0, y0) = (geo.x, geo.y);
-    let (x1, y1) = (
-        geo.x + geo.width as i32,
-        geo.y + geo.height as i32,
-    );
+    let (x1, y1) = (geo.x + geo.width as i32, geo.y + geo.height as i32);
     monitors.iter().any(|m| {
         let mp = m.position();
         let ms = m.size();
@@ -93,19 +94,19 @@ fn register_window_events(
     win: tauri::WebviewWindow,
     store: Arc<Store>,
     project_id: String,
+    session_id: Arc<Mutex<Option<String>>>,
     geometry: Arc<Mutex<Option<AiWindowGeometry>>>,
 ) {
     let win_cb = win.clone();
     win.on_window_event(move |ev| match ev {
         tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
             if let (Ok(pos), Ok(size)) = (win_cb.outer_position(), win_cb.inner_size()) {
-                *geometry.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some(AiWindowGeometry {
-                        x: pos.x,
-                        y: pos.y,
-                        width: size.width,
-                        height: size.height,
-                    });
+                *geometry.lock().unwrap_or_else(|p| p.into_inner()) = Some(AiWindowGeometry {
+                    x: pos.x,
+                    y: pos.y,
+                    width: size.width,
+                    height: size.height,
+                });
             }
         }
         tauri::WindowEvent::Destroyed => {
@@ -119,6 +120,7 @@ fn register_window_events(
                 AiWindowChanged {
                     project_id: project_id.clone(),
                     detached: false,
+                    session_id: session_id.lock().unwrap_or_else(|p| p.into_inner()).clone(),
                 },
             );
         }
@@ -157,28 +159,30 @@ pub async fn ai_window_open(
     // hash 经 JSON 字符串字面量转义后内插进注入 script（JSON 字符串即合法 JS 字符串）
     let hash_literal = serde_json::to_string(&init_hash).unwrap_or_else(|_| "\"\"".to_string());
     let init_script = format!("window.location.hash = {hash_literal};");
-    let win = WebviewWindowBuilder::new(&app, AI_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-        .title("AIShell — AI 助手")
-        .inner_size(460.0, 720.0)
-        .min_inner_size(360.0, 480.0)
-        .decorations(false)
-        .visible(false)
-        .center()
-        // 与主窗口一致：wry 的 OS DropTarget 会截杀页面内 HTML5 拖拽（图片拖入输入框）
-        .disable_drag_drop_handler()
-        .initialization_script(init_script)
-        .build()
-        .map_err(|e| format!("创建 AI 助手窗口失败: {e}"))?;
+    let win =
+        WebviewWindowBuilder::new(&app, AI_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+            .title("AIShell — AI 助手")
+            .inner_size(460.0, 720.0)
+            .min_inner_size(360.0, 480.0)
+            .decorations(false)
+            .visible(false)
+            .center()
+            // 与主窗口一致：wry 的 OS DropTarget 会截杀页面内 HTML5 拖拽（图片拖入输入框）
+            .disable_drag_drop_handler()
+            .initialization_script(init_script)
+            .build()
+            .map_err(|e| format!("创建 AI 助手窗口失败: {e}"))?;
 
     // 记住的几何（物理像素）仍在任一显示器上才恢复，否则保持居中默认尺寸
-    if let Some(geo) = saved_geometry
-        .filter(|g| g.width > 0 && g.height > 0 && visible_on_some_monitor(&app, g))
+    if let Some(geo) =
+        saved_geometry.filter(|g| g.width > 0 && g.height > 0 && visible_on_some_monitor(&app, g))
     {
         let _ = win.set_size(PhysicalSize::new(geo.width, geo.height));
         let _ = win.set_position(PhysicalPosition::new(geo.x, geo.y));
     }
 
     *state.project_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(project_id.clone());
+    *state.session_id.lock().unwrap_or_else(|p| p.into_inner()) = session_id.clone();
     *state.geometry.lock().unwrap_or_else(|p| p.into_inner()) = None;
 
     crate::disable_webview2_browser_keys(&win);
@@ -187,6 +191,7 @@ pub async fn ai_window_open(
         win.clone(),
         store.inner().clone(),
         project_id.clone(),
+        state.session_id.clone(),
         state.geometry.clone(),
     );
 
@@ -197,18 +202,27 @@ pub async fn ai_window_open(
         AiWindowChanged {
             project_id,
             detached: true,
+            session_id,
         },
     );
     Ok(())
 }
 
-/// 聚合还原：优雅关闭分离窗口。close 触发分离窗口 JS closeRequested（直接放行，任务由
-/// 宿主窗口的常驻上下文无缝接续），destroy 后 Destroyed 事件广播 ai:window-changed
-/// {detached:false}，宿主据此重挂侧栏 AI 面板。
+/// 聚合还原：记录独立窗口最后活动的会话，随后直接销毁窗口。前端「聚合」按钮与 X 关闭
+/// 守卫都会先 flush 正式消息再调用；destroy 不再触发 closeRequested，避免递归关窗。
+/// Destroyed 事件广播 ai:window-changed {detached:false, sessionId}，宿主据此重对账并重挂。
 #[tauri::command]
-pub async fn ai_window_close(app: AppHandle) -> Result<(), String> {
+pub async fn ai_window_close(
+    app: AppHandle,
+    state: State<'_, AiWindowState>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    if let Some(sid) = session_id.filter(|sid| !sid.trim().is_empty()) {
+        *state.session_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(sid);
+    }
     if let Some(win) = app.get_webview_window(AI_WINDOW_LABEL) {
-        win.close().map_err(|e| format!("关闭 AI 助手窗口失败: {e}"))?;
+        win.destroy()
+            .map_err(|e| format!("关闭 AI 助手窗口失败: {e}"))?;
     }
     Ok(())
 }
@@ -229,4 +243,39 @@ pub async fn ai_forward_ref(
 ) -> Result<(), String> {
     app.emit(&format!("ai:forward-ref:{project_id}"), payload)
         .map_err(|e| format!("转发引用失败: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_hash_carries_optional_session() {
+        assert_eq!(
+            window_hash("p1", Some("s1"), "workbench"),
+            "#/ai-window?project=p1&host=workbench&session=s1"
+        );
+        assert_eq!(
+            window_hash("p1", None, "welcome"),
+            "#/ai-window?project=p1&host=welcome"
+        );
+        assert_eq!(
+            window_hash("p1", Some("  "), "welcome"),
+            "#/ai-window?project=p1&host=welcome"
+        );
+    }
+
+    #[test]
+    fn window_changed_serializes_session_id_in_camel_case() {
+        let value = serde_json::to_value(AiWindowChanged {
+            project_id: "p1".to_string(),
+            detached: false,
+            session_id: Some("s1".to_string()),
+        })
+        .expect("序列化分离窗口事件");
+        assert_eq!(
+            value,
+            serde_json::json!({"projectId": "p1", "detached": false, "sessionId": "s1"})
+        );
+    }
 }
