@@ -4,7 +4,7 @@
  * - OS 文件拖入全局兜底(dragDropEnabled:false 后 WebView2 默认行为是导航到拖入文件);
  * - 禁用 WebView2 原生右键菜单(输入框放行);F12 打开 DevTools(应用自控);
  * - AI 任务未结束时拦截窗口关闭,弹确认框二次确认(anyAiBusy + onCloseRequested);
- *   分离窗口(label = ai-detach)关闭即聚合:先释放项目上下文再放行,不弹确认;
+ *   分离窗口(label = ai-detach)关闭即聚合:先 flush 正式会话快照再销毁,不弹确认;
  * - 命令面板 / Debug 日志总线为自包含命令式浮层,保持旧模块不动,继续在此初始化。
  */
 import './styles/design.css';
@@ -17,7 +17,9 @@ import { initUpdates } from './updates';
 import { navigate } from './router';
 import { applyTheme } from './theme';
 import { confirmDialog } from './ui';
-import { anyAiBusy, flushAiPendingOutput } from './pages/workbench/ai/ai-engine';
+import {
+  anyAiBusy, currentDetachedAiSessionId, flushAiPendingOutput, flushAiSessionSnapshots,
+} from './pages/workbench/ai/ai-engine';
 import { ErrorBoundary } from './shared/ErrorBoundary';
 import App from './App';
 
@@ -55,9 +57,8 @@ document.addEventListener('keydown', (e) => {
 
 /* ---------- 程序关闭二次确认:AI 助手任务尚未结束时先拦截 ---------- */
 /* 按窗口分两种角色：
-   - 分离窗口(label = ai-detach):关闭即聚合——直接放行(api 层随后 destroy,后端 Destroyed
-     广播 ai:window-changed 让宿主还原面板);分离是双端订阅,宿主 ctx 全程在线收流,
-     关闭不影响任务,故 AI 忙也不弹确认。
+   - 分离窗口(label = ai-detach):关闭即聚合——onCloseRequested 先 flush 正式消息，
+     再由 ai_window_close 记录当前会话并 destroy；宿主 ctx 全程在线收流，AI 忙也不弹确认。
    - 主窗口:有任务(anyAiBusy 本窗口常驻上下文——分离后 ctx 仍在收流,天然覆盖分离窗口的
      忙态;外加 aiAnyBusy 后端进程表兜底)一律 preventDefault 拦下,弹确认框;确认后先带走
      分离窗口再 destroy() 强制关闭——destroy 不再触发 closeRequested(不会递归回本守卫),
@@ -71,8 +72,22 @@ void (async () => {
   try {
     win = getCurrentWindow();
     const isDetachWindow = win.label === 'ai-detach';
+    let detachCloseStarted = false;
     await win.onCloseRequested(async (event) => {
-      if (isDetachWindow) return; // 关闭即聚合:直接放行
+      if (isDetachWindow) {
+        /* X 关闭先落盘正式消息；后端 destroy 不会递归进入本守卫。 */
+        event.preventDefault();
+        if (detachCloseStarted) return;
+        detachCloseStarted = true;
+        try {
+          await flushAiSessionSnapshots();
+          await aiWindowClose(currentDetachedAiSessionId());
+        } catch (err) {
+          detachCloseStarted = false;
+          console.error('[AI] 聚合窗口关闭失败:', err);
+        }
+        return;
+      }
       const backendBusy = await aiAnyBusy().catch(() => false);
       if (!anyAiBusy() && !backendBusy) {
         await aiWindowClose().catch(() => { /* 无分离窗口时为 no-op */ });

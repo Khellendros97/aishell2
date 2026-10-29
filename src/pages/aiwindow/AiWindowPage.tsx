@@ -6,9 +6,10 @@
  * + 全高 AiPanel（workbenchIntegration=false，无终端/浏览器联动）。
  * 宿主窗口的「添加到对话」经 ai_forward_ref 命令 + ai:forward-ref:<projectId> 事件转发进来，
  * 由 ai-engine 的转发分发插入引用 chip。
- * 关闭（按钮/X）=「关闭即聚合」：close 触发 closeRequested → 引擎 releaseAllProjectContexts
- * （flush 落盘 + 退订）→ 放行销毁 → 后端 Destroyed 广播 ai:window-changed {detached:false}，
- * 宿主窗口据此重挂侧栏 AI 面板。
+ * 关闭（按钮/X）=「关闭即聚合」：closeRequested → 引擎 flushAiSessionSnapshots
+ * （正式消息落盘，不提前定稿生成中的 pending）→ ai_window_close 记录当前会话并销毁，
+ * 后端 Destroyed 广播 ai:window-changed {detached:false, sessionId}，
+ * 宿主窗口据此重对账消息并重挂侧栏 AI 面板。
  * 会话连续性：pi 进程与 aishell.json 会话快照 app 级共享，本窗口重新挂载拉全量历史即可续流。
  */
 import { useEffect, useState } from 'react';
@@ -88,7 +89,7 @@ export function AiWindowPage({ params }: { params: URLSearchParams }): JSX.Eleme
         <div className="tb-win-controls">
           <button className="tb-win-btn tb-win-min" title="最小化" onClick={() => getWindow()?.minimize()}><Icon name="minus" /></button>
           <button className="tb-win-btn tb-win-max" title="最大化 / 还原" onClick={() => { const w = getWindow(); if (w) void w.toggleMaximize(); }}><Icon name={maximized ? 'restore' : 'square'} /></button>
-          {/* 关闭即聚合：关窗流程见文件头说明（引擎释放上下文后放行，宿主自动还原面板） */}
+          {/* 关闭即聚合：main.tsx 关窗守卫先落盘，再销毁并回传当前会话 */}
           <button className="tb-win-btn tb-win-close" title="关闭（聚合回主窗口）" onClick={() => { const w = getWindow(); if (w) void w.close(); }}><Icon name="x" /></button>
         </div>
       </div>

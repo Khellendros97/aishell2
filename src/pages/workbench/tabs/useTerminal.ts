@@ -19,6 +19,8 @@
  * 终端搜索(2026-10):Ctrl+F 或右键「查找…」打开右上角浮层(@xterm/addon-search);
  * 输入即增量查找、Enter/Shift+Enter 上下条、Esc 关闭并交还终端焦点;匹配全高亮 + 结果计数,
  * 「Aa」切换区分大小写。搜索条绝对定位于 .term-xterm 内,不参与 FitAddon 布局。
+ * SSH 语义高亮(terminal-highlight.ts):xterm 解析后按逻辑行识别错误/警告/成功,
+ * 以底层 decoration 加整行底色,不改写输出字节,复制/导出/已有 ANSI 颜色均不受影响。
  *
  * React 差异(语义对齐 legacy):
  * - 无 tab.el / tab.pane 命令式 DOM:标签栏「已退出」置灰经 setTabBarExited 按
@@ -33,7 +35,7 @@
  */
 import { useEffect, useRef, type RefObject } from 'react';
 import { Terminal } from '@xterm/xterm';
-import type { IBuffer, ITheme } from '@xterm/xterm';
+import type { IDecoration, IBuffer, ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SearchAddon, type ISearchOptions } from '@xterm/addon-search';
@@ -53,6 +55,9 @@ import { icon, type IconName } from '../../../icons';
 import { attachCombo, copyText, showContextMenu, toast, uid, type CtxMenuItems } from '../../../ui';
 import { dbg } from '../../../debug';
 import { currentTheme, onThemeChange } from '../../../theme';
+import {
+  classifyTerminalLine, TERMINAL_HIGHLIGHT_COLORS, type TerminalHighlightLevel,
+} from './terminal-highlight';
 import {
   getActiveTab, tabApis, useWorkbench, wbEvents, wbHandles,
   type Tab, type TerminalApi,
@@ -89,7 +94,7 @@ declare global {
   interface Window { __terms?: Set<TermSession> }
 }
 window.__terms = liveTerms;
-onThemeChange((t) => { liveTerms.forEach((s) => { s.term.options.theme = TERM_THEMES[t]; }); });
+onThemeChange((t) => { liveTerms.forEach((s) => { s.applyTheme(t); }); });
 
 /* ---------- 自动录制终端开关（Settings.autoRecordTerminal，默认关闭） ----------
    照 shared/notify.ts 的惰性缓存模式：首次使用时经 getState 读取，设置页保存后广播
@@ -131,6 +136,9 @@ interface TermBlock {
 
 /** 单块 output 行数上限（计划：每块上限 2000 行）。 */
 const MAX_BLOCK_LINES = 2000;
+/** SSH 高亮装饰保留上限与每秒新建上限：错误日志洪泛时不制造无界 DOM/对象 churn。 */
+const MAX_TERMINAL_HIGHLIGHTS = 300;
+const TERMINAL_HIGHLIGHT_RATE = 80;
 
 /** 剥除 ANSI 转义（CSI / OSC / 单字符转义），用于区块 output 的纯文本捕获。 */
 function stripAnsi(s: string): string {
@@ -199,6 +207,11 @@ export function extractCommandFromBuffer(buf: IBuffer): string {
     if (start - row >= 11 && !ln.isWrapped) break;
   }
   return cursorLine.trim();
+}
+
+interface TermHighlight {
+  decoration: IDecoration;
+  level: TerminalHighlightLevel;
 }
 
 /** TermSession 构造所需的 DOM 元素(由 TerminalTab 的 JSX ref 解析后传入)。 */
@@ -300,6 +313,12 @@ class TermSession {
   private searchCaseSensitive = false;
   /** addon-search 结果计数（仅在带 decorations 搜索时回调） */
   private searchSub: { dispose(): void } | null = null;
+  /** 仅 SSH 终端启用语义高亮；decoration 与 marker 成对由 xterm 跟踪滚动/回收。 */
+  private readonly highlightsEnabled: boolean;
+  private highlightDecos: TermHighlight[] = [];
+  private highlightRefreshFrame: number | null = null;
+  private highlightWindowStart = 0;
+  private highlightWindowCount = 0;
 
   /** 日志用短 id（term:srv-xxx:t-yyyy → t-yyyy） */
   private get sid(): string {
@@ -325,6 +344,7 @@ class TermSession {
     this.addChatBtn = els.addChatBtn;
     this.pinBtn = els.pinBtn;
     this.recBtn = els.recBtn;
+    this.highlightsEnabled = (tab.data as { kind?: string }).kind === 'ssh';
 
     this.clearBtn.disabled = true; // 初始无区块
     this.drawerToggle.onclick = () => this.drawer.classList.toggle('term-drawer-hidden');
@@ -365,6 +385,13 @@ class TermSession {
     this.term.parser.registerCsiHandler({ prefix: '?', intermediates: '$', final: 'p' }, (params) => this.answerDecrqm(params, false));
     this.term.open(this.host);
     this.term.onData((data) => this.onUserInput(data));
+    if (this.highlightsEnabled) {
+      /* 换行前一行已经完整，立即扫描可覆盖大批输出中的每一行；onWriteParsed 再补扫
+         没有换行的当前行（进度条/末尾片段）。装饰只在关键词命中时创建。 */
+      this.term.onLineFeed(() => this.highlightCursorLine(true));
+      this.term.onWriteParsed(() => this.highlightCursorLine(false));
+      this.term.onResize(() => this.scheduleHighlightRefresh());
+    }
 
     /* 自定义右键菜单（原生菜单已全局禁用）：添加到对话 / 打开文件管理器 / 复制 / 粘贴 / 重连。
        添加到对话 = 把该终端对应引用加入 AI 输入框（SSH → @remote:服务器名称，本地 → @local）；
@@ -792,6 +819,104 @@ class TermSession {
   /** 从 xterm buffer 提取光标所在输入行的命令文本（实现见模块级纯函数 extractCommandFromBuffer） */
   private readCommandFromBuffer(): string {
     return extractCommandFromBuffer(this.term.buffer.active);
+  }
+
+  applyTheme(theme: 'dark' | 'light'): void {
+    this.term.options.theme = TERM_THEMES[theme];
+    this.scheduleHighlightRefresh();
+  }
+
+  private highlightCursorLine(previous: boolean): void {
+    const buf = this.term.buffer.active;
+    if (buf.type !== 'normal') return;
+    const row = buf.baseY + buf.cursorY - (previous ? 1 : 0);
+    if (row >= 0) this.highlightLogicalLine(row);
+  }
+
+  /** 扫描一条逻辑行（含自动折行），所有物理行共用同一语义底色。 */
+  private highlightLogicalLine(endRow: number): void {
+    const buf = this.term.buffer.active;
+    if (buf.type !== 'normal' || !buf.getLine(endRow)) return;
+    let startRow = endRow;
+    while (startRow > 0 && buf.getLine(startRow)?.isWrapped) startRow--;
+    let text = '';
+    for (let row = startRow; row <= endRow; row++) {
+      text += buf.getLine(row)?.translateToString(true) ?? '';
+    }
+    const level = classifyTerminalLine(text);
+    if (!level) return;
+
+    let changed = false;
+    for (let row = startRow; row <= endRow; row++) {
+      const old = this.highlightDecos.find((h) => h.decoration.marker.line === row);
+      if (old?.level === level) continue;
+      if (!changed) {
+        /* 同一逻辑行只计一次限额；已有装饰只换级别时不计入洪泛预算。 */
+        const now = Date.now();
+        if (now - this.highlightWindowStart >= 1000) {
+          this.highlightWindowStart = now;
+          this.highlightWindowCount = 0;
+        }
+        if (!old && this.highlightWindowCount >= TERMINAL_HIGHLIGHT_RATE) return;
+        if (!old) this.highlightWindowCount++;
+        changed = true;
+      }
+      old?.decoration.dispose();
+      this.addHighlight(row, level);
+    }
+  }
+
+  private addHighlight(row: number, level: TerminalHighlightLevel): void {
+    const buf = this.term.buffer.active;
+    const marker = this.term.registerMarker(row - (buf.baseY + buf.cursorY));
+    if (!marker) return;
+    const decoration = this.term.registerDecoration({
+      marker,
+      width: this.term.cols,
+      backgroundColor: TERMINAL_HIGHLIGHT_COLORS[currentTheme()][level],
+      layer: 'bottom',
+    });
+    if (!decoration) {
+      marker.dispose();
+      return;
+    }
+    const entry: TermHighlight = { decoration, level };
+    this.highlightDecos.push(entry);
+    decoration.onDispose(() => {
+      const idx = this.highlightDecos.indexOf(entry);
+      if (idx >= 0) this.highlightDecos.splice(idx, 1);
+      if (!marker.isDisposed) marker.dispose();
+    });
+    marker.onDispose(() => decoration.dispose());
+    while (this.highlightDecos.length > MAX_TERMINAL_HIGHLIGHTS) {
+      this.highlightDecos[0].decoration.dispose();
+    }
+  }
+
+  /** 主题/列宽变化后重建（decoration 颜色与宽度不可变），合并到下一帧避免连续 resize 抖动。 */
+  private scheduleHighlightRefresh(): void {
+    if (!this.highlightsEnabled || this.highlightRefreshFrame !== null) return;
+    this.highlightRefreshFrame = window.requestAnimationFrame(() => {
+      this.highlightRefreshFrame = null;
+      this.clearHighlights();
+      const buf = this.term.buffer.active;
+      if (buf.type !== 'normal') return;
+      this.highlightWindowStart = 0;
+      this.highlightWindowCount = 0;
+      for (let row = 0; row < buf.length; row++) {
+        if (buf.getLine(row)?.isWrapped) continue;
+        let end = row;
+        while (buf.getLine(end + 1)?.isWrapped) end++;
+        this.highlightLogicalLine(end);
+        row = end;
+      }
+    });
+  }
+
+  private clearHighlights(): void {
+    const all = this.highlightDecos;
+    this.highlightDecos = [];
+    for (const h of all) h.decoration.dispose();
   }
 
   /* ---------- 后端输出：写 xterm + 区块 output 捕获 ---------- */
@@ -1426,6 +1551,11 @@ class TermSession {
     this.searchBar = null;
     this.searchInput = null;
     this.searchCountEl = null;
+    if (this.highlightRefreshFrame !== null) {
+      window.cancelAnimationFrame(this.highlightRefreshFrame);
+      this.highlightRefreshFrame = null;
+    }
+    this.clearHighlights();
     if (!this.exited) void termClose(this.tab.id).catch(() => {});
     try { this.term.dispose(); } catch { /* 忽略 dispose 异常 */ }
   }
